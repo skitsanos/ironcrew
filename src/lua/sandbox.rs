@@ -65,11 +65,11 @@ pub fn create_tool_lua() -> LuaResult<Lua> {
     let fs_table = lua.create_table()?;
     let fs_read = lua.create_function(|_, path: String| {
         std::fs::read_to_string(&path)
-            .map_err(|e| mlua::Error::external(e))
+            .map_err(mlua::Error::external)
     })?;
     let fs_write = lua.create_function(|_, (path, content): (String, String)| {
         std::fs::write(&path, &content)
-            .map_err(|e| mlua::Error::external(e))
+            .map_err(mlua::Error::external)
     })?;
     fs_table.set("read", fs_read)?;
     fs_table.set("write", fs_write)?;

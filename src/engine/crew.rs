@@ -7,6 +7,7 @@ use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
+#[allow(dead_code)]
 pub struct ProviderConfig {
     pub provider: String,
     pub model: String,
@@ -15,6 +16,7 @@ pub struct ProviderConfig {
 }
 
 pub struct Crew {
+    #[allow(dead_code)]
     pub goal: String,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
@@ -164,13 +166,13 @@ impl Crew {
 
         // Inject dependency results
         for dep_name in &task.depends_on {
-            if let Some(dep_result) = completed_results.get(dep_name) {
-                if dep_result.success {
-                    prompt_parts.push(format!(
-                        "Result from '{}': {}",
-                        dep_name, dep_result.output
-                    ));
-                }
+            if let Some(dep_result) = completed_results.get(dep_name)
+                && dep_result.success
+            {
+                prompt_parts.push(format!(
+                    "Result from '{}': {}",
+                    dep_name, dep_result.output
+                ));
             }
         }
 

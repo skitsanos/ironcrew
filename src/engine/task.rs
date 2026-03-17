@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::utils::error::{IronCrewError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
     pub description: String,
@@ -17,18 +17,6 @@ pub struct Task {
     pub depends_on: Vec<String>,
 }
 
-impl Default for Task {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            description: String::new(),
-            agent: None,
-            expected_output: None,
-            context: None,
-            depends_on: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskResult {

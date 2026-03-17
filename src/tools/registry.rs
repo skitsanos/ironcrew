@@ -8,6 +8,12 @@ pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -19,14 +25,17 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
+    #[allow(dead_code)]
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.values().map(|t| t.schema()).collect()
     }

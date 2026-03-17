@@ -37,13 +37,13 @@ impl FileWriteTool {
             });
         }
 
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if !self.allowed_extensions.iter().any(|a| a == ext) {
-                return Err(IronCrewError::ToolExecution {
-                    tool: "file_write".into(),
-                    message: format!("Extension '.{}' not allowed", ext),
-                });
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && !self.allowed_extensions.iter().any(|a| a == ext)
+        {
+            return Err(IronCrewError::ToolExecution {
+                tool: "file_write".into(),
+                message: format!("Extension '.{}' not allowed", ext),
+            });
         }
 
         if let Some(ref base) = self.base_dir {

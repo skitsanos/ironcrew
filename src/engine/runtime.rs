@@ -29,6 +29,7 @@ impl Runtime {
         }
     }
 
+    #[allow(dead_code)]
     pub fn enable_shell_tool(&mut self) {
         self.tool_registry.register(Box::new(ShellTool::new()));
     }

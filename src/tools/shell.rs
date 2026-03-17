@@ -6,7 +6,14 @@ use super::Tool;
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
+#[allow(dead_code)]
 pub struct ShellTool;
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ShellTool {
     pub fn new() -> Self {

@@ -12,6 +12,7 @@ use crate::llm::provider::ToolSchema;
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    #[allow(dead_code)]
     fn description(&self) -> &str;
     fn schema(&self) -> ToolSchema;
     async fn execute(&self, args: serde_json::Value) -> Result<String>;

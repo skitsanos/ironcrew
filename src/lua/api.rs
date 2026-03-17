@@ -331,7 +331,7 @@ impl UserData for LuaCrew {
             let results = crew
                 .run(this.runtime.provider.as_ref(), &this.runtime.tool_registry)
                 .await
-                .map_err(|e| mlua::Error::external(e))?;
+                .map_err(mlua::Error::external)?;
 
             // Convert results to Lua table
             let results_table = lua.create_table()?;

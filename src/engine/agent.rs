@@ -11,7 +11,7 @@ pub enum ResponseFormat {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
     pub goal: String,
@@ -33,22 +33,6 @@ pub struct Agent {
     pub response_format: Option<ResponseFormat>,
 }
 
-impl Default for Agent {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            goal: String::new(),
-            expected_output: None,
-            system_prompt: None,
-            capabilities: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: None,
-            model: None,
-            response_format: None,
-        }
-    }
-}
 
 pub struct AgentSelector;
 
@@ -102,7 +86,7 @@ impl AgentSelector {
         ];
         let referenced_tools: Vec<&str> = tool_keywords
             .iter()
-            .filter(|kw| task_words.contains(&kw.to_string()))
+            .filter(|kw| task_words.contains(**kw))
             .copied()
             .collect();
 
