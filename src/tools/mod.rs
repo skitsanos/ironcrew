@@ -1,5 +1,6 @@
 pub mod file_read;
 pub mod file_write;
+pub mod lua_tool;
 pub mod registry;
 pub mod shell;
 pub mod web_scrape;

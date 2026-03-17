@@ -1,8 +1,18 @@
-use mlua::{Lua, Result as LuaResult, Table, Value};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use mlua::{Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
+use tokio::sync::Mutex;
 
 use crate::engine::agent::{Agent, ResponseFormat};
+use crate::engine::crew::{Crew, ProviderConfig};
+use crate::engine::runtime::Runtime;
 use crate::engine::task::Task;
 use crate::utils::error::{IronCrewError, Result};
+
+// ---------------------------------------------------------------------------
+// Agent parsing
+// ---------------------------------------------------------------------------
 
 /// Parse an Agent from a Lua table.
 pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
@@ -79,12 +89,17 @@ fn parse_response_format(table: &Table) -> LuaResult<Option<ResponseFormat>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JSON conversion helpers
+// ---------------------------------------------------------------------------
+
 /// Recursively convert a Lua table to serde_json::Value.
 pub fn lua_table_to_json(table: &Table) -> LuaResult<serde_json::Value> {
     // Check if it's an array (sequential integer keys starting at 1)
     let is_array = table.clone().sequence_values::<Value>().next().is_some()
         && table.clone().pairs::<Value, Value>().all(|pair| {
-            pair.map(|(k, _)| matches!(k, Value::Integer(_))).unwrap_or(false)
+            pair.map(|(k, _)| matches!(k, Value::Integer(_)))
+                .unwrap_or(false)
         });
 
     if is_array {
@@ -116,6 +131,10 @@ fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task parsing
+// ---------------------------------------------------------------------------
+
 /// Parse a Task from a Lua table.
 pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let name: String = table.get("name")?;
@@ -143,8 +162,98 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Lua tool definitions
+// ---------------------------------------------------------------------------
+
+/// Metadata for a Lua-defined tool (parsed from tools/*.lua files).
+pub struct LuaToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    pub source_path: PathBuf,
+}
+
+/// Parse tool definition from a Lua table. Validates all required fields including execute.
+pub fn tool_def_from_lua_table(table: &Table, source_path: &Path) -> LuaResult<LuaToolDef> {
+    let name: String = table.get("name")?;
+    let description: String = table.get("description")?;
+
+    let params_table: Table = table.get("parameters")?;
+    let parameters = lua_table_to_json(&params_table)?;
+
+    // Validate execute function exists and is callable
+    let _execute: Function = table.get("execute").map_err(|_| {
+        mlua::Error::external(IronCrewError::Validation(format!(
+            "Tool '{}' is missing required 'execute' function",
+            name
+        )))
+    })?;
+
+    // Convert our parameter format to JSON Schema
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+
+    if let serde_json::Value::Object(params) = &parameters {
+        for (key, value) in params {
+            if let serde_json::Value::Object(param_def) = value {
+                let mut prop = serde_json::Map::new();
+                if let Some(t) = param_def.get("type") {
+                    prop.insert("type".into(), t.clone());
+                }
+                if let Some(d) = param_def.get("description") {
+                    prop.insert("description".into(), d.clone());
+                }
+                properties.insert(key.clone(), serde_json::Value::Object(prop));
+
+                if param_def.get("required") == Some(&serde_json::Value::Bool(true)) {
+                    required.push(serde_json::Value::String(key.clone()));
+                }
+            }
+        }
+    }
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    });
+
+    Ok(LuaToolDef {
+        name,
+        description,
+        parameters: schema,
+        source_path: source_path.to_path_buf(),
+    })
+}
+
+/// Load tool definitions from Lua files (metadata only, not execute functions).
+pub fn load_tool_defs_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
+    let mut tools = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(file).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
+        })?;
+        let table: Table = lua.load(&source).eval().map_err(IronCrewError::Lua)?;
+        let tool_def = tool_def_from_lua_table(&table, file).map_err(|e| {
+            IronCrewError::Validation(format!(
+                "Invalid tool definition in {}: {}",
+                file.display(),
+                e
+            ))
+        })?;
+        tracing::info!("Loaded tool '{}' from {}", tool_def.name, file.display());
+        tools.push(tool_def);
+    }
+    Ok(tools)
+}
+
+// ---------------------------------------------------------------------------
+// File-based agent loading
+// ---------------------------------------------------------------------------
+
 /// Load agent definitions from Lua files.
-pub fn load_agents_from_files(lua: &Lua, files: &[std::path::PathBuf]) -> Result<Vec<Agent>> {
+pub fn load_agents_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     for file in files {
         let source = std::fs::read_to_string(file).map_err(|e| {
@@ -164,11 +273,13 @@ pub fn load_agents_from_files(lua: &Lua, files: &[std::path::PathBuf]) -> Result
     Ok(agents)
 }
 
+// ---------------------------------------------------------------------------
+// Global registrations
+// ---------------------------------------------------------------------------
+
 /// Register the env() global function in Lua.
 pub fn register_env_function(lua: &Lua) -> LuaResult<()> {
-    let env_fn = lua.create_function(|_, name: String| {
-        Ok(std::env::var(&name).ok())
-    })?;
+    let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
     lua.globals().set("env", env_fn)?;
     Ok(())
 }
@@ -187,5 +298,98 @@ pub fn register_agent_constructor(lua: &Lua) -> LuaResult<()> {
 
     agent_table.set("new", new_fn)?;
     lua.globals().set("Agent", agent_table)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LuaCrew — Lua userdata wrapping a Crew + Runtime
+// ---------------------------------------------------------------------------
+
+/// Wrapper holding crew + runtime for Lua userdata.
+pub struct LuaCrew {
+    pub crew: Arc<Mutex<Crew>>,
+    pub runtime: Arc<Runtime>,
+}
+
+impl UserData for LuaCrew {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // Use add_async_method for all methods to avoid block_on inside Tokio
+        methods.add_async_method("add_agent", |_, this, table: Table| async move {
+            let agent = agent_from_lua_table(&table)?;
+            this.crew.lock().await.add_agent(agent);
+            Ok(())
+        });
+
+        methods.add_async_method("add_task", |_, this, table: Table| async move {
+            let task = task_from_lua_table(&table)?;
+            this.crew.lock().await.add_task(task);
+            Ok(())
+        });
+
+        methods.add_async_method("run", |lua, this, ()| async move {
+            let crew = this.crew.lock().await;
+            let results = crew
+                .run(this.runtime.provider.as_ref(), &this.runtime.tool_registry)
+                .await
+                .map_err(|e| mlua::Error::external(e))?;
+
+            // Convert results to Lua table
+            let results_table = lua.create_table()?;
+            for (i, result) in results.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("task", result.task.clone())?;
+                entry.set("agent", result.agent.clone())?;
+                entry.set("output", result.output.clone())?;
+                entry.set("success", result.success)?;
+                entry.set("duration_ms", result.duration_ms)?;
+                results_table.set(i + 1, entry)?;
+            }
+
+            Ok(results_table)
+        });
+    }
+}
+
+/// Register Crew.new() constructor. Requires provider setup.
+/// Preloaded agents (from agents/ directory) are auto-injected into every new Crew.
+pub fn register_crew_constructor(
+    lua: &Lua,
+    runtime: Arc<Runtime>,
+    preloaded_agents: Vec<Agent>,
+) -> LuaResult<()> {
+    let crew_table = lua.create_table()?;
+    let agents = Arc::new(preloaded_agents);
+
+    let new_fn = lua.create_function(move |_, table: Table| {
+        let goal: String = table.get("goal")?;
+        let provider: String =
+            table.get::<String>("provider").unwrap_or_else(|_| "openai".into());
+        let model: String =
+            table.get::<String>("model").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let base_url: Option<String> = table.get("base_url").ok();
+        let api_key: Option<String> = table.get("api_key").ok();
+
+        let config = ProviderConfig {
+            provider,
+            model,
+            base_url,
+            api_key,
+        };
+
+        let mut crew = Crew::new(goal, config);
+
+        // Auto-inject preloaded agents from agents/ directory
+        for agent in agents.iter() {
+            crew.add_agent(agent.clone());
+        }
+
+        Ok(LuaCrew {
+            crew: Arc::new(Mutex::new(crew)),
+            runtime: runtime.clone(),
+        })
+    })?;
+
+    crew_table.set("new", new_fn)?;
+    lua.globals().set("Crew", crew_table)?;
     Ok(())
 }

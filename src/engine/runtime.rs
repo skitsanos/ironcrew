@@ -32,4 +32,19 @@ impl Runtime {
     pub fn enable_shell_tool(&mut self) {
         self.tool_registry.register(Box::new(ShellTool::new()));
     }
+
+    /// Register Lua-defined tools from tool definition metadata.
+    /// Reads source from each tool's file path and wraps it in a LuaScriptTool.
+    pub fn register_lua_tools(&mut self, tool_defs: Vec<crate::lua::api::LuaToolDef>) {
+        for def in tool_defs {
+            let source = std::fs::read_to_string(&def.source_path).unwrap_or_default();
+            let lua_tool = crate::tools::lua_tool::LuaScriptTool::new(
+                def.name,
+                def.description,
+                def.parameters,
+                source,
+            );
+            self.tool_registry.register(Box::new(lua_tool));
+        }
+    }
 }
