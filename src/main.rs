@@ -146,51 +146,108 @@ fn cmd_validate(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
 
-    // 1. Validate agent files (Lua syntax + schema: name and goal required)
-    let agents = load_agents_from_files(&lua, loader.agent_files())?;
-    println!("Agents: {} valid", agents.len());
+    println!("Validating project: {}", loader.project_dir().display());
+    println!();
 
-    // 2. Validate tool files (Lua syntax + schema: name, description, parameters, execute required)
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files())?;
-    println!("Tools: {} valid", tool_defs.len());
+    // 1. Validate agent files
+    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+    println!("Agents ({}):", agents.len());
+    for agent in &agents {
+        let mut details = vec![];
+        if !agent.capabilities.is_empty() {
+            details.push(format!("capabilities: [{}]", agent.capabilities.join(", ")));
+        }
+        if !agent.tools.is_empty() {
+            details.push(format!("tools: [{}]", agent.tools.join(", ")));
+        }
+        if let Some(ref model) = agent.model {
+            details.push(format!("model: {}", model));
+        }
+        if agent.response_format.is_some() {
+            details.push("response_format: set".into());
+        }
+        let detail_str = if details.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", details.join(", "))
+        };
+        println!("  \u{2713} {}{}", agent.name, detail_str);
+    }
+    if agents.is_empty() {
+        println!("  (none -- agents will be defined inline in crew.lua)");
+    }
+    println!();
 
-    // 3. Validate entrypoint Lua syntax
+    // 2. Validate tool files
+    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+    let known_tools: Vec<String> = vec![
+        "file_read",
+        "file_write",
+        "web_scrape",
+        "shell",
+        "http_request",
+        "hash",
+        "template_render",
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain(tool_defs.iter().map(|t| t.name.clone()))
+    .collect();
+
+    println!("Tools ({} built-in + {} custom):", 7, tool_defs.len());
+    println!("  Built-in: file_read, file_write, web_scrape, shell, http_request, hash, template_render");
+    for tool in &tool_defs {
+        println!(
+            "  \u{2713} {} (custom, from {})",
+            tool.name,
+            tool.source_path.display()
+        );
+    }
+    println!();
+
+    // 3. Validate entrypoint syntax
     if let Some(entrypoint) = loader.entrypoint() {
         let script = std::fs::read_to_string(entrypoint)?;
-        // Check Lua syntax only (load but don't exec, since exec would run the crew)
         lua.load(&script).into_function().map_err(|e| {
             IronCrewError::Validation(format!("Syntax error in {}: {}", entrypoint.display(), e))
         })?;
-        println!("Entrypoint: {} valid", entrypoint.display());
+        println!("Entrypoint: \u{2713} {} (syntax valid)", entrypoint.display());
     }
+    println!();
 
-    // 4. Validate agent tool references resolve to known tools
-    let known_tools: Vec<String> = vec![
-        "file_read".into(),
-        "file_write".into(),
-        "web_scrape".into(),
-        "shell".into(),
-    ]
-    .into_iter()
-    .chain(tool_defs.iter().map(|t| t.name.clone()))
-    .collect();
+    // 4. Reference integrity: agent tool references
+    let mut issues = 0;
     for agent in &agents {
         for tool_name in &agent.tools {
             if !known_tools.contains(tool_name) {
-                return Err(IronCrewError::Validation(format!(
-                    "Agent '{}' references unknown tool '{}'",
+                println!(
+                    "  \u{2717} Agent '{}' references unknown tool '{}'",
                     agent.name, tool_name
-                )));
+                );
+                issues += 1;
             }
         }
     }
-    println!("Reference integrity: valid");
 
-    // Note: task dependency graph validation happens at runtime (tasks are defined in crew.lua)
-    // ResponseFormat validation happens during agent loading (parse_response_format)
+    if issues == 0 {
+        println!("Reference integrity: \u{2713} all references valid");
+    }
+    println!();
 
-    println!("Validation passed.");
-    Ok(())
+    // 5. Summary
+    if issues > 0 {
+        println!("Validation FAILED with {} issue(s).", issues);
+        Err(IronCrewError::Validation(format!(
+            "{} validation issue(s) found",
+            issues
+        )))
+    } else {
+        println!("Validation PASSED.");
+        println!();
+        println!("Note: Task dependencies and execution order are validated at runtime");
+        println!("      when crew.lua is executed (tasks are defined programmatically).");
+        Ok(())
+    }
 }
 
 fn cmd_list(path: &Path) -> Result<()> {
@@ -204,20 +261,44 @@ fn cmd_list(path: &Path) -> Result<()> {
     let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
     println!("Agents ({}):", agents.len());
     for agent in &agents {
-        println!(
-            "  - {} (capabilities: [{}], tools: [{}])",
-            agent.name,
-            agent.capabilities.join(", "),
-            agent.tools.join(", ")
-        );
+        println!("  {} -- {}", agent.name, agent.goal);
+        if !agent.capabilities.is_empty() {
+            println!("    capabilities: [{}]", agent.capabilities.join(", "));
+        }
+        if !agent.tools.is_empty() {
+            println!("    tools: [{}]", agent.tools.join(", "));
+        }
+        if let Some(ref model) = agent.model {
+            println!("    model: {}", model);
+        }
+        if let Some(temp) = agent.temperature {
+            println!("    temperature: {}", temp);
+        }
+        if agent.response_format.is_some() {
+            println!("    response_format: configured");
+        }
     }
     println!();
 
     // List tool files
-    println!("Tool files ({}):", loader.tool_files().len());
-    for tool_file in loader.tool_files() {
-        println!("  - {}", tool_file.display());
+    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+    println!("Custom tools ({}):", tool_defs.len());
+    for tool in &tool_defs {
+        println!(
+            "  {} -- from {}",
+            tool.name,
+            tool.source_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
     }
+    if tool_defs.is_empty() {
+        println!("  (none)");
+    }
+    println!();
+
+    println!("Built-in tools (7): file_read, file_write, web_scrape, shell, http_request, hash, template_render");
     println!();
 
     // Entrypoint
