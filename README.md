@@ -90,9 +90,10 @@ Agents and tools in their directories are auto-discovered. Everything can also b
 
 ## Agent Definition
 
+Inline in `crew.lua`:
+
 ```lua
--- agents/researcher.lua
-return {
+crew:add_agent(Agent.new({
     name = "researcher",
     goal = "Find and analyze information on given topics",
     system_prompt = "You are a thorough researcher who cites sources.",
@@ -114,6 +115,17 @@ return {
             additionalProperties = false,
         },
     },
+}))
+```
+
+Or as a declarative file in `agents/researcher.lua` (auto-discovered):
+
+```lua
+return {
+    name = "researcher",
+    goal = "Find and analyze information on given topics",
+    capabilities = {"research", "analysis"},
+    temperature = 0.3,
 }
 ```
 
