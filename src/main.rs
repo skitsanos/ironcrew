@@ -1,3 +1,4 @@
+mod api;
 mod engine;
 mod llm;
 mod lua;
@@ -78,6 +79,18 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Start the REST API server
+    Serve {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind to
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Directory containing crew flows
+        #[arg(long, default_value = ".")]
+        flows_dir: PathBuf,
+    },
     /// List past runs
     Runs {
         /// Filter by status: success, partial_failure, failed
@@ -102,6 +115,11 @@ async fn main() {
         Commands::Nodes => cmd_nodes(),
         Commands::Inspect { run_id, project } => cmd_inspect(&project, &run_id),
         Commands::Clean { project, keep, all } => cmd_clean(&project, keep, all),
+        Commands::Serve {
+            host,
+            port,
+            flows_dir,
+        } => cmd_serve(&host, port, &flows_dir).await,
         Commands::Runs { status, project } => cmd_runs(&project, status.as_deref()),
     };
 
@@ -181,6 +199,46 @@ async fn cmd_run(path: &Path) -> Result<()> {
         .exec_async()
         .await
         .map_err(IronCrewError::Lua)?;
+
+    Ok(())
+}
+
+async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
+    use tower_http::cors::CorsLayer;
+
+    // Load .env from CWD
+    dotenvy::dotenv().ok();
+
+    let flows_dir = std::fs::canonicalize(flows_dir).unwrap_or_else(|_| flows_dir.to_path_buf());
+    let store_dir = flows_dir.join(".ironcrew").join("runs");
+
+    let state = Arc::new(api::AppState {
+        flows_dir: flows_dir.clone(),
+        store_dir,
+    });
+
+    let app = api::create_router(state).layer(CorsLayer::permissive());
+
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        IronCrewError::Validation(format!("Failed to bind to {}: {}", addr, e))
+    })?;
+
+    println!("IronCrew API server v{}", env!("CARGO_PKG_VERSION"));
+    println!("Listening on http://{}", addr);
+    println!("Flows directory: {}", flows_dir.display());
+    println!();
+    println!("Endpoints:");
+    println!("  GET  /health          - Health check");
+    println!("  POST /flows/run       - Run a crew");
+    println!("  GET  /runs            - List past runs");
+    println!("  GET  /runs/{{id}}       - Get run details");
+    println!("  DELETE /runs/{{id}}     - Delete a run");
+    println!("  GET  /nodes           - List built-in tools");
+
+    axum::serve(listener, app).await.map_err(|e| {
+        IronCrewError::Validation(format!("Server error: {}", e))
+    })?;
 
     Ok(())
 }
