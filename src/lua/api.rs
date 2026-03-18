@@ -8,6 +8,8 @@ use crate::engine::agent::{Agent, ResponseFormat};
 use crate::engine::crew::{Crew, ProviderConfig};
 use crate::engine::runtime::Runtime;
 use crate::engine::task::Task;
+use crate::llm::openai::OpenAiProvider;
+use crate::llm::provider::LlmProvider;
 use crate::utils::error::{IronCrewError, Result};
 
 // ---------------------------------------------------------------------------
@@ -346,9 +348,12 @@ pub fn register_agent_constructor(lua: &Lua) -> LuaResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Wrapper holding crew + runtime for Lua userdata.
+/// If the Lua Crew.new() specifies a custom api_key or base_url,
+/// a per-crew provider overrides the runtime's default provider.
 pub struct LuaCrew {
     pub crew: Arc<Mutex<Crew>>,
     pub runtime: Arc<Runtime>,
+    pub custom_provider: Option<Arc<dyn LlmProvider>>,
 }
 
 impl UserData for LuaCrew {
@@ -368,8 +373,12 @@ impl UserData for LuaCrew {
 
         methods.add_async_method("run", |lua, this, ()| async move {
             let crew = this.crew.lock().await;
+            let provider: &dyn LlmProvider = match &this.custom_provider {
+                Some(p) => p.as_ref(),
+                None => this.runtime.provider.as_ref(),
+            };
             let results = crew
-                .run(this.runtime.provider.as_ref(), &this.runtime.tool_registry)
+                .run(provider, &this.runtime.tool_registry)
                 .await
                 .map_err(mlua::Error::external)?;
 
@@ -409,6 +418,19 @@ pub fn register_crew_constructor(
         let base_url: Option<String> = table.get("base_url").ok();
         let api_key: Option<String> = table.get("api_key").ok();
 
+        // Create a custom provider if api_key or base_url differ from defaults
+        let custom_provider: Option<Arc<dyn LlmProvider>> =
+            if api_key.is_some() || base_url.is_some() {
+                let key = api_key
+                    .clone()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    .unwrap_or_default();
+                let url = base_url.clone();
+                Some(Arc::new(OpenAiProvider::new(key, url)))
+            } else {
+                None
+            };
+
         let config = ProviderConfig {
             provider,
             model,
@@ -426,6 +448,7 @@ pub fn register_crew_constructor(
         Ok(LuaCrew {
             crew: Arc::new(Mutex::new(crew)),
             runtime: runtime.clone(),
+            custom_provider,
         })
     })?;
 
