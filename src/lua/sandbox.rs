@@ -81,6 +81,89 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     })?;
     lua.globals().set("log", log_fn)?;
 
+    // regex namespace — Rust regex engine exposed to Lua
+    let regex_table = lua.create_table()?;
+
+    // regex.match(pattern, text) -> bool
+    let regex_match = lua.create_function(|_, (pattern, text): (String, String)| {
+        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        Ok(re.is_match(&text))
+    })?;
+    regex_table.set("match", regex_match)?;
+
+    // regex.find(pattern, text) -> string|nil (first match)
+    let regex_find = lua.create_function(|_, (pattern, text): (String, String)| {
+        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        Ok(re.find(&text).map(|m| m.as_str().to_string()))
+    })?;
+    regex_table.set("find", regex_find)?;
+
+    // regex.find_all(pattern, text) -> table of strings (all matches)
+    let regex_find_all = lua.create_function(|lua, (pattern, text): (String, String)| {
+        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let matches: Vec<String> = re.find_iter(&text).map(|m| m.as_str().to_string()).collect();
+        let table = lua.create_table()?;
+        for (i, m) in matches.iter().enumerate() {
+            table.set(i + 1, m.as_str())?;
+        }
+        Ok(table)
+    })?;
+    regex_table.set("find_all", regex_find_all)?;
+
+    // regex.captures(pattern, text) -> table of capture groups|nil
+    let regex_captures = lua.create_function(|lua, (pattern, text): (String, String)| {
+        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        match re.captures(&text) {
+            Some(caps) => {
+                let table = lua.create_table()?;
+                for (i, cap) in caps.iter().enumerate() {
+                    if let Some(m) = cap {
+                        table.set(i, m.as_str().to_string())?;
+                    }
+                }
+                // Also set named captures
+                for name in re.capture_names().flatten() {
+                    if let Some(m) = caps.name(name) {
+                        table.set(name, m.as_str().to_string())?;
+                    }
+                }
+                Ok(mlua::Value::Table(table))
+            }
+            None => Ok(mlua::Value::Nil),
+        }
+    })?;
+    regex_table.set("captures", regex_captures)?;
+
+    // regex.replace(pattern, text, replacement) -> string (first match)
+    let regex_replace =
+        lua.create_function(|_, (pattern, text, replacement): (String, String, String)| {
+            let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+            Ok(re.replace(&text, replacement.as_str()).into_owned())
+        })?;
+    regex_table.set("replace", regex_replace)?;
+
+    // regex.replace_all(pattern, text, replacement) -> string
+    let regex_replace_all =
+        lua.create_function(|_, (pattern, text, replacement): (String, String, String)| {
+            let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+            Ok(re.replace_all(&text, replacement.as_str()).into_owned())
+        })?;
+    regex_table.set("replace_all", regex_replace_all)?;
+
+    // regex.split(pattern, text) -> table of strings
+    let regex_split = lua.create_function(|lua, (pattern, text): (String, String)| {
+        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let parts: Vec<&str> = re.split(&text).collect();
+        let table = lua.create_table()?;
+        for (i, part) in parts.iter().enumerate() {
+            table.set(i + 1, *part)?;
+        }
+        Ok(table)
+    })?;
+    regex_table.set("split", regex_split)?;
+
+    lua.globals().set("regex", regex_table)?;
+
     Ok(())
 }
 

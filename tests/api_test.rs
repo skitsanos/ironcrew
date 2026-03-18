@@ -245,3 +245,110 @@ fn test_globals_available_in_tool_lua() {
         .unwrap();
     assert_eq!(decoded, "test");
 }
+
+#[test]
+fn test_regex_match() {
+    let lua = create_crew_lua().unwrap();
+    let result: bool = lua
+        .load(r#"return regex.match("\\d+", "hello 42 world")"#)
+        .eval()
+        .unwrap();
+    assert!(result);
+
+    let result: bool = lua
+        .load(r#"return regex.match("\\d+", "no numbers here")"#)
+        .eval()
+        .unwrap();
+    assert!(!result);
+}
+
+#[test]
+fn test_regex_find() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return regex.find("\\d+", "hello 42 world")"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "42");
+}
+
+#[test]
+fn test_regex_find_all() {
+    let lua = create_crew_lua().unwrap();
+    let result: Vec<String> = lua
+        .load(
+            r#"
+        local matches = regex.find_all("\\d+", "a1 b22 c333")
+        local out = {}
+        for i = 1, #matches do out[i] = matches[i] end
+        return out
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(result, vec!["1", "22", "333"]);
+}
+
+#[test]
+fn test_regex_captures() {
+    let lua = create_crew_lua().unwrap();
+    let (full, year, month): (String, String, String) = lua
+        .load(
+            r#"
+        local caps = regex.captures("(\\d{4})-(\\d{2})", "date: 2026-03-18")
+        return caps[0], caps[1], caps[2]
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(full, "2026-03");
+    assert_eq!(year, "2026");
+    assert_eq!(month, "03");
+}
+
+#[test]
+fn test_regex_replace() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return regex.replace("\\d+", "a1 b2 c3", "X")"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "aX b2 c3");
+}
+
+#[test]
+fn test_regex_replace_all() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return regex.replace_all("\\d+", "a1 b2 c3", "X")"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "aX bX cX");
+}
+
+#[test]
+fn test_regex_split() {
+    let lua = create_crew_lua().unwrap();
+    let result: Vec<String> = lua
+        .load(
+            r#"
+        local parts = regex.split("[,;]\\s*", "a, b; c,d")
+        local out = {}
+        for i = 1, #parts do out[i] = parts[i] end
+        return out
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(result, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn test_regex_available_in_tool_lua() {
+    let lua = create_tool_lua().unwrap();
+    let result: bool = lua
+        .load(r#"return regex.match("[a-z]+", "hello")"#)
+        .eval()
+        .unwrap();
+    assert!(result);
+}
