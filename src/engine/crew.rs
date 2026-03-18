@@ -319,10 +319,205 @@ impl Crew {
                     .join(", ")
             );
 
-            // Handle collaborative tasks first (they run sequentially)
+            // Handle foreach and collaborative tasks first (they run sequentially)
             let mut standard_tasks: Vec<&Task> = Vec::new();
             for task in &phase_tasks {
-                if task.task_type.as_deref() == Some("collaborative")
+                // Handle foreach tasks
+                if let Some(ref source_key) = task.foreach_source {
+                    let item_var = task
+                        .foreach_as
+                        .clone()
+                        .unwrap_or_else(|| "item".to_string());
+
+                    // Select agent for foreach task
+                    let agent = if let Some(ref agent_name) = task.agent {
+                        self.agents
+                            .iter()
+                            .find(|a| a.name == *agent_name)
+                            .ok_or_else(|| {
+                                IronCrewError::Validation(format!(
+                                    "Task '{}' assigned to unknown agent '{}'",
+                                    task.name, agent_name
+                                ))
+                            })?
+                    } else {
+                        AgentSelector::select(&self.agents, task)
+                    };
+
+                    // Find the source data: check results first, then memory
+                    let source_data = if let Some(result) = results.get(source_key) {
+                        // Try to parse the output as a JSON value
+                        serde_json::from_str::<serde_json::Value>(&result.output).ok()
+                    } else {
+                        // Try memory
+                        self.memory.get(source_key).await
+                    };
+
+                    let items = match source_data {
+                        Some(serde_json::Value::Array(arr)) => arr,
+                        Some(serde_json::Value::String(ref s)) => {
+                            // Try parsing string as JSON array
+                            serde_json::from_str::<Vec<serde_json::Value>>(s)
+                                .unwrap_or_default()
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "foreach source '{}' is not an array, skipping task '{}'",
+                                source_key,
+                                task.name
+                            );
+                            results.insert(
+                                task.name.clone(),
+                                TaskResult {
+                                    task: task.name.clone(),
+                                    agent: String::new(),
+                                    output: format!(
+                                        "Skipped: foreach source '{}' is not an array",
+                                        source_key
+                                    ),
+                                    success: false,
+                                    duration_ms: 0,
+                                },
+                            );
+                            failed_tasks.insert(task.name.clone());
+                            continue;
+                        }
+                    };
+
+                    if items.is_empty() {
+                        results.insert(
+                            task.name.clone(),
+                            TaskResult {
+                                task: task.name.clone(),
+                                agent: String::new(),
+                                output: "Skipped: foreach source is empty".into(),
+                                success: true,
+                                duration_ms: 0,
+                            },
+                        );
+                        continue;
+                    }
+
+                    tracing::info!(
+                        "Running foreach task '{}' with {} items",
+                        task.name,
+                        items.len()
+                    );
+
+                    // Run each item sequentially, collecting individual results
+                    let mut foreach_outputs: Vec<String> = Vec::new();
+                    let mut all_success = true;
+                    let start = Instant::now();
+
+                    for (idx, item) in items.iter().enumerate() {
+                        let item_str = match item {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+
+                        // Create a modified task with the item injected into context
+                        let mut item_task = (*task).clone();
+                        let item_context = format!(
+                            "Processing {} {}/{}: {}",
+                            item_var,
+                            idx + 1,
+                            items.len(),
+                            item_str
+                        );
+                        item_task.context = Some(match &task.context {
+                            Some(existing) => format!("{}\n\n{}", existing, item_context),
+                            None => item_context,
+                        });
+                        // Interpolate the description with the item
+                        item_task.description = item_task
+                            .description
+                            .replace(&format!("${{{}}}", item_var), &item_str);
+
+                        let memory_context =
+                            self.memory.build_context(&item_task.description, 3).await;
+                        let messages_context = self.messagebus.receive(&agent.name).await;
+                        let msg_ctx = if messages_context.is_empty() {
+                            String::new()
+                        } else {
+                            let strs: Vec<String> = messages_context
+                                .iter()
+                                .map(|m| {
+                                    format!(
+                                        "[Message from {} ({:?})]: {}",
+                                        m.from, m.message_type, m.content
+                                    )
+                                })
+                                .collect();
+                            format!("Messages from other agents:\n{}", strs.join("\n"))
+                        };
+
+                        let model = agent
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| self.provider_config.model.clone());
+
+                        match execute_task_standalone(
+                            &item_task,
+                            agent,
+                            provider.as_ref(),
+                            tool_registry,
+                            &results,
+                            &model,
+                            self.max_tool_rounds,
+                            &memory_context,
+                            &msg_ctx,
+                        )
+                        .await
+                        {
+                            Ok(output) => {
+                                foreach_outputs.push(output);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "foreach item {}/{} failed: {}",
+                                    idx + 1,
+                                    items.len(),
+                                    e
+                                );
+                                foreach_outputs.push(format!("Error: {}", e));
+                                all_success = false;
+                            }
+                        }
+                    }
+
+                    // Combine all outputs into a JSON array result
+                    let combined =
+                        serde_json::to_string_pretty(&foreach_outputs).unwrap_or_default();
+
+                    results.insert(
+                        task.name.clone(),
+                        TaskResult {
+                            task: task.name.clone(),
+                            agent: agent.name.clone(),
+                            output: combined,
+                            success: all_success,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    );
+
+                    if !all_success {
+                        tracing::warn!("foreach task '{}' had some failures", task.name);
+                    }
+
+                    // Store in memory
+                    self.memory
+                        .set(
+                            format!("task:{}", task.name),
+                            serde_json::json!({
+                                "output": &foreach_outputs,
+                                "agent": agent.name,
+                                "count": items.len(),
+                            }),
+                        )
+                        .await;
+
+                    continue; // Don't go through normal spawn path
+                } else if task.task_type.as_deref() == Some("collaborative")
                     && task.collaborative_agents.len() >= 2
                 {
                     tracing::info!(

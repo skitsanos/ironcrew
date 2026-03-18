@@ -163,3 +163,27 @@ fn test_topological_phases_empty() {
     let phases = topological_phases(&tasks);
     assert!(phases.is_empty());
 }
+
+#[test]
+fn test_task_with_foreach_fields() {
+    let task = Task {
+        name: "process".into(),
+        description: "Process ${item}".into(),
+        foreach_source: Some("items_list".into()),
+        foreach_as: Some("item".into()),
+        ..Default::default()
+    };
+    assert_eq!(task.foreach_source, Some("items_list".into()));
+    assert_eq!(task.foreach_as, Some("item".into()));
+}
+
+#[test]
+fn test_task_foreach_fields_default_to_none() {
+    let task = Task {
+        name: "test".into(),
+        description: "test".into(),
+        ..Default::default()
+    };
+    assert_eq!(task.foreach_source, None);
+    assert_eq!(task.foreach_as, None);
+}

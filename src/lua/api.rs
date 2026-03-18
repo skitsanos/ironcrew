@@ -203,6 +203,8 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         })
         .unwrap_or_default();
     let max_turns: Option<usize> = table.get::<Option<usize>>("max_turns")?.or(None);
+    let foreach_source: Option<String> = table.get::<Option<String>>("foreach")?.or(None);
+    let foreach_as: Option<String> = table.get::<Option<String>>("foreach_as")?.or(None);
 
     Ok(Task {
         name,
@@ -219,6 +221,8 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         task_type,
         collaborative_agents,
         max_turns,
+        foreach_source,
+        foreach_as,
     })
 }
 
@@ -512,6 +516,18 @@ impl UserData for LuaCrew {
                 }
             },
         );
+
+        // Foreach task method
+        methods.add_async_method("add_foreach_task", |_, this, table: Table| async move {
+            let task = task_from_lua_table(&table)?;
+            if task.foreach_source.is_none() {
+                return Err(mlua::Error::external(IronCrewError::Validation(
+                    "foreach task requires 'foreach' field specifying the source key".into(),
+                )));
+            }
+            this.crew.lock().await.add_task(task);
+            Ok(())
+        });
 
         // Collaborative task method
         methods.add_async_method(

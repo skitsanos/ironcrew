@@ -31,6 +31,10 @@ pub struct Task {
     pub collaborative_agents: Vec<String>, // agent names for collaborative tasks
     #[serde(default)]
     pub max_turns: Option<usize>, // max conversation turns (default 3)
+    #[serde(default)]
+    pub foreach_source: Option<String>, // key in results to iterate over (JSON array)
+    #[serde(default)]
+    pub foreach_as: Option<String>, // variable name for the current item (default: "item")
 }
 
 
