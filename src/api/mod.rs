@@ -15,17 +15,6 @@ use crate::utils::error::IronCrewError;
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
-    pub store_dir: PathBuf,
-}
-
-/// Request to run a crew
-#[derive(Deserialize)]
-pub struct RunCrewRequest {
-    /// Path to the crew file or directory (relative to flows_dir)
-    pub flow: String,
-    /// Optional initial context as JSON
-    #[allow(dead_code)]
-    pub context: Option<serde_json::Value>,
 }
 
 /// Response from running a crew
@@ -51,15 +40,6 @@ pub struct TaskResultResponse {
 #[derive(Deserialize)]
 pub struct ListRunsQuery {
     pub status: Option<String>,
-    /// Flow/project path (relative to flows_dir) to look up runs for
-    pub flow: Option<String>,
-}
-
-/// Query params for run operations
-#[derive(Deserialize)]
-pub struct RunQuery {
-    /// Flow/project path (relative to flows_dir)
-    pub flow: Option<String>,
 }
 
 /// Error response
@@ -72,22 +52,21 @@ fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<Erro
     (status, Json(ErrorResponse { error: message }))
 }
 
-/// Resolve the runs directory for a given flow path (per-project).
-fn resolve_runs_dir(state: &AppState, flow: Option<&str>) -> PathBuf {
-    match flow {
-        Some(f) => state.flows_dir.join(f).join(".ironcrew").join("runs"),
-        None => state.store_dir.clone(),
-    }
+/// Resolve the runs directory for a given flow.
+fn resolve_runs_dir(state: &AppState, flow: &str) -> PathBuf {
+    state.flows_dir.join(flow).join(".ironcrew").join("runs")
 }
 
 /// Build the router
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/flows/run", post(run_crew))
-        .route("/runs", get(list_runs))
-        .route("/runs/{id}", get(get_run))
-        .route("/runs/{id}", delete(delete_run))
+        .route("/flows/{flow}/run", post(run_flow))
+        .route("/flows/{flow}/runs", get(list_runs))
+        .route("/flows/{flow}/runs/{id}", get(get_run))
+        .route("/flows/{flow}/runs/{id}", delete(delete_run))
+        .route("/flows/{flow}/validate", get(validate_flow))
+        .route("/flows/{flow}/agents", get(list_agents))
         .route("/nodes", get(list_nodes))
         .with_state(state)
 }
@@ -99,21 +78,24 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-async fn run_crew(
+// ---------------------------------------------------------------------------
+// Flow execution
+// ---------------------------------------------------------------------------
+
+async fn run_flow(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RunCrewRequest>,
+    Path(flow): Path<String>,
 ) -> Result<Json<RunCrewResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = state.flows_dir.join(&req.flow);
+    let flow_path = state.flows_dir.join(&flow);
 
     if !flow_path.exists() {
         return Err(error_response(
             StatusCode::NOT_FOUND,
-            format!("Flow not found: {}", req.flow),
+            format!("Flow not found: {}", flow),
         ));
     }
 
-    // Execute the crew
-    let result = execute_crew_from_path(&flow_path, &state.store_dir).await;
+    let result = execute_crew_from_path(&flow_path).await;
 
     match result {
         Ok(response) => Ok(Json(response)),
@@ -126,7 +108,6 @@ async fn run_crew(
 
 async fn execute_crew_from_path(
     flow_path: &std::path::Path,
-    _store_dir: &std::path::Path,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::engine::runtime::Runtime;
     use crate::llm::openai::OpenAiProvider;
@@ -216,7 +197,6 @@ async fn execute_crew_from_path(
         });
     }
 
-    // If no history available, return a minimal response
     Ok(RunCrewResponse {
         run_id: uuid::Uuid::new_v4().to_string(),
         flow_name: "unknown".into(),
@@ -226,11 +206,16 @@ async fn execute_crew_from_path(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Run history (per-flow)
+// ---------------------------------------------------------------------------
+
 async fn list_runs(
     State(state): State<Arc<AppState>>,
+    Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let runs_dir = resolve_runs_dir(&state, &flow);
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -243,10 +228,9 @@ async fn list_runs(
 
 async fn get_run(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<RunQuery>,
+    Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let runs_dir = resolve_runs_dir(&state, &flow);
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -259,10 +243,9 @@ async fn get_run(
 
 async fn delete_run(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<RunQuery>,
+    Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let runs_dir = resolve_runs_dir(&state, &flow);
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -272,6 +255,113 @@ async fn delete_run(
 
     Ok(Json(serde_json::json!({"deleted": id})))
 }
+
+// ---------------------------------------------------------------------------
+// Flow inspection
+// ---------------------------------------------------------------------------
+
+async fn validate_flow(
+    State(state): State<Arc<AppState>>,
+    Path(flow): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let flow_path = state.flows_dir.join(&flow);
+    if !flow_path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Flow not found: {}", flow),
+        ));
+    }
+
+    use crate::lua::api::*;
+    use crate::lua::loader::ProjectLoader;
+    use crate::lua::sandbox::create_crew_lua;
+
+    let loader = if flow_path.is_file() {
+        ProjectLoader::from_file(&flow_path)
+    } else {
+        ProjectLoader::from_directory(&flow_path)
+    }
+    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let lua = create_crew_lua()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+
+    // Check entrypoint syntax
+    let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
+        if let Ok(script) = std::fs::read_to_string(ep) {
+            lua.load(&script).into_function().is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    Ok(Json(serde_json::json!({
+        "flow": flow,
+        "valid": entrypoint_valid,
+        "agents": agents.iter().map(|a| serde_json::json!({
+            "name": a.name,
+            "goal": a.goal,
+            "capabilities": a.capabilities,
+            "tools": a.tools,
+        })).collect::<Vec<_>>(),
+        "custom_tools": tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        "entrypoint": loader.entrypoint().map(|p| p.display().to_string()),
+    })))
+}
+
+async fn list_agents(
+    State(state): State<Arc<AppState>>,
+    Path(flow): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
+    let flow_path = state.flows_dir.join(&flow);
+    if !flow_path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Flow not found: {}", flow),
+        ));
+    }
+
+    use crate::lua::api::*;
+    use crate::lua::loader::ProjectLoader;
+    use crate::lua::sandbox::create_crew_lua;
+
+    let loader = if flow_path.is_file() {
+        ProjectLoader::from_file(&flow_path)
+    } else {
+        ProjectLoader::from_directory(&flow_path)
+    }
+    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let lua = create_crew_lua()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+
+    let result: Vec<serde_json::Value> = agents
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "goal": a.goal,
+                "capabilities": a.capabilities,
+                "tools": a.tools,
+                "temperature": a.temperature,
+                "model": a.model,
+            })
+        })
+        .collect();
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Nodes (global)
+// ---------------------------------------------------------------------------
 
 async fn list_nodes() -> Json<Vec<serde_json::Value>> {
     use crate::tools::registry::ToolRegistry;
