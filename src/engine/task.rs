@@ -15,6 +15,12 @@ pub struct Task {
     pub context: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    #[serde(default)]
+    pub retry_backoff_secs: Option<f64>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 

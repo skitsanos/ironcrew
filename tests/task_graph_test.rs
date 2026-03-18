@@ -44,3 +44,30 @@ fn test_topological_sort_order() {
     assert!(pos_a < pos_b);
     assert!(pos_b < pos_c);
 }
+
+#[test]
+fn test_task_with_retry_fields() {
+    let task = Task {
+        name: "test".into(),
+        description: "test".into(),
+        max_retries: Some(3),
+        retry_backoff_secs: Some(1.0),
+        timeout_secs: Some(60),
+        ..Default::default()
+    };
+    assert_eq!(task.max_retries, Some(3));
+    assert_eq!(task.retry_backoff_secs, Some(1.0));
+    assert_eq!(task.timeout_secs, Some(60));
+}
+
+#[test]
+fn test_task_retry_fields_default_to_none() {
+    let task = Task {
+        name: "test".into(),
+        description: "test".into(),
+        ..Default::default()
+    };
+    assert_eq!(task.max_retries, None);
+    assert_eq!(task.retry_backoff_secs, None);
+    assert_eq!(task.timeout_secs, None);
+}

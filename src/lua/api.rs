@@ -119,7 +119,7 @@ pub fn lua_table_to_json(table: &Table) -> LuaResult<serde_json::Value> {
     }
 }
 
-fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
+pub fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
     match value {
         Value::Nil => Ok(serde_json::Value::Null),
         Value::Boolean(b) => Ok(serde_json::Value::Bool(b)),
@@ -128,6 +128,38 @@ fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
         Value::String(s) => Ok(serde_json::Value::String(s.to_str()?.to_string())),
         Value::Table(t) => lua_table_to_json(&t),
         _ => Ok(serde_json::Value::Null),
+    }
+}
+
+/// Convert a serde_json::Value into a Lua value.
+pub fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Nil),
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(Value::Number(f))
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+        serde_json::Value::String(s) => Ok(Value::String(lua.create_string(s)?)),
+        serde_json::Value::Array(arr) => {
+            let table = lua.create_table()?;
+            for (i, v) in arr.iter().enumerate() {
+                table.set(i + 1, json_value_to_lua(lua, v)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table()?;
+            for (k, v) in map {
+                table.set(k.as_str(), json_value_to_lua(lua, v)?)?;
+            }
+            Ok(Value::Table(table))
+        }
     }
 }
 
@@ -152,6 +184,10 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         })
         .unwrap_or_default();
 
+    let max_retries: Option<u32> = table.get::<Option<u32>>("max_retries")?.or(None);
+    let retry_backoff_secs: Option<f64> = table.get::<Option<f64>>("retry_backoff_secs")?.or(None);
+    let timeout_secs: Option<u64> = table.get::<Option<u64>>("timeout_secs")?.or(None);
+
     Ok(Task {
         name,
         description,
@@ -159,6 +195,9 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         expected_output,
         context,
         depends_on,
+        max_retries,
+        retry_backoff_secs,
+        timeout_secs,
     })
 }
 
@@ -278,6 +317,7 @@ pub fn load_agents_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<Agent>
 // ---------------------------------------------------------------------------
 
 /// Register the env() global function in Lua.
+#[allow(dead_code)]
 pub fn register_env_function(lua: &Lua) -> LuaResult<()> {
     let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
     lua.globals().set("env", env_fn)?;

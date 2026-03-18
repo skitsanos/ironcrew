@@ -95,10 +95,60 @@ impl Crew {
 
             let start = Instant::now();
 
-            match self
-                .execute_task(task, agent, provider, tool_registry, &results)
-                .await
-            {
+            let max_retries = task.max_retries.unwrap_or(0);
+            let base_backoff = task.retry_backoff_secs.unwrap_or(1.0);
+            let timeout_duration = task
+                .timeout_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(std::time::Duration::from_secs(300));
+
+            let mut attempt = 0u32;
+            let output = loop {
+                let task_future =
+                    self.execute_task(task, agent, provider, tool_registry, &results);
+
+                match tokio::time::timeout(timeout_duration, task_future).await {
+                    Ok(Ok(output)) => break Ok(output),
+                    Ok(Err(e)) => {
+                        if attempt >= max_retries {
+                            break Err(e);
+                        }
+                        let backoff = base_backoff * 2f64.powi(attempt as i32);
+                        tracing::warn!(
+                            "Task '{}' failed (attempt {}/{}), retrying in {:.1}s: {}",
+                            task.name,
+                            attempt + 1,
+                            max_retries + 1,
+                            backoff,
+                            e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
+                        attempt += 1;
+                    }
+                    Err(_) => {
+                        let msg =
+                            format!("Timed out after {}s", timeout_duration.as_secs());
+                        if attempt >= max_retries {
+                            break Err(IronCrewError::Task {
+                                task: task.name.clone(),
+                                message: msg,
+                            });
+                        }
+                        let backoff = base_backoff * 2f64.powi(attempt as i32);
+                        tracing::warn!(
+                            "Task '{}' timed out (attempt {}/{}), retrying in {:.1}s",
+                            task.name,
+                            attempt + 1,
+                            max_retries + 1,
+                            backoff
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
+                        attempt += 1;
+                    }
+                }
+            };
+
+            match output {
                 Ok(output) => {
                     let result = TaskResult {
                         task: task.name.clone(),

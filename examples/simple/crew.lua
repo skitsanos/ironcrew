@@ -16,6 +16,9 @@ crew:add_task({
     name = "answer",
     description = "Explain what ownership means in Rust in 2-3 sentences.",
     expected_output = "A clear, concise explanation of Rust ownership",
+    max_retries = 2,
+    retry_backoff_secs = 1.0,
+    timeout_secs = 120,
 })
 
 local results = crew:run()
