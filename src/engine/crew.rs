@@ -30,6 +30,7 @@ pub struct Crew {
     pub max_concurrent_tasks: Option<usize>,
     pub memory: MemoryStore,
     pub messagebus: MessageBus,
+    pub stream: bool,
 }
 
 impl Crew {
@@ -43,6 +44,7 @@ impl Crew {
             max_concurrent_tasks: None,
             memory,
             messagebus: MessageBus::new(),
+            stream: false,
         }
     }
 
@@ -466,6 +468,7 @@ impl Crew {
                             self.max_tool_rounds,
                             &memory_context,
                             &msg_ctx,
+                            task.stream || self.stream,
                         )
                         .await
                         {
@@ -613,6 +616,7 @@ impl Crew {
                                         self.max_tool_rounds,
                                         "",
                                         "",
+                                        false,
                                     )
                                     .await
                                     {
@@ -729,6 +733,7 @@ impl Crew {
                     .clone()
                     .unwrap_or_else(|| self.provider_config.model.clone());
                 let max_tool_rounds = self.max_tool_rounds;
+                let should_stream = task.stream || self.stream;
                 let sem = semaphore.clone();
 
                 let handle = tokio::spawn(async move {
@@ -757,6 +762,7 @@ impl Crew {
                             max_tool_rounds,
                             &memory_context,
                             &messages_context,
+                            should_stream,
                         );
                         match tokio::time::timeout(timeout_dur, result).await {
                             Ok(Ok(out)) => break Ok(out),
@@ -894,6 +900,7 @@ impl Crew {
                                         self.max_tool_rounds,
                                         "",
                                         "",
+                                        false,
                                     )
                                     .await
                                     {
@@ -1048,6 +1055,7 @@ async fn execute_task_standalone(
     max_tool_rounds: usize,
     memory_context: &str,
     messages_context: &str,
+    should_stream: bool,
 ) -> Result<String> {
     let mut messages = Vec::new();
 
@@ -1119,7 +1127,33 @@ async fn execute_task_standalone(
             response_format: agent.response_format.clone(),
         };
 
-        let response = if has_tools {
+        let response = if should_stream && !has_tools {
+            // Stream mode: print chunks to stderr as they arrive
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+
+            let print_handle = tokio::spawn(async move {
+                use std::io::Write;
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        StreamChunk::Text(text) => {
+                            eprint!("{}", text);
+                            std::io::stderr().flush().ok();
+                        }
+                        StreamChunk::Done => {
+                            eprintln!(); // newline at end
+                        }
+                        StreamChunk::Error(e) => {
+                            eprintln!("\n[Stream error: {}]", e);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let result = provider.chat_stream(request, tx).await;
+            print_handle.await.ok();
+            result?
+        } else if has_tools {
             provider.chat_with_tools(request, &tool_schemas).await?
         } else {
             provider.chat(request).await?

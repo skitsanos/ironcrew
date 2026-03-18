@@ -35,6 +35,8 @@ pub struct Task {
     pub foreach_source: Option<String>, // key in results to iterate over (JSON array)
     #[serde(default)]
     pub foreach_as: Option<String>, // variable name for the current item (default: "item")
+    #[serde(default)]
+    pub stream: bool, // if true, stream LLM response to stderr in real-time
 }
 
 

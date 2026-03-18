@@ -12,6 +12,7 @@ crew:add_agent(Agent.new({
     temperature = 0.5,
 }))
 
+-- Add stream = true to see LLM responses in real-time:
 crew:add_task({
     name = "answer",
     description = "Explain what ownership means in Rust in 2-3 sentences.",
@@ -19,6 +20,7 @@ crew:add_task({
     max_retries = 2,
     retry_backoff_secs = 1.0,
     timeout_secs = 120,
+    -- stream = true,  -- uncomment to enable streaming output
 })
 
 local results = crew:run()

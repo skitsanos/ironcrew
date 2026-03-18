@@ -205,6 +205,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let max_turns: Option<usize> = table.get::<Option<usize>>("max_turns")?.or(None);
     let foreach_source: Option<String> = table.get::<Option<String>>("foreach")?.or(None);
     let foreach_as: Option<String> = table.get::<Option<String>>("foreach_as")?.or(None);
+    let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
     Ok(Task {
         name,
@@ -223,6 +224,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         max_turns,
         foreach_source,
         foreach_as,
+        stream,
     })
 }
 
@@ -780,8 +782,11 @@ pub fn register_crew_constructor(
             _ => MemoryStore::ephemeral_with_config(memory_config),
         };
 
+        let stream: bool = table.get::<bool>("stream").unwrap_or(false);
+
         let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
+        crew.stream = stream;
 
         // Auto-inject preloaded agents from agents/ directory
         for agent in agents.iter() {

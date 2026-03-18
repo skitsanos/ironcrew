@@ -67,6 +67,22 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
 }
 
+/// A chunk of a streaming response.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum StreamChunk {
+    /// A text delta (partial content)
+    Text(String),
+    /// A tool call starting
+    ToolCallStart { id: String, name: String },
+    /// Tool call arguments delta
+    ToolCallDelta { id: String, arguments_delta: String },
+    /// Stream finished
+    Done,
+    /// Error during streaming
+    Error(String),
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
@@ -75,4 +91,18 @@ pub trait LlmProvider: Send + Sync {
         request: ChatRequest,
         tools: &[ToolSchema],
     ) -> Result<ChatResponse>;
+
+    /// Stream a chat response. Default implementation falls back to non-streaming.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+        tx: tokio::sync::mpsc::Sender<StreamChunk>,
+    ) -> Result<ChatResponse> {
+        let response = self.chat(request).await?;
+        if let Some(ref content) = response.content {
+            let _ = tx.send(StreamChunk::Text(content.clone())).await;
+        }
+        let _ = tx.send(StreamChunk::Done).await;
+        Ok(response)
+    }
 }
