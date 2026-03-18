@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::engine::agent::{Agent, AgentSelector};
+use crate::engine::interpolate::interpolate;
 use crate::engine::task::{validate_dependency_graph, topological_sort, Task, TaskResult};
 use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
@@ -91,7 +92,8 @@ impl Crew {
 
             // Check condition if present
             if let Some(ref condition) = task.condition {
-                let should_run = self.evaluate_condition(condition, &results);
+                let interpolated_condition = interpolate(condition, &results);
+                let should_run = self.evaluate_condition(&interpolated_condition, &results);
                 if !should_run {
                     let result = TaskResult {
                         task: task.name.clone(),
@@ -388,15 +390,26 @@ impl Crew {
             .unwrap_or_else(|| format!("You are {}. Your goal: {}", agent.name, agent.goal));
         messages.push(ChatMessage::system(&system_content));
 
-        // Build user prompt with context
-        let mut prompt_parts = vec![format!("Task: {}", task.description)];
+        // Interpolate task fields with completed results
+        let description = interpolate(&task.description, completed_results);
+        let expected_output = task
+            .expected_output
+            .as_ref()
+            .map(|s| interpolate(s, completed_results));
+        let context = task
+            .context
+            .as_ref()
+            .map(|s| interpolate(s, completed_results));
 
-        if let Some(ref expected) = task.expected_output {
+        // Build user prompt with interpolated context
+        let mut prompt_parts = vec![format!("Task: {}", description)];
+
+        if let Some(ref expected) = expected_output {
             prompt_parts.push(format!("Expected output: {}", expected));
         }
 
-        if let Some(ref context) = task.context {
-            prompt_parts.push(format!("Additional context: {}", context));
+        if let Some(ref ctx) = context {
+            prompt_parts.push(format!("Additional context: {}", ctx));
         }
 
         // Inject dependency results

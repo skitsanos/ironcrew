@@ -13,7 +13,7 @@ crew:add_task({
 
 crew:add_task({
     name = "write_summary",
-    description = "Write a one-paragraph summary based on the research findings",
+    description = "Write a one-paragraph summary based on these research findings:\n\n${results.research.output}",
     agent = "writer",
     depends_on = {"research"},
 })
