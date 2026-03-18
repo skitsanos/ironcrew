@@ -153,3 +153,52 @@ async fn test_peek_does_not_consume() {
     // Now empty
     assert_eq!(bus.pending_count("bob").await, 0);
 }
+
+#[tokio::test]
+async fn test_broadcast_before_registration() {
+    let bus = MessageBus::new();
+
+    // Send broadcast BEFORE any agents are registered
+    bus.send(Message::new(
+        "system".into(),
+        "*".into(),
+        "early broadcast".into(),
+        MessageType::Broadcast,
+    ))
+    .await;
+
+    // Now register agents — they should receive the pending broadcast
+    bus.register_agent("alice").await;
+    bus.register_agent("bob").await;
+
+    let alice_msgs = bus.receive("alice").await;
+    assert_eq!(alice_msgs.len(), 1);
+    assert_eq!(alice_msgs[0].content, "early broadcast");
+
+    let bob_msgs = bus.receive("bob").await;
+    assert_eq!(bob_msgs.len(), 1);
+    assert_eq!(bob_msgs[0].content, "early broadcast");
+}
+
+#[tokio::test]
+async fn test_broadcast_excludes_sender_on_late_register() {
+    let bus = MessageBus::new();
+
+    // Broadcast from "system" before registration
+    bus.send(Message::new(
+        "system".into(),
+        "*".into(),
+        "hello all".into(),
+        MessageType::Broadcast,
+    ))
+    .await;
+
+    // Register including the sender
+    bus.register_agent("system").await;
+    bus.register_agent("agent1").await;
+
+    // system should NOT get its own broadcast
+    assert!(bus.receive("system").await.is_empty());
+    // agent1 should get it
+    assert_eq!(bus.receive("agent1").await.len(), 1);
+}

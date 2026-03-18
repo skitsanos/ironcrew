@@ -54,6 +54,8 @@ pub struct MessageBus {
     queues: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
     /// History of all messages (for debugging/inspection).
     history: Arc<RwLock<Vec<Message>>>,
+    /// Pending broadcasts sent before agents were registered.
+    pending_broadcasts: Arc<RwLock<Vec<Message>>>,
 }
 
 impl MessageBus {
@@ -61,6 +63,7 @@ impl MessageBus {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
             history: Arc::new(RwLock::new(Vec::new())),
+            pending_broadcasts: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -72,8 +75,14 @@ impl MessageBus {
         let mut queues = self.queues.write().await;
 
         if message.to == "*" {
-            // Broadcast: add to all queues except sender
+            // Broadcast: add to all existing queues except sender
             let agent_names: Vec<String> = queues.keys().cloned().collect();
+            if agent_names.is_empty() {
+                // No agents registered yet — store for later delivery
+                drop(queues);
+                self.pending_broadcasts.write().await.push(message);
+                return;
+            }
             for name in agent_names {
                 if name != message.from {
                     queues.entry(name).or_default().push_back(message.clone());
@@ -87,10 +96,21 @@ impl MessageBus {
         }
     }
 
-    /// Register an agent (creates their message queue).
+    /// Register an agent (creates their message queue and delivers pending broadcasts).
     pub async fn register_agent(&self, name: &str) {
         let mut queues = self.queues.write().await;
         queues.entry(name.to_string()).or_default();
+
+        // Deliver any pending broadcasts to this agent
+        let pending = self.pending_broadcasts.read().await;
+        for msg in pending.iter() {
+            if msg.from != name {
+                queues
+                    .entry(name.to_string())
+                    .or_default()
+                    .push_back(msg.clone());
+            }
+        }
     }
 
     /// Retrieve and consume all pending messages for an agent.
