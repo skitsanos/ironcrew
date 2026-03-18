@@ -42,6 +42,8 @@ pub struct Crew {
     pub messagebus: MessageBus,
     pub stream: bool,
     pub model_router: ModelRouter,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
 }
 
 impl Crew {
@@ -57,6 +59,8 @@ impl Crew {
             messagebus: MessageBus::new(),
             stream: false,
             model_router: ModelRouter::new(),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         }
     }
 
@@ -86,6 +90,17 @@ impl Crew {
             RunStatus::Failed
         };
 
+        let total_tokens: u32 = results
+            .iter()
+            .filter_map(|r| r.token_usage.as_ref())
+            .map(|u| u.total_tokens)
+            .sum();
+        let cached_tokens: u32 = results
+            .iter()
+            .filter_map(|r| r.token_usage.as_ref())
+            .map(|u| u.cached_tokens)
+            .sum();
+
         RunRecord {
             run_id: uuid::Uuid::new_v4().to_string(),
             flow_name: self.goal.clone(),
@@ -96,6 +111,8 @@ impl Crew {
             task_results: results.to_vec(),
             agent_count: self.agents.len(),
             task_count: self.tasks.len(),
+            total_tokens,
+            cached_tokens,
         }
     }
 

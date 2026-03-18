@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::Result;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub cached_tokens: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -38,6 +46,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub response_format: Option<ResponseFormat>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +68,7 @@ pub struct ToolCallFunction {
 pub struct ChatResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize)]

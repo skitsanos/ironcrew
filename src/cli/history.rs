@@ -59,6 +59,10 @@ pub fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
     println!("Started: {}", record.started_at);
     println!("Finished: {}", record.finished_at);
     println!("Duration: {}ms", record.duration_ms);
+    println!(
+        "Tokens: {} total ({} cached)",
+        record.total_tokens, record.cached_tokens
+    );
     println!("Agents: {}", record.agent_count);
     println!(
         "Tasks: {}/{} succeeded",

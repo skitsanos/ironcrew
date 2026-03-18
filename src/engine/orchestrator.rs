@@ -9,7 +9,9 @@ use crate::engine::crew::Crew;
 use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
-use crate::engine::task::{validate_dependency_graph, topological_phases, Task, TaskResult};
+use crate::engine::task::{
+    validate_dependency_graph, topological_phases, Task, TaskResult, TaskTokenUsage,
+};
 use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
@@ -61,6 +63,7 @@ fn filter_eligible_tasks<'a>(
                 output: format!("Skipped: dependency '{}' failed", failed_dep),
                 success: false,
                 duration_ms: 0,
+                token_usage: None,
             };
             failed_tasks.insert(task.name.clone());
             results.insert(task.name.clone(), result);
@@ -83,6 +86,7 @@ fn filter_eligible_tasks<'a>(
                     output: format!("Skipped: condition '{}' evaluated to false", condition),
                     success: true,
                     duration_ms: 0,
+                    token_usage: None,
                 };
                 results.insert(task.name.clone(), result);
                 tracing::info!(
@@ -101,7 +105,10 @@ fn filter_eligible_tasks<'a>(
 }
 
 /// The result type returned by each spawned task handle.
-type TaskJoinResult = std::result::Result<(String, String, Result<String>, u64), tokio::task::JoinError>;
+type TaskJoinResult = std::result::Result<
+    (String, String, Result<String>, u64, Option<TaskTokenUsage>),
+    tokio::task::JoinError,
+>;
 
 /// Process the join results from spawned standard tasks, handling success, failure, and error recovery.
 async fn process_phase_results(
@@ -113,12 +120,11 @@ async fn process_phase_results(
     failed_tasks: &mut HashSet<String>,
 ) -> Result<()> {
     for join_result in phase_results {
-        let (task_name, agent_name, output, duration_ms) = join_result.map_err(|e| {
-            IronCrewError::Task {
+        let (task_name, agent_name, output, duration_ms, token_usage) =
+            join_result.map_err(|e| IronCrewError::Task {
                 task: "unknown".into(),
                 message: format!("Task panicked: {}", e),
-            }
-        })?;
+            })?;
 
         match output {
             Ok(out) => {
@@ -128,6 +134,7 @@ async fn process_phase_results(
                     output: out,
                     success: true,
                     duration_ms,
+                    token_usage,
                 };
                 tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
                 results.insert(task_name, result);
@@ -169,6 +176,7 @@ async fn process_phase_results(
                     output: error_msg,
                     success: false,
                     duration_ms,
+                    token_usage: None,
                 };
                 tracing::error!("Task '{}' failed: {}", task_name, e);
                 failed_tasks.insert(task_name.clone());
@@ -342,7 +350,7 @@ pub async fn run_crew(
                 )
                 .await
                 {
-                    Ok(output) => {
+                    Ok((output, collab_usage)) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
                         tracing::info!(
                             "Collaborative task '{}' completed in {}ms",
@@ -357,6 +365,7 @@ pub async fn run_crew(
                                 output,
                                 success: true,
                                 duration_ms,
+                                token_usage: collab_usage,
                             },
                         );
                     }
@@ -414,7 +423,7 @@ pub async fn run_crew(
                                 )
                                 .await
                                 {
-                                    Ok(output) => {
+                                    Ok((output, handler_usage)) => {
                                         results.insert(
                                             task.name.clone(),
                                             TaskResult {
@@ -428,6 +437,7 @@ pub async fn run_crew(
                                                 ),
                                                 success: true,
                                                 duration_ms,
+                                                token_usage: None,
                                             },
                                         );
                                         results.insert(
@@ -441,6 +451,7 @@ pub async fn run_crew(
                                                     .elapsed()
                                                     .as_millis()
                                                     as u64,
+                                                token_usage: handler_usage,
                                             },
                                         );
                                         continue;
@@ -466,6 +477,7 @@ pub async fn run_crew(
                                 output: error_msg,
                                 success: false,
                                 duration_ms,
+                                token_usage: None,
                             },
                         );
                     }
@@ -575,6 +587,7 @@ pub async fn run_crew(
                     output: "Skipped: error handler not triggered".into(),
                     success: true,
                     duration_ms: 0,
+                    token_usage: None,
                 },
             );
         }

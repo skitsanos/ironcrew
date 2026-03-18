@@ -5,7 +5,7 @@ use crate::engine::agent::Agent;
 use crate::engine::executor::execute_task_standalone;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
-use crate::engine::task::{Task, TaskResult};
+use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::Result;
@@ -55,6 +55,7 @@ pub async fn execute_foreach_task(
                 ),
                 success: false,
                 duration_ms: 0,
+                token_usage: None,
             });
         }
     };
@@ -66,6 +67,7 @@ pub async fn execute_foreach_task(
             output: "Skipped: foreach source is empty".into(),
             success: true,
             duration_ms: 0,
+            token_usage: None,
         });
     }
 
@@ -78,6 +80,7 @@ pub async fn execute_foreach_task(
     // Run each item sequentially, collecting individual results
     let mut foreach_outputs: Vec<String> = Vec::new();
     let mut all_success = true;
+    let mut accumulated_usage = TaskTokenUsage::default();
     let start = Instant::now();
 
     for (idx, item) in items.iter().enumerate() {
@@ -135,7 +138,13 @@ pub async fn execute_foreach_task(
         )
         .await
         {
-            Ok(output) => {
+            Ok((output, item_usage)) => {
+                if let Some(u) = &item_usage {
+                    accumulated_usage.prompt_tokens += u.prompt_tokens;
+                    accumulated_usage.completion_tokens += u.completion_tokens;
+                    accumulated_usage.total_tokens += u.total_tokens;
+                    accumulated_usage.cached_tokens += u.cached_tokens;
+                }
                 foreach_outputs.push(output);
             }
             Err(e) => {
@@ -172,11 +181,17 @@ pub async fn execute_foreach_task(
         )
         .await;
 
+    let has_usage = accumulated_usage.total_tokens > 0;
     Ok(TaskResult {
         task: task.name.clone(),
         agent: agent.name.clone(),
         output: combined,
         success: all_success,
         duration_ms,
+        token_usage: if has_usage {
+            Some(accumulated_usage)
+        } else {
+            None
+        },
     })
 }

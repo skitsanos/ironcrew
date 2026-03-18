@@ -19,9 +19,12 @@ fn test_save_and_load_run() {
             output: "done".into(),
             success: true,
             duration_ms: 3000,
+            token_usage: None,
         }],
         agent_count: 1,
         task_count: 1,
+        total_tokens: 0,
+        cached_tokens: 0,
     };
 
     history.save(&record).unwrap();
@@ -52,6 +55,8 @@ fn test_list_runs() {
             task_results: vec![],
             agent_count: 1,
             task_count: 1,
+            total_tokens: 0,
+            cached_tokens: 0,
         };
         history.save(&record).unwrap();
     }
@@ -81,6 +86,8 @@ fn test_delete_run() {
         task_results: vec![],
         agent_count: 0,
         task_count: 0,
+        total_tokens: 0,
+        cached_tokens: 0,
     };
     history.save(&record).unwrap();
 

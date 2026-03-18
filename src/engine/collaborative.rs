@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::engine::agent::Agent;
-use crate::engine::task::TaskResult;
+use crate::engine::task::{TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -16,12 +16,14 @@ pub async fn execute_collaborative_task(
     memory_context: &str,
     model: &str,
     synthesis_model: &str,
-) -> Result<String> {
+) -> Result<(String, Option<TaskTokenUsage>)> {
     if agents.len() < 2 {
         return Err(IronCrewError::Validation(
             "Collaborative task requires at least 2 agents".into(),
         ));
     }
+
+    let mut total_usage = TaskTokenUsage::default();
 
     // Build conversation history shared across all agents
     let mut conversation: Vec<String> = Vec::new();
@@ -74,9 +76,17 @@ pub async fn execute_collaborative_task(
                 temperature: agent.temperature,
                 max_tokens: agent.max_tokens,
                 response_format: agent.response_format.clone(),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             };
 
             let response = provider.chat(request).await?;
+            if let Some(usage) = &response.usage {
+                total_usage.prompt_tokens += usage.prompt_tokens;
+                total_usage.completion_tokens += usage.completion_tokens;
+                total_usage.total_tokens += usage.total_tokens;
+                total_usage.cached_tokens += usage.cached_tokens;
+            }
             let content = response.content.unwrap_or_default();
 
             conversation.push(format!("[{}]: {}", agent.name, content));
@@ -109,10 +119,20 @@ pub async fn execute_collaborative_task(
         temperature: synth_agent.temperature,
         max_tokens: synth_agent.max_tokens,
         response_format: synth_agent.response_format.clone(),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
 
     let response = provider.chat(request).await?;
+    if let Some(usage) = &response.usage {
+        total_usage.prompt_tokens += usage.prompt_tokens;
+        total_usage.completion_tokens += usage.completion_tokens;
+        total_usage.total_tokens += usage.total_tokens;
+        total_usage.cached_tokens += usage.cached_tokens;
+    }
+    let has_usage = total_usage.total_tokens > 0;
     response
         .content
+        .map(|c| (c, if has_usage { Some(total_usage) } else { None }))
         .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
 }

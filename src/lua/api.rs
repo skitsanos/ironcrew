@@ -130,10 +130,15 @@ pub fn register_crew_constructor(
             ModelRouter::new()
         };
 
+        let prompt_cache_key: Option<String> = table.get("prompt_cache_key").ok();
+        let prompt_cache_retention: Option<String> = table.get("prompt_cache_retention").ok();
+
         let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
         crew.stream = stream;
         crew.model_router = model_router;
+        crew.prompt_cache_key = prompt_cache_key;
+        crew.prompt_cache_retention = prompt_cache_retention;
 
         // Auto-inject preloaded agents from agents/ directory
         for agent in agents.iter() {

@@ -15,6 +15,10 @@ pub struct RunRecord {
     pub task_results: Vec<TaskResult>,
     pub agent_count: usize,
     pub task_count: usize,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

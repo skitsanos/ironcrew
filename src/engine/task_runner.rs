@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::executor::execute_task_standalone;
-use crate::engine::task::{Task, TaskResult};
+use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
@@ -14,7 +14,7 @@ use crate::engine::messagebus::MessageBus;
 
 /// Execute a single task with retry/timeout logic inside a spawned context.
 ///
-/// Returns `(task_name, agent_name, result, duration_ms)`.
+/// Returns `(task_name, agent_name, result, duration_ms, token_usage)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_single_task(
     task: &Task,
@@ -32,6 +32,7 @@ pub async fn run_single_task(
     String,
     std::result::Result<String, IronCrewError>,
     u64,
+    Option<TaskTokenUsage>,
 ) {
     // Build memory context for this task
     let memory_context = memory.build_context(&task.description, 5).await;
@@ -66,7 +67,7 @@ pub async fn run_single_task(
         .unwrap_or(std::time::Duration::from_secs(300));
 
     let mut attempt = 0u32;
-    let output = loop {
+    let (output, token_usage) = loop {
         let result = execute_task_standalone(
             &task_owned,
             &agent_owned,
@@ -80,10 +81,10 @@ pub async fn run_single_task(
             should_stream,
         );
         match tokio::time::timeout(timeout_dur, result).await {
-            Ok(Ok(out)) => break Ok(out),
+            Ok(Ok((out, usage))) => break (Ok(out), usage),
             Ok(Err(e)) => {
                 if attempt >= max_retries {
-                    break Err(e);
+                    break (Err(e), None);
                 }
                 let backoff = base_backoff * 2f64.powi(attempt as i32);
                 tracing::warn!(
@@ -99,10 +100,13 @@ pub async fn run_single_task(
             }
             Err(_) => {
                 if attempt >= max_retries {
-                    break Err(IronCrewError::Task {
-                        task: task_owned.name.clone(),
-                        message: format!("Timed out after {}s", timeout_dur.as_secs()),
-                    });
+                    break (
+                        Err(IronCrewError::Task {
+                            task: task_owned.name.clone(),
+                            message: format!("Timed out after {}s", timeout_dur.as_secs()),
+                        }),
+                        None,
+                    );
                 }
                 let backoff = base_backoff * 2f64.powi(attempt as i32);
                 tracing::warn!(
@@ -119,7 +123,13 @@ pub async fn run_single_task(
     };
 
     let duration = start.elapsed().as_millis() as u64;
-    (task_owned.name.clone(), agent_owned.name.clone(), output, duration)
+    (
+        task_owned.name.clone(),
+        agent_owned.name.clone(),
+        output,
+        duration,
+        token_usage,
+    )
 }
 
 /// Handle a task error by running the on_error handler task if one is configured.
@@ -212,7 +222,7 @@ pub async fn handle_task_error(
     )
     .await
     {
-        Ok(output) => {
+        Ok((output, token_usage)) => {
             tracing::info!(
                 "Error handler '{}' succeeded, task '{}' recovered",
                 error_handler_name,
@@ -224,6 +234,7 @@ pub async fn handle_task_error(
                 output: format!("Recovered via '{}': {}", error_handler_name, output),
                 success: true,
                 duration_ms: 0, // caller sets actual duration
+                token_usage: None,
             };
             let handler_result = TaskResult {
                 task: error_handler_name.clone(),
@@ -231,6 +242,7 @@ pub async fn handle_task_error(
                 output,
                 success: true,
                 duration_ms: error_start.elapsed().as_millis() as u64,
+                token_usage,
             };
             Some((recovered_result, Some(handler_result)))
         }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::engine::agent::Agent;
 use crate::engine::interpolate::interpolate;
-use crate::engine::task::{Task, TaskResult};
+use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
@@ -18,11 +18,14 @@ pub struct TaskExecutionContext<'a> {
     pub memory_context: String,
     pub messages_context: String,
     pub should_stream: bool,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
 }
 
 impl<'a> TaskExecutionContext<'a> {
-    pub async fn execute(&self) -> Result<String> {
+    pub async fn execute(&self) -> Result<(String, Option<TaskTokenUsage>)> {
         let mut messages = Vec::new();
+        let mut total_usage = TaskTokenUsage::default();
 
         // System prompt
         let system_content = self
@@ -93,6 +96,8 @@ impl<'a> TaskExecutionContext<'a> {
                 temperature: self.agent.temperature,
                 max_tokens: self.agent.max_tokens,
                 response_format: self.agent.response_format.clone(),
+                prompt_cache_key: self.prompt_cache_key.clone(),
+                prompt_cache_retention: self.prompt_cache_retention.clone(),
             };
 
             let response = if self.should_stream && !has_tools {
@@ -127,10 +132,20 @@ impl<'a> TaskExecutionContext<'a> {
                 self.provider.chat(request).await?
             };
 
+            // Accumulate token usage
+            if let Some(usage) = &response.usage {
+                total_usage.prompt_tokens += usage.prompt_tokens;
+                total_usage.completion_tokens += usage.completion_tokens;
+                total_usage.total_tokens += usage.total_tokens;
+                total_usage.cached_tokens += usage.cached_tokens;
+            }
+
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
+                let has_usage = total_usage.total_tokens > 0;
                 return response
                     .content
+                    .map(|c| (c, if has_usage { Some(total_usage) } else { None }))
                     .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()));
             }
 
@@ -189,7 +204,40 @@ pub async fn execute_task_standalone(
     memory_context: &str,
     messages_context: &str,
     should_stream: bool,
-) -> Result<String> {
+) -> Result<(String, Option<TaskTokenUsage>)> {
+    execute_task_standalone_with_cache(
+        task,
+        agent,
+        provider,
+        tool_registry,
+        completed_results,
+        model,
+        max_tool_rounds,
+        memory_context,
+        messages_context,
+        should_stream,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Execute a task with optional prompt cache configuration.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_task_standalone_with_cache(
+    task: &Task,
+    agent: &Agent,
+    provider: &dyn LlmProvider,
+    tool_registry: &ToolRegistry,
+    completed_results: &HashMap<String, TaskResult>,
+    model: &str,
+    max_tool_rounds: usize,
+    memory_context: &str,
+    messages_context: &str,
+    should_stream: bool,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<String>,
+) -> Result<(String, Option<TaskTokenUsage>)> {
     let ctx = TaskExecutionContext {
         task,
         agent,
@@ -201,6 +249,8 @@ pub async fn execute_task_standalone(
         memory_context: memory_context.to_string(),
         messages_context: messages_context.to_string(),
         should_stream,
+        prompt_cache_key,
+        prompt_cache_retention,
     };
     ctx.execute().await
 }

@@ -42,6 +42,14 @@ pub struct Task {
 }
 
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskTokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub cached_tokens: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
@@ -49,6 +57,8 @@ pub struct TaskResult {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub token_usage: Option<TaskTokenUsage>,
 }
 
 /// Validate dependency references and detect cycles.

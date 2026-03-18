@@ -96,6 +96,13 @@ impl OpenAiProvider {
             body["tools"] = json!(tools_json);
         }
 
+        if let Some(ref key) = request.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if let Some(ref retention) = request.prompt_cache_retention {
+            body["prompt_cache_retention"] = json!(retention);
+        }
+
         body
     }
 
@@ -134,9 +141,19 @@ impl OpenAiProvider {
             .and_then(|tc| serde_json::from_value(tc.clone()).ok())
             .unwrap_or_default();
 
+        let usage = resp_body.get("usage").map(|u| TokenUsage {
+            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+            cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
+        });
+
         Ok(ChatResponse {
             content,
             tool_calls,
+            usage,
         })
     }
 
@@ -265,6 +282,7 @@ impl OpenAiProvider {
         Ok(ChatResponse {
             content,
             tool_calls,
+            usage: None,
         })
     }
 }

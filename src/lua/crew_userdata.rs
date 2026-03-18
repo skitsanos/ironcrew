@@ -357,6 +357,14 @@ impl UserData for LuaCrew {
                 entry.set("output", result.output.clone())?;
                 entry.set("success", result.success)?;
                 entry.set("duration_ms", result.duration_ms)?;
+                if let Some(ref usage) = result.token_usage {
+                    let usage_table = lua.create_table()?;
+                    usage_table.set("prompt_tokens", usage.prompt_tokens)?;
+                    usage_table.set("completion_tokens", usage.completion_tokens)?;
+                    usage_table.set("total_tokens", usage.total_tokens)?;
+                    usage_table.set("cached_tokens", usage.cached_tokens)?;
+                    entry.set("token_usage", usage_table)?;
+                }
                 results_table.set(i + 1, entry)?;
             }
 
