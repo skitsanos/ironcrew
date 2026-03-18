@@ -10,6 +10,7 @@ use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
 use crate::engine::task::{validate_dependency_graph, topological_phases, TaskResult};
+use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
@@ -371,27 +372,6 @@ pub async fn run_crew(
 
             tracing::info!("Task '{}' assigned to agent '{}'", task.name, agent.name);
 
-            // Build memory context for this task
-            let memory_context = crew.memory.build_context(&task.description, 5).await;
-
-            // Collect pending messages for this agent
-            let pending_messages = crew.messagebus.receive(&agent.name).await;
-            let messages_context = if pending_messages.is_empty() {
-                String::new()
-            } else {
-                let msg_strs: Vec<String> = pending_messages
-                    .iter()
-                    .map(|m| {
-                        format!(
-                            "[Message from {} ({:?})]: {}",
-                            m.from, m.message_type, m.content
-                        )
-                    })
-                    .collect();
-                format!("Messages from other agents:\n{}", msg_strs.join("\n"))
-            };
-
-            // Clone everything needed for the spawned task
             let task_owned = (*task).clone();
             let agent_owned = agent.clone();
             let provider_clone = provider.clone();
@@ -404,6 +384,8 @@ pub async fn run_crew(
             let max_tool_rounds = crew.max_tool_rounds;
             let should_stream = task.stream || crew.stream;
             let sem = semaphore.clone();
+            let memory = crew.memory.clone();
+            let messagebus = crew.messagebus.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = match sem {
@@ -411,74 +393,19 @@ pub async fn run_crew(
                     None => None,
                 };
 
-                let start = Instant::now();
-                let max_retries = task_owned.max_retries.unwrap_or(0);
-                let base_backoff = task_owned.retry_backoff_secs.unwrap_or(1.0);
-                let timeout_dur = task_owned
-                    .timeout_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or(std::time::Duration::from_secs(300));
-
-                let mut attempt = 0u32;
-                let output = loop {
-                    let result = execute_task_standalone(
-                        &task_owned,
-                        &agent_owned,
-                        provider_clone.as_ref(),
-                        &tool_registry_clone,
-                        &results_snapshot,
-                        &model,
-                        max_tool_rounds,
-                        &memory_context,
-                        &messages_context,
-                        should_stream,
-                    );
-                    match tokio::time::timeout(timeout_dur, result).await {
-                        Ok(Ok(out)) => break Ok(out),
-                        Ok(Err(e)) => {
-                            if attempt >= max_retries {
-                                break Err(e);
-                            }
-                            let backoff = base_backoff * 2f64.powi(attempt as i32);
-                            tracing::warn!(
-                                "Task '{}' failed (attempt {}/{}), retrying in {:.1}s: {}",
-                                task_owned.name,
-                                attempt + 1,
-                                max_retries + 1,
-                                backoff,
-                                e
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs_f64(backoff))
-                                .await;
-                            attempt += 1;
-                        }
-                        Err(_) => {
-                            if attempt >= max_retries {
-                                break Err(IronCrewError::Task {
-                                    task: task_owned.name.clone(),
-                                    message: format!(
-                                        "Timed out after {}s",
-                                        timeout_dur.as_secs()
-                                    ),
-                                });
-                            }
-                            let backoff = base_backoff * 2f64.powi(attempt as i32);
-                            tracing::warn!(
-                                "Task '{}' timed out (attempt {}/{}), retrying in {:.1}s",
-                                task_owned.name,
-                                attempt + 1,
-                                max_retries + 1,
-                                backoff
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs_f64(backoff))
-                                .await;
-                            attempt += 1;
-                        }
-                    }
-                };
-
-                let duration = start.elapsed().as_millis() as u64;
-                (task_owned.name.clone(), agent_owned.name.clone(), output, duration)
+                run_single_task(
+                    &task_owned,
+                    &agent_owned,
+                    provider_clone,
+                    tool_registry_clone,
+                    results_snapshot,
+                    model,
+                    max_tool_rounds,
+                    &memory,
+                    &messagebus,
+                    should_stream,
+                )
+                .await
             });
 
             handles.push(handle);
@@ -514,110 +441,29 @@ pub async fn run_crew(
                     // Check if this task has an on_error handler
                     let task_def = crew.tasks.iter().find(|t| t.name == task_name);
                     if let Some(task_def) = task_def
-                        && let Some(ref error_handler_name) = task_def.on_error
-                    {
-                            tracing::info!(
-                                "Task '{}' failed, routing to error handler '{}'",
-                                task_name,
-                                error_handler_name
-                            );
-
-                            if let Some(error_handler) =
-                                crew.tasks.iter().find(|t| t.name == *error_handler_name)
-                            {
-                                let mut error_task = error_handler.clone();
-                                let error_context = format!(
-                                    "Error from task '{}' (agent: {}): {}",
-                                    task_name, agent_name, error_msg
-                                );
-                                error_task.context = Some(
-                                    error_task
-                                        .context
-                                        .as_ref()
-                                        .map_or(error_context.clone(), |existing| {
-                                            format!("{}\n\n{}", existing, error_context)
-                                        }),
-                                );
-
-                                let error_agent =
-                                    if let Some(ref ea_name) = error_task.agent {
-                                        crew.agents
-                                            .iter()
-                                            .find(|a| a.name == *ea_name)
-                                            .unwrap_or(
-                                                crew.agents
-                                                    .iter()
-                                                    .find(|a| a.name == agent_name)
-                                                    .unwrap_or(&crew.agents[0]),
-                                            )
-                                    } else {
-                                        AgentSelector::select(&crew.agents, &error_task)
-                                    };
-
-                                let error_model = error_agent
-                                    .model
-                                    .clone()
-                                    .unwrap_or_else(|| crew.provider_config.model.clone());
-                                let error_start = Instant::now();
-                                match execute_task_standalone(
-                                    &error_task,
-                                    error_agent,
-                                    provider.as_ref(),
-                                    tool_registry,
-                                    &results,
-                                    &error_model,
-                                    crew.max_tool_rounds,
-                                    "",
-                                    "",
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok(output) => {
-                                        tracing::info!(
-                                            "Error handler '{}' succeeded, task '{}' recovered",
-                                            error_handler_name,
-                                            task_name
-                                        );
-                                        let result = TaskResult {
-                                            task: task_name.clone(),
-                                            agent: agent_name.clone(),
-                                            output: format!(
-                                                "Recovered via '{}': {}",
-                                                error_handler_name, output
-                                            ),
-                                            success: true,
-                                            duration_ms,
-                                        };
-                                        results.insert(task_name, result);
-                                        let handler_result = TaskResult {
-                                            task: error_handler_name.clone(),
-                                            agent: error_agent.name.clone(),
-                                            output,
-                                            success: true,
-                                            duration_ms: error_start.elapsed().as_millis()
-                                                as u64,
-                                        };
-                                        results
-                                            .insert(error_handler_name.clone(), handler_result);
-                                        continue;
-                                    }
-                                    Err(handler_err) => {
-                                        tracing::error!(
-                                            "Error handler '{}' also failed: {}",
-                                            error_handler_name,
-                                            handler_err
-                                        );
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "on_error handler '{}' not found for task '{}'",
-                                    error_handler_name,
-                                    task_name
-                                );
+                        && task_def.on_error.is_some()
+                        && let Some((mut recovered, handler_result)) = handle_task_error(
+                            task_def,
+                            &agent_name,
+                            &error_msg,
+                            &crew.tasks,
+                            &crew.agents,
+                            provider.clone(),
+                            tool_registry,
+                            &results,
+                            &crew.memory,
+                            &crew.provider_config.model,
+                            crew.max_tool_rounds,
+                        )
+                        .await
+                        {
+                            recovered.duration_ms = duration_ms;
+                            results.insert(task_name, recovered);
+                            if let Some(hr) = handler_result {
+                                results.insert(hr.task.clone(), hr);
                             }
-                    }
+                            continue;
+                        }
 
                     // Original failure path (no handler or handler failed)
                     let result = TaskResult {

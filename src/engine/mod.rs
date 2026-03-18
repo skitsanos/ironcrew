@@ -9,5 +9,6 @@ pub mod memory;
 pub mod messagebus;
 pub mod orchestrator;
 pub mod run_history;
+pub mod task_runner;
 pub mod runtime;
 pub mod task;
