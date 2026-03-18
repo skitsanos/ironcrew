@@ -189,6 +189,8 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let max_retries: Option<u32> = table.get::<Option<u32>>("max_retries")?.or(None);
     let retry_backoff_secs: Option<f64> = table.get::<Option<f64>>("retry_backoff_secs")?.or(None);
     let timeout_secs: Option<u64> = table.get::<Option<u64>>("timeout_secs")?.or(None);
+    let condition: Option<String> = table.get::<Option<String>>("condition")?.or(None);
+    let on_error: Option<String> = table.get::<Option<String>>("on_error")?.or(None);
 
     Ok(Task {
         name,
@@ -200,6 +202,8 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         max_retries,
         retry_backoff_secs,
         timeout_secs,
+        condition,
+        on_error,
     })
 }
 
@@ -354,6 +358,7 @@ pub struct LuaCrew {
     pub crew: Arc<Mutex<Crew>>,
     pub runtime: Arc<Runtime>,
     pub custom_provider: Option<Arc<dyn LlmProvider>>,
+    pub project_dir: PathBuf,
 }
 
 impl UserData for LuaCrew {
@@ -370,6 +375,128 @@ impl UserData for LuaCrew {
             this.crew.lock().await.add_task(task);
             Ok(())
         });
+
+        methods.add_async_method(
+            "add_task_if",
+            |_, this, (condition, table): (String, Table)| async move {
+                let mut task = task_from_lua_table(&table)?;
+                task.condition = Some(condition);
+                this.crew.lock().await.add_task(task);
+                Ok(())
+            },
+        );
+
+        methods.add_async_method(
+            "subworkflow",
+            |lua, this, (path, options): (String, Option<Table>)| async move {
+                // Resolve path relative to the project directory
+                let project_dir = this.project_dir.clone();
+
+                let flow_path = if Path::new(&path).is_absolute() {
+                    PathBuf::from(&path)
+                } else {
+                    project_dir.join(&path)
+                };
+
+                if !flow_path.exists() {
+                    return Err(mlua::Error::external(IronCrewError::Validation(
+                        format!("Subworkflow not found: {}", flow_path.display()),
+                    )));
+                }
+
+                // Parse options
+                let output_key: Option<String> =
+                    options.as_ref().and_then(|o| o.get("output_key").ok());
+                let input_table: Option<Table> =
+                    options.as_ref().and_then(|o| o.get("input").ok());
+
+                // Serialize input to JSON so we can transfer between Lua states
+                let input_json: Option<serde_json::Value> = match input_table {
+                    Some(ref t) => Some(lua_table_to_json(t)?),
+                    None => None,
+                };
+
+                // Load and execute the subworkflow
+                let sub_lua =
+                    crate::lua::sandbox::create_crew_lua().map_err(mlua::Error::external)?;
+
+                // Register the same constructors
+                register_agent_constructor(&sub_lua)?;
+
+                // Load agents from sub-project if it's a directory
+                let sub_dir = flow_path.parent().unwrap_or(Path::new("."));
+                let sub_agents_dir = sub_dir.join("agents");
+                let sub_agent_files = if sub_agents_dir.is_dir() {
+                    std::fs::read_dir(&sub_agents_dir)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lua"))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                let sub_agents = load_agents_from_files(&sub_lua, &sub_agent_files)
+                    .map_err(mlua::Error::external)?;
+
+                // Register Crew.new() for the sub-workflow with its own runtime
+                let sub_project_dir = sub_dir.to_path_buf();
+                register_crew_constructor(
+                    &sub_lua,
+                    this.runtime.clone(),
+                    sub_agents,
+                    sub_project_dir,
+                )?;
+
+                // If input mapping provided, set it as globals
+                if let Some(json) = &input_json {
+                    let input_value = json_value_to_lua(&sub_lua, json)?;
+                    sub_lua.globals().set("input", input_value)?;
+                }
+
+                // Execute the subworkflow script
+                let script = std::fs::read_to_string(&flow_path).map_err(|e| {
+                    mlua::Error::external(IronCrewError::Io(e))
+                })?;
+
+                let sub_result: Value = sub_lua.load(&script).eval_async().await?;
+
+                // Return the result, optionally wrapped under output_key
+                if let Some(key) = output_key {
+                    let wrapper = lua.create_table()?;
+                    // Transfer the value between Lua states by serializing through JSON
+                    let json_str = match sub_result {
+                        Value::Table(t) => {
+                            let json = lua_table_to_json(&t)?;
+                            serde_json::to_string(&json).unwrap_or_default()
+                        }
+                        Value::String(s) => s.to_str()?.to_string(),
+                        _ => String::new(),
+                    };
+                    wrapper.set(key, json_str)?;
+                    Ok(Value::Table(wrapper))
+                } else {
+                    // Transfer between Lua states via JSON serialization
+                    match sub_result {
+                        Value::Table(t) => {
+                            let json = lua_table_to_json(&t)?;
+                            let transferred = json_value_to_lua(&lua, &json)?;
+                            Ok(transferred)
+                        }
+                        Value::String(s) => {
+                            let s = s.to_str()?.to_string();
+                            Ok(Value::String(lua.create_string(&s)?))
+                        }
+                        Value::Integer(i) => Ok(Value::Integer(i)),
+                        Value::Number(n) => Ok(Value::Number(n)),
+                        Value::Boolean(b) => Ok(Value::Boolean(b)),
+                        Value::Nil => Ok(Value::Nil),
+                        _ => Ok(Value::Nil),
+                    }
+                }
+            },
+        );
 
         methods.add_async_method("run", |lua, this, ()| async move {
             let crew = this.crew.lock().await;
@@ -405,11 +532,14 @@ pub fn register_crew_constructor(
     lua: &Lua,
     runtime: Arc<Runtime>,
     preloaded_agents: Vec<Agent>,
+    project_dir: PathBuf,
 ) -> LuaResult<()> {
     let crew_table = lua.create_table()?;
     let agents = Arc::new(preloaded_agents);
+    let project_dir = Arc::new(project_dir);
 
     let new_fn = lua.create_function(move |_, table: Table| {
+        let project_dir = (*project_dir).clone();
         let goal: String = table.get("goal")?;
         let provider: String =
             table.get::<String>("provider").unwrap_or_else(|_| "openai".into());
@@ -449,6 +579,7 @@ pub fn register_crew_constructor(
             crew: Arc::new(Mutex::new(crew)),
             runtime: runtime.clone(),
             custom_provider,
+            project_dir,
         })
     })?;
 

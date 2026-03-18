@@ -5,7 +5,7 @@ use mlua::{Lua, Result as LuaResult, StdLib, Value};
 use crate::lua::api::{json_value_to_lua, lua_value_to_json};
 
 /// Register utility global functions available in all Lua sandboxes.
-fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
+pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // env()
     let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
     lua.globals().set("env", env_fn)?;

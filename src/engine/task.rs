@@ -21,6 +21,10 @@ pub struct Task {
     pub retry_backoff_secs: Option<f64>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub on_error: Option<String>,
 }
 
 

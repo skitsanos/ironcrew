@@ -71,3 +71,28 @@ fn test_task_retry_fields_default_to_none() {
     assert_eq!(task.retry_backoff_secs, None);
     assert_eq!(task.timeout_secs, None);
 }
+
+#[test]
+fn test_task_with_condition_field() {
+    let task = Task {
+        name: "conditional".into(),
+        description: "test".into(),
+        condition: Some("results.step1.success == true".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        task.condition,
+        Some("results.step1.success == true".into())
+    );
+}
+
+#[test]
+fn test_task_with_on_error_field() {
+    let task = Task {
+        name: "risky".into(),
+        description: "test".into(),
+        on_error: Some("error_handler".into()),
+        ..Default::default()
+    };
+    assert_eq!(task.on_error, Some("error_handler".into()));
+}

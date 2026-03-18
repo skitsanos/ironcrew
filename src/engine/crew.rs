@@ -61,7 +61,18 @@ impl Crew {
         let mut results: HashMap<String, TaskResult> = HashMap::new();
         let mut failed_tasks: HashSet<String> = HashSet::new();
 
+        // Collect error handler task names so we can skip them in normal execution
+        let error_handler_names: HashSet<&str> = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.on_error.as_deref())
+            .collect();
+
         for task in &sorted_tasks {
+            // Skip error handler tasks — they run only when triggered
+            if error_handler_names.contains(task.name.as_str()) {
+                continue;
+            }
             // Check if any dependency failed
             let dep_failed = task.depends_on.iter().find(|dep| failed_tasks.contains(*dep));
             if let Some(failed_dep) = dep_failed {
@@ -76,6 +87,30 @@ impl Crew {
                 results.insert(task.name.clone(), result);
                 tracing::warn!("Skipping task '{}': dependency '{}' failed", task.name, failed_dep);
                 continue;
+            }
+
+            // Check condition if present
+            if let Some(ref condition) = task.condition {
+                let should_run = self.evaluate_condition(condition, &results);
+                if !should_run {
+                    let result = TaskResult {
+                        task: task.name.clone(),
+                        agent: String::new(),
+                        output: format!(
+                            "Skipped: condition '{}' evaluated to false",
+                            condition
+                        ),
+                        success: true,
+                        duration_ms: 0,
+                    };
+                    results.insert(task.name.clone(), result);
+                    tracing::info!(
+                        "Skipping task '{}': condition '{}' is false",
+                        task.name,
+                        condition
+                    );
+                    continue;
+                }
             }
 
             // Select agent
@@ -165,10 +200,103 @@ impl Crew {
                     results.insert(task.name.clone(), result);
                 }
                 Err(e) => {
+                    let error_msg = e.to_string();
+
+                    // Check if this task has an on_error handler
+                    if let Some(ref error_handler_name) = task.on_error {
+                        tracing::info!(
+                            "Task '{}' failed, routing to error handler '{}'",
+                            task.name,
+                            error_handler_name
+                        );
+
+                        if let Some(error_handler) =
+                            self.tasks.iter().find(|t| t.name == *error_handler_name)
+                        {
+                            let mut error_task = error_handler.clone();
+                            let error_context = format!(
+                                "Error from task '{}' (agent: {}): {}",
+                                task.name, agent.name, error_msg
+                            );
+                            error_task.context = Some(
+                                error_task
+                                    .context
+                                    .as_ref()
+                                    .map_or(error_context.clone(), |existing| {
+                                        format!("{}\n\n{}", existing, error_context)
+                                    }),
+                            );
+
+                            let error_agent =
+                                if let Some(ref agent_name) = error_task.agent {
+                                    self.agents
+                                        .iter()
+                                        .find(|a| a.name == *agent_name)
+                                        .unwrap_or(agent)
+                                } else {
+                                    AgentSelector::select(&self.agents, &error_task)
+                                };
+
+                            let error_start = Instant::now();
+                            match self
+                                .execute_task(
+                                    &error_task,
+                                    error_agent,
+                                    provider,
+                                    tool_registry,
+                                    &results,
+                                )
+                                .await
+                            {
+                                Ok(output) => {
+                                    tracing::info!(
+                                        "Error handler '{}' succeeded, task '{}' recovered",
+                                        error_handler_name,
+                                        task.name
+                                    );
+                                    let result = TaskResult {
+                                        task: task.name.clone(),
+                                        agent: agent.name.clone(),
+                                        output: format!(
+                                            "Recovered via '{}': {}",
+                                            error_handler_name, output
+                                        ),
+                                        success: true,
+                                        duration_ms: start.elapsed().as_millis() as u64,
+                                    };
+                                    results.insert(task.name.clone(), result);
+                                    let handler_result = TaskResult {
+                                        task: error_handler_name.clone(),
+                                        agent: error_agent.name.clone(),
+                                        output,
+                                        success: true,
+                                        duration_ms: error_start.elapsed().as_millis() as u64,
+                                    };
+                                    results.insert(error_handler_name.clone(), handler_result);
+                                    continue;
+                                }
+                                Err(handler_err) => {
+                                    tracing::error!(
+                                        "Error handler '{}' also failed: {}",
+                                        error_handler_name,
+                                        handler_err
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "on_error handler '{}' not found for task '{}'",
+                                error_handler_name,
+                                task.name
+                            );
+                        }
+                    }
+
+                    // Original failure path (no handler or handler failed)
                     let result = TaskResult {
                         task: task.name.clone(),
                         agent: agent.name.clone(),
-                        output: e.to_string(),
+                        output: error_msg,
                         success: false,
                         duration_ms: start.elapsed().as_millis() as u64,
                     };
@@ -179,11 +307,68 @@ impl Crew {
             }
         }
 
+        // Mark untriggered error handler tasks as skipped
+        let all_error_handler_names: HashSet<String> = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.on_error.clone())
+            .collect();
+        for handler_name in &all_error_handler_names {
+            if !results.contains_key(handler_name) {
+                results.insert(
+                    handler_name.clone(),
+                    TaskResult {
+                        task: handler_name.clone(),
+                        agent: String::new(),
+                        output: "Skipped: error handler not triggered".into(),
+                        success: true,
+                        duration_ms: 0,
+                    },
+                );
+            }
+        }
+
         // Return results in sorted order
         Ok(sorted_tasks
             .iter()
             .filter_map(|t| results.remove(&t.name))
             .collect())
+    }
+
+    fn evaluate_condition(
+        &self,
+        condition: &str,
+        results: &HashMap<String, TaskResult>,
+    ) -> bool {
+        let lua = mlua::Lua::new();
+
+        let Ok(ctx) = lua.create_table() else {
+            return false;
+        };
+        for (name, result) in results {
+            let Ok(entry) = lua.create_table() else {
+                continue;
+            };
+            let _ = entry.set("output", result.output.clone());
+            let _ = entry.set("success", result.success);
+            let _ = entry.set("agent", result.agent.clone());
+            let _ = ctx.set(name.as_str(), entry);
+        }
+        let _ = lua.globals().set("results", ctx);
+
+        match lua.load(condition).eval::<mlua::Value>() {
+            Ok(mlua::Value::Boolean(b)) => b,
+            Ok(mlua::Value::Nil) => false,
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Condition evaluation failed for '{}': {}",
+                    condition,
+                    e
+                );
+                false
+            }
+        }
     }
 
     async fn execute_task(

@@ -118,8 +118,13 @@ async fn cmd_run(path: &Path) -> Result<()> {
     let runtime = Arc::new(runtime);
 
     // Register Crew.new() with preloaded agents auto-injected
-    register_crew_constructor(&lua, runtime.clone(), preloaded_agents)
-        .map_err(IronCrewError::Lua)?;
+    register_crew_constructor(
+        &lua,
+        runtime.clone(),
+        preloaded_agents,
+        loader.project_dir().to_path_buf(),
+    )
+    .map_err(IronCrewError::Lua)?;
 
     // Execute entrypoint
     let entrypoint = loader
