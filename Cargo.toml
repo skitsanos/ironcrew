@@ -2,6 +2,21 @@
 name = "ironcrew"
 version = "0.1.0"
 edition = "2024"
+description = "A compiled Rust runtime for Lua-defined AI agent crews"
+license = "MIT"
+repository = "https://github.com/skitsanos/ironcrew"
+keywords = ["ai", "agents", "lua", "crew", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ironcrew"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 mlua = { version = "0.11.6", features = ["lua54", "async", "send", "serialize", "vendored"] }
