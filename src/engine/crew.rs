@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::interpolate::interpolate;
+use crate::engine::memory::MemoryStore;
 use crate::engine::task::{validate_dependency_graph, topological_phases, Task, TaskResult};
 use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
@@ -25,10 +26,11 @@ pub struct Crew {
     pub provider_config: ProviderConfig,
     pub max_tool_rounds: usize,
     pub max_concurrent_tasks: Option<usize>,
+    pub memory: MemoryStore,
 }
 
 impl Crew {
-    pub fn new(goal: String, provider_config: ProviderConfig) -> Self {
+    pub fn new(goal: String, provider_config: ProviderConfig, memory: MemoryStore) -> Self {
         Self {
             goal,
             agents: Vec::new(),
@@ -36,6 +38,7 @@ impl Crew {
             provider_config,
             max_tool_rounds: 10,
             max_concurrent_tasks: None,
+            memory,
         }
     }
 
@@ -178,6 +181,9 @@ impl Crew {
 
                 tracing::info!("Task '{}' assigned to agent '{}'", task.name, agent.name);
 
+                // Build memory context for this task
+                let memory_context = self.memory.build_context(&task.description, 5).await;
+
                 // Clone everything needed for the spawned task
                 let task_owned = (*task).clone();
                 let agent_owned = agent.clone();
@@ -215,6 +221,7 @@ impl Crew {
                             &results_snapshot,
                             &model,
                             max_tool_rounds,
+                            &memory_context,
                         );
                         match tokio::time::timeout(timeout_dur, result).await {
                             Ok(Ok(out)) => break Ok(out),
@@ -350,6 +357,7 @@ impl Crew {
                                         &results,
                                         &error_model,
                                         self.max_tool_rounds,
+                                        "",
                                     )
                                     .await
                                     {
@@ -413,6 +421,20 @@ impl Crew {
                     }
                 }
             }
+
+            // Store successful task results in memory
+            for (task_name, result) in &results {
+                if result.success {
+                    let value = serde_json::json!({
+                        "output": result.output,
+                        "agent": result.agent,
+                        "duration_ms": result.duration_ms,
+                    });
+                    self.memory
+                        .set(format!("task:{}", task_name), value)
+                        .await;
+                }
+            }
         }
 
         // Mark untriggered error handler tasks as skipped
@@ -435,6 +457,9 @@ impl Crew {
                 );
             }
         }
+
+        // Persist memory if using persistent backend
+        self.memory.save().await.ok();
 
         // Return results in phase order
         Ok(task_order
@@ -476,6 +501,7 @@ fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_task_standalone(
     task: &Task,
     agent: &Agent,
@@ -484,6 +510,7 @@ async fn execute_task_standalone(
     completed_results: &HashMap<String, TaskResult>,
     model: &str,
     max_tool_rounds: usize,
+    memory_context: &str,
 ) -> Result<String> {
     let mut messages = Vec::new();
 
@@ -514,6 +541,11 @@ async fn execute_task_standalone(
 
     if let Some(ref ctx) = context {
         prompt_parts.push(format!("Additional context: {}", ctx));
+    }
+
+    // Inject memory context if available
+    if !memory_context.is_empty() {
+        prompt_parts.push(format!("Relevant memory:\n{}", memory_context));
     }
 
     // Inject dependency results

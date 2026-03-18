@@ -1,0 +1,259 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::utils::error::{IronCrewError, Result};
+
+/// A single memory item with metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryItem {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub access_count: u64,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub ttl_ms: Option<i64>,
+}
+
+impl MemoryItem {
+    pub fn new(key: String, value: serde_json::Value) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        Self {
+            key,
+            value,
+            created_at: now,
+            updated_at: now,
+            access_count: 0,
+            tags: Vec::new(),
+            ttl_ms: None,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        if let Some(ttl) = self.ttl_ms {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            now > self.created_at + ttl
+        } else {
+            false
+        }
+    }
+}
+
+/// Thread-safe memory store with pluggable backend.
+#[derive(Clone)]
+pub struct MemoryStore {
+    items: Arc<RwLock<HashMap<String, MemoryItem>>>,
+    backend: MemoryBackend,
+}
+
+#[derive(Clone)]
+pub enum MemoryBackend {
+    /// In-memory only, lost when the process exits
+    Ephemeral,
+    /// Persisted to a JSON file
+    Persistent { path: PathBuf },
+}
+
+impl MemoryStore {
+    pub fn ephemeral() -> Self {
+        Self {
+            items: Arc::new(RwLock::new(HashMap::new())),
+            backend: MemoryBackend::Ephemeral,
+        }
+    }
+
+    pub fn persistent(path: PathBuf) -> Result<Self> {
+        let items = if path.exists() {
+            let data = std::fs::read_to_string(&path).map_err(IronCrewError::Io)?;
+            let items: HashMap<String, MemoryItem> =
+                serde_json::from_str(&data).unwrap_or_default();
+            // Filter out expired items on load
+            items.into_iter().filter(|(_, v)| !v.is_expired()).collect()
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Self {
+            items: Arc::new(RwLock::new(items)),
+            backend: MemoryBackend::Persistent { path },
+        })
+    }
+
+    /// Set a value in memory.
+    pub async fn set(&self, key: String, value: serde_json::Value) {
+        let mut items = self.items.write().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        if let Some(existing) = items.get_mut(&key) {
+            existing.value = value;
+            existing.updated_at = now;
+        } else {
+            items.insert(key.clone(), MemoryItem::new(key, value));
+        }
+    }
+
+    /// Set a value with tags and optional TTL.
+    pub async fn set_with_options(
+        &self,
+        key: String,
+        value: serde_json::Value,
+        tags: Vec<String>,
+        ttl_ms: Option<i64>,
+    ) {
+        let mut items = self.items.write().await;
+        let mut item = MemoryItem::new(key.clone(), value);
+        item.tags = tags;
+        item.ttl_ms = ttl_ms;
+        items.insert(key, item);
+    }
+
+    /// Get a value from memory. Returns None if not found or expired.
+    pub async fn get(&self, key: &str) -> Option<serde_json::Value> {
+        let mut items = self.items.write().await;
+        if let Some(item) = items.get_mut(key) {
+            if item.is_expired() {
+                items.remove(key);
+                return None;
+            }
+            item.access_count += 1;
+            Some(item.value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Delete a key from memory.
+    pub async fn delete(&self, key: &str) -> bool {
+        let mut items = self.items.write().await;
+        items.remove(key).is_some()
+    }
+
+    /// List all keys in memory (excluding expired).
+    pub async fn keys(&self) -> Vec<String> {
+        let items = self.items.read().await;
+        items
+            .iter()
+            .filter(|(_, v)| !v.is_expired())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Get all items (excluding expired) for context building.
+    #[allow(dead_code)]
+    pub async fn all(&self) -> Vec<MemoryItem> {
+        let items = self.items.read().await;
+        items.values().filter(|v| !v.is_expired()).cloned().collect()
+    }
+
+    /// Build a context string from memory items relevant to a query.
+    /// Uses simple keyword matching for relevance scoring.
+    pub async fn build_context(&self, query: &str, max_items: usize) -> String {
+        let items = self.items.read().await;
+        let query_words: std::collections::HashSet<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| {
+                s.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut scored: Vec<(&MemoryItem, f32)> = items
+            .values()
+            .filter(|item| !item.is_expired())
+            .map(|item| {
+                let mut score = 0.0f32;
+
+                // Tag match: +3 per matching tag
+                for tag in &item.tags {
+                    if query_words.contains(&tag.to_lowercase()) {
+                        score += 3.0;
+                    }
+                }
+
+                // Key match: +2 if query contains the key
+                if query_words.contains(&item.key.to_lowercase()) {
+                    score += 2.0;
+                }
+
+                // Value content match: +1 per overlapping word
+                if let Some(s) = item.value.as_str() {
+                    let value_words: std::collections::HashSet<String> = s
+                        .to_lowercase()
+                        .split_whitespace()
+                        .map(|w| {
+                            w.trim_matches(|c: char| !c.is_alphanumeric())
+                                .to_string()
+                        })
+                        .collect();
+                    let overlap = query_words.intersection(&value_words).count();
+                    score += overlap as f32;
+                }
+
+                // Recency bonus: more recent = higher score
+                score += 1.0 / (1.0 + (item.access_count as f32).ln());
+
+                (item, score)
+            })
+            .filter(|(_, score)| *score > 0.0)
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored
+            .iter()
+            .take(max_items)
+            .map(|(item, _)| {
+                let value_str = match &item.value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                format!("[{}]: {}", item.key, value_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Persist to disk (only for Persistent backend).
+    pub async fn save(&self) -> Result<()> {
+        if let MemoryBackend::Persistent { ref path } = self.backend {
+            let items = self.items.read().await;
+            // Filter expired before saving
+            let active: HashMap<&String, &MemoryItem> =
+                items.iter().filter(|(_, v)| !v.is_expired()).collect();
+            let json = serde_json::to_string_pretty(&active).map_err(|e| {
+                IronCrewError::Validation(format!("Failed to serialize memory: {}", e))
+            })?;
+
+            // Ensure parent directory exists
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            std::fs::write(path, json)?;
+            tracing::debug!("Memory persisted to {}", path.display());
+        }
+        Ok(())
+    }
+
+    /// Clear all memory.
+    pub async fn clear(&self) {
+        let mut items = self.items.write().await;
+        items.clear();
+    }
+}

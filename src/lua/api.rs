@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::engine::agent::{Agent, ResponseFormat};
 use crate::engine::crew::{Crew, ProviderConfig};
+use crate::engine::memory::MemoryStore;
 use crate::engine::runtime::Runtime;
 use crate::engine::task::Task;
 use crate::llm::openai::OpenAiProvider;
@@ -498,6 +499,65 @@ impl UserData for LuaCrew {
             },
         );
 
+        // Memory methods
+        methods.add_async_method(
+            "memory_set",
+            |_, this, (key, value): (String, Value)| async move {
+                let json_value = lua_value_to_json(value)?;
+                this.crew.lock().await.memory.set(key, json_value).await;
+                Ok(())
+            },
+        );
+
+        methods.add_async_method(
+            "memory_set_ex",
+            |_, this, (key, value, options): (String, Value, Table)| async move {
+                let json_value = lua_value_to_json(value)?;
+                let tags: Vec<String> = options
+                    .get::<Table>("tags")
+                    .map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ttl_ms: Option<i64> = options.get("ttl_ms").ok();
+                this.crew
+                    .lock()
+                    .await
+                    .memory
+                    .set_with_options(key, json_value, tags, ttl_ms)
+                    .await;
+                Ok(())
+            },
+        );
+
+        methods.add_async_method("memory_get", |lua, this, key: String| async move {
+            let value = this.crew.lock().await.memory.get(&key).await;
+            match value {
+                Some(v) => json_value_to_lua(&lua, &v),
+                None => Ok(Value::Nil),
+            }
+        });
+
+        methods.add_async_method("memory_delete", |_, this, key: String| async move {
+            Ok(this.crew.lock().await.memory.delete(&key).await)
+        });
+
+        methods.add_async_method("memory_keys", |lua, this, ()| async move {
+            let keys = this.crew.lock().await.memory.keys().await;
+            let table = lua.create_table()?;
+            for (i, key) in keys.iter().enumerate() {
+                table.set(i + 1, key.as_str())?;
+            }
+            Ok(table)
+        });
+
+        methods.add_async_method("memory_clear", |_, this, ()| async move {
+            this.crew.lock().await.memory.clear().await;
+            Ok(())
+        });
+
         methods.add_async_method("run", |lua, this, ()| async move {
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
@@ -569,7 +629,19 @@ pub fn register_crew_constructor(
             api_key,
         };
 
-        let mut crew = Crew::new(goal, config);
+        let memory_mode: String = table
+            .get::<String>("memory")
+            .unwrap_or_else(|_| "ephemeral".into());
+
+        let memory = match memory_mode.as_str() {
+            "persistent" => {
+                let memory_path = project_dir.join(".ironcrew").join("memory.json");
+                MemoryStore::persistent(memory_path).map_err(mlua::Error::external)?
+            }
+            _ => MemoryStore::ephemeral(),
+        };
+
+        let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
 
         // Auto-inject preloaded agents from agents/ directory
