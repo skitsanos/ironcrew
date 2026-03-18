@@ -99,13 +99,21 @@ return {
     capabilities = {"research", "analysis", "summarization"},
     tools = {"web_scrape", "file_write"},
     temperature = 0.3,
-    -- model = "gpt-4o",           -- per-agent model override
-    -- max_tokens = 4000,          -- optional
-    -- response_format = {         -- force structured JSON output
-    --     type = "json_schema",
-    --     name = "result",
-    --     schema = { ... },
-    -- },
+    model = "gpt-4o",
+    max_tokens = 4000,
+    response_format = {
+        type = "json_schema",
+        name = "research_result",
+        schema = {
+            type = "object",
+            properties = {
+                findings = { type = "array", items = { type = "string" } },
+                sources = { type = "array", items = { type = "string" } },
+            },
+            required = {"findings", "sources"},
+            additionalProperties = false,
+        },
+    },
 }
 ```
 
