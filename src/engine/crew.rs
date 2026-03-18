@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::interpolate::interpolate;
 use crate::engine::memory::MemoryStore;
+use crate::engine::messagebus::MessageBus;
 use crate::engine::task::{validate_dependency_graph, topological_phases, Task, TaskResult};
 use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
@@ -27,6 +28,7 @@ pub struct Crew {
     pub max_tool_rounds: usize,
     pub max_concurrent_tasks: Option<usize>,
     pub memory: MemoryStore,
+    pub messagebus: MessageBus,
 }
 
 impl Crew {
@@ -39,6 +41,7 @@ impl Crew {
             max_tool_rounds: 10,
             max_concurrent_tasks: None,
             memory,
+            messagebus: MessageBus::new(),
         }
     }
 
@@ -48,6 +51,125 @@ impl Crew {
 
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_collaborative_task(
+        &self,
+        task_description: &str,
+        agent_names: &[String],
+        max_turns: usize,
+        provider: Arc<dyn LlmProvider>,
+        _tool_registry: &ToolRegistry,
+        completed_results: &HashMap<String, TaskResult>,
+        memory_context: &str,
+    ) -> Result<String> {
+        // Resolve agents
+        let agents: Vec<&Agent> = agent_names
+            .iter()
+            .filter_map(|name| self.agents.iter().find(|a| a.name == *name))
+            .collect();
+
+        if agents.len() < 2 {
+            return Err(IronCrewError::Validation(
+                "Collaborative task requires at least 2 agents".into(),
+            ));
+        }
+
+        let model = self.provider_config.model.clone();
+
+        // Build conversation history shared across all agents
+        let mut conversation: Vec<String> = Vec::new();
+        conversation.push(format!("Task: {}", task_description));
+
+        if !memory_context.is_empty() {
+            conversation.push(format!("Context:\n{}", memory_context));
+        }
+
+        // Add dependency results as context
+        for (name, result) in completed_results {
+            if result.success {
+                conversation.push(format!("Result from '{}': {}", name, result.output));
+            }
+        }
+
+        for turn in 0..max_turns {
+            // Each agent takes a turn
+            for agent in &agents {
+                let system_prompt = agent.system_prompt.clone().unwrap_or_else(|| {
+                    format!(
+                        "You are {} in a collaborative discussion with other agents. Your goal: {}. \
+                         Build on what others have said. Be concise and constructive.",
+                        agent.name, agent.goal
+                    )
+                });
+
+                let mut messages = vec![ChatMessage::system(&system_prompt)];
+
+                // Add the conversation so far
+                let conversation_text = conversation.join("\n\n");
+                let user_prompt = if turn == 0 && conversation.len() <= 1 {
+                    format!(
+                        "{}\n\nYou are starting the discussion. Share your initial thoughts.",
+                        conversation_text
+                    )
+                } else {
+                    format!(
+                        "{}\n\nIt's your turn. Respond to the discussion, adding your perspective.",
+                        conversation_text
+                    )
+                };
+                messages.push(ChatMessage::user(&user_prompt));
+
+                let agent_model = agent.model.clone().unwrap_or_else(|| model.clone());
+
+                let request = ChatRequest {
+                    messages,
+                    model: agent_model,
+                    temperature: agent.temperature,
+                    max_tokens: agent.max_tokens,
+                    response_format: agent.response_format.clone(),
+                };
+
+                let response = provider.chat(request).await?;
+                let content = response.content.unwrap_or_default();
+
+                conversation.push(format!("[{}]: {}", agent.name, content));
+
+                tracing::info!(
+                    "Collaborative task turn {}, agent '{}' responded",
+                    turn + 1,
+                    agent.name
+                );
+            }
+        }
+
+        // Final synthesis: ask the first agent to summarize
+        let synth_agent = agents[0];
+        let system_prompt = format!(
+            "You are {}. Synthesize the collaborative discussion into a final, cohesive response.",
+            synth_agent.name
+        );
+        let conversation_text = conversation.join("\n\n");
+
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&format!(
+                    "Here is the full discussion:\n\n{}\n\nProvide a final synthesized response that combines the best insights from all participants.",
+                    conversation_text
+                )),
+            ],
+            model: synth_agent.model.clone().unwrap_or_else(|| model.clone()),
+            temperature: synth_agent.temperature,
+            max_tokens: synth_agent.max_tokens,
+            response_format: synth_agent.response_format.clone(),
+        };
+
+        let response = provider.chat(request).await?;
+        response
+            .content
+            .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
     }
 
     pub async fn run(
@@ -60,6 +182,11 @@ impl Crew {
         }
         if self.tasks.is_empty() {
             return Err(IronCrewError::Validation("No tasks in crew".into()));
+        }
+
+        // Register all agents in the messagebus
+        for agent in &self.agents {
+            self.messagebus.register_agent(&agent.name).await;
         }
 
         validate_dependency_graph(&self.tasks)?;
@@ -160,10 +287,173 @@ impl Crew {
                     .join(", ")
             );
 
-            // Spawn all tasks in this phase concurrently
+            // Handle collaborative tasks first (they run sequentially)
+            let mut standard_tasks: Vec<&Task> = Vec::new();
+            for task in &phase_tasks {
+                if task.task_type.as_deref() == Some("collaborative")
+                    && task.collaborative_agents.len() >= 2
+                {
+                    tracing::info!(
+                        "Running collaborative task '{}' with agents: [{}]",
+                        task.name,
+                        task.collaborative_agents.join(", ")
+                    );
+
+                    let memory_context = self.memory.build_context(&task.description, 5).await;
+                    let max_turns = task.max_turns.unwrap_or(3);
+
+                    let start = Instant::now();
+                    match self
+                        .execute_collaborative_task(
+                            &interpolate(&task.description, &results),
+                            &task.collaborative_agents,
+                            max_turns,
+                            provider.clone(),
+                            tool_registry,
+                            &results,
+                            &memory_context,
+                        )
+                        .await
+                    {
+                        Ok(output) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            tracing::info!(
+                                "Collaborative task '{}' completed in {}ms",
+                                task.name,
+                                duration_ms
+                            );
+                            results.insert(
+                                task.name.clone(),
+                                TaskResult {
+                                    task: task.name.clone(),
+                                    agent: task.collaborative_agents.join("+"),
+                                    output,
+                                    success: true,
+                                    duration_ms,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let error_msg = e.to_string();
+
+                            // Check for on_error handler
+                            if let Some(ref error_handler_name) = task.on_error {
+                                tracing::info!(
+                                    "Collaborative task '{}' failed, routing to error handler '{}'",
+                                    task.name,
+                                    error_handler_name
+                                );
+                                if let Some(error_handler) =
+                                    self.tasks.iter().find(|t| t.name == *error_handler_name)
+                                {
+                                    let mut error_task = error_handler.clone();
+                                    let error_context = format!(
+                                        "Error from collaborative task '{}': {}",
+                                        task.name, error_msg
+                                    );
+                                    error_task.context = Some(
+                                        error_task.context.as_ref().map_or(
+                                            error_context.clone(),
+                                            |existing| {
+                                                format!("{}\n\n{}", existing, error_context)
+                                            },
+                                        ),
+                                    );
+
+                                    let error_agent =
+                                        if let Some(ref ea_name) = error_task.agent {
+                                            self.agents
+                                                .iter()
+                                                .find(|a| a.name == *ea_name)
+                                                .unwrap_or(&self.agents[0])
+                                        } else {
+                                            AgentSelector::select(&self.agents, &error_task)
+                                        };
+
+                                    let error_model = error_agent
+                                        .model
+                                        .clone()
+                                        .unwrap_or_else(|| self.provider_config.model.clone());
+                                    let error_start = Instant::now();
+                                    match execute_task_standalone(
+                                        &error_task,
+                                        error_agent,
+                                        provider.as_ref(),
+                                        tool_registry,
+                                        &results,
+                                        &error_model,
+                                        self.max_tool_rounds,
+                                        "",
+                                        "",
+                                    )
+                                    .await
+                                    {
+                                        Ok(output) => {
+                                            results.insert(
+                                                task.name.clone(),
+                                                TaskResult {
+                                                    task: task.name.clone(),
+                                                    agent: task
+                                                        .collaborative_agents
+                                                        .join("+"),
+                                                    output: format!(
+                                                        "Recovered via '{}': {}",
+                                                        error_handler_name, output
+                                                    ),
+                                                    success: true,
+                                                    duration_ms,
+                                                },
+                                            );
+                                            results.insert(
+                                                error_handler_name.clone(),
+                                                TaskResult {
+                                                    task: error_handler_name.clone(),
+                                                    agent: error_agent.name.clone(),
+                                                    output,
+                                                    success: true,
+                                                    duration_ms: error_start
+                                                        .elapsed()
+                                                        .as_millis()
+                                                        as u64,
+                                                },
+                                            );
+                                            continue;
+                                        }
+                                        Err(handler_err) => {
+                                            tracing::error!(
+                                                "Error handler '{}' also failed: {}",
+                                                error_handler_name,
+                                                handler_err
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            tracing::error!("Collaborative task '{}' failed: {}", task.name, e);
+                            failed_tasks.insert(task.name.clone());
+                            results.insert(
+                                task.name.clone(),
+                                TaskResult {
+                                    task: task.name.clone(),
+                                    agent: task.collaborative_agents.join("+"),
+                                    output: error_msg,
+                                    success: false,
+                                    duration_ms,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    standard_tasks.push(task);
+                }
+            }
+
+            // Spawn all standard tasks in this phase concurrently
             let mut handles = Vec::new();
 
-            for task in &phase_tasks {
+            for task in &standard_tasks {
                 // Select agent
                 let agent = if let Some(ref agent_name) = task.agent {
                     self.agents
@@ -183,6 +473,23 @@ impl Crew {
 
                 // Build memory context for this task
                 let memory_context = self.memory.build_context(&task.description, 5).await;
+
+                // Collect pending messages for this agent
+                let pending_messages = self.messagebus.receive(&agent.name).await;
+                let messages_context = if pending_messages.is_empty() {
+                    String::new()
+                } else {
+                    let msg_strs: Vec<String> = pending_messages
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "[Message from {} ({:?})]: {}",
+                                m.from, m.message_type, m.content
+                            )
+                        })
+                        .collect();
+                    format!("Messages from other agents:\n{}", msg_strs.join("\n"))
+                };
 
                 // Clone everything needed for the spawned task
                 let task_owned = (*task).clone();
@@ -222,6 +529,7 @@ impl Crew {
                             &model,
                             max_tool_rounds,
                             &memory_context,
+                            &messages_context,
                         );
                         match tokio::time::timeout(timeout_dur, result).await {
                             Ok(Ok(out)) => break Ok(out),
@@ -357,6 +665,7 @@ impl Crew {
                                         &results,
                                         &error_model,
                                         self.max_tool_rounds,
+                                        "",
                                         "",
                                     )
                                     .await
@@ -511,6 +820,7 @@ async fn execute_task_standalone(
     model: &str,
     max_tool_rounds: usize,
     memory_context: &str,
+    messages_context: &str,
 ) -> Result<String> {
     let mut messages = Vec::new();
 
@@ -546,6 +856,11 @@ async fn execute_task_standalone(
     // Inject memory context if available
     if !memory_context.is_empty() {
         prompt_parts.push(format!("Relevant memory:\n{}", memory_context));
+    }
+
+    // Inject messages from other agents
+    if !messages_context.is_empty() {
+        prompt_parts.push(messages_context.to_string());
     }
 
     // Inject dependency results

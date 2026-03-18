@@ -25,6 +25,12 @@ pub struct Task {
     pub condition: Option<String>,
     #[serde(default)]
     pub on_error: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>, // "standard" (default) or "collaborative"
+    #[serde(default)]
+    pub collaborative_agents: Vec<String>, // agent names for collaborative tasks
+    #[serde(default)]
+    pub max_turns: Option<usize>, // max conversation turns (default 3)
 }
 
 

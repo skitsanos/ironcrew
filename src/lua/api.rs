@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::engine::agent::{Agent, ResponseFormat};
 use crate::engine::crew::{Crew, ProviderConfig};
 use crate::engine::memory::MemoryStore;
+use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
 use crate::engine::task::Task;
 use crate::llm::openai::OpenAiProvider;
@@ -192,6 +193,16 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let timeout_secs: Option<u64> = table.get::<Option<u64>>("timeout_secs")?.or(None);
     let condition: Option<String> = table.get::<Option<String>>("condition")?.or(None);
     let on_error: Option<String> = table.get::<Option<String>>("on_error")?.or(None);
+    let task_type: Option<String> = table.get::<Option<String>>("task_type")?.or(None);
+    let collaborative_agents: Vec<String> = table
+        .get::<Table>("agents")
+        .map(|t| {
+            t.sequence_values::<String>()
+                .filter_map(|v| v.ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let max_turns: Option<usize> = table.get::<Option<usize>>("max_turns")?.or(None);
 
     Ok(Task {
         name,
@@ -205,6 +216,9 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         timeout_secs,
         condition,
         on_error,
+        task_type,
+        collaborative_agents,
+        max_turns,
     })
 }
 
@@ -498,6 +512,79 @@ impl UserData for LuaCrew {
                 }
             },
         );
+
+        // Collaborative task method
+        methods.add_async_method(
+            "add_collaborative_task",
+            |_, this, table: Table| async move {
+                let mut task = task_from_lua_table(&table)?;
+                task.task_type = Some("collaborative".into());
+
+                if task.collaborative_agents.len() < 2 {
+                    return Err(mlua::Error::external(IronCrewError::Validation(
+                        "Collaborative task requires 'agents' field with at least 2 agent names"
+                            .into(),
+                    )));
+                }
+
+                this.crew.lock().await.add_task(task);
+                Ok(())
+            },
+        );
+
+        // MessageBus methods
+        methods.add_async_method(
+            "message_send",
+            |_, this, (from, to, content, msg_type): (String, String, String, Option<String>)| async move {
+                let message_type = match msg_type.as_deref() {
+                    Some("request") => MessageType::Request,
+                    Some("broadcast") => MessageType::Broadcast,
+                    _ => MessageType::Notification,
+                };
+                let message = Message::new(from, to, content, message_type);
+                this.crew.lock().await.messagebus.send(message).await;
+                Ok(())
+            },
+        );
+
+        methods.add_async_method(
+            "message_read",
+            |lua, this, agent_name: String| async move {
+                let messages = this
+                    .crew
+                    .lock()
+                    .await
+                    .messagebus
+                    .receive(&agent_name)
+                    .await;
+                let table = lua.create_table()?;
+                for (i, msg) in messages.iter().enumerate() {
+                    let entry = lua.create_table()?;
+                    entry.set("id", msg.id.clone())?;
+                    entry.set("from", msg.from.clone())?;
+                    entry.set("to", msg.to.clone())?;
+                    entry.set("content", msg.content.clone())?;
+                    entry.set("type", format!("{:?}", msg.message_type))?;
+                    entry.set("timestamp", msg.timestamp)?;
+                    table.set(i + 1, entry)?;
+                }
+                Ok(table)
+            },
+        );
+
+        methods.add_async_method("message_history", |lua, this, ()| async move {
+            let history = this.crew.lock().await.messagebus.get_history().await;
+            let table = lua.create_table()?;
+            for (i, msg) in history.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("from", msg.from.clone())?;
+                entry.set("to", msg.to.clone())?;
+                entry.set("content", msg.content.clone())?;
+                entry.set("type", format!("{:?}", msg.message_type))?;
+                table.set(i + 1, entry)?;
+            }
+            Ok(table)
+        });
 
         // Memory methods
         methods.add_async_method(
