@@ -69,13 +69,16 @@ async fn main() {
 }
 
 fn load_project(path: &Path) -> Result<ProjectLoader> {
-    // Load .env from project directory
+    // Load .env: check CWD first, then project directory
+    dotenvy::dotenv().ok();
+
     let project_dir = if path.is_file() {
         path.parent().unwrap_or(Path::new("."))
     } else {
         path
     };
 
+    // Project-level .env overrides CWD .env
     let env_file = project_dir.join(".env");
     if env_file.exists() {
         dotenvy::from_path(&env_file).ok();
