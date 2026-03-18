@@ -34,7 +34,7 @@ pub struct Task {
 }
 
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
     pub agent: String,

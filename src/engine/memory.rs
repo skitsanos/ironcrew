@@ -6,6 +6,22 @@ use tokio::sync::RwLock;
 
 use crate::utils::error::{IronCrewError, Result};
 
+/// Configuration for memory store limits.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryConfig {
+    pub max_items: Option<usize>,
+    pub max_total_tokens: Option<usize>,
+}
+
+/// Rough token estimate: ~4 chars per token for English text.
+fn estimate_tokens(value: &serde_json::Value) -> usize {
+    let text = match value {
+        serde_json::Value::String(s) => s.len(),
+        other => serde_json::to_string(other).unwrap_or_default().len(),
+    };
+    text.div_ceil(4)
+}
+
 /// A single memory item with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryItem {
@@ -18,6 +34,8 @@ pub struct MemoryItem {
     pub tags: Vec<String>,
     #[serde(default)]
     pub ttl_ms: Option<i64>,
+    #[serde(default)]
+    pub estimated_tokens: usize,
 }
 
 impl MemoryItem {
@@ -26,6 +44,7 @@ impl MemoryItem {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
+        let estimated_tokens = estimate_tokens(&value);
         Self {
             key,
             value,
@@ -34,6 +53,7 @@ impl MemoryItem {
             access_count: 0,
             tags: Vec::new(),
             ttl_ms: None,
+            estimated_tokens,
         }
     }
 
@@ -50,11 +70,23 @@ impl MemoryItem {
     }
 }
 
+/// Memory statistics for inspection.
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub total_items: usize,
+    pub total_tokens: usize,
+    #[allow(dead_code)]
+    pub max_items: Option<usize>,
+    #[allow(dead_code)]
+    pub max_total_tokens: Option<usize>,
+}
+
 /// Thread-safe memory store with pluggable backend.
 #[derive(Clone)]
 pub struct MemoryStore {
     items: Arc<RwLock<HashMap<String, MemoryItem>>>,
     backend: MemoryBackend,
+    config: MemoryConfig,
 }
 
 #[derive(Clone)]
@@ -66,14 +98,21 @@ pub enum MemoryBackend {
 }
 
 impl MemoryStore {
+    #[allow(dead_code)]
     pub fn ephemeral() -> Self {
-        Self {
-            items: Arc::new(RwLock::new(HashMap::new())),
-            backend: MemoryBackend::Ephemeral,
-        }
+        Self::with_config(MemoryBackend::Ephemeral, MemoryConfig::default())
     }
 
+    pub fn ephemeral_with_config(config: MemoryConfig) -> Self {
+        Self::with_config(MemoryBackend::Ephemeral, config)
+    }
+
+    #[allow(dead_code)]
     pub fn persistent(path: PathBuf) -> Result<Self> {
+        Self::persistent_with_config(path, MemoryConfig::default())
+    }
+
+    pub fn persistent_with_config(path: PathBuf, config: MemoryConfig) -> Result<Self> {
         let items = if path.exists() {
             let data = std::fs::read_to_string(&path).map_err(IronCrewError::Io)?;
             let items: HashMap<String, MemoryItem> =
@@ -84,26 +123,51 @@ impl MemoryStore {
             HashMap::new()
         };
 
-        Ok(Self {
+        Ok(Self::with_config_and_items(
+            MemoryBackend::Persistent { path },
+            config,
+            items,
+        ))
+    }
+
+    fn with_config(backend: MemoryBackend, config: MemoryConfig) -> Self {
+        Self {
+            items: Arc::new(RwLock::new(HashMap::new())),
+            backend,
+            config,
+        }
+    }
+
+    fn with_config_and_items(
+        backend: MemoryBackend,
+        config: MemoryConfig,
+        items: HashMap<String, MemoryItem>,
+    ) -> Self {
+        Self {
             items: Arc::new(RwLock::new(items)),
-            backend: MemoryBackend::Persistent { path },
-        })
+            backend,
+            config,
+        }
     }
 
     /// Set a value in memory.
     pub async fn set(&self, key: String, value: serde_json::Value) {
-        let mut items = self.items.write().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        {
+            let mut items = self.items.write().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
 
-        if let Some(existing) = items.get_mut(&key) {
-            existing.value = value;
-            existing.updated_at = now;
-        } else {
-            items.insert(key.clone(), MemoryItem::new(key, value));
+            if let Some(existing) = items.get_mut(&key) {
+                existing.estimated_tokens = estimate_tokens(&value);
+                existing.value = value;
+                existing.updated_at = now;
+            } else {
+                items.insert(key.clone(), MemoryItem::new(key, value));
+            }
         }
+        self.evict_if_needed().await;
     }
 
     /// Set a value with tags and optional TTL.
@@ -114,11 +178,14 @@ impl MemoryStore {
         tags: Vec<String>,
         ttl_ms: Option<i64>,
     ) {
-        let mut items = self.items.write().await;
-        let mut item = MemoryItem::new(key.clone(), value);
-        item.tags = tags;
-        item.ttl_ms = ttl_ms;
-        items.insert(key, item);
+        {
+            let mut items = self.items.write().await;
+            let mut item = MemoryItem::new(key.clone(), value);
+            item.tags = tags;
+            item.ttl_ms = ttl_ms;
+            items.insert(key, item);
+        }
+        self.evict_if_needed().await;
     }
 
     /// Get a value from memory. Returns None if not found or expired.
@@ -255,5 +322,69 @@ impl MemoryStore {
     pub async fn clear(&self) {
         let mut items = self.items.write().await;
         items.clear();
+    }
+
+    /// Get memory statistics.
+    pub async fn stats(&self) -> MemoryStats {
+        let items = self.items.read().await;
+        let active: Vec<&MemoryItem> = items.values().filter(|v| !v.is_expired()).collect();
+        MemoryStats {
+            total_items: active.len(),
+            total_tokens: active.iter().map(|v| v.estimated_tokens).sum(),
+            max_items: self.config.max_items,
+            max_total_tokens: self.config.max_total_tokens,
+        }
+    }
+
+    /// Evict items to stay within configured limits.
+    /// Removes least-recently-accessed (by access_count, then oldest updated_at) items first.
+    async fn evict_if_needed(&self) {
+        let mut items = self.items.write().await;
+
+        // Remove expired items first
+        items.retain(|_, v| !v.is_expired());
+
+        // Check max_items limit
+        if let Some(max) = self.config.max_items {
+            while items.len() > max {
+                if let Some(key) = Self::find_eviction_candidate(&items) {
+                    tracing::debug!("Evicting memory item '{}' (max_items exceeded)", key);
+                    items.remove(&key);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check max_total_tokens limit
+        if let Some(max_tokens) = self.config.max_total_tokens {
+            let mut total: usize = items.values().map(|v| v.estimated_tokens).sum();
+            while total > max_tokens && !items.is_empty() {
+                if let Some(key) = Self::find_eviction_candidate(&items) {
+                    if let Some(removed) = items.remove(&key) {
+                        tracing::debug!(
+                            "Evicting memory item '{}' (max_tokens exceeded, {} tokens)",
+                            key,
+                            removed.estimated_tokens
+                        );
+                        total -= removed.estimated_tokens;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Find the best candidate for eviction: least accessed, then oldest.
+    fn find_eviction_candidate(items: &HashMap<String, MemoryItem>) -> Option<String> {
+        items
+            .iter()
+            .min_by(|a, b| {
+                a.1.access_count
+                    .cmp(&b.1.access_count)
+                    .then(a.1.updated_at.cmp(&b.1.updated_at))
+            })
+            .map(|(k, _)| k.clone())
     }
 }

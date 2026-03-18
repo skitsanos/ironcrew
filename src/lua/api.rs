@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::engine::agent::{Agent, ResponseFormat};
 use crate::engine::crew::{Crew, ProviderConfig};
-use crate::engine::memory::MemoryStore;
+use crate::engine::memory::{MemoryConfig, MemoryStore};
 use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
 use crate::engine::task::Task;
@@ -645,7 +645,17 @@ impl UserData for LuaCrew {
             Ok(())
         });
 
+        methods.add_async_method("memory_stats", |lua, this, ()| async move {
+            let stats = this.crew.lock().await.memory.stats().await;
+            let table = lua.create_table()?;
+            table.set("total_items", stats.total_items)?;
+            table.set("total_tokens", stats.total_tokens)?;
+            Ok(table)
+        });
+
         methods.add_async_method("run", |lua, this, ()| async move {
+            let run_start = chrono::Utc::now();
+
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -655,6 +665,23 @@ impl UserData for LuaCrew {
                 .run(provider, &this.runtime.tool_registry)
                 .await
                 .map_err(mlua::Error::external)?;
+
+            let run_end = chrono::Utc::now();
+            let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
+
+            // Save run history
+            let store_dir = this.project_dir.join(".ironcrew").join("runs");
+            if let Ok(history) = crate::engine::run_history::RunHistory::new(store_dir) {
+                let record = crew.create_run_record(
+                    &results,
+                    &run_start.to_rfc3339(),
+                    &run_end.to_rfc3339(),
+                    total_ms,
+                );
+                if let Err(e) = history.save(&record) {
+                    tracing::warn!("Failed to save run history: {}", e);
+                }
+            }
 
             // Convert results to Lua table
             let results_table = lua.create_table()?;
@@ -720,12 +747,21 @@ pub fn register_crew_constructor(
             .get::<String>("memory")
             .unwrap_or_else(|_| "ephemeral".into());
 
+        let max_memory_items: Option<usize> = table.get("max_memory_items").ok();
+        let max_memory_tokens: Option<usize> = table.get("max_memory_tokens").ok();
+
+        let memory_config = MemoryConfig {
+            max_items: max_memory_items,
+            max_total_tokens: max_memory_tokens,
+        };
+
         let memory = match memory_mode.as_str() {
             "persistent" => {
                 let memory_path = project_dir.join(".ironcrew").join("memory.json");
-                MemoryStore::persistent(memory_path).map_err(mlua::Error::external)?
+                MemoryStore::persistent_with_config(memory_path, memory_config)
+                    .map_err(mlua::Error::external)?
             }
-            _ => MemoryStore::ephemeral(),
+            _ => MemoryStore::ephemeral_with_config(memory_config),
         };
 
         let mut crew = Crew::new(goal, config, memory);

@@ -1,4 +1,4 @@
-use ironcrew::engine::memory::MemoryStore;
+use ironcrew::engine::memory::{MemoryConfig, MemoryStore};
 use serde_json::json;
 
 #[tokio::test]
@@ -106,4 +106,79 @@ async fn test_memory_persistent_roundtrip() {
         assert_eq!(store.get("key1").await, Some(json!("value1")));
         assert_eq!(store.get("key2").await, Some(json!({"nested": true})));
     }
+}
+
+#[tokio::test]
+async fn test_memory_eviction_max_items() {
+    let config = MemoryConfig {
+        max_items: Some(3),
+        max_total_tokens: None,
+    };
+    let store = MemoryStore::ephemeral_with_config(config);
+
+    store.set("a".into(), json!("value_a")).await;
+    store.set("b".into(), json!("value_b")).await;
+    store.set("c".into(), json!("value_c")).await;
+    store.set("d".into(), json!("value_d")).await; // should trigger eviction
+
+    let keys = store.keys().await;
+    assert_eq!(keys.len(), 3);
+}
+
+#[tokio::test]
+async fn test_memory_eviction_preserves_accessed() {
+    let config = MemoryConfig {
+        max_items: Some(2),
+        max_total_tokens: None,
+    };
+    let store = MemoryStore::ephemeral_with_config(config);
+
+    store.set("a".into(), json!("value_a")).await;
+    store.set("b".into(), json!("value_b")).await;
+
+    // Access 'a' to increase its access_count
+    store.get("a").await;
+    store.get("a").await;
+
+    store.set("c".into(), json!("value_c")).await; // should evict 'b' (less accessed)
+
+    assert!(store.get("a").await.is_some()); // 'a' preserved (more accessed)
+    assert!(store.get("c").await.is_some()); // 'c' is new
+}
+
+#[tokio::test]
+async fn test_memory_token_estimation() {
+    let store = MemoryStore::ephemeral();
+    store.set("short".into(), json!("hi")).await;
+    store
+        .set(
+            "long".into(),
+            json!("this is a longer string with more tokens in it"),
+        )
+        .await;
+
+    let stats = store.stats().await;
+    assert_eq!(stats.total_items, 2);
+    assert!(stats.total_tokens > 0);
+}
+
+#[tokio::test]
+async fn test_memory_eviction_max_tokens() {
+    let config = MemoryConfig {
+        max_items: None,
+        max_total_tokens: Some(10),
+    };
+    let store = MemoryStore::ephemeral_with_config(config);
+
+    store.set("small".into(), json!("hi")).await; // ~1 token
+    store
+        .set(
+            "big".into(),
+            json!("this is a much longer string that has many more tokens"),
+        )
+        .await; // many tokens
+
+    let stats = store.stats().await;
+    // Should have evicted to stay under 10 tokens
+    assert!(stats.total_tokens <= 10 || stats.total_items <= 1);
 }

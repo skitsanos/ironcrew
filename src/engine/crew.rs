@@ -6,6 +6,7 @@ use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::interpolate::interpolate;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
+use crate::engine::run_history::{RunRecord, RunStatus};
 use crate::engine::task::{validate_dependency_graph, topological_phases, Task, TaskResult};
 use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
@@ -51,6 +52,37 @@ impl Crew {
 
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
+    }
+
+    /// Create a RunRecord from execution results.
+    pub fn create_run_record(
+        &self,
+        results: &[TaskResult],
+        started_at: &str,
+        finished_at: &str,
+        duration_ms: u64,
+    ) -> RunRecord {
+        let all_success = results.iter().all(|r| r.success);
+        let any_success = results.iter().any(|r| r.success);
+        let status = if all_success {
+            RunStatus::Success
+        } else if any_success {
+            RunStatus::PartialFailure
+        } else {
+            RunStatus::Failed
+        };
+
+        RunRecord {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            flow_name: self.goal.clone(),
+            status,
+            started_at: started_at.to_string(),
+            finished_at: finished_at.to_string(),
+            duration_ms,
+            task_results: results.to_vec(),
+            agent_count: self.agents.len(),
+            task_count: self.tasks.len(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use crate::engine::run_history::{RunHistory, RunStatus};
 use crate::llm::openai::OpenAiProvider;
 use crate::lua::api::{
     load_agents_from_files, load_tool_defs_from_files, register_agent_constructor,
@@ -57,6 +58,23 @@ enum Commands {
     },
     /// List all available built-in tools
     Nodes,
+    /// Inspect a past run by ID
+    Inspect {
+        /// Run ID to inspect
+        run_id: String,
+        /// Project path (to find .ironcrew/runs/)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List past runs
+    Runs {
+        /// Filter by status: success, partial_failure, failed
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Project path (to find .ironcrew/runs/)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +88,8 @@ async fn main() {
         Commands::List { path } => cmd_list(&path),
         Commands::Init { name } => cmd_init(&name),
         Commands::Nodes => cmd_nodes(),
+        Commands::Inspect { run_id, project } => cmd_inspect(&project, &run_id),
+        Commands::Runs { status, project } => cmd_runs(&project, status.as_deref()),
     };
 
     if let Err(e) = result {
@@ -289,7 +309,8 @@ fn cmd_init(name: &str) -> Result<()> {
         project_dir.join(".gitignore"),
         "/output\n\
          .env\n\
-         .DS_Store\n",
+         .DS_Store\n\
+         .ironcrew/\n",
     )?;
 
     // Write sample agent
@@ -465,6 +486,94 @@ fn cmd_list(path: &Path) -> Result<()> {
     // Entrypoint
     if let Some(ep) = loader.entrypoint() {
         println!("Entrypoint: {}", ep.display());
+    }
+
+    Ok(())
+}
+
+fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()> {
+    let store_dir = project.join(".ironcrew").join("runs");
+    let history = RunHistory::new(store_dir)?;
+    let runs = history.list(status_filter)?;
+
+    if runs.is_empty() {
+        println!("No runs found.");
+        return Ok(());
+    }
+
+    let header_started = "STARTED";
+    println!(
+        "{:<38} {:<16} {:<10} {:<10} {}",
+        "RUN ID", "STATUS", "TASKS", "DURATION", header_started
+    );
+    println!("{}", "-".repeat(90));
+
+    for run in &runs {
+        let status_display = match run.status {
+            RunStatus::Success => "success",
+            RunStatus::PartialFailure => "partial",
+            RunStatus::Failed => "failed",
+        };
+        println!(
+            "{:<38} {:<16} {:<10} {:<10} {}",
+            run.run_id,
+            status_display,
+            format!(
+                "{}/{}",
+                run.task_results.iter().filter(|r| r.success).count(),
+                run.task_count
+            ),
+            format!("{}ms", run.duration_ms),
+            if run.started_at.len() >= 19 {
+                &run.started_at[..19]
+            } else {
+                &run.started_at
+            },
+        );
+    }
+
+    println!("\n{} run(s) total.", runs.len());
+    Ok(())
+}
+
+fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
+    let store_dir = project.join(".ironcrew").join("runs");
+    let history = RunHistory::new(store_dir)?;
+    let record = history.get(run_id)?;
+
+    println!("Run: {}", record.run_id);
+    println!("Flow: {}", record.flow_name);
+    println!("Status: {}", record.status);
+    println!("Started: {}", record.started_at);
+    println!("Finished: {}", record.finished_at);
+    println!("Duration: {}ms", record.duration_ms);
+    println!("Agents: {}", record.agent_count);
+    println!(
+        "Tasks: {}/{} succeeded",
+        record.task_results.iter().filter(|r| r.success).count(),
+        record.task_count
+    );
+    println!();
+
+    for result in &record.task_results {
+        let status = if result.success { "OK" } else { "FAIL" };
+        let agent = if result.agent.is_empty() {
+            "(none)"
+        } else {
+            &result.agent
+        };
+        println!(
+            "[{}] {} (by {}, {}ms)",
+            status, result.task, agent, result.duration_ms
+        );
+        // Truncate long output
+        let output = if result.output.len() > 200 {
+            format!("{}...", &result.output[..200])
+        } else {
+            result.output.clone()
+        };
+        println!("  {}", output);
+        println!();
     }
 
     Ok(())
