@@ -109,57 +109,10 @@ async fn run_flow(
 async fn execute_crew_from_path(
     flow_path: &std::path::Path,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
-    use crate::engine::runtime::Runtime;
-    use crate::llm::openai::OpenAiProvider;
-    use crate::lua::api::*;
-    use crate::lua::loader::ProjectLoader;
-    use crate::lua::sandbox::create_crew_lua;
+    use crate::cli::project::{load_project, setup_crew_runtime};
 
-    // Load .env
-    dotenvy::dotenv().ok();
-    let project_dir = if flow_path.is_file() {
-        flow_path.parent().unwrap_or(std::path::Path::new("."))
-    } else {
-        flow_path
-    };
-    let env_file = project_dir.join(".env");
-    if env_file.exists() {
-        dotenvy::from_path(&env_file).ok();
-    }
-
-    // Load project
-    let loader = if flow_path.is_file() {
-        ProjectLoader::from_file(flow_path)?
-    } else {
-        ProjectLoader::from_directory(flow_path)?
-    };
-
-    let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
-    register_agent_constructor(&lua).map_err(IronCrewError::Lua)?;
-
-    // Create provider
-    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-        IronCrewError::Validation("OPENAI_API_KEY environment variable not set".into())
-    })?;
-    let base_url = std::env::var("OPENAI_BASE_URL").ok();
-    let provider: Box<dyn crate::llm::provider::LlmProvider> =
-        Box::new(OpenAiProvider::new(api_key, base_url));
-
-    // Load agents and tools
-    let preloaded_agents = load_agents_from_files(&lua, loader.agent_files())?;
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files())?;
-
-    let mut runtime = Runtime::new(provider, Some(loader.project_dir()));
-    runtime.register_lua_tools(tool_defs);
-    let runtime = Arc::new(runtime);
-
-    register_crew_constructor(
-        &lua,
-        runtime.clone(),
-        preloaded_agents,
-        loader.project_dir().to_path_buf(),
-    )
-    .map_err(IronCrewError::Lua)?;
+    let loader = load_project(flow_path)?;
+    let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
     // Execute
     let entrypoint = loader
@@ -173,7 +126,7 @@ async fn execute_crew_from_path(
         .map_err(IronCrewError::Lua)?;
 
     // Read the last run from history to get results
-    let runs_dir = project_dir.join(".ironcrew").join("runs");
+    let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
     if let Ok(history) = RunHistory::new(runs_dir)
         && let Ok(runs) = history.list(None)
         && let Some(latest) = runs.first()
