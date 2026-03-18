@@ -10,7 +10,10 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 use crate::llm::openai::OpenAiProvider;
-use crate::lua::api::*;
+use crate::lua::api::{
+    load_agents_from_files, load_tool_defs_from_files, register_agent_constructor,
+    register_crew_constructor,
+};
 use crate::lua::loader::ProjectLoader;
 use crate::lua::sandbox::create_crew_lua;
 use crate::utils::error::{IronCrewError, Result};
@@ -90,7 +93,6 @@ async fn cmd_run(path: &Path) -> Result<()> {
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
 
     // Register globals
-    register_env_function(&lua).map_err(IronCrewError::Lua)?;
     register_agent_constructor(&lua).map_err(IronCrewError::Lua)?;
 
     // Create provider
@@ -135,7 +137,6 @@ async fn cmd_run(path: &Path) -> Result<()> {
 fn cmd_validate(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
-    register_env_function(&lua).map_err(IronCrewError::Lua)?;
 
     // 1. Validate agent files (Lua syntax + schema: name and goal required)
     let agents = load_agents_from_files(&lua, loader.agent_files())?;
@@ -187,7 +188,6 @@ fn cmd_validate(path: &Path) -> Result<()> {
 fn cmd_list(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
-    register_env_function(&lua).map_err(IronCrewError::Lua)?;
 
     println!("Project: {}", loader.project_dir().display());
     println!();

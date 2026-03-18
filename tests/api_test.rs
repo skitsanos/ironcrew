@@ -1,5 +1,5 @@
 use ironcrew::lua::api::*;
-use ironcrew::lua::sandbox::create_crew_lua;
+use ironcrew::lua::sandbox::{create_crew_lua, create_tool_lua};
 use mlua::Table;
 
 #[test]
@@ -125,4 +125,123 @@ fn test_lua_table_to_json() {
     let json = lua_table_to_json(&table).unwrap();
     assert_eq!(json["type"], "object");
     assert!(json["properties"]["name"]["type"] == "string");
+}
+
+// ---------------------------------------------------------------------------
+// Lua global utility function tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_uuid4_returns_valid_uuid() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua.load(r#"return uuid4()"#).eval().unwrap();
+    assert_eq!(result.len(), 36);
+    assert_eq!(result.chars().filter(|c| *c == '-').count(), 4);
+}
+
+#[test]
+fn test_now_rfc3339_returns_timestamp() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua.load(r#"return now_rfc3339()"#).eval().unwrap();
+    assert!(result.contains('T'));
+    assert!(result.len() > 20);
+}
+
+#[test]
+fn test_now_unix_ms_returns_positive_number() {
+    let lua = create_crew_lua().unwrap();
+    let result: i64 = lua.load(r#"return now_unix_ms()"#).eval().unwrap();
+    assert!(result > 0);
+}
+
+#[test]
+fn test_json_parse_stringify_roundtrip() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(
+            r#"
+        local obj = json_parse('{"name":"alice","age":30,"active":true}')
+        return json_stringify(obj)
+        "#,
+        )
+        .eval()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["name"], "alice");
+    assert_eq!(parsed["age"], 30);
+    assert_eq!(parsed["active"], true);
+}
+
+#[test]
+fn test_json_parse_array() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(
+            r#"
+        local arr = json_parse('[1,2,3]')
+        return json_stringify(arr)
+        "#,
+        )
+        .eval()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed, serde_json::json!([1, 2, 3]));
+}
+
+#[test]
+fn test_base64_encode_decode_roundtrip() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(
+            r#"
+        local encoded = base64_encode("hello world")
+        return base64_decode(encoded)
+        "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(result, "hello world");
+}
+
+#[test]
+fn test_base64_encode_known_value() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return base64_encode("hello")"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "aGVsbG8=");
+}
+
+#[test]
+fn test_log_does_not_crash() {
+    let lua = create_crew_lua().unwrap();
+    lua.load(r#"log("info", "test message from lua")"#)
+        .exec()
+        .unwrap();
+    lua.load(r#"log("just a message")"#).exec().unwrap();
+    lua.load(r#"log("debug", "multi", "part", "message")"#)
+        .exec()
+        .unwrap();
+}
+
+#[test]
+fn test_globals_available_in_tool_lua() {
+    let lua = create_tool_lua().unwrap();
+    // Verify all globals are available in tool context too
+    let uuid: String = lua.load(r#"return uuid4()"#).eval().unwrap();
+    assert_eq!(uuid.len(), 36);
+
+    let ts: i64 = lua.load(r#"return now_unix_ms()"#).eval().unwrap();
+    assert!(ts > 0);
+
+    let encoded: String = lua
+        .load(r#"return base64_encode("test")"#)
+        .eval()
+        .unwrap();
+    let decoded: String = lua
+        .load(format!(r#"return base64_decode("{}")"#, encoded))
+        .eval()
+        .unwrap();
+    assert_eq!(decoded, "test");
 }
