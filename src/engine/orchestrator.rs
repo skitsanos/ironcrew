@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::engine::agent::AgentSelector;
+use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::collaborative::execute_collaborative_task;
 use crate::engine::condition::evaluate_condition;
 use crate::engine::crew::Crew;
@@ -14,6 +14,28 @@ use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
+
+/// Resolve the model to use for a task, following the priority chain:
+/// 1. Agent's model override
+/// 2. Task's model override
+/// 3. Model Router purpose-based mapping
+/// 4. Crew's default model
+pub fn resolve_model(task: &Task, agent: &Agent, crew: &Crew, purpose: &str) -> String {
+    // 1. Agent's model override
+    if let Some(ref model) = agent.model {
+        return model.clone();
+    }
+    // 2. Task's model override
+    if let Some(ref model) = task.model {
+        return model.clone();
+    }
+    // 3. Model Router purpose-based
+    if crew.model_router.is_configured() {
+        return crew.model_router.resolve(purpose, &crew.provider_config.model);
+    }
+    // 4. Crew default
+    crew.provider_config.model.clone()
+}
 
 /// Filter tasks in a phase to only those eligible for execution.
 /// Skips error handlers, tasks with failed dependencies, and tasks whose conditions are false.
@@ -241,10 +263,7 @@ pub async fn run_crew(
                     AgentSelector::select(&crew.agents, task)
                 };
 
-                let model = agent
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| crew.provider_config.model.clone());
+                let model = resolve_model(task, agent, crew, "task_execution");
 
                 let foreach_result = execute_foreach_task(
                     task,
@@ -292,7 +311,23 @@ pub async fn run_crew(
                     .filter_map(|name| crew.agents.iter().find(|a| a.name == *name))
                     .collect();
 
-                let model = crew.provider_config.model.clone();
+                // Resolve collaboration model: use task model override if set,
+                // otherwise use router or crew default
+                let collab_model = if let Some(ref m) = task.model {
+                    m.clone()
+                } else if crew.model_router.is_configured() {
+                    crew.model_router.resolve("collaboration", &crew.provider_config.model)
+                } else {
+                    crew.provider_config.model.clone()
+                };
+
+                let collab_synthesis_model = if let Some(ref m) = task.model {
+                    m.clone()
+                } else if crew.model_router.is_configured() {
+                    crew.model_router.resolve("collaboration_synthesis", &crew.provider_config.model)
+                } else {
+                    crew.provider_config.model.clone()
+                };
 
                 let start = Instant::now();
                 match execute_collaborative_task(
@@ -302,7 +337,8 @@ pub async fn run_crew(
                     provider.clone(),
                     &results,
                     &memory_context,
-                    &model,
+                    &collab_model,
+                    &collab_synthesis_model,
                 )
                 .await
                 {
@@ -362,10 +398,7 @@ pub async fn run_crew(
                                         AgentSelector::select(&crew.agents, &error_task)
                                     };
 
-                                let error_model = error_agent
-                                    .model
-                                    .clone()
-                                    .unwrap_or_else(|| crew.provider_config.model.clone());
+                                let error_model = resolve_model(&error_task, error_agent, crew, "task_execution");
                                 let error_start = Instant::now();
                                 match execute_task_standalone(
                                     &error_task,
@@ -468,10 +501,7 @@ pub async fn run_crew(
             let provider_clone = provider.clone();
             let tool_registry_clone = tool_registry.clone();
             let results_snapshot = results.clone();
-            let model = agent
-                .model
-                .clone()
-                .unwrap_or_else(|| crew.provider_config.model.clone());
+            let model = resolve_model(task, agent, crew, "task_execution");
             let max_tool_rounds = crew.max_tool_rounds;
             let should_stream = task.stream || crew.stream;
             let sem = semaphore.clone();

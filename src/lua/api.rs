@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::engine::agent::Agent;
 use crate::engine::crew::{Crew, ProviderConfig};
 use crate::engine::memory::{MemoryConfig, MemoryStore};
+use crate::engine::model_router::ModelRouter;
 use crate::engine::runtime::Runtime;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::LlmProvider;
@@ -119,9 +120,20 @@ pub fn register_crew_constructor(
 
         let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
+        let model_router = if let Ok(models_table) = table.get::<mlua::Table>("models") {
+            let mut router = ModelRouter::new();
+            for (purpose, model_name) in models_table.pairs::<String, String>().flatten() {
+                router.set(&purpose, model_name);
+            }
+            router
+        } else {
+            ModelRouter::new()
+        };
+
         let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
         crew.stream = stream;
+        crew.model_router = model_router;
 
         // Auto-inject preloaded agents from agents/ directory
         for agent in agents.iter() {

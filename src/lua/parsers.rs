@@ -126,6 +126,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let foreach_source: Option<String> = table.get::<Option<String>>("foreach")?.or(None);
     let foreach_as: Option<String> = table.get::<Option<String>>("foreach_as")?.or(None);
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
+    let model: Option<String> = table.get::<Option<String>>("model")?.or(None);
 
     Ok(Task {
         name,
@@ -145,6 +146,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         foreach_source,
         foreach_as,
         stream,
+        model,
     })
 }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::engine::agent::Agent;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
+use crate::engine::model_router::ModelRouter;
 use crate::engine::run_history::{RunRecord, RunStatus};
 use crate::engine::task::{Task, TaskResult};
 use crate::llm::provider::LlmProvider;
@@ -40,6 +41,7 @@ pub struct Crew {
     pub memory: MemoryStore,
     pub messagebus: MessageBus,
     pub stream: bool,
+    pub model_router: ModelRouter,
 }
 
 impl Crew {
@@ -54,6 +56,7 @@ impl Crew {
             memory,
             messagebus: MessageBus::new(),
             stream: false,
+            model_router: ModelRouter::new(),
         }
     }
 

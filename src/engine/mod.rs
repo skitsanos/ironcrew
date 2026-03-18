@@ -7,6 +7,7 @@ pub mod foreach;
 pub mod interpolate;
 pub mod memory;
 pub mod messagebus;
+pub mod model_router;
 pub mod orchestrator;
 pub mod run_history;
 pub mod task_runner;
