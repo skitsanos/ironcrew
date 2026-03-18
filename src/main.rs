@@ -366,14 +366,48 @@ end
 }
 
 fn cmd_nodes() -> Result<()> {
-    println!("Built-in tools:");
-    println!("  file_read       - Read file contents");
-    println!("  file_write      - Write content to a file");
-    println!("  web_scrape      - Scrape web page content");
-    println!("  shell           - Execute shell commands");
-    println!("  http_request    - Make HTTP requests");
-    println!("  hash            - Compute hash digests");
-    println!("  template_render - Render Tera templates");
+    // Create a temporary registry to get all built-in tools
+    let mut registry = crate::tools::registry::ToolRegistry::new();
+
+    // Register all built-in tools
+    registry.register(Box::new(crate::tools::file_read::FileReadTool::new(None)));
+    registry.register(Box::new(crate::tools::file_write::FileWriteTool::new(
+        None, None,
+    )));
+    registry.register(Box::new(crate::tools::web_scrape::WebScrapeTool::new(
+        None,
+    )));
+    registry.register(Box::new(crate::tools::shell::ShellTool::new()));
+    registry.register(Box::new(
+        crate::tools::http_request::HttpRequestTool::new(),
+    ));
+    registry.register(Box::new(crate::tools::hash::HashTool::new()));
+    registry.register(Box::new(
+        crate::tools::template_render::TemplateRenderTool::new(),
+    ));
+
+    println!("Built-in tools ({}):", registry.list().len());
+    println!();
+
+    // Get tools sorted by name
+    let mut tools: Vec<(String, String)> = Vec::new();
+    for name in registry.list() {
+        if let Some(tool) = registry.get(&name) {
+            tools.push((name, tool.description().to_string()));
+        }
+    }
+    tools.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Find the longest name for alignment
+    let max_name_len = tools.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+
+    for (name, description) in &tools {
+        println!("  {:<width$}  {}", name, description, width = max_name_len);
+    }
+
+    println!();
+    println!("Custom tools can be defined in tools/*.lua files in your project.");
+
     Ok(())
 }
 
