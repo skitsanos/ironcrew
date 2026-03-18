@@ -51,6 +51,15 @@ pub struct TaskResultResponse {
 #[derive(Deserialize)]
 pub struct ListRunsQuery {
     pub status: Option<String>,
+    /// Flow/project path (relative to flows_dir) to look up runs for
+    pub flow: Option<String>,
+}
+
+/// Query params for run operations
+#[derive(Deserialize)]
+pub struct RunQuery {
+    /// Flow/project path (relative to flows_dir)
+    pub flow: Option<String>,
 }
 
 /// Error response
@@ -61,6 +70,14 @@ pub struct ErrorResponse {
 
 fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ErrorResponse>) {
     (status, Json(ErrorResponse { error: message }))
+}
+
+/// Resolve the runs directory for a given flow path (per-project).
+fn resolve_runs_dir(state: &AppState, flow: Option<&str>) -> PathBuf {
+    match flow {
+        Some(f) => state.flows_dir.join(f).join(".ironcrew").join("runs"),
+        None => state.store_dir.clone(),
+    }
 }
 
 /// Build the router
@@ -213,7 +230,8 @@ async fn list_runs(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let history = RunHistory::new(state.store_dir.clone())
+    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let runs = history
@@ -226,8 +244,10 @@ async fn list_runs(
 async fn get_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<RunQuery>,
 ) -> Result<Json<RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let history = RunHistory::new(state.store_dir.clone())
+    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let record = history
@@ -240,8 +260,10 @@ async fn get_run(
 async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<RunQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let history = RunHistory::new(state.store_dir.clone())
+    let runs_dir = resolve_runs_dir(&state, params.flow.as_deref());
+    let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     history
