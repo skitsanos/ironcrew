@@ -96,7 +96,6 @@ impl RunHistory {
     }
 
     /// Delete a run record.
-    #[allow(dead_code)]
     pub fn delete(&self, run_id: &str) -> Result<()> {
         let filename = format!("{}.json", run_id);
         let path = self.store_dir.join(&filename);

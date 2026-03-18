@@ -66,6 +66,18 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Clean up old run history files
+    Clean {
+        /// Project path
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Keep only the last N runs (default: 10)
+        #[arg(short, long, default_value = "10")]
+        keep: usize,
+        /// Remove ALL run history
+        #[arg(long)]
+        all: bool,
+    },
     /// List past runs
     Runs {
         /// Filter by status: success, partial_failure, failed
@@ -89,6 +101,7 @@ async fn main() {
         Commands::Init { name } => cmd_init(&name),
         Commands::Nodes => cmd_nodes(),
         Commands::Inspect { run_id, project } => cmd_inspect(&project, &run_id),
+        Commands::Clean { project, keep, all } => cmd_clean(&project, keep, all),
         Commands::Runs { status, project } => cmd_runs(&project, status.as_deref()),
     };
 
@@ -486,6 +499,59 @@ fn cmd_list(path: &Path) -> Result<()> {
     // Entrypoint
     if let Some(ep) = loader.entrypoint() {
         println!("Entrypoint: {}", ep.display());
+    }
+
+    Ok(())
+}
+
+fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
+    let store_dir = project.join(".ironcrew").join("runs");
+
+    if !store_dir.exists() {
+        println!("No run history found.");
+        return Ok(());
+    }
+
+    let history = RunHistory::new(store_dir)?;
+    let runs = history.list(None)?;
+
+    if runs.is_empty() {
+        println!("No runs to clean.");
+        return Ok(());
+    }
+
+    if all {
+        // Delete everything
+        let count = runs.len();
+        for run in &runs {
+            history.delete(&run.run_id)?;
+        }
+        println!("Deleted all {} run(s).", count);
+
+        // Also clean up memory file if it exists
+        let memory_file = project.join(".ironcrew").join("memory.json");
+        if memory_file.exists() {
+            std::fs::remove_file(&memory_file)?;
+            println!("Deleted memory store.");
+        }
+    } else {
+        // Keep the last N, delete the rest
+        // runs are already sorted newest-first from history.list()
+        if runs.len() <= keep {
+            println!(
+                "Only {} run(s) found, nothing to clean (keeping {}).",
+                runs.len(),
+                keep
+            );
+            return Ok(());
+        }
+
+        let to_delete = &runs[keep..];
+        let count = to_delete.len();
+        for run in to_delete {
+            history.delete(&run.run_id)?;
+        }
+        println!("Deleted {} old run(s), kept {} most recent.", count, keep);
     }
 
     Ok(())
