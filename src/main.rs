@@ -49,6 +49,14 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Initialize a new IronCrew project
+    Init {
+        /// Project name (creates a directory with this name)
+        #[arg(default_value = "my-crew")]
+        name: String,
+    },
+    /// List all available built-in tools
+    Nodes,
 }
 
 #[tokio::main]
@@ -60,6 +68,8 @@ async fn main() {
         Commands::Run { path } => cmd_run(&path).await,
         Commands::Validate { path } => cmd_validate(&path),
         Commands::List { path } => cmd_list(&path),
+        Commands::Init { name } => cmd_init(&name),
+        Commands::Nodes => cmd_nodes(),
     };
 
     if let Err(e) = result {
@@ -248,6 +258,123 @@ fn cmd_validate(path: &Path) -> Result<()> {
         println!("      when crew.lua is executed (tasks are defined programmatically).");
         Ok(())
     }
+}
+
+fn cmd_init(name: &str) -> Result<()> {
+    let project_dir = Path::new(name);
+
+    if project_dir.exists() {
+        return Err(IronCrewError::Validation(format!(
+            "Directory '{}' already exists",
+            name
+        )));
+    }
+
+    // Create directory structure
+    std::fs::create_dir_all(project_dir.join("agents"))?;
+    std::fs::create_dir_all(project_dir.join("tools"))?;
+
+    // Write .env template
+    std::fs::write(
+        project_dir.join(".env"),
+        "# IronCrew Environment Configuration\n\
+         OPENAI_API_KEY=your-api-key-here\n\
+         OPENAI_BASE_URL=https://api.openai.com/v1\n\
+         OPENAI_MODEL=gpt-4o-mini\n\
+         IRONCREW_LOG=info\n",
+    )?;
+
+    // Write .gitignore
+    std::fs::write(
+        project_dir.join(".gitignore"),
+        "/output\n\
+         .env\n\
+         .DS_Store\n",
+    )?;
+
+    // Write sample agent
+    std::fs::write(
+        project_dir.join("agents/assistant.lua"),
+        r#"return {
+    name = "assistant",
+    goal = "Help with tasks by providing clear, accurate responses",
+    capabilities = {"general", "analysis", "writing"},
+    temperature = 0.7,
+}
+"#,
+    )?;
+
+    // Write crew.lua entrypoint
+    std::fs::write(
+        project_dir.join("crew.lua"),
+        format!(
+            r#"--[[
+    {name} - IronCrew Project
+
+    Run with: ironcrew run .
+    Validate with: ironcrew validate .
+]]
+
+local crew = Crew.new({{
+    goal = "Your crew goal here",
+    provider = "openai",
+    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    base_url = env("OPENAI_BASE_URL"),
+}})
+
+-- Add tasks
+crew:add_task({{
+    name = "hello",
+    description = "Say hello and introduce yourself briefly",
+    expected_output = "A friendly greeting",
+}})
+
+-- Run the crew
+local results = crew:run()
+
+-- Display results
+for _, result in ipairs(results) do
+    if result.success then
+        print("=== " .. result.task .. " (" .. result.duration_ms .. "ms) ===")
+        print(result.output)
+    else
+        print("FAILED: " .. result.task .. " - " .. result.output)
+    end
+    print()
+end
+"#,
+            name = name
+        ),
+    )?;
+
+    println!("Created new IronCrew project: {}", name);
+    println!();
+    println!("  {}/", name);
+    println!("  ├── .env              # API keys and config");
+    println!("  ├── .gitignore");
+    println!("  ├── agents/");
+    println!("  │   └── assistant.lua # Sample agent");
+    println!("  ├── tools/            # Custom tools (empty)");
+    println!("  └── crew.lua          # Entrypoint");
+    println!();
+    println!("Next steps:");
+    println!("  1. cd {}", name);
+    println!("  2. Edit .env with your API key");
+    println!("  3. ironcrew run .");
+
+    Ok(())
+}
+
+fn cmd_nodes() -> Result<()> {
+    println!("Built-in tools:");
+    println!("  file_read       - Read file contents");
+    println!("  file_write      - Write content to a file");
+    println!("  web_scrape      - Scrape web page content");
+    println!("  shell           - Execute shell commands");
+    println!("  http_request    - Make HTTP requests");
+    println!("  hash            - Compute hash digests");
+    println!("  template_render - Render Tera templates");
+    Ok(())
 }
 
 fn cmd_list(path: &Path) -> Result<()> {
