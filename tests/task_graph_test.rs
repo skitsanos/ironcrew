@@ -1,4 +1,6 @@
-use ironcrew::engine::task::{validate_dependency_graph, topological_sort, Task};
+use std::collections::HashSet;
+
+use ironcrew::engine::task::{topological_phases, validate_dependency_graph, topological_sort, Task};
 
 #[test]
 fn test_valid_dependency_graph() {
@@ -95,4 +97,69 @@ fn test_task_with_on_error_field() {
         ..Default::default()
     };
     assert_eq!(task.on_error, Some("error_handler".into()));
+}
+
+#[test]
+fn test_topological_phases_diamond() {
+    let tasks = vec![
+        Task { name: "a".into(), description: "A".into(), ..Default::default() },
+        Task { name: "b".into(), description: "B".into(), ..Default::default() },
+        Task { name: "c".into(), description: "C".into(), depends_on: vec!["a".into(), "b".into()], ..Default::default() },
+        Task { name: "d".into(), description: "D".into(), depends_on: vec!["c".into()], ..Default::default() },
+    ];
+
+    let phases = topological_phases(&tasks);
+    assert_eq!(phases.len(), 3); // phase 0: [a, b], phase 1: [c], phase 2: [d]
+
+    // Phase 0 should have a and b (no deps)
+    let phase0_names: HashSet<&str> = phases[0].iter().map(|t| t.name.as_str()).collect();
+    assert!(phase0_names.contains("a"));
+    assert!(phase0_names.contains("b"));
+    assert_eq!(phase0_names.len(), 2);
+
+    // Phase 1 should have c
+    assert_eq!(phases[1].len(), 1);
+    assert_eq!(phases[1][0].name, "c");
+
+    // Phase 2 should have d
+    assert_eq!(phases[2].len(), 1);
+    assert_eq!(phases[2][0].name, "d");
+}
+
+#[test]
+fn test_topological_phases_all_independent() {
+    let tasks = vec![
+        Task { name: "a".into(), description: "A".into(), ..Default::default() },
+        Task { name: "b".into(), description: "B".into(), ..Default::default() },
+        Task { name: "c".into(), description: "C".into(), ..Default::default() },
+    ];
+
+    let phases = topological_phases(&tasks);
+    assert_eq!(phases.len(), 1); // all in one phase
+    assert_eq!(phases[0].len(), 3);
+}
+
+#[test]
+fn test_topological_phases_linear_chain() {
+    let tasks = vec![
+        Task { name: "a".into(), description: "A".into(), ..Default::default() },
+        Task { name: "b".into(), description: "B".into(), depends_on: vec!["a".into()], ..Default::default() },
+        Task { name: "c".into(), description: "C".into(), depends_on: vec!["b".into()], ..Default::default() },
+    ];
+
+    let phases = topological_phases(&tasks);
+    assert_eq!(phases.len(), 3); // each task in its own phase
+    assert_eq!(phases[0].len(), 1);
+    assert_eq!(phases[0][0].name, "a");
+    assert_eq!(phases[1].len(), 1);
+    assert_eq!(phases[1][0].name, "b");
+    assert_eq!(phases[2].len(), 1);
+    assert_eq!(phases[2][0].name, "c");
+}
+
+#[test]
+fn test_topological_phases_empty() {
+    let tasks: Vec<Task> = vec![];
+    let phases = topological_phases(&tasks);
+    assert!(phases.is_empty());
 }

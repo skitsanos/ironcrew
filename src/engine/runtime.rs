@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::llm::provider::LlmProvider;
 use crate::tools::file_read::FileReadTool;
@@ -12,7 +13,7 @@ use crate::tools::web_scrape::WebScrapeTool;
 
 pub struct Runtime {
     pub tool_registry: ToolRegistry,
-    pub provider: Box<dyn LlmProvider>,
+    pub provider: Arc<dyn LlmProvider>,
 }
 
 impl Runtime {
@@ -31,7 +32,7 @@ impl Runtime {
 
         Self {
             tool_registry,
-            provider,
+            provider: Arc::from(provider),
         }
     }
 

@@ -500,9 +500,9 @@ impl UserData for LuaCrew {
 
         methods.add_async_method("run", |lua, this, ()| async move {
             let crew = this.crew.lock().await;
-            let provider: &dyn LlmProvider = match &this.custom_provider {
-                Some(p) => p.as_ref(),
-                None => this.runtime.provider.as_ref(),
+            let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
+                Some(p) => p.clone(),
+                None => this.runtime.provider.clone(),
             };
             let results = crew
                 .run(provider, &this.runtime.tool_registry)
@@ -547,6 +547,7 @@ pub fn register_crew_constructor(
             table.get::<String>("model").unwrap_or_else(|_| "gpt-4o-mini".into());
         let base_url: Option<String> = table.get("base_url").ok();
         let api_key: Option<String> = table.get("api_key").ok();
+        let max_concurrent: Option<usize> = table.get::<Option<usize>>("max_concurrent").ok().flatten();
 
         // Create a custom provider if api_key or base_url differ from defaults
         let custom_provider: Option<Arc<dyn LlmProvider>> =
@@ -569,6 +570,7 @@ pub fn register_crew_constructor(
         };
 
         let mut crew = Crew::new(goal, config);
+        crew.max_concurrent_tasks = max_concurrent;
 
         // Auto-inject preloaded agents from agents/ directory
         for agent in agents.iter() {

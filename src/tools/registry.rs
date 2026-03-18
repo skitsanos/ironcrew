@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::Tool;
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::Result;
 
+#[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl Default for ToolRegistry {
@@ -22,7 +24,8 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        self.tools
+            .insert(tool.name().to_string(), Arc::from(tool));
     }
 
     #[allow(dead_code)]
