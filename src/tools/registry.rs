@@ -28,17 +28,15 @@ impl ToolRegistry {
             .insert(tool.name().to_string(), Arc::from(tool));
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    #[allow(dead_code)]
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.values().map(|t| t.schema()).collect()
     }

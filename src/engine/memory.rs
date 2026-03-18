@@ -75,9 +75,9 @@ impl MemoryItem {
 pub struct MemoryStats {
     pub total_items: usize,
     pub total_tokens: usize,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // part of public API
     pub max_items: Option<usize>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // part of public API
     pub max_total_tokens: Option<usize>,
 }
 
@@ -98,7 +98,7 @@ pub enum MemoryBackend {
 }
 
 impl MemoryStore {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub fn ephemeral() -> Self {
         Self::with_config(MemoryBackend::Ephemeral, MemoryConfig::default())
     }
@@ -107,7 +107,7 @@ impl MemoryStore {
         Self::with_config(MemoryBackend::Ephemeral, config)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub fn persistent(path: PathBuf) -> Result<Self> {
         Self::persistent_with_config(path, MemoryConfig::default())
     }
@@ -217,13 +217,6 @@ impl MemoryStore {
             .filter(|(_, v)| !v.is_expired())
             .map(|(k, _)| k.clone())
             .collect()
-    }
-
-    /// Get all items (excluding expired) for context building.
-    #[allow(dead_code)]
-    pub async fn all(&self) -> Vec<MemoryItem> {
-        let items = self.items.read().await;
-        items.values().filter(|v| !v.is_expired()).cloned().collect()
     }
 
     /// Build a context string from memory items relevant to a query.
@@ -339,6 +332,10 @@ impl MemoryStore {
     /// Evict items to stay within configured limits.
     /// Removes least-recently-accessed (by access_count, then oldest updated_at) items first.
     async fn evict_if_needed(&self) {
+        if self.config.max_items.is_none() && self.config.max_total_tokens.is_none() {
+            return; // No limits configured, nothing to evict
+        }
+
         let mut items = self.items.write().await;
 
         // Remove expired items first

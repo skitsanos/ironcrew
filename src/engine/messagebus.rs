@@ -39,7 +39,7 @@ impl Message {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub fn reply(original: &Message, from: String, content: String) -> Self {
         let mut msg = Message::new(from, original.from.clone(), content, MessageType::Response);
         msg.reply_to = Some(original.id.clone());
@@ -123,7 +123,7 @@ impl MessageBus {
     }
 
     /// Peek at pending messages without consuming them.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub async fn peek(&self, agent_name: &str) -> Vec<Message> {
         let queues = self.queues.read().await;
         queues
@@ -133,7 +133,7 @@ impl MessageBus {
     }
 
     /// Get count of pending messages for an agent.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in integration tests
     pub async fn pending_count(&self, agent_name: &str) -> usize {
         let queues = self.queues.read().await;
         queues.get(agent_name).map(|q| q.len()).unwrap_or(0)
@@ -143,15 +143,6 @@ impl MessageBus {
     pub async fn get_history(&self) -> Vec<Message> {
         let history = self.history.read().await;
         history.clone()
-    }
-
-    /// Clear all queues and history.
-    #[allow(dead_code)]
-    pub async fn clear(&self) {
-        let mut queues = self.queues.write().await;
-        queues.clear();
-        let mut history = self.history.write().await;
-        history.clear();
     }
 }
 

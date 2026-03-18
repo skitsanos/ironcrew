@@ -332,19 +332,21 @@ impl UserData for LuaCrew {
             let run_end = chrono::Utc::now();
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
 
-            // Save run history
+            // Save run history (non-blocking file I/O)
             let store_dir = this.project_dir.join(".ironcrew").join("runs");
-            if let Ok(history) = crate::engine::run_history::RunHistory::new(store_dir) {
-                let record = crew.create_run_record(
-                    &results,
-                    &run_start.to_rfc3339(),
-                    &run_end.to_rfc3339(),
-                    total_ms,
-                );
-                if let Err(e) = history.save(&record) {
+            let record = crew.create_run_record(
+                &results,
+                &run_start.to_rfc3339(),
+                &run_end.to_rfc3339(),
+                total_ms,
+            );
+            tokio::task::spawn_blocking(move || {
+                if let Ok(history) = crate::engine::run_history::RunHistory::new(store_dir)
+                    && let Err(e) = history.save(&record)
+                {
                     tracing::warn!("Failed to save run history: {}", e);
                 }
-            }
+            });
 
             // Convert results to Lua table
             let results_table = lua.create_table()?;

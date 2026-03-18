@@ -9,11 +9,154 @@ use crate::engine::crew::Crew;
 use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
-use crate::engine::task::{validate_dependency_graph, topological_phases, TaskResult};
+use crate::engine::task::{validate_dependency_graph, topological_phases, Task, TaskResult};
 use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
+
+/// Filter tasks in a phase to only those eligible for execution.
+/// Skips error handlers, tasks with failed dependencies, and tasks whose conditions are false.
+fn filter_eligible_tasks<'a>(
+    phase: &[&'a Task],
+    error_handler_names: &HashSet<&str>,
+    failed_tasks: &mut HashSet<String>,
+    results: &mut HashMap<String, TaskResult>,
+) -> Vec<&'a Task> {
+    let mut eligible = Vec::new();
+
+    for task in phase {
+        // Skip error handler tasks -- they run only when triggered
+        if error_handler_names.contains(task.name.as_str()) {
+            continue;
+        }
+
+        // Check if any dependency failed
+        if let Some(failed_dep) = task.depends_on.iter().find(|d| failed_tasks.contains(*d)) {
+            let result = TaskResult {
+                task: task.name.clone(),
+                agent: String::new(),
+                output: format!("Skipped: dependency '{}' failed", failed_dep),
+                success: false,
+                duration_ms: 0,
+            };
+            failed_tasks.insert(task.name.clone());
+            results.insert(task.name.clone(), result);
+            tracing::warn!(
+                "Skipping task '{}': dependency '{}' failed",
+                task.name,
+                failed_dep
+            );
+            continue;
+        }
+
+        // Check condition if present
+        if let Some(ref condition) = task.condition {
+            let interpolated_condition = interpolate(condition, results);
+            let should_run = evaluate_condition(&interpolated_condition, results);
+            if !should_run {
+                let result = TaskResult {
+                    task: task.name.clone(),
+                    agent: String::new(),
+                    output: format!("Skipped: condition '{}' evaluated to false", condition),
+                    success: true,
+                    duration_ms: 0,
+                };
+                results.insert(task.name.clone(), result);
+                tracing::info!(
+                    "Skipping task '{}': condition '{}' is false",
+                    task.name,
+                    condition
+                );
+                continue;
+            }
+        }
+
+        eligible.push(*task);
+    }
+
+    eligible
+}
+
+/// The result type returned by each spawned task handle.
+type TaskJoinResult = std::result::Result<(String, String, Result<String>, u64), tokio::task::JoinError>;
+
+/// Process the join results from spawned standard tasks, handling success, failure, and error recovery.
+async fn process_phase_results(
+    phase_results: Vec<TaskJoinResult>,
+    crew: &Crew,
+    provider: &Arc<dyn LlmProvider>,
+    tool_registry: &ToolRegistry,
+    results: &mut HashMap<String, TaskResult>,
+    failed_tasks: &mut HashSet<String>,
+) -> Result<()> {
+    for join_result in phase_results {
+        let (task_name, agent_name, output, duration_ms) = join_result.map_err(|e| {
+            IronCrewError::Task {
+                task: "unknown".into(),
+                message: format!("Task panicked: {}", e),
+            }
+        })?;
+
+        match output {
+            Ok(out) => {
+                let result = TaskResult {
+                    task: task_name.clone(),
+                    agent: agent_name,
+                    output: out,
+                    success: true,
+                    duration_ms,
+                };
+                tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
+                results.insert(task_name, result);
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+
+                // Check if this task has an on_error handler
+                let task_def = crew.tasks.iter().find(|t| t.name == task_name);
+                if let Some(task_def) = task_def
+                    && task_def.on_error.is_some()
+                    && let Some((mut recovered, handler_result)) = handle_task_error(
+                        task_def,
+                        &agent_name,
+                        &error_msg,
+                        &crew.tasks,
+                        &crew.agents,
+                        provider.clone(),
+                        tool_registry,
+                        results,
+                        &crew.memory,
+                        &crew.provider_config.model,
+                        crew.max_tool_rounds,
+                    )
+                    .await
+                    {
+                        recovered.duration_ms = duration_ms;
+                        results.insert(task_name, recovered);
+                        if let Some(hr) = handler_result {
+                            results.insert(hr.task.clone(), hr);
+                        }
+                        continue;
+                    }
+
+                // Original failure path (no handler or handler failed)
+                let result = TaskResult {
+                    task: task_name.clone(),
+                    agent: agent_name,
+                    output: error_msg,
+                    success: false,
+                    duration_ms,
+                };
+                tracing::error!("Task '{}' failed: {}", task_name, e);
+                failed_tasks.insert(task_name.clone());
+                results.insert(task_name, result);
+            }
+        }
+    }
+
+    Ok(())
+}
 
 pub async fn run_crew(
     crew: &Crew,
@@ -56,64 +199,12 @@ pub async fn run_crew(
         .collect();
 
     for (phase_idx, phase) in phases.iter().enumerate() {
-        // Filter eligible tasks for this phase
-        let mut phase_tasks: Vec<&crate::engine::task::Task> = Vec::new();
-
-        for task in phase {
-            // Skip error handler tasks -- they run only when triggered
-            if error_handler_names.contains(task.name.as_str()) {
-                continue;
-            }
-
-            // Check if any dependency failed
-            if let Some(failed_dep) =
-                task.depends_on.iter().find(|d| failed_tasks.contains(*d))
-            {
-                let result = TaskResult {
-                    task: task.name.clone(),
-                    agent: String::new(),
-                    output: format!("Skipped: dependency '{}' failed", failed_dep),
-                    success: false,
-                    duration_ms: 0,
-                };
-                failed_tasks.insert(task.name.clone());
-                results.insert(task.name.clone(), result);
-                tracing::warn!(
-                    "Skipping task '{}': dependency '{}' failed",
-                    task.name,
-                    failed_dep
-                );
-                continue;
-            }
-
-            // Check condition if present
-            if let Some(ref condition) = task.condition {
-                let interpolated_condition = interpolate(condition, &results);
-                let should_run =
-                    evaluate_condition(&interpolated_condition, &results);
-                if !should_run {
-                    let result = TaskResult {
-                        task: task.name.clone(),
-                        agent: String::new(),
-                        output: format!(
-                            "Skipped: condition '{}' evaluated to false",
-                            condition
-                        ),
-                        success: true,
-                        duration_ms: 0,
-                    };
-                    results.insert(task.name.clone(), result);
-                    tracing::info!(
-                        "Skipping task '{}': condition '{}' is false",
-                        task.name,
-                        condition
-                    );
-                    continue;
-                }
-            }
-
-            phase_tasks.push(task);
-        }
+        let phase_tasks = filter_eligible_tasks(
+            phase,
+            &error_handler_names,
+            &mut failed_tasks,
+            &mut results,
+        );
 
         if phase_tasks.is_empty() {
             continue;
@@ -131,7 +222,7 @@ pub async fn run_crew(
         );
 
         // Handle foreach and collaborative tasks first (they run sequentially)
-        let mut standard_tasks: Vec<&crate::engine::task::Task> = Vec::new();
+        let mut standard_tasks: Vec<&Task> = Vec::new();
         for task in &phase_tasks {
             // Handle foreach tasks
             if task.foreach_source.is_some() {
@@ -169,15 +260,15 @@ pub async fn run_crew(
                 )
                 .await?;
 
-                if !foreach_result.success {
-                    // Check if the result indicates a source-not-array skip
-                    if foreach_result.output.starts_with("Skipped: foreach source") && foreach_result.agent.is_empty() {
-                        tracing::warn!(
-                            "foreach source for task '{}' is not an array, skipping",
-                            task.name
-                        );
-                        failed_tasks.insert(task.name.clone());
-                    }
+                if !foreach_result.success
+                    && foreach_result.output.starts_with("Skipped: foreach source")
+                    && foreach_result.agent.is_empty()
+                {
+                    tracing::warn!(
+                        "foreach source for task '{}' is not an array, skipping",
+                        task.name
+                    );
+                    failed_tasks.insert(task.name.clone());
                 }
 
                 results.insert(task.name.clone(), foreach_result);
@@ -411,74 +502,17 @@ pub async fn run_crew(
             handles.push(handle);
         }
 
-        // Await all handles in this phase
+        // Await all handles and process results
         let phase_results = futures::future::join_all(handles).await;
-
-        // Process results
-        for join_result in phase_results {
-            let (task_name, agent_name, output, duration_ms) = join_result.map_err(|e| {
-                IronCrewError::Task {
-                    task: "unknown".into(),
-                    message: format!("Task panicked: {}", e),
-                }
-            })?;
-
-            match output {
-                Ok(out) => {
-                    let result = TaskResult {
-                        task: task_name.clone(),
-                        agent: agent_name,
-                        output: out,
-                        success: true,
-                        duration_ms,
-                    };
-                    tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
-                    results.insert(task_name, result);
-                }
-                Err(e) => {
-                    let error_msg = e.to_string();
-
-                    // Check if this task has an on_error handler
-                    let task_def = crew.tasks.iter().find(|t| t.name == task_name);
-                    if let Some(task_def) = task_def
-                        && task_def.on_error.is_some()
-                        && let Some((mut recovered, handler_result)) = handle_task_error(
-                            task_def,
-                            &agent_name,
-                            &error_msg,
-                            &crew.tasks,
-                            &crew.agents,
-                            provider.clone(),
-                            tool_registry,
-                            &results,
-                            &crew.memory,
-                            &crew.provider_config.model,
-                            crew.max_tool_rounds,
-                        )
-                        .await
-                        {
-                            recovered.duration_ms = duration_ms;
-                            results.insert(task_name, recovered);
-                            if let Some(hr) = handler_result {
-                                results.insert(hr.task.clone(), hr);
-                            }
-                            continue;
-                        }
-
-                    // Original failure path (no handler or handler failed)
-                    let result = TaskResult {
-                        task: task_name.clone(),
-                        agent: agent_name,
-                        output: error_msg,
-                        success: false,
-                        duration_ms,
-                    };
-                    tracing::error!("Task '{}' failed: {}", task_name, e);
-                    failed_tasks.insert(task_name.clone());
-                    results.insert(task_name, result);
-                }
-            }
-        }
+        process_phase_results(
+            phase_results,
+            crew,
+            &provider,
+            tool_registry,
+            &mut results,
+            &mut failed_tasks,
+        )
+        .await?;
 
         // Store successful task results in memory
         for (task_name, result) in &results {

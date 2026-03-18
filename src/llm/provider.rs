@@ -69,7 +69,7 @@ pub struct ToolSchema {
 
 /// A chunk of a streaming response.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // variants and fields are used via channel send/receive across modules
 pub enum StreamChunk {
     /// A text delta (partial content)
     Text(String),

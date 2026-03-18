@@ -173,7 +173,7 @@ pub fn topological_phases(tasks: &[Task]) -> Vec<Vec<&Task>> {
 }
 
 /// Topologically sort tasks. Assumes validate_dependency_graph passed.
-#[allow(dead_code)]
+#[allow(dead_code)] // used in integration tests
 pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
     let task_map: HashMap<&str, &Task> = tasks.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
@@ -183,7 +183,10 @@ pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
         in_degree.entry(task.name.as_str()).or_insert(0);
         adjacency.entry(task.name.as_str()).or_default();
         for dep in &task.depends_on {
-            adjacency.entry(dep.as_str()).or_default().push(task.name.as_str());
+            adjacency
+                .entry(dep.as_str())
+                .or_default()
+                .push(task.name.as_str());
             *in_degree.entry(task.name.as_str()).or_insert(0) += 1;
         }
     }
@@ -211,3 +214,4 @@ pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
 
     sorted
 }
+

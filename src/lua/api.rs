@@ -29,7 +29,7 @@ pub use super::parsers::{
 // ---------------------------------------------------------------------------
 
 /// Register the env() global function in Lua.
-#[allow(dead_code)]
+#[allow(dead_code)] // used in integration tests
 pub fn register_env_function(lua: &Lua) -> LuaResult<()> {
     let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
     lua.globals().set("env", env_fn)?;

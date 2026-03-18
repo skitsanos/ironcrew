@@ -36,7 +36,7 @@ impl Runtime {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // part of public API
     pub fn enable_shell_tool(&mut self) {
         self.tool_registry.register(Box::new(ShellTool::new()));
     }

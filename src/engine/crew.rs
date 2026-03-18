@@ -21,6 +21,7 @@ pub use crate::engine::foreach::execute_foreach_task;
 #[allow(unused_imports)]
 pub use crate::engine::orchestrator::run_crew;
 
+// used from Lua
 #[allow(dead_code)]
 pub struct ProviderConfig {
     pub provider: String,
@@ -30,7 +31,6 @@ pub struct ProviderConfig {
 }
 
 pub struct Crew {
-    #[allow(dead_code)]
     pub goal: String,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
