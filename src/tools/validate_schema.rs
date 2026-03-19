@@ -53,12 +53,12 @@ impl Tool for ValidateSchemaTool {
                 message: "Missing 'data' argument".into(),
             })?;
 
-        let schema_value =
-            args.get("schema")
-                .ok_or_else(|| IronCrewError::ToolExecution {
-                    tool: "validate_schema".into(),
-                    message: "Missing 'schema' argument".into(),
-                })?;
+        let schema_value = args
+            .get("schema")
+            .ok_or_else(|| IronCrewError::ToolExecution {
+                tool: "validate_schema".into(),
+                message: "Missing 'schema' argument".into(),
+            })?;
 
         // Parse the data
         let data: serde_json::Value =
