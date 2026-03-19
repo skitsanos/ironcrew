@@ -135,8 +135,8 @@ impl UserData for LuaCrew {
                 } else {
                     vec![]
                 };
-                let sub_agents = load_agents_from_files(&sub_agent_files)
-                    .map_err(mlua::Error::external)?;
+                let sub_agents =
+                    load_agents_from_files(&sub_agent_files).map_err(mlua::Error::external)?;
 
                 // Register Crew.new() for the sub-workflow with its own runtime
                 let sub_project_dir = sub_dir.to_path_buf();
