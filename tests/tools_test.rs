@@ -2,6 +2,7 @@ use ironcrew::tools::Tool;
 use ironcrew::tools::file_read_glob::FileReadGlobTool;
 use ironcrew::tools::hash::HashTool;
 use ironcrew::tools::template_render::TemplateRenderTool;
+use ironcrew::tools::validate_schema::ValidateSchemaTool;
 use serde_json::json;
 
 #[tokio::test]
@@ -86,4 +87,46 @@ async fn test_file_read_glob_traversal_blocked() {
     let tool = FileReadGlobTool::new(None);
     let result = tool.execute(json!({"pattern": "../etc/*.conf"})).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_validate_schema_valid() {
+    let tool = ValidateSchemaTool::new();
+    let result = tool
+        .execute(json!({
+            "data": r#"{"name": "Alice", "age": 30}"#,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"}
+                },
+                "required": ["name", "age"]
+            }
+        }))
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["valid"], true);
+}
+
+#[tokio::test]
+async fn test_validate_schema_invalid() {
+    let tool = ValidateSchemaTool::new();
+    let result = tool
+        .execute(json!({
+            "data": r#"{"name": 123}"#,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"]
+            }
+        }))
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["valid"], false);
+    assert!(parsed["error_count"].as_u64().unwrap() > 0);
 }

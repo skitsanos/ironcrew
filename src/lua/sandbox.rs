@@ -3,7 +3,7 @@ use base64::engine::general_purpose::STANDARD;
 use mlua::{Lua, Result as LuaResult, StdLib, Value};
 use std::path::{Component, Path, PathBuf};
 
-use crate::lua::api::{json_value_to_lua, lua_value_to_json};
+use crate::lua::api::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
 
 /// Register utility global functions available in all Lua sandboxes.
 pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
@@ -167,6 +167,45 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     regex_table.set("split", regex_split)?;
 
     lua.globals().set("regex", regex_table)?;
+
+    // validate_json(json_string, schema_table) -> {valid=bool, errors=table}
+    let validate_json_fn =
+        lua.create_function(|lua, (data_str, schema_table): (String, mlua::Table)| {
+            let data: serde_json::Value =
+                serde_json::from_str(&data_str).map_err(mlua::Error::external)?;
+            let schema = lua_table_to_json(&schema_table)?;
+
+            let compiled = jsonschema::draft7::new(&schema)
+                .map_err(|e| mlua::Error::external(format!("Invalid schema: {}", e)))?;
+
+            let result_table = lua.create_table()?;
+
+            match compiled.validate(&data) {
+                Ok(()) => {
+                    result_table.set("valid", true)?;
+                    result_table.set("errors", lua.create_table()?)?;
+                }
+                Err(first_error) => {
+                    result_table.set("valid", false)?;
+                    let errors_table = lua.create_table()?;
+                    let err = lua.create_table()?;
+                    err.set("path", first_error.instance_path().to_string())?;
+                    err.set("message", first_error.to_string())?;
+                    errors_table.set(1, err)?;
+
+                    for (i, error) in compiled.iter_errors(&data).skip(1).enumerate() {
+                        let err = lua.create_table()?;
+                        err.set("path", error.instance_path().to_string())?;
+                        err.set("message", error.to_string())?;
+                        errors_table.set(i + 2, err)?;
+                    }
+                    result_table.set("errors", errors_table)?;
+                }
+            }
+
+            Ok(result_table)
+        })?;
+    lua.globals().set("validate_json", validate_json_fn)?;
 
     Ok(())
 }

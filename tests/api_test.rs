@@ -346,3 +346,39 @@ fn test_regex_available_in_tool_lua() {
         .unwrap();
     assert!(result);
 }
+
+#[test]
+fn test_validate_json_lua_global() {
+    let lua = create_crew_lua().unwrap();
+    let result: bool = lua
+        .load(
+            r#"
+        local result = validate_json(
+            '{"name": "Alice", "age": 30}',
+            {type = "object", properties = {name = {type = "string"}, age = {type = "integer"}}, required = {"name", "age"}}
+        )
+        return result.valid
+    "#,
+        )
+        .eval()
+        .unwrap();
+    assert!(result);
+}
+
+#[test]
+fn test_validate_json_lua_invalid() {
+    let lua = create_crew_lua().unwrap();
+    let result: bool = lua
+        .load(
+            r#"
+        local result = validate_json(
+            '{"name": 123}',
+            {type = "object", properties = {name = {type = "string"}}, required = {"name"}}
+        )
+        return result.valid
+    "#,
+        )
+        .eval()
+        .unwrap();
+    assert!(!result);
+}

@@ -258,7 +258,8 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
     use crate::tools::{
         file_read::FileReadTool, file_read_glob::FileReadGlobTool, file_write::FileWriteTool,
         hash::HashTool, http_request::HttpRequestTool, shell::ShellTool,
-        template_render::TemplateRenderTool, web_scrape::WebScrapeTool,
+        template_render::TemplateRenderTool, validate_schema::ValidateSchemaTool,
+        web_scrape::WebScrapeTool,
     };
 
     let mut registry = ToolRegistry::new();
@@ -270,6 +271,7 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
     registry.register(Box::new(HttpRequestTool::new()));
     registry.register(Box::new(HashTool::new()));
     registry.register(Box::new(TemplateRenderTool::new()));
+    registry.register(Box::new(ValidateSchemaTool::new()));
 
     let mut tools: Vec<serde_json::Value> = Vec::new();
     let mut names = registry.list();

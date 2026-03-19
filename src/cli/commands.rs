@@ -73,15 +73,16 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
         "http_request",
         "hash",
         "template_render",
+        "validate_schema",
     ]
     .into_iter()
     .map(String::from)
     .chain(tool_defs.iter().map(|t| t.name.clone()))
     .collect();
 
-    println!("Tools ({} built-in + {} custom):", 8, tool_defs.len());
+    println!("Tools ({} built-in + {} custom):", 9, tool_defs.len());
     println!(
-        "  Built-in: file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render"
+        "  Built-in: file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema"
     );
     for tool in &tool_defs {
         println!(
@@ -265,6 +266,9 @@ pub fn cmd_nodes() -> Result<()> {
     registry.register(Box::new(
         crate::tools::template_render::TemplateRenderTool::new(),
     ));
+    registry.register(Box::new(
+        crate::tools::validate_schema::ValidateSchemaTool::new(),
+    ));
 
     println!("Built-in tools ({}):", registry.list().len());
     println!();
@@ -339,7 +343,7 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     println!();
 
     println!(
-        "Built-in tools (8): file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render"
+        "Built-in tools (9): file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema"
     );
     println!();
 
