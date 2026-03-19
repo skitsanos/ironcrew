@@ -11,7 +11,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ironcrew", version, about = "Lua-scripted AI agent crew runner")]
+#[command(
+    name = "ironcrew",
+    version,
+    about = "Lua-scripted AI agent crew runner"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

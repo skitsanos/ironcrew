@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
@@ -55,26 +55,58 @@ impl UserData for LuaCrew {
         methods.add_async_method(
             "subworkflow",
             |lua, this, (path, options): (String, Option<Table>)| async move {
-                // Resolve path relative to the project directory
-                let project_dir = this.project_dir.clone();
+                // Resolve path relative to the project directory.
+                let flow_path = {
+                    let flow_path = Path::new(&path);
+                    if flow_path.as_os_str().is_empty()
+                        || flow_path.is_absolute()
+                        || flow_path.components().any(|c| {
+                            matches!(
+                                c,
+                                Component::ParentDir
+                                    | Component::RootDir
+                                    | Component::Prefix(_)
+                                    | Component::CurDir
+                            )
+                        })
+                    {
+                        return Err(mlua::Error::external(IronCrewError::Validation(
+                            "Invalid subworkflow path".into(),
+                        )));
+                    }
 
-                let flow_path = if Path::new(&path).is_absolute() {
-                    PathBuf::from(&path)
-                } else {
-                    project_dir.join(&path)
+                    let project_dir = this.project_dir.clone();
+                    let candidate = project_dir.join(flow_path);
+                    let base = project_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| project_dir.clone());
+                    let canonical = candidate.canonicalize().map_err(|e| {
+                        mlua::Error::external(IronCrewError::Validation(format!(
+                            "Failed to resolve subworkflow '{}': {}",
+                            path, e
+                        )))
+                    })?;
+
+                    if !canonical.starts_with(&base) {
+                        return Err(mlua::Error::external(IronCrewError::Validation(
+                            "Subworkflow path escapes project directory".into(),
+                        )));
+                    }
+
+                    canonical
                 };
 
-                if !flow_path.exists() {
-                    return Err(mlua::Error::external(IronCrewError::Validation(
-                        format!("Subworkflow not found: {}", flow_path.display()),
-                    )));
+                if !flow_path.is_file() {
+                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                        "Subworkflow not found: {}",
+                        flow_path.display()
+                    ))));
                 }
 
                 // Parse options
                 let output_key: Option<String> =
                     options.as_ref().and_then(|o| o.get("output_key").ok());
-                let input_table: Option<Table> =
-                    options.as_ref().and_then(|o| o.get("input").ok());
+                let input_table: Option<Table> = options.as_ref().and_then(|o| o.get("input").ok());
 
                 // Serialize input to JSON so we can transfer between Lua states
                 let input_json: Option<serde_json::Value> = match input_table {
@@ -103,7 +135,7 @@ impl UserData for LuaCrew {
                 } else {
                     vec![]
                 };
-                let sub_agents = load_agents_from_files(&sub_lua, &sub_agent_files)
+                let sub_agents = load_agents_from_files(&sub_agent_files)
                     .map_err(mlua::Error::external)?;
 
                 // Register Crew.new() for the sub-workflow with its own runtime
@@ -122,9 +154,8 @@ impl UserData for LuaCrew {
                 }
 
                 // Execute the subworkflow script
-                let script = std::fs::read_to_string(&flow_path).map_err(|e| {
-                    mlua::Error::external(IronCrewError::Io(e))
-                })?;
+                let script = std::fs::read_to_string(&flow_path)
+                    .map_err(|e| mlua::Error::external(IronCrewError::Io(e)))?;
 
                 let sub_result: Value = sub_lua.load(&script).eval_async().await?;
 
@@ -135,7 +166,12 @@ impl UserData for LuaCrew {
                     let json_str = match sub_result {
                         Value::Table(t) => {
                             let json = lua_table_to_json(&t)?;
-                            serde_json::to_string(&json).unwrap_or_default()
+                            serde_json::to_string(&json).map_err(|e| {
+                                mlua::Error::external(IronCrewError::Validation(format!(
+                                    "Failed to serialize subworkflow output: {}",
+                                    e
+                                )))
+                            })?
                         }
                         Value::String(s) => s.to_str()?.to_string(),
                         _ => String::new(),
@@ -210,30 +246,21 @@ impl UserData for LuaCrew {
             },
         );
 
-        methods.add_async_method(
-            "message_read",
-            |lua, this, agent_name: String| async move {
-                let messages = this
-                    .crew
-                    .lock()
-                    .await
-                    .messagebus
-                    .receive(&agent_name)
-                    .await;
-                let table = lua.create_table()?;
-                for (i, msg) in messages.iter().enumerate() {
-                    let entry = lua.create_table()?;
-                    entry.set("id", msg.id.clone())?;
-                    entry.set("from", msg.from.clone())?;
-                    entry.set("to", msg.to.clone())?;
-                    entry.set("content", msg.content.clone())?;
-                    entry.set("type", format!("{:?}", msg.message_type))?;
-                    entry.set("timestamp", msg.timestamp)?;
-                    table.set(i + 1, entry)?;
-                }
-                Ok(table)
-            },
-        );
+        methods.add_async_method("message_read", |lua, this, agent_name: String| async move {
+            let messages = this.crew.lock().await.messagebus.receive(&agent_name).await;
+            let table = lua.create_table()?;
+            for (i, msg) in messages.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("id", msg.id.clone())?;
+                entry.set("from", msg.from.clone())?;
+                entry.set("to", msg.to.clone())?;
+                entry.set("content", msg.content.clone())?;
+                entry.set("type", format!("{:?}", msg.message_type))?;
+                entry.set("timestamp", msg.timestamp)?;
+                table.set(i + 1, entry)?;
+            }
+            Ok(table)
+        });
 
         methods.add_async_method("message_history", |lua, this, ()| async move {
             let history = this.crew.lock().await.messagebus.get_history().await;
@@ -332,7 +359,7 @@ impl UserData for LuaCrew {
             let run_end = chrono::Utc::now();
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
 
-            // Save run history (non-blocking file I/O)
+            // Save run history before returning so API callers can resolve this exact run.
             let store_dir = this.project_dir.join(".ironcrew").join("runs");
             let record = crew.create_run_record(
                 &results,
@@ -340,13 +367,20 @@ impl UserData for LuaCrew {
                 &run_end.to_rfc3339(),
                 total_ms,
             );
-            tokio::task::spawn_blocking(move || {
-                if let Ok(history) = crate::engine::run_history::RunHistory::new(store_dir)
-                    && let Err(e) = history.save(&record)
-                {
-                    tracing::warn!("Failed to save run history: {}", e);
-                }
-            });
+            let run_id =
+                tokio::task::spawn_blocking(move || -> crate::utils::error::Result<String> {
+                    let history = crate::engine::run_history::RunHistory::new(store_dir)?;
+                    history.save(&record)
+                })
+                .await
+                .map_err(|e| {
+                    mlua::Error::external(IronCrewError::Task {
+                        task: "run_history".into(),
+                        message: format!("Failed to join run history task: {}", e),
+                    })
+                })?
+                .map_err(mlua::Error::external)?;
+            lua.globals().set("__ironcrew_last_run_id", run_id)?;
 
             // Convert results to Lua table
             let results_table = lua.create_table()?;

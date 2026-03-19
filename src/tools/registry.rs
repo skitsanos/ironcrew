@@ -24,8 +24,7 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools
-            .insert(tool.name().to_string(), Arc::from(tool));
+        self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

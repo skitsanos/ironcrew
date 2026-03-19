@@ -115,7 +115,10 @@ pub async fn execute_collaborative_task(
                 conversation_text
             )),
         ],
-        model: synth_agent.model.clone().unwrap_or_else(|| synthesis_model.to_string()),
+        model: synth_agent
+            .model
+            .clone()
+            .unwrap_or_else(|| synthesis_model.to_string()),
         temperature: synth_agent.temperature,
         max_tokens: synth_agent.max_tokens,
         response_format: synth_agent.response_format.clone(),

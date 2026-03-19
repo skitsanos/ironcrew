@@ -33,16 +33,12 @@ pub struct Agent {
     pub response_format: Option<ResponseFormat>,
 }
 
-
 pub struct AgentSelector;
 
 impl AgentSelector {
     /// Select the best agent for a task using heuristic scoring.
     /// Weights: capability_match=0.4, tool_match=0.3, goal_alignment=0.3
-    pub fn select<'a>(
-        agents: &'a [Agent],
-        task: &super::task::Task,
-    ) -> &'a Agent {
+    pub fn select<'a>(agents: &'a [Agent], task: &super::task::Task) -> &'a Agent {
         agents
             .iter()
             .enumerate()

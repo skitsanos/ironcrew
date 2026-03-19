@@ -19,9 +19,9 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let app = api::create_router(state).layer(CorsLayer::permissive());
 
     let addr = format!("{}:{}", host, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-        IronCrewError::Validation(format!("Failed to bind to {}: {}", addr, e))
-    })?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| IronCrewError::Validation(format!("Failed to bind to {}: {}", addr, e)))?;
 
     println!("IronCrew API server v{}", env!("CARGO_PKG_VERSION"));
     println!("Listening on http://{}", addr);
@@ -37,9 +37,9 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     println!("  GET    /flows/{{flow}}/agents           - List agents in a flow");
     println!("  GET    /nodes                         - List built-in tools");
 
-    axum::serve(listener, app).await.map_err(|e| {
-        IronCrewError::Validation(format!("Server error: {}", e))
-    })?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| IronCrewError::Validation(format!("Server error: {}", e)))?;
 
     Ok(())
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::Tool;
 use crate::llm::provider::ToolSchema;
@@ -17,8 +17,8 @@ impl FileWriteTool {
             base_dir,
             allowed_extensions: allowed_extensions.unwrap_or_else(|| {
                 vec![
-                    "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml",
-                    "html", "css", "js", "ts", "py", "rs", "lua", "sh",
+                    "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml", "html", "css", "js",
+                    "ts", "py", "rs", "lua", "sh",
                 ]
                 .into_iter()
                 .map(String::from)
@@ -30,7 +30,14 @@ impl FileWriteTool {
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
 
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if path.is_absolute()
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
             return Err(IronCrewError::ToolExecution {
                 tool: "file_write".into(),
                 message: "Directory traversal not allowed".into(),
@@ -102,12 +109,12 @@ impl Tool for FileWriteTool {
         let validated = self.validate_path(path)?;
 
         if let Some(parent) = validated.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                IronCrewError::ToolExecution {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| IronCrewError::ToolExecution {
                     tool: "file_write".into(),
                     message: format!("Failed to create directories: {}", e),
-                }
-            })?;
+                })?;
         }
 
         tokio::fs::write(&validated, content)
@@ -117,6 +124,10 @@ impl Tool for FileWriteTool {
                 message: format!("Failed to write '{}': {}", path, e),
             })?;
 
-        Ok(format!("Successfully wrote {} bytes to {}", content.len(), path))
+        Ok(format!(
+            "Successfully wrote {} bytes to {}",
+            content.len(),
+            path
+        ))
     }
 }

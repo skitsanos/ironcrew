@@ -102,10 +102,13 @@ impl Tool for WebScrapeTool {
                 message: format!("Failed to fetch '{}': {}", url, e),
             })?;
 
-        let html = resp.text().await.map_err(|e| IronCrewError::ToolExecution {
-            tool: "web_scrape".into(),
-            message: format!("Failed to read response: {}", e),
-        })?;
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| IronCrewError::ToolExecution {
+                tool: "web_scrape".into(),
+                message: format!("Failed to read response: {}", e),
+            })?;
 
         let document = Html::parse_document(&html);
         let body_selector = Selector::parse("body").unwrap();

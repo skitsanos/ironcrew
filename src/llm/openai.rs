@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 use super::provider::*;
@@ -106,7 +106,17 @@ impl OpenAiProvider {
         body
     }
 
+    fn ensure_api_key(&self) -> Result<()> {
+        if self.api_key.trim().is_empty() {
+            return Err(IronCrewError::Validation(
+                "OPENAI_API_KEY is required for OpenAI provider".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
+        self.ensure_api_key()?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let resp = self
@@ -162,6 +172,7 @@ impl OpenAiProvider {
         mut body: Value,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
+        self.ensure_api_key()?;
         body["stream"] = json!(true);
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -229,9 +240,7 @@ impl OpenAiProvider {
                     }
 
                     // Tool calls delta
-                    if let Some(tc_deltas) =
-                        delta.get("tool_calls").and_then(|v| v.as_array())
-                    {
+                    if let Some(tc_deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tc_deltas {
                             let index = tc["index"].as_u64().unwrap_or(0) as usize;
                             let entry = tool_call_buffers
@@ -291,7 +300,10 @@ impl OpenAiProvider {
 impl LlmProvider for OpenAiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let body = self.build_body(&request, None);
-        tracing::debug!("LLM request: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        tracing::debug!(
+            "LLM request: {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
         let response = self.send_request(body).await?;
         tracing::debug!("LLM response: {:?}", response);
         Ok(response)
@@ -303,7 +315,10 @@ impl LlmProvider for OpenAiProvider {
         tools: &[ToolSchema],
     ) -> Result<ChatResponse> {
         let body = self.build_body(&request, Some(tools));
-        tracing::debug!("LLM request (with tools): {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        tracing::debug!(
+            "LLM request (with tools): {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
         let response = self.send_request(body).await?;
         tracing::debug!("LLM response: {:?}", response);
         Ok(response)

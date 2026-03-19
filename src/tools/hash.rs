@@ -82,7 +82,7 @@ impl Tool for HashTool {
                 return Err(IronCrewError::ToolExecution {
                     tool: "hash".into(),
                     message: format!("Unsupported algorithm: {}", other),
-                })
+                });
             }
         };
 

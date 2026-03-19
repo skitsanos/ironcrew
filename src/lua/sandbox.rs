@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mlua::{Lua, Result as LuaResult, StdLib, Value};
+use std::path::{Component, Path, PathBuf};
 
 use crate::lua::api::{json_value_to_lua, lua_value_to_json};
 
@@ -29,8 +30,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
     // json_parse(str) -> Lua value
     let json_parse_fn = lua.create_function(|lua, s: String| {
-        let value: serde_json::Value =
-            serde_json::from_str(&s).map_err(mlua::Error::external)?;
+        let value: serde_json::Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
         json_value_to_lua(lua, &value)
     })?;
     lua.globals().set("json_parse", json_parse_fn)?;
@@ -43,8 +43,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     lua.globals().set("json_stringify", json_stringify_fn)?;
 
     // base64_encode(str)
-    let b64_encode_fn =
-        lua.create_function(|_, s: String| Ok(STANDARD.encode(s.as_bytes())))?;
+    let b64_encode_fn = lua.create_function(|_, s: String| Ok(STANDARD.encode(s.as_bytes())))?;
     lua.globals().set("base64_encode", b64_encode_fn)?;
 
     // base64_decode(str)
@@ -101,7 +100,10 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // regex.find_all(pattern, text) -> table of strings (all matches)
     let regex_find_all = lua.create_function(|lua, (pattern, text): (String, String)| {
         let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
-        let matches: Vec<String> = re.find_iter(&text).map(|m| m.as_str().to_string()).collect();
+        let matches: Vec<String> = re
+            .find_iter(&text)
+            .map(|m| m.as_str().to_string())
+            .collect();
         let table = lua.create_table()?;
         for (i, m) in matches.iter().enumerate() {
             table.set(i + 1, m.as_str())?;
@@ -135,19 +137,21 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     regex_table.set("captures", regex_captures)?;
 
     // regex.replace(pattern, text, replacement) -> string (first match)
-    let regex_replace =
-        lua.create_function(|_, (pattern, text, replacement): (String, String, String)| {
+    let regex_replace = lua.create_function(
+        |_, (pattern, text, replacement): (String, String, String)| {
             let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
             Ok(re.replace(&text, replacement.as_str()).into_owned())
-        })?;
+        },
+    )?;
     regex_table.set("replace", regex_replace)?;
 
     // regex.replace_all(pattern, text, replacement) -> string
-    let regex_replace_all =
-        lua.create_function(|_, (pattern, text, replacement): (String, String, String)| {
+    let regex_replace_all = lua.create_function(
+        |_, (pattern, text, replacement): (String, String, String)| {
             let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
             Ok(re.replace_all(&text, replacement.as_str()).into_owned())
-        })?;
+        },
+    )?;
     regex_table.set("replace_all", regex_replace_all)?;
 
     // regex.split(pattern, text) -> table of strings
@@ -207,6 +211,10 @@ pub fn create_crew_lua() -> LuaResult<Lua> {
 /// (full llm/http/fs sandbox APIs will be wired when the tool is executed
 /// with a provider context — see LuaScriptTool::execute).
 pub fn create_tool_lua() -> LuaResult<Lua> {
+    create_tool_lua_with_base_dir(None)
+}
+
+pub fn create_tool_lua_with_base_dir(base_dir: Option<PathBuf>) -> LuaResult<Lua> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH,
         mlua::LuaOptions::default(),
@@ -226,17 +234,24 @@ pub fn create_tool_lua() -> LuaResult<Lua> {
 
     register_lua_globals(&lua)?;
 
-    // Register fs namespace (thin wrappers around Rust)
-    let fs_table = lua.create_table()?;
-    let fs_read = lua.create_function(|_, path: String| {
-        std::fs::read_to_string(&path).map_err(mlua::Error::external)
-    })?;
-    let fs_write = lua.create_function(|_, (path, content): (String, String)| {
-        std::fs::write(&path, &content).map_err(mlua::Error::external)
-    })?;
-    fs_table.set("read", fs_read)?;
-    fs_table.set("write", fs_write)?;
-    lua.globals().set("fs", fs_table)?;
+    if let Some(base_dir) = base_dir {
+        let fs_table = lua.create_table()?;
+        let read_base = base_dir.clone();
+        let write_base = base_dir;
+
+        let fs_read = lua.create_function(move |_, path: String| {
+            let validated = validate_tool_fs_path(&read_base, &path)?;
+            std::fs::read_to_string(&validated).map_err(mlua::Error::external)
+        })?;
+        let fs_write = lua.create_function(move |_, (path, content): (String, String)| {
+            let validated = validate_tool_fs_path(&write_base, &path)?;
+            std::fs::write(&validated, &content).map_err(mlua::Error::external)
+        })?;
+
+        fs_table.set("read", fs_read)?;
+        fs_table.set("write", fs_write)?;
+        lua.globals().set("fs", fs_table)?;
+    }
 
     // Note: llm and http namespaces require async and a provider/client reference.
     // These are registered per-execution in LuaScriptTool::execute when a provider
@@ -244,4 +259,54 @@ pub fn create_tool_lua() -> LuaResult<Lua> {
     // to be wired in a future iteration with the async tool sandbox.
 
     Ok(lua)
+}
+
+fn validate_tool_fs_path(base_dir: &Path, path: &str) -> LuaResult<PathBuf> {
+    let candidate = Path::new(path);
+    if candidate.as_os_str().is_empty()
+        || candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+                    | Component::CurDir
+            )
+        })
+    {
+        return Err(mlua::Error::external("invalid fs path"));
+    }
+
+    let joined = base_dir.join(candidate);
+
+    // Canonicalize and verify containment to prevent symlink escapes
+    if joined.exists() {
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| mlua::Error::external(format!("failed to resolve path: {}", e)))?;
+        let base_canonical = base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| base_dir.to_path_buf());
+        if !canonical.starts_with(&base_canonical) {
+            return Err(mlua::Error::external("path escapes project directory"));
+        }
+        Ok(canonical)
+    } else {
+        // File doesn't exist yet (write case) — verify the parent stays in bounds
+        if let Some(parent) = joined.parent()
+            && parent.exists()
+        {
+            let parent_canonical = parent
+                .canonicalize()
+                .map_err(|e| mlua::Error::external(format!("failed to resolve path: {}", e)))?;
+            let base_canonical = base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| base_dir.to_path_buf());
+            if !parent_canonical.starts_with(&base_canonical) {
+                return Err(mlua::Error::external("path escapes project directory"));
+            }
+        }
+        Ok(joined)
+    }
 }

@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use mlua::{Function, Lua, Result as LuaResult, Table};
+use mlua::{Function, Result as LuaResult, Table};
 
 use crate::engine::agent::{Agent, ResponseFormat};
 use crate::engine::task::Task;
+use crate::lua::sandbox::create_tool_lua;
 use crate::utils::error::{IronCrewError, Result};
 
 use super::json::lua_table_to_json;
@@ -62,7 +63,9 @@ fn parse_response_format(table: &Table) -> LuaResult<Option<ResponseFormat>> {
         Err(_) => return Ok(None),
     };
 
-    let rf_type: String = rf_table.get::<String>("type").unwrap_or_else(|_| "text".into());
+    let rf_type: String = rf_table
+        .get::<String>("type")
+        .unwrap_or_else(|_| "text".into());
 
     match rf_type.as_str() {
         "text" => Ok(Some(ResponseFormat::Text)),
@@ -81,9 +84,10 @@ fn parse_response_format(table: &Table) -> LuaResult<Option<ResponseFormat>> {
             let schema = lua_table_to_json(&schema_table)?;
             Ok(Some(ResponseFormat::JsonSchema { name, schema }))
         }
-        other => Err(mlua::Error::external(IronCrewError::Validation(
-            format!("Unknown response_format type: '{}'", other),
-        ))),
+        other => Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Unknown response_format type: '{}'",
+            other
+        )))),
     }
 }
 
@@ -216,13 +220,19 @@ pub fn tool_def_from_lua_table(table: &Table, source_path: &Path) -> LuaResult<L
 }
 
 /// Load tool definitions from Lua files (metadata only, not execute functions).
-pub fn load_tool_defs_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
+pub fn load_tool_defs_from_files(files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
     let mut tools = Vec::new();
     for file in files {
         let source = std::fs::read_to_string(file).map_err(|e| {
             IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
         })?;
-        let table: Table = lua.load(&source).eval().map_err(IronCrewError::Lua)?;
+        let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+        let table: Table = tool_lua
+            .load(&source)
+            .into_function()
+            .map_err(IronCrewError::Lua)?
+            .call(())
+            .map_err(IronCrewError::Lua)?;
         let tool_def = tool_def_from_lua_table(&table, file).map_err(|e| {
             IronCrewError::Validation(format!(
                 "Invalid tool definition in {}: {}",
@@ -241,13 +251,19 @@ pub fn load_tool_defs_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<Lua
 // ---------------------------------------------------------------------------
 
 /// Load agent definitions from Lua files.
-pub fn load_agents_from_files(lua: &Lua, files: &[PathBuf]) -> Result<Vec<Agent>> {
+pub fn load_agents_from_files(files: &[PathBuf]) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     for file in files {
         let source = std::fs::read_to_string(file).map_err(|e| {
             IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
         })?;
-        let table: Table = lua.load(&source).eval().map_err(IronCrewError::Lua)?;
+        let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+        let table: Table = tool_lua
+            .load(&source)
+            .into_function()
+            .map_err(IronCrewError::Lua)?
+            .call(())
+            .map_err(IronCrewError::Lua)?;
         let agent = agent_from_lua_table(&table).map_err(|e| {
             IronCrewError::Validation(format!(
                 "Invalid agent definition in {}: {}",

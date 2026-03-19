@@ -10,7 +10,7 @@ use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
 use crate::engine::task::{
-    validate_dependency_graph, topological_phases, Task, TaskResult, TaskTokenUsage,
+    Task, TaskResult, TaskTokenUsage, topological_phases, validate_dependency_graph,
 };
 use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
@@ -33,7 +33,9 @@ pub fn resolve_model(task: &Task, agent: &Agent, crew: &Crew, purpose: &str) -> 
     }
     // 3. Model Router purpose-based
     if crew.model_router.is_configured() {
-        return crew.model_router.resolve(purpose, &crew.provider_config.model);
+        return crew
+            .model_router
+            .resolve(purpose, &crew.provider_config.model);
     }
     // 4. Crew default
     crew.provider_config.model.clone()
@@ -160,14 +162,14 @@ async fn process_phase_results(
                         crew.max_tool_rounds,
                     )
                     .await
-                    {
-                        recovered.duration_ms = duration_ms;
-                        results.insert(task_name, recovered);
-                        if let Some(hr) = handler_result {
-                            results.insert(hr.task.clone(), hr);
-                        }
-                        continue;
+                {
+                    recovered.duration_ms = duration_ms;
+                    results.insert(task_name, recovered);
+                    if let Some(hr) = handler_result {
+                        results.insert(hr.task.clone(), hr);
                     }
+                    continue;
+                }
 
                 // Original failure path (no handler or handler failed)
                 let result = TaskResult {
@@ -229,12 +231,8 @@ pub async fn run_crew(
         .collect();
 
     for (phase_idx, phase) in phases.iter().enumerate() {
-        let phase_tasks = filter_eligible_tasks(
-            phase,
-            &error_handler_names,
-            &mut failed_tasks,
-            &mut results,
-        );
+        let phase_tasks =
+            filter_eligible_tasks(phase, &error_handler_names, &mut failed_tasks, &mut results);
 
         if phase_tasks.is_empty() {
             continue;
@@ -324,7 +322,8 @@ pub async fn run_crew(
                 let collab_model = if let Some(ref m) = task.model {
                     m.clone()
                 } else if crew.model_router.is_configured() {
-                    crew.model_router.resolve("collaboration", &crew.provider_config.model)
+                    crew.model_router
+                        .resolve("collaboration", &crew.provider_config.model)
                 } else {
                     crew.provider_config.model.clone()
                 };
@@ -332,7 +331,8 @@ pub async fn run_crew(
                 let collab_synthesis_model = if let Some(ref m) = task.model {
                     m.clone()
                 } else if crew.model_router.is_configured() {
-                    crew.model_router.resolve("collaboration_synthesis", &crew.provider_config.model)
+                    crew.model_router
+                        .resolve("collaboration_synthesis", &crew.provider_config.model)
                 } else {
                     crew.provider_config.model.clone()
                 };
@@ -389,25 +389,25 @@ pub async fn run_crew(
                                     task.name, error_msg
                                 );
                                 error_task.context = Some(
-                                    error_task.context.as_ref().map_or(
-                                        error_context.clone(),
-                                        |existing| {
+                                    error_task
+                                        .context
+                                        .as_ref()
+                                        .map_or(error_context.clone(), |existing| {
                                             format!("{}\n\n{}", existing, error_context)
-                                        },
-                                    ),
+                                        }),
                                 );
 
-                                let error_agent =
-                                    if let Some(ref ea_name) = error_task.agent {
-                                        crew.agents
-                                            .iter()
-                                            .find(|a| a.name == *ea_name)
-                                            .unwrap_or(&crew.agents[0])
-                                    } else {
-                                        AgentSelector::select(&crew.agents, &error_task)
-                                    };
+                                let error_agent = if let Some(ref ea_name) = error_task.agent {
+                                    crew.agents
+                                        .iter()
+                                        .find(|a| a.name == *ea_name)
+                                        .unwrap_or(&crew.agents[0])
+                                } else {
+                                    AgentSelector::select(&crew.agents, &error_task)
+                                };
 
-                                let error_model = resolve_model(&error_task, error_agent, crew, "task_execution");
+                                let error_model =
+                                    resolve_model(&error_task, error_agent, crew, "task_execution");
                                 let error_start = Instant::now();
                                 match execute_task_standalone(
                                     &error_task,
@@ -428,9 +428,7 @@ pub async fn run_crew(
                                             task.name.clone(),
                                             TaskResult {
                                                 task: task.name.clone(),
-                                                agent: task
-                                                    .collaborative_agents
-                                                    .join("+"),
+                                                agent: task.collaborative_agents.join("+"),
                                                 output: format!(
                                                     "Recovered via '{}': {}",
                                                     error_handler_name, output
@@ -447,9 +445,7 @@ pub async fn run_crew(
                                                 agent: error_agent.name.clone(),
                                                 output,
                                                 success: true,
-                                                duration_ms: error_start
-                                                    .elapsed()
-                                                    .as_millis()
+                                                duration_ms: error_start.elapsed().as_millis()
                                                     as u64,
                                                 token_usage: handler_usage,
                                             },
@@ -564,9 +560,7 @@ pub async fn run_crew(
                     "agent": result.agent,
                     "duration_ms": result.duration_ms,
                 });
-                crew.memory
-                    .set(format!("task:{}", task_name), value)
-                    .await;
+                crew.memory.set(format!("task:{}", task_name), value).await;
             }
         }
     }

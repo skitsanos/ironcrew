@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use crate::utils::error::{IronCrewError, Result};
@@ -36,10 +37,12 @@ pub struct MemoryItem {
     pub ttl_ms: Option<i64>,
     #[serde(default)]
     pub estimated_tokens: usize,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl MemoryItem {
-    pub fn new(key: String, value: serde_json::Value) -> Self {
+    pub fn new(key: String, value: serde_json::Value, revision: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -54,6 +57,7 @@ impl MemoryItem {
             tags: Vec::new(),
             ttl_ms: None,
             estimated_tokens,
+            revision,
         }
     }
 
@@ -87,6 +91,7 @@ pub struct MemoryStore {
     items: Arc<RwLock<HashMap<String, MemoryItem>>>,
     backend: MemoryBackend,
     config: MemoryConfig,
+    next_revision: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -135,6 +140,7 @@ impl MemoryStore {
             items: Arc::new(RwLock::new(HashMap::new())),
             backend,
             config,
+            next_revision: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -143,15 +149,22 @@ impl MemoryStore {
         config: MemoryConfig,
         items: HashMap<String, MemoryItem>,
     ) -> Self {
+        let next_revision = items.values().map(|item| item.revision).max().unwrap_or(0) + 1;
         Self {
             items: Arc::new(RwLock::new(items)),
             backend,
             config,
+            next_revision: Arc::new(AtomicU64::new(next_revision)),
         }
+    }
+
+    fn allocate_revision(&self) -> u64 {
+        self.next_revision.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Set a value in memory.
     pub async fn set(&self, key: String, value: serde_json::Value) {
+        let revision = self.allocate_revision();
         {
             let mut items = self.items.write().await;
             let now = std::time::SystemTime::now()
@@ -163,8 +176,9 @@ impl MemoryStore {
                 existing.estimated_tokens = estimate_tokens(&value);
                 existing.value = value;
                 existing.updated_at = now;
+                existing.revision = revision;
             } else {
-                items.insert(key.clone(), MemoryItem::new(key, value));
+                items.insert(key.clone(), MemoryItem::new(key, value, revision));
             }
         }
         self.evict_if_needed().await;
@@ -178,9 +192,10 @@ impl MemoryStore {
         tags: Vec<String>,
         ttl_ms: Option<i64>,
     ) {
+        let revision = self.allocate_revision();
         {
             let mut items = self.items.write().await;
-            let mut item = MemoryItem::new(key.clone(), value);
+            let mut item = MemoryItem::new(key.clone(), value, revision);
             item.tags = tags;
             item.ttl_ms = ttl_ms;
             items.insert(key, item);
@@ -190,6 +205,7 @@ impl MemoryStore {
 
     /// Get a value from memory. Returns None if not found or expired.
     pub async fn get(&self, key: &str) -> Option<serde_json::Value> {
+        let revision = self.allocate_revision();
         let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(key) {
             if item.is_expired() {
@@ -197,6 +213,7 @@ impl MemoryStore {
                 return None;
             }
             item.access_count += 1;
+            item.revision = revision;
             Some(item.value.clone())
         } else {
             None
@@ -226,10 +243,7 @@ impl MemoryStore {
         let query_words: std::collections::HashSet<String> = query
             .to_lowercase()
             .split_whitespace()
-            .map(|s| {
-                s.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_string()
-            })
+            .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -256,10 +270,7 @@ impl MemoryStore {
                     let value_words: std::collections::HashSet<String> = s
                         .to_lowercase()
                         .split_whitespace()
-                        .map(|w| {
-                            w.trim_matches(|c: char| !c.is_alphanumeric())
-                                .to_string()
-                        })
+                        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
                         .collect();
                     let overlap = query_words.intersection(&value_words).count();
                     score += overlap as f32;
@@ -373,7 +384,7 @@ impl MemoryStore {
         }
     }
 
-    /// Find the best candidate for eviction: least accessed, then oldest.
+    /// Find the best candidate for eviction: least accessed, then least recently touched.
     fn find_eviction_candidate(items: &HashMap<String, MemoryItem>) -> Option<String> {
         items
             .iter()
@@ -381,6 +392,7 @@ impl MemoryStore {
                 a.1.access_count
                     .cmp(&b.1.access_count)
                     .then(a.1.updated_at.cmp(&b.1.updated_at))
+                    .then(a.1.revision.cmp(&b.1.revision))
             })
             .map(|(k, _)| k.clone())
     }

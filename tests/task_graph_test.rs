@@ -1,22 +1,41 @@
 use std::collections::HashSet;
 
-use ironcrew::engine::task::{topological_phases, validate_dependency_graph, topological_sort, Task};
+use ironcrew::engine::task::{
+    Task, topological_phases, topological_sort, validate_dependency_graph,
+};
 
 #[test]
 fn test_valid_dependency_graph() {
     let tasks = vec![
-        Task { name: "a".into(), description: "Task A".into(), ..Default::default() },
-        Task { name: "b".into(), description: "Task B".into(), depends_on: vec!["a".into()], ..Default::default() },
-        Task { name: "c".into(), description: "Task C".into(), depends_on: vec!["a".into(), "b".into()], ..Default::default() },
+        Task {
+            name: "a".into(),
+            description: "Task A".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "Task B".into(),
+            depends_on: vec!["a".into()],
+            ..Default::default()
+        },
+        Task {
+            name: "c".into(),
+            description: "Task C".into(),
+            depends_on: vec!["a".into(), "b".into()],
+            ..Default::default()
+        },
     ];
     assert!(validate_dependency_graph(&tasks).is_ok());
 }
 
 #[test]
 fn test_missing_dependency() {
-    let tasks = vec![
-        Task { name: "a".into(), description: "Task A".into(), depends_on: vec!["nonexistent".into()], ..Default::default() },
-    ];
+    let tasks = vec![Task {
+        name: "a".into(),
+        description: "Task A".into(),
+        depends_on: vec!["nonexistent".into()],
+        ..Default::default()
+    }];
     let err = validate_dependency_graph(&tasks).unwrap_err();
     assert!(err.to_string().contains("nonexistent"));
 }
@@ -24,8 +43,18 @@ fn test_missing_dependency() {
 #[test]
 fn test_circular_dependency() {
     let tasks = vec![
-        Task { name: "a".into(), description: "A".into(), depends_on: vec!["b".into()], ..Default::default() },
-        Task { name: "b".into(), description: "B".into(), depends_on: vec!["a".into()], ..Default::default() },
+        Task {
+            name: "a".into(),
+            description: "A".into(),
+            depends_on: vec!["b".into()],
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "B".into(),
+            depends_on: vec!["a".into()],
+            ..Default::default()
+        },
     ];
     let err = validate_dependency_graph(&tasks).unwrap_err();
     assert!(err.to_string().contains("Circular dependency"));
@@ -34,9 +63,23 @@ fn test_circular_dependency() {
 #[test]
 fn test_topological_sort_order() {
     let tasks = vec![
-        Task { name: "c".into(), description: "C".into(), depends_on: vec!["b".into()], ..Default::default() },
-        Task { name: "a".into(), description: "A".into(), ..Default::default() },
-        Task { name: "b".into(), description: "B".into(), depends_on: vec!["a".into()], ..Default::default() },
+        Task {
+            name: "c".into(),
+            description: "C".into(),
+            depends_on: vec!["b".into()],
+            ..Default::default()
+        },
+        Task {
+            name: "a".into(),
+            description: "A".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "B".into(),
+            depends_on: vec!["a".into()],
+            ..Default::default()
+        },
     ];
     let sorted = topological_sort(&tasks);
     let names: Vec<&str> = sorted.iter().map(|t| t.name.as_str()).collect();
@@ -82,10 +125,7 @@ fn test_task_with_condition_field() {
         condition: Some("results.step1.success == true".into()),
         ..Default::default()
     };
-    assert_eq!(
-        task.condition,
-        Some("results.step1.success == true".into())
-    );
+    assert_eq!(task.condition, Some("results.step1.success == true".into()));
 }
 
 #[test]
@@ -102,10 +142,28 @@ fn test_task_with_on_error_field() {
 #[test]
 fn test_topological_phases_diamond() {
     let tasks = vec![
-        Task { name: "a".into(), description: "A".into(), ..Default::default() },
-        Task { name: "b".into(), description: "B".into(), ..Default::default() },
-        Task { name: "c".into(), description: "C".into(), depends_on: vec!["a".into(), "b".into()], ..Default::default() },
-        Task { name: "d".into(), description: "D".into(), depends_on: vec!["c".into()], ..Default::default() },
+        Task {
+            name: "a".into(),
+            description: "A".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "B".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "c".into(),
+            description: "C".into(),
+            depends_on: vec!["a".into(), "b".into()],
+            ..Default::default()
+        },
+        Task {
+            name: "d".into(),
+            description: "D".into(),
+            depends_on: vec!["c".into()],
+            ..Default::default()
+        },
     ];
 
     let phases = topological_phases(&tasks);
@@ -129,9 +187,21 @@ fn test_topological_phases_diamond() {
 #[test]
 fn test_topological_phases_all_independent() {
     let tasks = vec![
-        Task { name: "a".into(), description: "A".into(), ..Default::default() },
-        Task { name: "b".into(), description: "B".into(), ..Default::default() },
-        Task { name: "c".into(), description: "C".into(), ..Default::default() },
+        Task {
+            name: "a".into(),
+            description: "A".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "B".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "c".into(),
+            description: "C".into(),
+            ..Default::default()
+        },
     ];
 
     let phases = topological_phases(&tasks);
@@ -142,9 +212,23 @@ fn test_topological_phases_all_independent() {
 #[test]
 fn test_topological_phases_linear_chain() {
     let tasks = vec![
-        Task { name: "a".into(), description: "A".into(), ..Default::default() },
-        Task { name: "b".into(), description: "B".into(), depends_on: vec!["a".into()], ..Default::default() },
-        Task { name: "c".into(), description: "C".into(), depends_on: vec!["b".into()], ..Default::default() },
+        Task {
+            name: "a".into(),
+            description: "A".into(),
+            ..Default::default()
+        },
+        Task {
+            name: "b".into(),
+            description: "B".into(),
+            depends_on: vec!["a".into()],
+            ..Default::default()
+        },
+        Task {
+            name: "c".into(),
+            description: "C".into(),
+            depends_on: vec!["b".into()],
+            ..Default::default()
+        },
     ];
 
     let phases = topological_phases(&tasks);

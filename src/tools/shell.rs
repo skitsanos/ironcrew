@@ -71,7 +71,10 @@ impl Tool for ShellTool {
         if output.status.success() {
             Ok(stdout.to_string())
         } else {
-            Ok(format!("Exit code: {}\nStdout: {}\nStderr: {}", output.status, stdout, stderr))
+            Ok(format!(
+                "Exit code: {}\nStdout: {}\nStderr: {}",
+                output.status, stdout, stderr
+            ))
         }
     }
 }

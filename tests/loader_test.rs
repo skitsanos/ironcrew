@@ -8,8 +8,16 @@ fn test_discover_project_directory() {
     let tools_dir = dir.path().join("tools");
     fs::create_dir_all(&agents_dir).unwrap();
     fs::create_dir_all(&tools_dir).unwrap();
-    fs::write(agents_dir.join("researcher.lua"), "return {name='researcher', goal='research'}").unwrap();
-    fs::write(agents_dir.join("writer.lua"), "return {name='writer', goal='write'}").unwrap();
+    fs::write(
+        agents_dir.join("researcher.lua"),
+        "return {name='researcher', goal='research'}",
+    )
+    .unwrap();
+    fs::write(
+        agents_dir.join("writer.lua"),
+        "return {name='writer', goal='write'}",
+    )
+    .unwrap();
     fs::write(tools_dir.join("summarize.lua"), "return {name='summarize'}").unwrap();
     fs::write(dir.path().join("crew.lua"), "-- entrypoint").unwrap();
 

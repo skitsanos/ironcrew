@@ -206,10 +206,7 @@ fn test_base64_encode_decode_roundtrip() {
 #[test]
 fn test_base64_encode_known_value() {
     let lua = create_crew_lua().unwrap();
-    let result: String = lua
-        .load(r#"return base64_encode("hello")"#)
-        .eval()
-        .unwrap();
+    let result: String = lua.load(r#"return base64_encode("hello")"#).eval().unwrap();
     assert_eq!(result, "aGVsbG8=");
 }
 
@@ -235,10 +232,7 @@ fn test_globals_available_in_tool_lua() {
     let ts: i64 = lua.load(r#"return now_unix_ms()"#).eval().unwrap();
     assert!(ts > 0);
 
-    let encoded: String = lua
-        .load(r#"return base64_encode("test")"#)
-        .eval()
-        .unwrap();
+    let encoded: String = lua.load(r#"return base64_encode("test")"#).eval().unwrap();
     let decoded: String = lua
         .load(format!(r#"return base64_decode("{}")"#, encoded))
         .eval()

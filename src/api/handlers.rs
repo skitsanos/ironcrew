@@ -6,11 +6,20 @@ use axum::{
 use std::sync::Arc;
 
 use crate::engine::run_history::RunHistory;
+use crate::utils::error::IronCrewError;
 
 use super::{
-    error_response, resolve_runs_dir, AppState, ErrorResponse, ListRunsQuery, RunCrewResponse,
-    TaskResultResponse,
+    AppState, ErrorResponse, ListRunsQuery, RunCrewResponse, TaskResultResponse, error_response,
+    resolve_flow_path, resolve_runs_dir,
 };
+
+fn flow_status(err: &IronCrewError) -> StatusCode {
+    if err.to_string().contains("not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
 
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -27,14 +36,8 @@ pub async fn run_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<RunCrewResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = state.flows_dir.join(&flow);
-
-    if !flow_path.exists() {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("Flow not found: {}", flow),
-        ));
-    }
+    let flow_path = resolve_flow_path(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
 
     let result = execute_crew_from_path(&flow_path).await;
 
@@ -56,9 +59,9 @@ pub async fn execute_crew_from_path(
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
     // Execute
-    let entrypoint = loader
-        .entrypoint()
-        .ok_or_else(|| crate::utils::error::IronCrewError::Validation("No entrypoint found".into()))?;
+    let entrypoint = loader.entrypoint().ok_or_else(|| {
+        crate::utils::error::IronCrewError::Validation("No entrypoint found".into())
+    })?;
     let script = std::fs::read_to_string(entrypoint)?;
 
     lua.load(&script)
@@ -66,18 +69,19 @@ pub async fn execute_crew_from_path(
         .await
         .map_err(crate::utils::error::IronCrewError::Lua)?;
 
-    // Read the last run from history to get results
+    let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
+
+    // Read the recorded run directly so concurrent executions cannot swap results.
     let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
-    if let Ok(history) = RunHistory::new(runs_dir)
-        && let Ok(runs) = history.list(None)
-        && let Some(latest) = runs.first()
-    {
+    if let Some(run_id) = run_id {
+        let history = RunHistory::new(runs_dir)?;
+        let run = history.get(&run_id)?;
         return Ok(RunCrewResponse {
-            run_id: latest.run_id.clone(),
-            flow_name: latest.flow_name.clone(),
-            status: latest.status.to_string(),
-            duration_ms: latest.duration_ms,
-            results: latest
+            run_id: run.run_id.clone(),
+            flow_name: run.flow_name.clone(),
+            status: run.status.to_string(),
+            duration_ms: run.duration_ms,
+            results: run
                 .task_results
                 .iter()
                 .map(|r| TaskResultResponse {
@@ -109,7 +113,8 @@ pub async fn list_runs(
     Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<crate::engine::run_history::RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow);
+    let runs_dir = resolve_runs_dir(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -124,7 +129,8 @@ pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow);
+    let runs_dir = resolve_runs_dir(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -139,7 +145,8 @@ pub async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow);
+    let runs_dir = resolve_runs_dir(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
     let history = RunHistory::new(runs_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -158,17 +165,12 @@ pub async fn validate_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = state.flows_dir.join(&flow);
-    if !flow_path.exists() {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("Flow not found: {}", flow),
-        ));
-    }
+    let flow_path = resolve_flow_path(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
 
     use crate::lua::api::*;
     use crate::lua::loader::ProjectLoader;
-    use crate::lua::sandbox::create_crew_lua;
+    use crate::lua::sandbox::create_tool_lua;
 
     let loader = if flow_path.is_file() {
         ProjectLoader::from_file(&flow_path)
@@ -177,11 +179,13 @@ pub async fn validate_flow(
     }
     .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let lua = create_crew_lua()
+    let lua = create_tool_lua()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+    let agents = load_agents_from_files(loader.agent_files())
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tool_defs = load_tool_defs_from_files(loader.tool_files())
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Check entrypoint syntax
     let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
@@ -212,17 +216,11 @@ pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = state.flows_dir.join(&flow);
-    if !flow_path.exists() {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("Flow not found: {}", flow),
-        ));
-    }
+    let flow_path = resolve_flow_path(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
 
     use crate::lua::api::*;
     use crate::lua::loader::ProjectLoader;
-    use crate::lua::sandbox::create_crew_lua;
 
     let loader = if flow_path.is_file() {
         ProjectLoader::from_file(&flow_path)
@@ -231,10 +229,8 @@ pub async fn list_agents(
     }
     .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let lua = create_crew_lua()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+    let agents = load_agents_from_files(loader.agent_files())
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let result: Vec<serde_json::Value> = agents
         .iter()

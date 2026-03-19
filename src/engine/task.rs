@@ -41,7 +41,6 @@ pub struct Task {
     pub model: Option<String>, // per-task model override
 }
 
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskTokenUsage {
     pub prompt_tokens: u32,
@@ -63,6 +62,8 @@ pub struct TaskResult {
 
 /// Validate dependency references and detect cycles.
 pub fn validate_dependency_graph(tasks: &[Task]) -> Result<()> {
+    validate_unique_task_names(tasks)?;
+
     let task_names: HashSet<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
 
     // Check all depends_on references resolve
@@ -85,7 +86,10 @@ pub fn validate_dependency_graph(tasks: &[Task]) -> Result<()> {
         in_degree.entry(task.name.as_str()).or_insert(0);
         adjacency.entry(task.name.as_str()).or_default();
         for dep in &task.depends_on {
-            adjacency.entry(dep.as_str()).or_default().push(task.name.as_str());
+            adjacency
+                .entry(dep.as_str())
+                .or_default()
+                .push(task.name.as_str());
             *in_degree.entry(task.name.as_str()).or_insert(0) += 1;
         }
     }
@@ -127,9 +131,27 @@ pub fn validate_dependency_graph(tasks: &[Task]) -> Result<()> {
     Ok(())
 }
 
+fn validate_unique_task_names(tasks: &[Task]) -> Result<()> {
+    let mut names = HashSet::new();
+    for task in tasks {
+        if !names.insert(task.name.as_str()) {
+            return Err(IronCrewError::Validation(format!(
+                "Duplicate task name: {}",
+                task.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Group tasks into execution phases for parallel execution.
 /// Tasks in the same phase have no dependencies on each other and can run concurrently.
 pub fn topological_phases(tasks: &[Task]) -> Vec<Vec<&Task>> {
+    if let Err(err) = validate_unique_task_names(tasks) {
+        tracing::error!("{}", err);
+        return Vec::new();
+    }
+
     let task_map: HashMap<&str, &Task> = tasks.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -187,6 +209,11 @@ pub fn topological_phases(tasks: &[Task]) -> Vec<Vec<&Task>> {
 /// Topologically sort tasks. Assumes validate_dependency_graph passed.
 #[allow(dead_code)] // used in integration tests
 pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
+    if let Err(err) = validate_unique_task_names(tasks) {
+        tracing::error!("{}", err);
+        return Vec::new();
+    }
+
     let task_map: HashMap<&str, &Task> = tasks.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -226,4 +253,3 @@ pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
 
     sorted
 }
-

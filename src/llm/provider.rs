@@ -26,16 +26,36 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: &str) -> Self {
-        Self { role: "system".into(), content: Some(content.into()), tool_call_id: None, tool_calls: None }
+        Self {
+            role: "system".into(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }
     }
     pub fn user(content: &str) -> Self {
-        Self { role: "user".into(), content: Some(content.into()), tool_call_id: None, tool_calls: None }
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }
     }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCallRequest>>) -> Self {
-        Self { role: "assistant".into(), content, tool_call_id: None, tool_calls }
+        Self {
+            role: "assistant".into(),
+            content,
+            tool_call_id: None,
+            tool_calls,
+        }
     }
     pub fn tool(tool_call_id: &str, content: &str) -> Self {
-        Self { role: "tool".into(), content: Some(content.into()), tool_call_id: Some(tool_call_id.into()), tool_calls: None }
+        Self {
+            role: "tool".into(),
+            content: Some(content.into()),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: None,
+        }
     }
 }
 

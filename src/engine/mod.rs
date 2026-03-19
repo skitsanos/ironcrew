@@ -10,6 +10,6 @@ pub mod messagebus;
 pub mod model_router;
 pub mod orchestrator;
 pub mod run_history;
-pub mod task_runner;
 pub mod runtime;
 pub mod task;
+pub mod task_runner;

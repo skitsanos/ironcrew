@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::Tool;
 use crate::llm::provider::ToolSchema;
@@ -18,8 +18,15 @@ impl FileReadTool {
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
 
-        // Prevent directory traversal
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        // Prevent absolute paths and directory traversal
+        if path.is_absolute()
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
             return Err(IronCrewError::ToolExecution {
                 tool: "file_read".into(),
                 message: "Directory traversal not allowed".into(),

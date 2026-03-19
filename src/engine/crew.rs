@@ -16,7 +16,7 @@ pub use crate::engine::collaborative::execute_collaborative_task;
 #[allow(unused_imports)]
 pub use crate::engine::condition::evaluate_condition;
 #[allow(unused_imports)]
-pub use crate::engine::executor::{execute_task_standalone, TaskExecutionContext};
+pub use crate::engine::executor::{TaskExecutionContext, execute_task_standalone};
 #[allow(unused_imports)]
 pub use crate::engine::foreach::execute_foreach_task;
 #[allow(unused_imports)]

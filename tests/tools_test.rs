@@ -1,6 +1,6 @@
+use ironcrew::tools::Tool;
 use ironcrew::tools::hash::HashTool;
 use ironcrew::tools::template_render::TemplateRenderTool;
-use ironcrew::tools::Tool;
 use serde_json::json;
 
 #[tokio::test]

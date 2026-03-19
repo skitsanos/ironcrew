@@ -49,10 +49,7 @@ pub async fn execute_foreach_task(
             return Ok(TaskResult {
                 task: task.name.clone(),
                 agent: String::new(),
-                output: format!(
-                    "Skipped: foreach source '{}' is not an array",
-                    source_key
-                ),
+                output: format!("Skipped: foreach source '{}' is not an array", source_key),
                 success: false,
                 duration_ms: 0,
                 token_usage: None,
@@ -148,12 +145,7 @@ pub async fn execute_foreach_task(
                 foreach_outputs.push(output);
             }
             Err(e) => {
-                tracing::warn!(
-                    "foreach item {}/{} failed: {}",
-                    idx + 1,
-                    items.len(),
-                    e
-                );
+                tracing::warn!("foreach item {}/{} failed: {}", idx + 1, items.len(), e);
                 foreach_outputs.push(format!("Error: {}", e));
                 all_success = false;
             }

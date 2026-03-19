@@ -46,31 +46,27 @@ pub fn load_project(path: &Path) -> Result<ProjectLoader> {
 /// 6. Registering Crew.new() with preloaded agents
 ///
 /// Returns the configured Lua VM and the shared Runtime.
-pub fn setup_crew_runtime(
-    loader: &ProjectLoader,
-) -> Result<(mlua::Lua, Arc<Runtime>)> {
+pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runtime>)> {
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
 
     // Register globals
     register_agent_constructor(&lua).map_err(IronCrewError::Lua)?;
 
     // Create provider
-    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-        IronCrewError::Validation("OPENAI_API_KEY environment variable not set".into())
-    })?;
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let base_url = std::env::var("OPENAI_BASE_URL").ok();
     let provider = Box::new(OpenAiProvider::new(api_key, base_url));
 
     // Load declarative agents from agents/ directory
-    let preloaded_agents = load_agents_from_files(&lua, loader.agent_files())?;
+    let preloaded_agents = load_agents_from_files(loader.agent_files())?;
     tracing::info!("Loaded {} agent(s) from files", preloaded_agents.len());
 
     // Load Lua tool definitions
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files())?;
+    let tool_defs = load_tool_defs_from_files(loader.tool_files())?;
 
     // Create runtime with built-in + Lua tools
     let mut runtime = Runtime::new(provider, Some(loader.project_dir()));
-    runtime.register_lua_tools(tool_defs);
+    runtime.register_lua_tools(tool_defs)?;
     let runtime = Arc::new(runtime);
 
     // Register Crew.new() with preloaded agents auto-injected

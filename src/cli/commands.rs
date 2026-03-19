@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::lua::api::{load_agents_from_files, load_tool_defs_from_files};
-use crate::lua::sandbox::create_crew_lua;
+use crate::lua::sandbox::create_tool_lua;
 use crate::utils::error::{IronCrewError, Result};
 
 use super::project::{load_project, setup_crew_runtime};
@@ -28,13 +28,13 @@ pub async fn cmd_run(path: &Path) -> Result<()> {
 
 pub fn cmd_validate(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
-    let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
+    let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
 
     println!("Validating project: {}", loader.project_dir().display());
     println!();
 
     // 1. Validate agent files
-    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+    let agents = load_agents_from_files(loader.agent_files())?;
     println!("Agents ({}):", agents.len());
     for agent in &agents {
         let mut details = vec![];
@@ -63,7 +63,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     println!();
 
     // 2. Validate tool files
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+    let tool_defs = load_tool_defs_from_files(loader.tool_files())?;
     let known_tools: Vec<String> = vec![
         "file_read",
         "file_write",
@@ -79,7 +79,9 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     .collect();
 
     println!("Tools ({} built-in + {} custom):", 7, tool_defs.len());
-    println!("  Built-in: file_read, file_write, web_scrape, shell, http_request, hash, template_render");
+    println!(
+        "  Built-in: file_read, file_write, web_scrape, shell, http_request, hash, template_render"
+    );
     for tool in &tool_defs {
         println!(
             "  \u{2713} {} (custom, from {})",
@@ -95,7 +97,10 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
         lua.load(&script).into_function().map_err(|e| {
             IronCrewError::Validation(format!("Syntax error in {}: {}", entrypoint.display(), e))
         })?;
-        println!("Entrypoint: \u{2713} {} (syntax valid)", entrypoint.display());
+        println!(
+            "Entrypoint: \u{2713} {} (syntax valid)",
+            entrypoint.display()
+        );
     }
     println!();
 
@@ -249,13 +254,9 @@ pub fn cmd_nodes() -> Result<()> {
     registry.register(Box::new(crate::tools::file_write::FileWriteTool::new(
         None, None,
     )));
-    registry.register(Box::new(crate::tools::web_scrape::WebScrapeTool::new(
-        None,
-    )));
+    registry.register(Box::new(crate::tools::web_scrape::WebScrapeTool::new(None)));
     registry.register(Box::new(crate::tools::shell::ShellTool::new()));
-    registry.register(Box::new(
-        crate::tools::http_request::HttpRequestTool::new(),
-    ));
+    registry.register(Box::new(crate::tools::http_request::HttpRequestTool::new()));
     registry.register(Box::new(crate::tools::hash::HashTool::new()));
     registry.register(Box::new(
         crate::tools::template_render::TemplateRenderTool::new(),
@@ -288,13 +289,12 @@ pub fn cmd_nodes() -> Result<()> {
 
 pub fn cmd_list(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
-    let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
 
     println!("Project: {}", loader.project_dir().display());
     println!();
 
     // List agents
-    let agents = load_agents_from_files(&lua, loader.agent_files()).unwrap_or_default();
+    let agents = load_agents_from_files(loader.agent_files())?;
     println!("Agents ({}):", agents.len());
     for agent in &agents {
         println!("  {} -- {}", agent.name, agent.goal);
@@ -317,7 +317,7 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     println!();
 
     // List tool files
-    let tool_defs = load_tool_defs_from_files(&lua, loader.tool_files()).unwrap_or_default();
+    let tool_defs = load_tool_defs_from_files(loader.tool_files())?;
     println!("Custom tools ({}):", tool_defs.len());
     for tool in &tool_defs {
         println!(
@@ -334,7 +334,9 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     }
     println!();
 
-    println!("Built-in tools (7): file_read, file_write, web_scrape, shell, http_request, hash, template_render");
+    println!(
+        "Built-in tools (7): file_read, file_write, web_scrape, shell, http_request, hash, template_render"
+    );
     println!();
 
     // Entrypoint

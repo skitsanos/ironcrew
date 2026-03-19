@@ -11,6 +11,7 @@ use crate::engine::model_router::ModelRouter;
 use crate::engine::runtime::Runtime;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::LlmProvider;
+use crate::utils::error::IronCrewError;
 
 // Re-export everything that was previously defined here so that existing
 // import paths (`crate::lua::api::…`) continue to work unchanged.
@@ -21,8 +22,8 @@ pub use super::crew_userdata::LuaCrew;
 pub use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
 #[allow(unused_imports)]
 pub use super::parsers::{
-    agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files, task_from_lua_table,
-    tool_def_from_lua_table, LuaToolDef,
+    LuaToolDef, agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files,
+    task_from_lua_table, tool_def_from_lua_table,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,21 +70,40 @@ pub fn register_crew_constructor(
     let new_fn = lua.create_function(move |_, table: Table| {
         let project_dir = (*project_dir).clone();
         let goal: String = table.get("goal")?;
-        let provider: String =
-            table.get::<String>("provider").unwrap_or_else(|_| "openai".into());
-        let model: String =
-            table.get::<String>("model").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let provider: String = table
+            .get::<String>("provider")
+            .unwrap_or_else(|_| "openai".into());
+        let model: String = table
+            .get::<String>("model")
+            .unwrap_or_else(|_| "gpt-4o-mini".into());
         let base_url: Option<String> = table.get("base_url").ok();
         let api_key: Option<String> = table.get("api_key").ok();
-        let max_concurrent: Option<usize> = table.get::<Option<usize>>("max_concurrent").ok().flatten();
+        let max_concurrent: Option<usize> =
+            table.get::<Option<usize>>("max_concurrent").ok().flatten();
+        let normalized_provider = provider.to_lowercase();
+
+        if normalized_provider != "openai" {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Unsupported provider '{}'. Only 'openai' is supported.",
+                provider
+            ))));
+        }
 
         // Create a custom provider if api_key or base_url differ from defaults
         let custom_provider: Option<Arc<dyn LlmProvider>> =
             if api_key.is_some() || base_url.is_some() {
-                let key = api_key
+                let key = match api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .unwrap_or_default();
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    Some(key) => key,
+                    None => {
+                        return Err(mlua::Error::external(IronCrewError::Validation(
+                            "Crew with custom provider settings requires an api_key".to_string(),
+                        )));
+                    }
+                };
                 let url = base_url.clone();
                 Some(Arc::new(OpenAiProvider::new(key, url)))
             } else {

@@ -24,11 +24,7 @@ pub fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>
         Ok(mlua::Value::Nil) => false,
         Ok(_) => true,
         Err(e) => {
-            tracing::warn!(
-                "Condition evaluation failed for '{}': {}",
-                condition,
-                e
-            );
+            tracing::warn!("Condition evaluation failed for '{}': {}", condition, e);
             false
         }
     }

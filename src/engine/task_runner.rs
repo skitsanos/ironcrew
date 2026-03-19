@@ -186,15 +186,12 @@ pub async fn handle_task_error(
     );
 
     let error_agent = if let Some(ref ea_name) = error_task.agent {
-        crew_agents
-            .iter()
-            .find(|a| a.name == *ea_name)
-            .unwrap_or(
-                crew_agents
-                    .iter()
-                    .find(|a| a.name == agent_name)
-                    .unwrap_or(&crew_agents[0]),
-            )
+        crew_agents.iter().find(|a| a.name == *ea_name).unwrap_or(
+            crew_agents
+                .iter()
+                .find(|a| a.name == agent_name)
+                .unwrap_or(&crew_agents[0]),
+        )
     } else {
         AgentSelector::select(crew_agents, &error_task)
     };

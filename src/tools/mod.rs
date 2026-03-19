@@ -8,9 +8,9 @@ pub mod shell;
 pub mod template_render;
 pub mod web_scrape;
 
-use async_trait::async_trait;
-use crate::utils::error::Result;
 use crate::llm::provider::ToolSchema;
+use crate::utils::error::Result;
+use async_trait::async_trait;
 
 #[async_trait]
 pub trait Tool: Send + Sync {

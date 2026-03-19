@@ -79,7 +79,7 @@ impl Tool for HttpRequestTool {
                 return Err(IronCrewError::ToolExecution {
                     tool: "http_request".into(),
                     message: format!("Unsupported method: {other}"),
-                })
+                });
             }
         };
 
@@ -143,10 +143,13 @@ impl Tool for HttpRequestTool {
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
-        let body_text = resp.text().await.map_err(|e| IronCrewError::ToolExecution {
-            tool: "http_request".into(),
-            message: format!("Failed to read response: {e}"),
-        })?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| IronCrewError::ToolExecution {
+                tool: "http_request".into(),
+                message: format!("Failed to read response: {e}"),
+            })?;
 
         // Try to parse as JSON for pretty output
         let body_value: serde_json::Value =

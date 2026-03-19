@@ -50,17 +50,17 @@ impl Tool for TemplateRenderTool {
         let data = args.get("data").cloned().unwrap_or(json!({}));
 
         let mut tera = Tera::default();
-        tera.add_raw_template("inline", template_str)
-            .map_err(|e| IronCrewError::ToolExecution {
+        tera.add_raw_template("inline", template_str).map_err(|e| {
+            IronCrewError::ToolExecution {
                 tool: "template_render".into(),
                 message: format!("Template parse error: {}", e),
-            })?;
+            }
+        })?;
 
-        let context =
-            Context::from_serialize(&data).map_err(|e| IronCrewError::ToolExecution {
-                tool: "template_render".into(),
-                message: format!("Context error: {}", e),
-            })?;
+        let context = Context::from_serialize(&data).map_err(|e| IronCrewError::ToolExecution {
+            tool: "template_render".into(),
+            message: format!("Context error: {}", e),
+        })?;
 
         tera.render("inline", &context)
             .map_err(|e| IronCrewError::ToolExecution {

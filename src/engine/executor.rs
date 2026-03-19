@@ -28,11 +28,12 @@ impl<'a> TaskExecutionContext<'a> {
         let mut total_usage = TaskTokenUsage::default();
 
         // System prompt
-        let system_content = self
-            .agent
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| format!("You are {}. Your goal: {}", self.agent.name, self.agent.goal));
+        let system_content = self.agent.system_prompt.clone().unwrap_or_else(|| {
+            format!(
+                "You are {}. Your goal: {}",
+                self.agent.name, self.agent.goal
+            )
+        });
         messages.push(ChatMessage::system(&system_content));
 
         // Interpolate task fields with completed results
@@ -74,10 +75,7 @@ impl<'a> TaskExecutionContext<'a> {
             if let Some(dep_result) = self.completed_results.get(dep_name)
                 && dep_result.success
             {
-                prompt_parts.push(format!(
-                    "Result from '{}': {}",
-                    dep_name, dep_result.output
-                ));
+                prompt_parts.push(format!("Result from '{}': {}", dep_name, dep_result.output));
             }
         }
 
@@ -127,7 +125,9 @@ impl<'a> TaskExecutionContext<'a> {
                 print_handle.await.ok();
                 result?
             } else if has_tools {
-                self.provider.chat_with_tools(request, &tool_schemas).await?
+                self.provider
+                    .chat_with_tools(request, &tool_schemas)
+                    .await?
             } else {
                 self.provider.chat(request).await?
             };
@@ -171,9 +171,8 @@ impl<'a> TaskExecutionContext<'a> {
                     self.task.name
                 );
 
-                let args: serde_json::Value =
-                    serde_json::from_str(&tool_call.function.arguments)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
                 let tool_result = self
                     .tool_registry

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::llm::provider::LlmProvider;
@@ -10,10 +10,12 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::ShellTool;
 use crate::tools::template_render::TemplateRenderTool;
 use crate::tools::web_scrape::WebScrapeTool;
+use crate::utils::error::{IronCrewError, Result};
 
 pub struct Runtime {
     pub tool_registry: ToolRegistry,
     pub provider: Arc<dyn LlmProvider>,
+    project_dir: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -33,6 +35,7 @@ impl Runtime {
         Self {
             tool_registry,
             provider: Arc::from(provider),
+            project_dir: base_dir,
         }
     }
 
@@ -43,16 +46,26 @@ impl Runtime {
 
     /// Register Lua-defined tools from tool definition metadata.
     /// Reads source from each tool's file path and wraps it in a LuaScriptTool.
-    pub fn register_lua_tools(&mut self, tool_defs: Vec<crate::lua::api::LuaToolDef>) {
+    pub fn register_lua_tools(
+        &mut self,
+        tool_defs: Vec<crate::lua::api::LuaToolDef>,
+    ) -> Result<()> {
         for def in tool_defs {
-            let source = std::fs::read_to_string(&def.source_path).unwrap_or_default();
+            let source = std::fs::read_to_string(&def.source_path).map_err(|err| {
+                IronCrewError::Validation(format!(
+                    "Failed to read Lua tool source '{}': {}",
+                    def.name, err
+                ))
+            })?;
             let lua_tool = crate::tools::lua_tool::LuaScriptTool::new(
                 def.name,
                 def.description,
                 def.parameters,
                 source,
+                self.project_dir.clone(),
             );
             self.tool_registry.register(Box::new(lua_tool));
         }
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
-use ironcrew::tools::registry::ToolRegistry;
 use ironcrew::tools::file_read::FileReadTool;
 use ironcrew::tools::file_write::FileWriteTool;
+use ironcrew::tools::registry::ToolRegistry;
 
 #[test]
 fn test_register_and_get_tool() {
