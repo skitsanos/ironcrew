@@ -1,4 +1,5 @@
 use ironcrew::tools::Tool;
+use ironcrew::tools::file_read_glob::FileReadGlobTool;
 use ironcrew::tools::hash::HashTool;
 use ironcrew::tools::template_render::TemplateRenderTool;
 use serde_json::json;
@@ -63,4 +64,26 @@ async fn test_template_render_with_conditional() {
         .await
         .unwrap();
     assert_eq!(result, "Active");
+}
+
+#[tokio::test]
+async fn test_file_read_glob_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "content a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "content b").unwrap();
+    std::fs::write(dir.path().join("c.md"), "content c").unwrap();
+
+    let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
+    let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0]["content"], "content a");
+    assert_eq!(parsed[1]["content"], "content b");
+}
+
+#[tokio::test]
+async fn test_file_read_glob_traversal_blocked() {
+    let tool = FileReadGlobTool::new(None);
+    let result = tool.execute(json!({"pattern": "../etc/*.conf"})).await;
+    assert!(result.is_err());
 }

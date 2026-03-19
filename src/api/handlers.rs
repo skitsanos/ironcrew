@@ -256,13 +256,14 @@ pub async fn list_agents(
 pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
     use crate::tools::registry::ToolRegistry;
     use crate::tools::{
-        file_read::FileReadTool, file_write::FileWriteTool, hash::HashTool,
-        http_request::HttpRequestTool, shell::ShellTool, template_render::TemplateRenderTool,
-        web_scrape::WebScrapeTool,
+        file_read::FileReadTool, file_read_glob::FileReadGlobTool, file_write::FileWriteTool,
+        hash::HashTool, http_request::HttpRequestTool, shell::ShellTool,
+        template_render::TemplateRenderTool, web_scrape::WebScrapeTool,
     };
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(FileReadTool::new(None)));
+    registry.register(Box::new(FileReadGlobTool::new(None)));
     registry.register(Box::new(FileWriteTool::new(None, None)));
     registry.register(Box::new(WebScrapeTool::new(None)));
     registry.register(Box::new(ShellTool::new()));

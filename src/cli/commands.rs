@@ -66,6 +66,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     let tool_defs = load_tool_defs_from_files(loader.tool_files())?;
     let known_tools: Vec<String> = vec![
         "file_read",
+        "file_read_glob",
         "file_write",
         "web_scrape",
         "shell",
@@ -78,9 +79,9 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     .chain(tool_defs.iter().map(|t| t.name.clone()))
     .collect();
 
-    println!("Tools ({} built-in + {} custom):", 7, tool_defs.len());
+    println!("Tools ({} built-in + {} custom):", 8, tool_defs.len());
     println!(
-        "  Built-in: file_read, file_write, web_scrape, shell, http_request, hash, template_render"
+        "  Built-in: file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render"
     );
     for tool in &tool_defs {
         println!(
@@ -251,6 +252,9 @@ pub fn cmd_nodes() -> Result<()> {
 
     // Register all built-in tools
     registry.register(Box::new(crate::tools::file_read::FileReadTool::new(None)));
+    registry.register(Box::new(
+        crate::tools::file_read_glob::FileReadGlobTool::new(None),
+    ));
     registry.register(Box::new(crate::tools::file_write::FileWriteTool::new(
         None, None,
     )));
@@ -335,7 +339,7 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     println!();
 
     println!(
-        "Built-in tools (7): file_read, file_write, web_scrape, shell, http_request, hash, template_render"
+        "Built-in tools (8): file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render"
     );
     println!();
 

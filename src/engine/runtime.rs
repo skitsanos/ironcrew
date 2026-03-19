@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use crate::llm::provider::LlmProvider;
 use crate::tools::file_read::FileReadTool;
+use crate::tools::file_read_glob::FileReadGlobTool;
 use crate::tools::file_write::FileWriteTool;
 use crate::tools::hash::HashTool;
 use crate::tools::http_request::HttpRequestTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::ShellTool;
 use crate::tools::template_render::TemplateRenderTool;
+use crate::tools::validate_schema::ValidateSchemaTool;
 use crate::tools::web_scrape::WebScrapeTool;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -25,11 +27,13 @@ impl Runtime {
         let base_dir = project_dir.map(|p| p.to_path_buf());
 
         tool_registry.register(Box::new(FileReadTool::new(base_dir.clone())));
+        tool_registry.register(Box::new(FileReadGlobTool::new(base_dir.clone())));
         tool_registry.register(Box::new(FileWriteTool::new(base_dir.clone(), None)));
         tool_registry.register(Box::new(WebScrapeTool::new(None)));
         tool_registry.register(Box::new(HttpRequestTool::new()));
         tool_registry.register(Box::new(HashTool::new()));
         tool_registry.register(Box::new(TemplateRenderTool::new()));
+        tool_registry.register(Box::new(ValidateSchemaTool::new()));
         // Shell tool intentionally NOT registered by default
 
         Self {
