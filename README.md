@@ -458,6 +458,42 @@ ironcrew serve --flows-dir ./flows --port 3000
 | GET | `/flows/{flow}/agents` | List agents |
 | GET | `/nodes` | List built-in tools |
 
+## Docker + REST API (examples/simple)
+
+If your local service already uses port `3000`, expose IronCrew on another host port.
+
+```bash
+docker run --rm -d \
+  -p 3001:3000 \
+  --env-file /path/to/ironcrew/.env \
+  -v /path/to/ironcrew/.env:/app/.env:ro \
+  -v /path/to/ironcrew/examples:/app/examples \
+  ironcrew:local \
+  serve --host 0.0.0.0 --flows-dir /app/examples --port 3000
+```
+
+Why this layout:
+- `--flows-dir /app/examples` so flow names map directly to folders like `simple`.
+- `.env` is loaded by `--env-file` and is also mounted at `/app/.env`.
+- `examples` is mounted read-write so run history is persisted under `examples/<flow>/.ironcrew/runs`.
+
+Smoke test:
+
+```bash
+curl -sS http://127.0.0.1:3001/health
+curl -sS http://127.0.0.1:3001/flows/simple/validate
+curl -sS -X POST http://127.0.0.1:3001/flows/simple/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":{"topic":"Rust ownership"}}'
+curl -sS http://127.0.0.1:3001/flows/simple/runs
+```
+
+SSE stream:
+
+```bash
+curl -N -sS http://127.0.0.1:3001/flows/simple/events/<run_id>
+```
+
 ## Using Other Providers
 
 Any OpenAI-compatible API works by setting `base_url` and `api_key`:

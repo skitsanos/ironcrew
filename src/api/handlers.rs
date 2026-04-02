@@ -61,6 +61,9 @@ pub async fn run_flow(
     tokio::spawn(async move {
         let result = execute_crew_from_path_with_events(&flow_path, &eventbus).await;
 
+        // Small delay to let any final print()/log() events drain before run_complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         match result {
             Ok(response) => {
                 eventbus.emit(CrewEvent::RunComplete {
@@ -215,6 +218,19 @@ pub async fn execute_crew_from_path(
 // SSE event stream
 // ---------------------------------------------------------------------------
 
+fn event_type_str(event: &CrewEvent) -> &'static str {
+    match event {
+        CrewEvent::PhaseStart { .. } => "phase_start",
+        CrewEvent::TaskAssigned { .. } => "task_assigned",
+        CrewEvent::TaskCompleted { .. } => "task_completed",
+        CrewEvent::TaskFailed { .. } => "task_failed",
+        CrewEvent::TaskSkipped { .. } => "task_skipped",
+        CrewEvent::ToolCall { .. } => "tool_call",
+        CrewEvent::Log { .. } => "log",
+        CrewEvent::RunComplete { .. } => "run_complete",
+    }
+}
+
 pub async fn flow_events(
     State(state): State<Arc<AppState>>,
     Path((flow, run_id)): Path<(String, String)>,
@@ -234,29 +250,31 @@ pub async fn flow_events(
         )
     })?;
 
+    // Get replay buffer and live subscription
+    let replay = eventbus.replay().await;
     let mut rx = eventbus.subscribe();
     drop(active_runs);
 
     let stream = async_stream::stream! {
+        // First: replay all past events for late subscribers
+        for event in replay {
+            let event_type = event_type_str(&event);
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            yield Ok(Event::default().event(event_type).data(data));
+
+            if matches!(event, CrewEvent::RunComplete { .. }) {
+                return; // Run already finished, no need for live stream
+            }
+        }
+
+        // Then: stream live events
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    let event_type = match &event {
-                        CrewEvent::PhaseStart { .. } => "phase_start",
-                        CrewEvent::TaskAssigned { .. } => "task_assigned",
-                        CrewEvent::TaskCompleted { .. } => "task_completed",
-                        CrewEvent::TaskFailed { .. } => "task_failed",
-                        CrewEvent::TaskSkipped { .. } => "task_skipped",
-                        CrewEvent::ToolCall { .. } => "tool_call",
-                        CrewEvent::Log { .. } => "log",
-                        CrewEvent::RunComplete { .. } => "run_complete",
-                    };
-
+                    let event_type = event_type_str(&event);
                     let data = serde_json::to_string(&event).unwrap_or_default();
-                    let sse_event = Event::default().event(event_type).data(data);
-                    yield Ok(sse_event);
+                    yield Ok(Event::default().event(event_type).data(data));
 
-                    // Close stream after run_complete
                     if matches!(event, CrewEvent::RunComplete { .. }) {
                         break;
                     }

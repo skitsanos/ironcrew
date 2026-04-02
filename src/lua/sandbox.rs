@@ -53,8 +53,8 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     })?;
     lua.globals().set("base64_decode", b64_decode_fn)?;
 
-    // log(level, msg...)
-    let log_fn = lua.create_function(|_, args: mlua::Variadic<String>| {
+    // log(level, msg...) — also emits to EventBus if available
+    let log_fn = lua.create_function(|lua, args: mlua::Variadic<String>| {
         let args: Vec<String> = args.into_iter().collect();
         if args.is_empty() {
             return Ok(());
@@ -76,9 +76,34 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
             "error" => tracing::error!("<lua> {}", message),
             _ => tracing::info!("<lua> {}", message),
         }
+
+        // Emit to EventBus if one is injected via app_data
+        if let Some(eventbus) = lua.app_data_ref::<crate::engine::eventbus::EventBus>() {
+            eventbus.emit(crate::engine::eventbus::CrewEvent::Log {
+                level: level.clone(),
+                message: message.clone(),
+            });
+        }
+
         Ok(())
     })?;
     lua.globals().set("log", log_fn)?;
+
+    // Override print() to also emit to EventBus as a log event
+    let print_fn = lua.create_function(|lua, args: mlua::Variadic<String>| {
+        let message = args.into_iter().collect::<Vec<_>>().join("\t");
+        println!("{}", message);
+
+        if let Some(eventbus) = lua.app_data_ref::<crate::engine::eventbus::EventBus>() {
+            eventbus.emit(crate::engine::eventbus::CrewEvent::Log {
+                level: "info".into(),
+                message,
+            });
+        }
+
+        Ok(())
+    })?;
+    lua.globals().set("print", print_fn)?;
 
     // regex namespace — Rust regex engine exposed to Lua
     let regex_table = lua.create_table()?;

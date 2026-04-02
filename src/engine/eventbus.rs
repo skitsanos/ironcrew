@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -52,6 +52,8 @@ pub enum CrewEvent {
 #[derive(Clone)]
 pub struct EventBus {
     sender: Arc<broadcast::Sender<CrewEvent>>,
+    /// Replay buffer: all emitted events stored for late subscribers.
+    history: Arc<RwLock<Vec<CrewEvent>>>,
 }
 
 impl EventBus {
@@ -59,16 +61,26 @@ impl EventBus {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender: Arc::new(sender),
+            history: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     pub fn emit(&self, event: CrewEvent) {
-        // Ignore send errors (no subscribers)
+        // Store in replay buffer
+        if let Ok(mut history) = self.history.try_write() {
+            history.push(event.clone());
+        }
+        // Broadcast to live subscribers (ignore if none)
         let _ = self.sender.send(event);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CrewEvent> {
         self.sender.subscribe()
+    }
+
+    /// Get all events emitted so far (for replay to late subscribers).
+    pub async fn replay(&self) -> Vec<CrewEvent> {
+        self.history.read().await.clone()
     }
 }
 
