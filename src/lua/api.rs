@@ -121,12 +121,18 @@ pub fn register_crew_constructor(
             .get::<String>("memory")
             .unwrap_or_else(|_| "ephemeral".into());
 
-        let max_memory_items: Option<usize> = table.get("max_memory_items").ok();
-        let max_memory_tokens: Option<usize> = table.get("max_memory_tokens").ok();
-
+        let defaults = MemoryConfig::default();
         let memory_config = MemoryConfig {
-            max_items: max_memory_items,
-            max_total_tokens: max_memory_tokens,
+            max_items: table
+                .get::<Option<usize>>("max_memory_items")
+                .ok()
+                .flatten()
+                .or(defaults.max_items),
+            max_total_tokens: table
+                .get::<Option<usize>>("max_memory_tokens")
+                .ok()
+                .flatten()
+                .or(defaults.max_total_tokens),
         };
 
         let memory = match memory_mode.as_str() {

@@ -62,36 +62,58 @@ pub async fn run_flow(
         // Maximum run lifetime: 30 minutes
         let max_lifetime = std::time::Duration::from_secs(30 * 60);
 
-        let result = tokio::time::timeout(max_lifetime, async {
-            execute_crew_from_path_with_events(&flow_path, &eventbus).await
-        })
-        .await;
+        // Spawn the actual work as a child task so we can abort it on timeout
+        let eventbus_inner = eventbus.clone();
+        let mut work_handle = tokio::spawn(async move {
+            execute_crew_from_path_with_events(&flow_path, &eventbus_inner).await
+        });
 
-        // Small delay to let any final print()/log() events drain before run_complete
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Race the work against the timeout
+        tokio::select! {
+            join_result = &mut work_handle => {
+                // Small delay to drain final events
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        match result {
-            Ok(Ok(response)) => {
-                eventbus.emit(CrewEvent::RunComplete {
-                    run_id: response.run_id.clone(),
-                    status: response.status.clone(),
-                    duration_ms: response.duration_ms,
-                    total_tokens: response.results.iter().map(|_| 0u32).sum(),
-                });
+                match join_result {
+                    Ok(Ok(response)) => {
+                        eventbus.emit(CrewEvent::RunComplete {
+                            run_id: response.run_id.clone(),
+                            status: response.status.clone(),
+                            duration_ms: response.duration_ms,
+                            total_tokens: response.results.iter().map(|_| 0u32).sum(),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        eventbus.emit(CrewEvent::Log {
+                            level: "error".into(),
+                            message: e.to_string(),
+                        });
+                        eventbus.emit(CrewEvent::RunComplete {
+                            run_id: run_id_clone.clone(),
+                            status: "failed".into(),
+                            duration_ms: 0,
+                            total_tokens: 0,
+                        });
+                    }
+                    Err(join_err) => {
+                        eventbus.emit(CrewEvent::Log {
+                            level: "error".into(),
+                            message: format!("Task panicked: {}", join_err),
+                        });
+                        eventbus.emit(CrewEvent::RunComplete {
+                            run_id: run_id_clone.clone(),
+                            status: "failed".into(),
+                            duration_ms: 0,
+                            total_tokens: 0,
+                        });
+                    }
+                }
             }
-            Ok(Err(e)) => {
-                eventbus.emit(CrewEvent::Log {
-                    level: "error".into(),
-                    message: e.to_string(),
-                });
-                eventbus.emit(CrewEvent::RunComplete {
-                    run_id: run_id_clone.clone(),
-                    status: "failed".into(),
-                    duration_ms: 0,
-                    total_tokens: 0,
-                });
-            }
-            Err(_timeout) => {
+            _ = tokio::time::sleep(max_lifetime) => {
+                // Timeout: abort the work handle to cancel ongoing LLM calls
+                // and any sub-tasks awaiting inside the orchestrator.
+                work_handle.abort();
+                tracing::warn!("Run {} timed out after {}s", run_id_clone, max_lifetime.as_secs());
                 eventbus.emit(CrewEvent::RunComplete {
                     run_id: run_id_clone.clone(),
                     status: "timeout".into(),
