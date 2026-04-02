@@ -67,12 +67,13 @@ impl OpenAiProvider {
                     body["response_format"] = json!({"type": "json_object"});
                 }
                 ResponseFormat::JsonSchema { name, schema } => {
+                    // Note: "strict" omitted for cross-provider compatibility
+                    // (Gemini and others reject it; OpenAI works without it)
                     body["response_format"] = json!({
                         "type": "json_schema",
                         "json_schema": {
                             "name": name,
                             "schema": schema,
-                            "strict": true,
                         }
                     });
                 }
@@ -133,8 +134,14 @@ impl OpenAiProvider {
         let resp_body: Value = resp.json().await.map_err(IronCrewError::Http)?;
 
         if !status.is_success() {
+            // Handle different error formats across providers:
+            // OpenAI: {"error": {"message": "..."}}
+            // Gemini: {"error": {"message": "...", "status": "..."}}
+            // Some: plain text or {"message": "..."}
             let error_msg = resp_body["error"]["message"]
                 .as_str()
+                .or_else(|| resp_body["message"].as_str())
+                .or_else(|| resp_body["error"].as_str())
                 .unwrap_or("Unknown API error");
             return Err(IronCrewError::Provider(format!(
                 "HTTP {}: {}",
@@ -146,10 +153,10 @@ impl OpenAiProvider {
 
         let content = choice["content"].as_str().map(|s| s.to_string());
 
-        let tool_calls: Vec<ToolCallRequest> = choice
-            .get("tool_calls")
-            .and_then(|tc| serde_json::from_value(tc.clone()).ok())
-            .unwrap_or_default();
+        // Parse tool calls leniently — providers return different formats:
+        // - OpenAI: arguments as JSON string, type="function", id present
+        // - Gemini: arguments as object (not string), may omit type/id
+        let tool_calls = parse_tool_calls_lenient(choice.get("tool_calls"));
 
         let usage = resp_body.get("usage").map(|u| TokenUsage {
             prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
@@ -294,6 +301,46 @@ impl OpenAiProvider {
             usage: None,
         })
     }
+}
+
+/// Parse tool calls leniently to handle different provider response formats.
+/// - OpenAI: `arguments` is a JSON string, `type` is "function", `id` is present
+/// - Gemini: `arguments` may be a JSON object (not string), `type`/`id` may be missing
+fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallRequest> {
+    let Some(tc_array) = tool_calls_value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    tc_array
+        .iter()
+        .filter_map(|tc| {
+            let id = tc["id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let call_type = tc["type"]
+                .as_str()
+                .unwrap_or("function")
+                .to_string();
+
+            let name = tc["function"]["name"].as_str()?.to_string();
+
+            // Handle arguments as either a string (OpenAI) or an object (Gemini)
+            let arguments = match &tc["function"]["arguments"] {
+                Value::String(s) => s.clone(),
+                Value::Object(_) | Value::Array(_) => {
+                    serde_json::to_string(&tc["function"]["arguments"]).unwrap_or_default()
+                }
+                _ => String::from("{}"),
+            };
+
+            Some(ToolCallRequest {
+                id,
+                call_type,
+                function: ToolCallFunction { name, arguments },
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
