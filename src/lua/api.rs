@@ -92,15 +92,31 @@ pub fn register_crew_constructor(
         // Create a custom provider if api_key or base_url differ from defaults
         let custom_provider: Option<Arc<dyn LlmProvider>> =
             if api_key.is_some() || base_url.is_some() {
+                // Resolve API key: explicit > provider-specific env var > OPENAI_API_KEY
                 let key = match api_key
                     .clone()
+                    .or_else(|| {
+                        // Try provider-specific env vars based on base_url
+                        if let Some(ref url) = base_url {
+                            if url.contains("generativelanguage.googleapis.com") || url.contains("gemini") {
+                                return std::env::var("GEMINI_API_KEY").ok();
+                            }
+                            if url.contains("groq.com") {
+                                return std::env::var("GROQ_API_KEY").ok();
+                            }
+                            if url.contains("anthropic.com") {
+                                return std::env::var("ANTHROPIC_API_KEY").ok();
+                            }
+                        }
+                        None
+                    })
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                     .filter(|k| !k.trim().is_empty())
                 {
                     Some(key) => key,
                     None => {
                         return Err(mlua::Error::external(IronCrewError::Validation(
-                            "Crew with custom provider settings requires an api_key".to_string(),
+                            "Crew with custom provider settings requires an api_key (set via env var or Crew.new config)".to_string(),
                         )));
                     }
                 };
