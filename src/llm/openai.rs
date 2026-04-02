@@ -17,7 +17,6 @@ impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
-            .http1_only()  // Force HTTP/1.1 — avoids HTTP/2 framing issues with Google/Gemini
             .build()
             .expect("Failed to build HTTP client");
 
