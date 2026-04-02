@@ -381,8 +381,9 @@ return {
     },
     execute = function(args)
         -- Pure Lua logic, or use built-in helpers:
+        -- http.get(url), http.post(url, {json = {...}})
         -- fs.read(path), fs.write(path, content)
-        -- env("VAR_NAME")
+        -- env("VAR_NAME"), json_parse(), regex.*
         return args.text:sub(1, (args.max_words or 100) * 5)
     end,
 }
@@ -411,6 +412,27 @@ Available in all Lua contexts:
 | `regex.replace_all(pat, text, repl)` | Replace all |
 | `regex.split(pat, text)` | Split by pattern |
 | `validate_json(str, schema)` | Validate JSON against a JSON Schema |
+| `http.get(url, opts?)` | HTTP GET, returns `{status, headers, body, json, ok}` |
+| `http.post(url, opts?)` | HTTP POST (supports `body` or `json` option) |
+| `http.put(url, opts?)` | HTTP PUT |
+| `http.delete(url, opts?)` | HTTP DELETE |
+| `http.request(method, url, opts?)` | Any HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD) |
+
+### HTTP Options
+
+```lua
+local resp = http.post("https://api.example.com/data", {
+    headers = { ["Authorization"] = "Bearer " .. env("API_KEY") },
+    json = { name = "test", value = 42 },  -- auto-serialized Lua table
+    -- or: body = '{"raw":"string"}',      -- raw string body
+    timeout = 10,                           -- seconds (default 30)
+})
+
+if resp.ok then              -- true for 2xx status codes
+    local data = resp.json   -- auto-parsed if response is JSON
+    print(data.id)
+end
+```
 
 ## Built-in Tools
 
