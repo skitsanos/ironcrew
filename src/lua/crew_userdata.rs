@@ -5,6 +5,7 @@ use mlua::{Table, UserData, UserDataMethods, Value};
 use tokio::sync::Mutex;
 
 use crate::engine::crew::Crew;
+use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
 use crate::llm::provider::LlmProvider;
@@ -346,7 +347,13 @@ impl UserData for LuaCrew {
         methods.add_async_method("run", |lua, this, ()| async move {
             let run_start = chrono::Utc::now();
 
-            let crew = this.crew.lock().await;
+            let mut crew = this.crew.lock().await;
+
+            // If an EventBus was injected via Lua app_data (from API handler), use it.
+            if let Some(eventbus) = lua.app_data_ref::<EventBus>() {
+                crew.eventbus = eventbus.clone();
+            }
+
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
                 None => this.runtime.provider.clone(),

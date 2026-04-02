@@ -7,12 +7,17 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::engine::eventbus::EventBus;
 
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
+    pub active_runs: Arc<RwLock<HashMap<String, EventBus>>>,
 }
 
 /// Response from running a crew
@@ -116,6 +121,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/runs/{id}", delete(delete_run))
         .route("/flows/{flow}/validate", get(validate_flow))
         .route("/flows/{flow}/agents", get(list_agents))
+        .route("/flows/{flow}/events/{run_id}", get(flow_events))
         .route("/nodes", get(list_nodes))
         .with_state(state)
 }

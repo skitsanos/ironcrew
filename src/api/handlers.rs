@@ -2,9 +2,13 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
+    response::sse::{Event, Sse},
 };
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
+use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::run_history::RunHistory;
 use crate::utils::error::IronCrewError;
 
@@ -35,39 +39,86 @@ pub async fn health() -> Json<serde_json::Value> {
 pub async fn run_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
-) -> Result<Json<RunCrewResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
 
-    let result = execute_crew_from_path(&flow_path).await;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let eventbus = EventBus::new(256);
 
-    match result {
-        Ok(response) => Ok(Json(response)),
-        Err(e) => Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-        )),
-    }
+    // Store for SSE subscribers
+    state
+        .active_runs
+        .write()
+        .await
+        .insert(run_id.clone(), eventbus.clone());
+
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let flow_clone = flow.clone();
+
+    // Spawn execution in background
+    tokio::spawn(async move {
+        let result = execute_crew_from_path_with_events(&flow_path, &eventbus).await;
+
+        match result {
+            Ok(response) => {
+                eventbus.emit(CrewEvent::RunComplete {
+                    run_id: response.run_id.clone(),
+                    status: response.status.clone(),
+                    duration_ms: response.duration_ms,
+                    total_tokens: response.results.iter().map(|_| 0u32).sum(),
+                });
+            }
+            Err(e) => {
+                eventbus.emit(CrewEvent::Log {
+                    level: "error".into(),
+                    message: e.to_string(),
+                });
+                eventbus.emit(CrewEvent::RunComplete {
+                    run_id: run_id_clone.clone(),
+                    status: "failed".into(),
+                    duration_ms: 0,
+                    total_tokens: 0,
+                });
+            }
+        }
+
+        // Clean up after a delay to allow SSE clients to receive the final event
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        state_clone.active_runs.write().await.remove(&run_id_clone);
+    });
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id,
+        "status": "started",
+        "events_url": format!("/flows/{}/events/{}", flow_clone, run_id),
+    })))
 }
 
-pub async fn execute_crew_from_path(
+/// Execute a crew from a flow path, injecting an EventBus so the orchestrator emits events.
+async fn execute_crew_from_path_with_events(
     flow_path: &std::path::Path,
-) -> std::result::Result<RunCrewResponse, crate::utils::error::IronCrewError> {
+    eventbus: &EventBus,
+) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
 
     let loader = load_project(flow_path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
+    // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
+    lua.set_app_data(eventbus.clone());
+
     // Execute
-    let entrypoint = loader.entrypoint().ok_or_else(|| {
-        crate::utils::error::IronCrewError::Validation("No entrypoint found".into())
-    })?;
+    let entrypoint = loader
+        .entrypoint()
+        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
     let script = std::fs::read_to_string(entrypoint)?;
 
     lua.load(&script)
         .exec_async()
         .await
-        .map_err(crate::utils::error::IronCrewError::Lua)?;
+        .map_err(IronCrewError::Lua)?;
 
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
@@ -102,6 +153,128 @@ pub async fn execute_crew_from_path(
         duration_ms: 0,
         results: vec![],
     })
+}
+
+/// Original synchronous-style execution (kept for backward compatibility / CLI use).
+#[allow(dead_code)]
+pub async fn execute_crew_from_path(
+    flow_path: &std::path::Path,
+) -> std::result::Result<RunCrewResponse, IronCrewError> {
+    use crate::cli::project::{load_project, setup_crew_runtime};
+
+    let loader = load_project(flow_path)?;
+    let (lua, _runtime) = setup_crew_runtime(&loader)?;
+
+    // Execute
+    let entrypoint = loader
+        .entrypoint()
+        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
+    let script = std::fs::read_to_string(entrypoint)?;
+
+    lua.load(&script)
+        .exec_async()
+        .await
+        .map_err(IronCrewError::Lua)?;
+
+    let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
+
+    // Read the recorded run directly so concurrent executions cannot swap results.
+    let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
+    if let Some(run_id) = run_id {
+        let history = RunHistory::new(runs_dir)?;
+        let run = history.get(&run_id)?;
+        return Ok(RunCrewResponse {
+            run_id: run.run_id.clone(),
+            flow_name: run.flow_name.clone(),
+            status: run.status.to_string(),
+            duration_ms: run.duration_ms,
+            results: run
+                .task_results
+                .iter()
+                .map(|r| TaskResultResponse {
+                    task: r.task.clone(),
+                    agent: r.agent.clone(),
+                    output: r.output.clone(),
+                    success: r.success,
+                    duration_ms: r.duration_ms,
+                })
+                .collect(),
+        });
+    }
+
+    Ok(RunCrewResponse {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        flow_name: "unknown".into(),
+        status: "completed".into(),
+        duration_ms: 0,
+        results: vec![],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SSE event stream
+// ---------------------------------------------------------------------------
+
+pub async fn flow_events(
+    State(state): State<Arc<AppState>>,
+    Path((flow, run_id)): Path<(String, String)>,
+) -> Result<
+    Sse<impl futures::stream::Stream<Item = std::result::Result<Event, Infallible>>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    // Validate flow exists
+    let _ = resolve_flow_path(&state, &flow)
+        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+
+    let active_runs = state.active_runs.read().await;
+    let eventbus = active_runs.get(&run_id).ok_or_else(|| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found or already completed", run_id),
+        )
+    })?;
+
+    let mut rx = eventbus.subscribe();
+    drop(active_runs);
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let event_type = match &event {
+                        CrewEvent::PhaseStart { .. } => "phase_start",
+                        CrewEvent::TaskAssigned { .. } => "task_assigned",
+                        CrewEvent::TaskCompleted { .. } => "task_completed",
+                        CrewEvent::TaskFailed { .. } => "task_failed",
+                        CrewEvent::TaskSkipped { .. } => "task_skipped",
+                        CrewEvent::ToolCall { .. } => "tool_call",
+                        CrewEvent::Log { .. } => "log",
+                        CrewEvent::RunComplete { .. } => "run_complete",
+                    };
+
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    let sse_event = Event::default().event(event_type).data(data);
+                    yield Ok(sse_event);
+
+                    // Close stream after run_complete
+                    if matches!(event, CrewEvent::RunComplete { .. }) {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let sse_event = Event::default()
+                        .event("warning")
+                        .data(format!("{{\"message\":\"missed {} events\"}}", n));
+                    yield Ok(sse_event);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream))
 }
 
 // ---------------------------------------------------------------------------

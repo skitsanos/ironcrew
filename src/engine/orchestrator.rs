@@ -6,6 +6,7 @@ use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::collaborative::execute_collaborative_task;
 use crate::engine::condition::evaluate_condition;
 use crate::engine::crew::Crew;
+use crate::engine::eventbus::CrewEvent;
 use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
@@ -48,6 +49,7 @@ fn filter_eligible_tasks<'a>(
     error_handler_names: &HashSet<&str>,
     failed_tasks: &mut HashSet<String>,
     results: &mut HashMap<String, TaskResult>,
+    crew: &Crew,
 ) -> Vec<&'a Task> {
     let mut eligible = Vec::new();
 
@@ -59,10 +61,15 @@ fn filter_eligible_tasks<'a>(
 
         // Check if any dependency failed
         if let Some(failed_dep) = task.depends_on.iter().find(|d| failed_tasks.contains(*d)) {
+            let reason = format!("dependency '{}' failed", failed_dep);
+            crew.eventbus.emit(CrewEvent::TaskSkipped {
+                task: task.name.clone(),
+                reason: reason.clone(),
+            });
             let result = TaskResult {
                 task: task.name.clone(),
                 agent: String::new(),
-                output: format!("Skipped: dependency '{}' failed", failed_dep),
+                output: format!("Skipped: {}", reason),
                 success: false,
                 duration_ms: 0,
                 token_usage: None,
@@ -82,6 +89,10 @@ fn filter_eligible_tasks<'a>(
             let interpolated_condition = interpolate(condition, results);
             let should_run = evaluate_condition(&interpolated_condition, results);
             if !should_run {
+                crew.eventbus.emit(CrewEvent::TaskSkipped {
+                    task: task.name.clone(),
+                    reason: format!("condition '{}' evaluated to false", condition),
+                });
                 let result = TaskResult {
                     task: task.name.clone(),
                     agent: String::new(),
@@ -130,6 +141,12 @@ async fn process_phase_results(
 
         match output {
             Ok(out) => {
+                crew.eventbus.emit(CrewEvent::TaskCompleted {
+                    task: task_name.clone(),
+                    agent: agent_name.clone(),
+                    duration_ms,
+                    success: true,
+                });
                 let result = TaskResult {
                     task: task_name.clone(),
                     agent: agent_name,
@@ -172,6 +189,11 @@ async fn process_phase_results(
                 }
 
                 // Original failure path (no handler or handler failed)
+                crew.eventbus.emit(CrewEvent::TaskFailed {
+                    task: task_name.clone(),
+                    agent: agent_name.clone(),
+                    error: error_msg.clone(),
+                });
                 let result = TaskResult {
                     task: task_name.clone(),
                     agent: agent_name,
@@ -231,12 +253,22 @@ pub async fn run_crew(
         .collect();
 
     for (phase_idx, phase) in phases.iter().enumerate() {
-        let phase_tasks =
-            filter_eligible_tasks(phase, &error_handler_names, &mut failed_tasks, &mut results);
+        let phase_tasks = filter_eligible_tasks(
+            phase,
+            &error_handler_names,
+            &mut failed_tasks,
+            &mut results,
+            crew,
+        );
 
         if phase_tasks.is_empty() {
             continue;
         }
+
+        crew.eventbus.emit(CrewEvent::PhaseStart {
+            phase: phase_idx,
+            tasks: phase_tasks.iter().map(|t| t.name.clone()).collect(),
+        });
 
         tracing::info!(
             "Phase {}: executing {} task(s) in parallel: [{}]",
@@ -269,6 +301,12 @@ pub async fn run_crew(
                     AgentSelector::select(&crew.agents, task)
                 };
 
+                crew.eventbus.emit(CrewEvent::TaskAssigned {
+                    task: task.name.clone(),
+                    agent: agent.name.clone(),
+                    phase: phase_idx,
+                });
+
                 let model = resolve_model(task, agent, crew, "task_execution");
 
                 let foreach_result = execute_foreach_task(
@@ -289,11 +327,23 @@ pub async fn run_crew(
                     && foreach_result.output.starts_with("Skipped: foreach source")
                     && foreach_result.agent.is_empty()
                 {
+                    crew.eventbus.emit(CrewEvent::TaskFailed {
+                        task: task.name.clone(),
+                        agent: agent.name.clone(),
+                        error: foreach_result.output.clone(),
+                    });
                     tracing::warn!(
                         "foreach source for task '{}' is not an array, skipping",
                         task.name
                     );
                     failed_tasks.insert(task.name.clone());
+                } else {
+                    crew.eventbus.emit(CrewEvent::TaskCompleted {
+                        task: task.name.clone(),
+                        agent: agent.name.clone(),
+                        duration_ms: foreach_result.duration_ms,
+                        success: foreach_result.success,
+                    });
                 }
 
                 results.insert(task.name.clone(), foreach_result);
@@ -301,6 +351,12 @@ pub async fn run_crew(
             } else if task.task_type.as_deref() == Some("collaborative")
                 && task.collaborative_agents.len() >= 2
             {
+                crew.eventbus.emit(CrewEvent::TaskAssigned {
+                    task: task.name.clone(),
+                    agent: task.collaborative_agents.join("+"),
+                    phase: phase_idx,
+                });
+
                 tracing::info!(
                     "Running collaborative task '{}' with agents: [{}]",
                     task.name,
@@ -352,6 +408,12 @@ pub async fn run_crew(
                 {
                     Ok((output, collab_usage)) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
+                        crew.eventbus.emit(CrewEvent::TaskCompleted {
+                            task: task.name.clone(),
+                            agent: task.collaborative_agents.join("+"),
+                            duration_ms,
+                            success: true,
+                        });
                         tracing::info!(
                             "Collaborative task '{}' completed in {}ms",
                             task.name,
@@ -463,6 +525,11 @@ pub async fn run_crew(
                             }
                         }
 
+                        crew.eventbus.emit(CrewEvent::TaskFailed {
+                            task: task.name.clone(),
+                            agent: task.collaborative_agents.join("+"),
+                            error: error_msg.clone(),
+                        });
                         tracing::error!("Collaborative task '{}' failed: {}", task.name, e);
                         failed_tasks.insert(task.name.clone());
                         results.insert(
@@ -502,6 +569,11 @@ pub async fn run_crew(
                 AgentSelector::select(&crew.agents, task)
             };
 
+            crew.eventbus.emit(CrewEvent::TaskAssigned {
+                task: task.name.clone(),
+                agent: agent.name.clone(),
+                phase: phase_idx,
+            });
             tracing::info!("Task '{}' assigned to agent '{}'", task.name, agent.name);
 
             let task_owned = (*task).clone();
@@ -589,6 +661,24 @@ pub async fn run_crew(
 
     // Persist memory if using persistent backend
     crew.memory.save().await.ok();
+
+    // Emit run_complete event
+    let total_tokens: u32 = results
+        .values()
+        .filter_map(|r| r.token_usage.as_ref())
+        .map(|u| u.total_tokens)
+        .sum();
+    crew.eventbus.emit(CrewEvent::RunComplete {
+        run_id: String::new(), // caller sets the real run_id
+        status: if failed_tasks.is_empty() {
+            "success"
+        } else {
+            "partial_failure"
+        }
+        .into(),
+        duration_ms: 0, // caller computes actual duration
+        total_tokens,
+    });
 
     // Return results in phase order
     Ok(task_order

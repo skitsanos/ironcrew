@@ -14,6 +14,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
 
     let state = Arc::new(api::AppState {
         flows_dir: flows_dir.clone(),
+        active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     let app = api::create_router(state).layer(CorsLayer::permissive());
@@ -29,7 +30,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     println!();
     println!("Endpoints:");
     println!("  GET    /health                       - Health check");
-    println!("  POST   /flows/{{flow}}/run             - Run a crew");
+    println!("  POST   /flows/{{flow}}/run             - Run a crew (async, returns run_id)");
+    println!("  GET    /flows/{{flow}}/events/{{run_id}} - SSE event stream for a run");
     println!("  GET    /flows/{{flow}}/runs            - List runs for a flow");
     println!("  GET    /flows/{{flow}}/runs/{{id}}       - Get run details");
     println!("  DELETE /flows/{{flow}}/runs/{{id}}       - Delete a run");

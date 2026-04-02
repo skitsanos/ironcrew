@@ -2,6 +2,7 @@ pub mod agent;
 pub mod collaborative;
 pub mod condition;
 pub mod crew;
+pub mod eventbus;
 pub mod executor;
 pub mod foreach;
 pub mod interpolate;

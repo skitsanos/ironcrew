@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::engine::agent::Agent;
+use crate::engine::eventbus::EventBus;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
 use crate::engine::model_router::ModelRouter;
@@ -44,6 +45,7 @@ pub struct Crew {
     pub model_router: ModelRouter,
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<String>,
+    pub eventbus: EventBus,
 }
 
 impl Crew {
@@ -61,6 +63,7 @@ impl Crew {
             model_router: ModelRouter::new(),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            eventbus: EventBus::default(),
         }
     }
 
