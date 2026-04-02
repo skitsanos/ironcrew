@@ -228,6 +228,8 @@ pub async fn run_crew(
     for agent in &crew.agents {
         crew.messagebus.register_agent(&agent.name).await;
     }
+    // Clear pending broadcasts now that all agents have received them
+    crew.messagebus.clear_pending_broadcasts().await;
 
     validate_dependency_graph(&crew.tasks)?;
     let phases = topological_phases(&crew.tasks);
@@ -580,7 +582,12 @@ pub async fn run_crew(
             let agent_owned = agent.clone();
             let provider_clone = provider.clone();
             let tool_registry_clone = tool_registry.clone();
-            let results_snapshot = results.clone();
+            // Clone only the results this task depends on (not the full map)
+            let results_snapshot: HashMap<String, TaskResult> = task
+                .depends_on
+                .iter()
+                .filter_map(|dep| results.get(dep).map(|r| (dep.clone(), r.clone())))
+                .collect();
             let model = resolve_model(task, agent, crew, "task_execution");
             let max_tool_rounds = crew.max_tool_rounds;
             let should_stream = task.stream || crew.stream;

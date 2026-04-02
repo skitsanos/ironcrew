@@ -59,13 +59,19 @@ pub async fn run_flow(
 
     // Spawn execution in background
     tokio::spawn(async move {
-        let result = execute_crew_from_path_with_events(&flow_path, &eventbus).await;
+        // Maximum run lifetime: 30 minutes
+        let max_lifetime = std::time::Duration::from_secs(30 * 60);
+
+        let result = tokio::time::timeout(max_lifetime, async {
+            execute_crew_from_path_with_events(&flow_path, &eventbus).await
+        })
+        .await;
 
         // Small delay to let any final print()/log() events drain before run_complete
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         match result {
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 eventbus.emit(CrewEvent::RunComplete {
                     run_id: response.run_id.clone(),
                     status: response.status.clone(),
@@ -73,7 +79,7 @@ pub async fn run_flow(
                     total_tokens: response.results.iter().map(|_| 0u32).sum(),
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eventbus.emit(CrewEvent::Log {
                     level: "error".into(),
                     message: e.to_string(),
@@ -82,6 +88,14 @@ pub async fn run_flow(
                     run_id: run_id_clone.clone(),
                     status: "failed".into(),
                     duration_ms: 0,
+                    total_tokens: 0,
+                });
+            }
+            Err(_timeout) => {
+                eventbus.emit(CrewEvent::RunComplete {
+                    run_id: run_id_clone.clone(),
+                    status: "timeout".into(),
+                    duration_ms: max_lifetime.as_millis() as u64,
                     total_tokens: 0,
                 });
             }

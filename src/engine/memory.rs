@@ -8,10 +8,19 @@ use tokio::sync::RwLock;
 use crate::utils::error::{IronCrewError, Result};
 
 /// Configuration for memory store limits.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MemoryConfig {
     pub max_items: Option<usize>,
     pub max_total_tokens: Option<usize>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_items: Some(500),
+            max_total_tokens: Some(50_000),
+        }
+    }
 }
 
 /// Rough token estimate: ~4 chars per token for English text.

@@ -52,8 +52,10 @@ pub enum CrewEvent {
 #[derive(Clone)]
 pub struct EventBus {
     sender: Arc<broadcast::Sender<CrewEvent>>,
-    /// Replay buffer: all emitted events stored for late subscribers.
+    /// Replay buffer: emitted events stored for late subscribers (capped).
     history: Arc<RwLock<Vec<CrewEvent>>>,
+    /// Maximum number of events to keep in the replay buffer.
+    max_replay: usize,
 }
 
 impl EventBus {
@@ -62,6 +64,7 @@ impl EventBus {
         Self {
             sender: Arc::new(sender),
             history: Arc::new(RwLock::new(Vec::new())),
+            max_replay: 1000,
         }
     }
 
@@ -69,6 +72,11 @@ impl EventBus {
         // Store in replay buffer
         if let Ok(mut history) = self.history.try_write() {
             history.push(event.clone());
+            // Trim oldest if over cap
+            if history.len() > self.max_replay {
+                let excess = history.len() - self.max_replay;
+                history.drain(..excess);
+            }
         }
         // Broadcast to live subscribers (ignore if none)
         let _ = self.sender.send(event);

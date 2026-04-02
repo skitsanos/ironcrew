@@ -67,10 +67,20 @@ impl MessageBus {
         }
     }
 
+    /// Clear pending broadcasts (call after all agents are registered).
+    pub async fn clear_pending_broadcasts(&self) {
+        self.pending_broadcasts.write().await.clear();
+    }
+
     /// Send a message to a specific agent or broadcast to all.
     pub async fn send(&self, message: Message) {
         let mut history = self.history.write().await;
         history.push(message.clone());
+        // Cap history to last 500 messages
+        if history.len() > 500 {
+            let excess = history.len() - 500;
+            history.drain(..excess);
+        }
 
         let mut queues = self.queues.write().await;
 
