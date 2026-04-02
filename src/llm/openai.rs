@@ -68,13 +68,12 @@ impl OpenAiProvider {
                     body["response_format"] = json!({"type": "json_object"});
                 }
                 ResponseFormat::JsonSchema { name, schema } => {
-                    // Note: "strict" omitted for cross-provider compatibility
-                    // (Gemini and others reject it; OpenAI works without it)
                     body["response_format"] = json!({
                         "type": "json_schema",
                         "json_schema": {
                             "name": name,
                             "schema": schema,
+                            "strict": true,
                         }
                     });
                 }
