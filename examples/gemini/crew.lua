@@ -2,7 +2,7 @@
     Google Gemini Provider Example
 
     Demonstrates using Google Gemini via its OpenAI-compatible endpoint.
-    Requires GEMENI_API_KEY in .env
+    Requires GEMINI_API_KEY in .env
 
     Run: ironcrew run examples/gemini
 ]]
@@ -12,7 +12,7 @@ local crew = Crew.new({
     provider = "openai",
     model = env("GEMINI_MODEL") or "gemini-2.5-flash",
     base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
-    api_key = env("GEMENI_API_KEY"),
+    api_key = env("GEMINI_API_KEY"),
 })
 
 crew:add_agent(Agent.new({
