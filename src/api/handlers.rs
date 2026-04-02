@@ -69,7 +69,13 @@ pub async fn run_flow(
         let eventbus_inner = eventbus.clone();
         let run_id_for_work = run_id_clone.clone();
         let mut work_handle = tokio::spawn(async move {
-            execute_crew_from_path_with_events(&flow_path, &eventbus_inner, &run_id_for_work, input.as_ref()).await
+            execute_crew_from_path_with_events(
+                &flow_path,
+                &eventbus_inner,
+                &run_id_for_work,
+                input.as_ref(),
+            )
+            .await
         });
 
         // Race the work against the timeout
