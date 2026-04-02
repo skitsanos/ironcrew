@@ -232,7 +232,170 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         })?;
     lua.globals().set("validate_json", validate_json_fn)?;
 
+    // http namespace — async HTTP client for Lua scripts
+    let http_table = lua.create_table()?;
+
+    // Shared reqwest client for all http.* calls
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("IronCrew/Lua")
+        .build()
+        .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {}", e)))?;
+
+    // http.get(url, options?) -> {status, headers, body}
+    let client_get = client.clone();
+    let http_get = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+        let client = client_get.clone();
+        async move {
+            let mut req = client.get(&url);
+            req = apply_http_options(req, &options)?;
+            execute_http_request(lua, req).await
+        }
+    })?;
+    http_table.set("get", http_get)?;
+
+    // http.post(url, options?) -> {status, headers, body}
+    let client_post = client.clone();
+    let http_post = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+        let client = client_post.clone();
+        async move {
+            let mut req = client.post(&url);
+            req = apply_http_options(req, &options)?;
+            if let Some(ref opts) = options {
+                req = apply_http_body(req, opts)?;
+            }
+            execute_http_request(lua, req).await
+        }
+    })?;
+    http_table.set("post", http_post)?;
+
+    // http.put(url, options?) -> {status, headers, body}
+    let client_put = client.clone();
+    let http_put = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+        let client = client_put.clone();
+        async move {
+            let mut req = client.put(&url);
+            req = apply_http_options(req, &options)?;
+            if let Some(ref opts) = options {
+                req = apply_http_body(req, opts)?;
+            }
+            execute_http_request(lua, req).await
+        }
+    })?;
+    http_table.set("put", http_put)?;
+
+    // http.delete(url, options?) -> {status, headers, body}
+    let client_delete = client.clone();
+    let http_delete = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+        let client = client_delete.clone();
+        async move {
+            let mut req = client.delete(&url);
+            req = apply_http_options(req, &options)?;
+            execute_http_request(lua, req).await
+        }
+    })?;
+    http_table.set("delete", http_delete)?;
+
+    // http.request(method, url, options?) -> {status, headers, body}
+    let client_any = client;
+    let http_request = lua.create_async_function(move |lua, (method, url, options): (String, String, Option<mlua::Table>)| {
+        let client = client_any.clone();
+        async move {
+            let mut req = match method.to_uppercase().as_str() {
+                "GET" => client.get(&url),
+                "POST" => client.post(&url),
+                "PUT" => client.put(&url),
+                "DELETE" => client.delete(&url),
+                "PATCH" => client.patch(&url),
+                "HEAD" => client.head(&url),
+                other => return Err(mlua::Error::external(format!("Unsupported method: {}", other))),
+            };
+            req = apply_http_options(req, &options)?;
+            if let Some(ref opts) = options {
+                req = apply_http_body(req, opts)?;
+            }
+            execute_http_request(lua, req).await
+        }
+    })?;
+    http_table.set("request", http_request)?;
+
+    lua.globals().set("http", http_table)?;
+
     Ok(())
+}
+
+/// Apply headers and timeout from an options table to a request builder.
+fn apply_http_options(
+    mut req: reqwest::RequestBuilder,
+    options: &Option<mlua::Table>,
+) -> mlua::Result<reqwest::RequestBuilder> {
+    if let Some(opts) = options {
+        // Headers
+        if let Ok(headers) = opts.get::<mlua::Table>("headers") {
+            for pair in headers.pairs::<String, String>() {
+                let (key, value) = pair?;
+                req = req.header(key.as_str(), value.as_str());
+            }
+        }
+        // Timeout override
+        if let Ok(timeout_secs) = opts.get::<f64>("timeout") {
+            req = req.timeout(std::time::Duration::from_secs_f64(timeout_secs));
+        }
+    }
+    Ok(req)
+}
+
+/// Apply body from options table.
+fn apply_http_body(
+    mut req: reqwest::RequestBuilder,
+    opts: &mlua::Table,
+) -> mlua::Result<reqwest::RequestBuilder> {
+    if let Ok(body) = opts.get::<String>("body") {
+        // Auto-detect JSON
+        if body.starts_with('{') || body.starts_with('[') {
+            req = req.header("Content-Type", "application/json");
+        }
+        req = req.body(body);
+    } else if let Ok(json_table) = opts.get::<mlua::Table>("json") {
+        // Serialize Lua table as JSON body
+        let json_value = lua_table_to_json(&json_table)?;
+        let json_str = serde_json::to_string(&json_value)
+            .map_err(|e| mlua::Error::external(format!("JSON serialize error: {}", e)))?;
+        req = req
+            .header("Content-Type", "application/json")
+            .body(json_str);
+    }
+    Ok(req)
+}
+
+/// Execute an HTTP request and return the result as a Lua table.
+async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::Result<mlua::Table> {
+    let resp = req.send().await.map_err(mlua::Error::external)?;
+
+    let status = resp.status().as_u16();
+    let headers_table = lua.create_table()?;
+    for (key, value) in resp.headers() {
+        if let Ok(v) = value.to_str() {
+            headers_table.set(key.as_str(), v.to_string())?;
+        }
+    }
+
+    let body_text = resp.text().await.map_err(mlua::Error::external)?;
+
+    let result = lua.create_table()?;
+    result.set("status", status)?;
+    result.set("headers", headers_table)?;
+    result.set("body", body_text.clone())?;
+
+    // Try to parse as JSON for convenience
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        let lua_value = json_value_to_lua(&lua, &json_value)?;
+        result.set("json", lua_value)?;
+    }
+
+    result.set("ok", (200..300).contains(&status))?;
+
+    Ok(result)
 }
 
 /// Create a Lua VM for crew.lua (full access context).
