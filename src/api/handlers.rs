@@ -39,9 +39,12 @@ pub async fn health() -> Json<serde_json::Value> {
 pub async fn run_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+
+    let input = body.map(|Json(v)| v);
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
@@ -65,7 +68,7 @@ pub async fn run_flow(
         // Spawn the actual work as a child task so we can abort it on timeout
         let eventbus_inner = eventbus.clone();
         let mut work_handle = tokio::spawn(async move {
-            execute_crew_from_path_with_events(&flow_path, &eventbus_inner).await
+            execute_crew_from_path_with_events(&flow_path, &eventbus_inner, input.as_ref()).await
         });
 
         // Race the work against the timeout
@@ -135,18 +138,28 @@ pub async fn run_flow(
     })))
 }
 
-/// Execute a crew from a flow path, injecting an EventBus so the orchestrator emits events.
+/// Execute a crew from a flow path, injecting an EventBus and optional input context.
 async fn execute_crew_from_path_with_events(
     flow_path: &std::path::Path,
     eventbus: &EventBus,
+    input: Option<&serde_json::Value>,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
+    use crate::lua::api::json_value_to_lua;
 
     let loader = load_project(flow_path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
     // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
     lua.set_app_data(eventbus.clone());
+
+    // Inject input as a global `input` table (from the HTTP request body)
+    if let Some(input_value) = input {
+        let lua_input = json_value_to_lua(&lua, input_value).map_err(IronCrewError::Lua)?;
+        lua.globals()
+            .set("input", lua_input)
+            .map_err(IronCrewError::Lua)?;
+    }
 
     // Execute
     let entrypoint = loader
