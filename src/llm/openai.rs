@@ -17,6 +17,7 @@ impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
+            .http1_only()  // Force HTTP/1.1 — avoids HTTP/2 framing issues with Google/Gemini
             .build()
             .expect("Failed to build HTTP client");
 
@@ -131,7 +132,18 @@ impl OpenAiProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
-        let resp_body: Value = resp.json().await.map_err(IronCrewError::Http)?;
+
+        // Read body as text first, then parse — more resilient than resp.json()
+        // which can fail on HTTP/2 framing issues with some providers (e.g., Google)
+        let resp_text = resp.text().await.map_err(IronCrewError::Http)?;
+        let resp_body: Value = serde_json::from_str(&resp_text).map_err(|e| {
+            tracing::debug!("Failed to parse response as JSON: {}", e);
+            tracing::debug!("Raw response body: {}", &resp_text[..resp_text.len().min(500)]);
+            IronCrewError::Provider(format!(
+                "Invalid JSON response from LLM provider: {}",
+                e
+            ))
+        })?;
 
         if !status.is_success() {
             // Handle different error formats across providers:
