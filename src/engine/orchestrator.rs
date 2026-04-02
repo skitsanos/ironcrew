@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::collaborative::execute_collaborative_task;
 use crate::engine::condition::evaluate_condition;
@@ -117,28 +119,19 @@ fn filter_eligible_tasks<'a>(
     eligible
 }
 
-/// The result type returned by each spawned task handle.
-type TaskJoinResult = std::result::Result<
-    (String, String, Result<String>, u64, Option<TaskTokenUsage>),
-    tokio::task::JoinError,
->;
+/// The result type from each concurrent task future.
+type TaskFutureResult = (String, String, Result<String>, u64, Option<TaskTokenUsage>);
 
-/// Process the join results from spawned standard tasks, handling success, failure, and error recovery.
+/// Process the results from concurrent task futures, handling success, failure, and error recovery.
 async fn process_phase_results(
-    phase_results: Vec<TaskJoinResult>,
+    phase_results: Vec<TaskFutureResult>,
     crew: &Crew,
     provider: &Arc<dyn LlmProvider>,
     tool_registry: &ToolRegistry,
     results: &mut HashMap<String, TaskResult>,
     failed_tasks: &mut HashSet<String>,
 ) -> Result<()> {
-    for join_result in phase_results {
-        let (task_name, agent_name, output, duration_ms, token_usage) =
-            join_result.map_err(|e| IronCrewError::Task {
-                task: "unknown".into(),
-                message: format!("Task panicked: {}", e),
-            })?;
-
+    for (task_name, agent_name, output, duration_ms, token_usage) in phase_results {
         match output {
             Ok(out) => {
                 crew.eventbus.emit(CrewEvent::TaskCompleted {
@@ -552,8 +545,11 @@ pub async fn run_crew(
             }
         }
 
-        // Spawn all standard tasks in this phase concurrently
-        let mut handles = Vec::new();
+        // Run all standard tasks in this phase concurrently using FuturesUnordered.
+        // Unlike tokio::spawn, these futures run on the current task — when the
+        // orchestrator is aborted (e.g., API timeout), all in-flight futures are
+        // dropped and their resources (HTTP connections, memory) freed immediately.
+        let mut futures = FuturesUnordered::new();
 
         for task in &standard_tasks {
             // Select agent
@@ -595,7 +591,7 @@ pub async fn run_crew(
             let memory = crew.memory.clone();
             let messagebus = crew.messagebus.clone();
 
-            let handle = tokio::spawn(async move {
+            futures.push(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.unwrap()),
                     None => None,
@@ -615,12 +611,13 @@ pub async fn run_crew(
                 )
                 .await
             });
-
-            handles.push(handle);
         }
 
-        // Await all handles and process results
-        let phase_results = futures::future::join_all(handles).await;
+        // Collect all results from concurrent futures
+        let mut phase_results = Vec::new();
+        while let Some(result) = futures.next().await {
+            phase_results.push(result);
+        }
         process_phase_results(
             phase_results,
             crew,
