@@ -244,79 +244,90 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
     // http.get(url, options?) -> {status, headers, body}
     let client_get = client.clone();
-    let http_get = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
-        let client = client_get.clone();
-        async move {
-            let mut req = client.get(&url);
-            req = apply_http_options(req, &options)?;
-            execute_http_request(lua, req).await
-        }
-    })?;
+    let http_get =
+        lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+            let client = client_get.clone();
+            async move {
+                let mut req = client.get(&url);
+                req = apply_http_options(req, &options)?;
+                execute_http_request(lua, req).await
+            }
+        })?;
     http_table.set("get", http_get)?;
 
     // http.post(url, options?) -> {status, headers, body}
     let client_post = client.clone();
-    let http_post = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
-        let client = client_post.clone();
-        async move {
-            let mut req = client.post(&url);
-            req = apply_http_options(req, &options)?;
-            if let Some(ref opts) = options {
-                req = apply_http_body(req, opts)?;
+    let http_post =
+        lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+            let client = client_post.clone();
+            async move {
+                let mut req = client.post(&url);
+                req = apply_http_options(req, &options)?;
+                if let Some(ref opts) = options {
+                    req = apply_http_body(req, opts)?;
+                }
+                execute_http_request(lua, req).await
             }
-            execute_http_request(lua, req).await
-        }
-    })?;
+        })?;
     http_table.set("post", http_post)?;
 
     // http.put(url, options?) -> {status, headers, body}
     let client_put = client.clone();
-    let http_put = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
-        let client = client_put.clone();
-        async move {
-            let mut req = client.put(&url);
-            req = apply_http_options(req, &options)?;
-            if let Some(ref opts) = options {
-                req = apply_http_body(req, opts)?;
+    let http_put =
+        lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+            let client = client_put.clone();
+            async move {
+                let mut req = client.put(&url);
+                req = apply_http_options(req, &options)?;
+                if let Some(ref opts) = options {
+                    req = apply_http_body(req, opts)?;
+                }
+                execute_http_request(lua, req).await
             }
-            execute_http_request(lua, req).await
-        }
-    })?;
+        })?;
     http_table.set("put", http_put)?;
 
     // http.delete(url, options?) -> {status, headers, body}
     let client_delete = client.clone();
-    let http_delete = lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
-        let client = client_delete.clone();
-        async move {
-            let mut req = client.delete(&url);
-            req = apply_http_options(req, &options)?;
-            execute_http_request(lua, req).await
-        }
-    })?;
+    let http_delete =
+        lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
+            let client = client_delete.clone();
+            async move {
+                let mut req = client.delete(&url);
+                req = apply_http_options(req, &options)?;
+                execute_http_request(lua, req).await
+            }
+        })?;
     http_table.set("delete", http_delete)?;
 
     // http.request(method, url, options?) -> {status, headers, body}
     let client_any = client;
-    let http_request = lua.create_async_function(move |lua, (method, url, options): (String, String, Option<mlua::Table>)| {
-        let client = client_any.clone();
-        async move {
-            let mut req = match method.to_uppercase().as_str() {
-                "GET" => client.get(&url),
-                "POST" => client.post(&url),
-                "PUT" => client.put(&url),
-                "DELETE" => client.delete(&url),
-                "PATCH" => client.patch(&url),
-                "HEAD" => client.head(&url),
-                other => return Err(mlua::Error::external(format!("Unsupported method: {}", other))),
-            };
-            req = apply_http_options(req, &options)?;
-            if let Some(ref opts) = options {
-                req = apply_http_body(req, opts)?;
+    let http_request = lua.create_async_function(
+        move |lua, (method, url, options): (String, String, Option<mlua::Table>)| {
+            let client = client_any.clone();
+            async move {
+                let mut req = match method.to_uppercase().as_str() {
+                    "GET" => client.get(&url),
+                    "POST" => client.post(&url),
+                    "PUT" => client.put(&url),
+                    "DELETE" => client.delete(&url),
+                    "PATCH" => client.patch(&url),
+                    "HEAD" => client.head(&url),
+                    other => {
+                        return Err(mlua::Error::external(format!(
+                            "Unsupported method: {}",
+                            other
+                        )));
+                    }
+                };
+                req = apply_http_options(req, &options)?;
+                if let Some(ref opts) = options {
+                    req = apply_http_body(req, opts)?;
+                }
+                execute_http_request(lua, req).await
             }
-            execute_http_request(lua, req).await
-        }
-    })?;
+        },
+    )?;
     http_table.set("request", http_request)?;
 
     lua.globals().set("http", http_table)?;

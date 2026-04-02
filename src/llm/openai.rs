@@ -136,11 +136,11 @@ impl OpenAiProvider {
         let resp_text = resp.text().await.map_err(IronCrewError::Http)?;
         let resp_body: Value = serde_json::from_str(&resp_text).map_err(|e| {
             tracing::debug!("Failed to parse response as JSON: {}", e);
-            tracing::debug!("Raw response body: {}", &resp_text[..resp_text.len().min(500)]);
-            IronCrewError::Provider(format!(
-                "Invalid JSON response from LLM provider: {}",
-                e
-            ))
+            tracing::debug!(
+                "Raw response body: {}",
+                &resp_text[..resp_text.len().min(500)]
+            );
+            IronCrewError::Provider(format!("Invalid JSON response from LLM provider: {}", e))
         })?;
 
         if !status.is_success() {
@@ -335,14 +335,8 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
     tc_array
         .iter()
         .filter_map(|tc| {
-            let id = tc["id"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let call_type = tc["type"]
-                .as_str()
-                .unwrap_or("function")
-                .to_string();
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let call_type = tc["type"].as_str().unwrap_or("function").to_string();
 
             let name = tc["function"]["name"].as_str()?.to_string();
 
