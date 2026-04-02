@@ -8,5 +8,7 @@ target/
 *.swp
 *.swo
 docs/
+docs/superpowers
+examples/clients
 Taskfile.yaml
 ironcrew-cover.jpg
