@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::engine::agent::Agent;
+use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::task::{TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
 use crate::utils::error::{IronCrewError, Result};
@@ -9,6 +10,7 @@ use crate::utils::error::{IronCrewError, Result};
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_collaborative_task(
     agents: &[&Agent],
+    task_name: &str,
     task_description: &str,
     max_turns: usize,
     provider: Arc<dyn LlmProvider>,
@@ -16,6 +18,7 @@ pub async fn execute_collaborative_task(
     memory_context: &str,
     model: &str,
     synthesis_model: &str,
+    eventbus: &EventBus,
 ) -> Result<(String, Option<TaskTokenUsage>)> {
     if agents.len() < 2 {
         return Err(IronCrewError::Validation(
@@ -90,6 +93,13 @@ pub async fn execute_collaborative_task(
             let content = response.content.unwrap_or_default();
 
             conversation.push(format!("[{}]: {}", agent.name, content));
+
+            eventbus.emit(CrewEvent::CollaborationTurn {
+                task: task_name.to_string(),
+                agent: agent.name.clone(),
+                turn: turn + 1,
+                content: content.clone(),
+            });
 
             tracing::info!(
                 "Collaborative task turn {}, agent '{}' responded",

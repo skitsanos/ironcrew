@@ -280,12 +280,18 @@ pub async fn execute_crew_from_path(
 
 fn event_type_str(event: &CrewEvent) -> &'static str {
     match event {
+        CrewEvent::CrewStarted { .. } => "crew_started",
         CrewEvent::PhaseStart { .. } => "phase_start",
         CrewEvent::TaskAssigned { .. } => "task_assigned",
         CrewEvent::TaskCompleted { .. } => "task_completed",
         CrewEvent::TaskFailed { .. } => "task_failed",
         CrewEvent::TaskSkipped { .. } => "task_skipped",
+        CrewEvent::TaskRetry { .. } => "task_retry",
         CrewEvent::ToolCall { .. } => "tool_call",
+        CrewEvent::ToolResult { .. } => "tool_result",
+        CrewEvent::MessageSent { .. } => "message_sent",
+        CrewEvent::CollaborationTurn { .. } => "collaboration_turn",
+        CrewEvent::MemorySet { .. } => "memory_set",
         CrewEvent::Log { .. } => "log",
         CrewEvent::RunComplete { .. } => "run_complete",
     }

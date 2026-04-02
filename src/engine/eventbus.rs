@@ -6,9 +6,20 @@ use tokio::sync::{RwLock, broadcast};
 #[serde(tag = "event", content = "data")]
 #[allow(dead_code)]
 pub enum CrewEvent {
+    // ─── Crew lifecycle ─────────────────────────────────────────────────────
+    #[serde(rename = "crew_started")]
+    CrewStarted {
+        goal: String,
+        agent_count: usize,
+        task_count: usize,
+        model: String,
+    },
+
+    // ─── Phase lifecycle ────────────────────────────────────────────────────
     #[serde(rename = "phase_start")]
     PhaseStart { phase: usize, tasks: Vec<String> },
 
+    // ─── Task lifecycle ─────────────────────────────────────────────────────
     #[serde(rename = "task_assigned")]
     TaskAssigned {
         task: String,
@@ -22,6 +33,8 @@ pub enum CrewEvent {
         agent: String,
         duration_ms: u64,
         success: bool,
+        output: String,
+        token_usage: Option<TokenUsageSummary>,
     },
 
     #[serde(rename = "task_failed")]
@@ -29,17 +42,59 @@ pub enum CrewEvent {
         task: String,
         agent: String,
         error: String,
+        duration_ms: u64,
     },
 
     #[serde(rename = "task_skipped")]
     TaskSkipped { task: String, reason: String },
 
+    #[serde(rename = "task_retry")]
+    TaskRetry {
+        task: String,
+        attempt: u32,
+        max_retries: u32,
+        backoff_secs: f64,
+        error: String,
+    },
+
+    // ─── Tool calls ─────────────────────────────────────────────────────────
     #[serde(rename = "tool_call")]
     ToolCall { task: String, tool: String },
 
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        task: String,
+        tool: String,
+        success: bool,
+        duration_ms: u64,
+    },
+
+    // ─── Agent messages ─────────────────────────────────────────────────────
+    #[serde(rename = "message_sent")]
+    MessageSent {
+        from: String,
+        to: String,
+        message_type: String,
+    },
+
+    // ─── Collaborative ──────────────────────────────────────────────────────
+    #[serde(rename = "collaboration_turn")]
+    CollaborationTurn {
+        task: String,
+        agent: String,
+        turn: usize,
+        content: String,
+    },
+
+    // ─── Memory ─────────────────────────────────────────────────────────────
+    #[serde(rename = "memory_set")]
+    MemorySet { key: String },
+
+    // ─── Logging ────────────────────────────────────────────────────────────
     #[serde(rename = "log")]
     Log { level: String, message: String },
 
+    // ─── Run complete ───────────────────────────────────────────────────────
     #[serde(rename = "run_complete")]
     RunComplete {
         run_id: String,
@@ -47,6 +102,14 @@ pub enum CrewEvent {
         duration_ms: u64,
         total_tokens: u32,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenUsageSummary {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub cached_tokens: u32,
 }
 
 #[derive(Clone)]

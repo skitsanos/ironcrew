@@ -8,7 +8,7 @@ use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::collaborative::execute_collaborative_task;
 use crate::engine::condition::evaluate_condition;
 use crate::engine::crew::Crew;
-use crate::engine::eventbus::CrewEvent;
+use crate::engine::eventbus::{CrewEvent, TokenUsageSummary};
 use crate::engine::executor::execute_task_standalone;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
@@ -139,6 +139,13 @@ async fn process_phase_results(
                     agent: agent_name.clone(),
                     duration_ms,
                     success: true,
+                    output: out.clone(),
+                    token_usage: token_usage.as_ref().map(|u| TokenUsageSummary {
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                        cached_tokens: u.cached_tokens,
+                    }),
                 });
                 let result = TaskResult {
                     task: task_name.clone(),
@@ -186,6 +193,7 @@ async fn process_phase_results(
                     task: task_name.clone(),
                     agent: agent_name.clone(),
                     error: error_msg.clone(),
+                    duration_ms,
                 });
                 let result = TaskResult {
                     task: task_name.clone(),
@@ -216,6 +224,13 @@ pub async fn run_crew(
     if crew.tasks.is_empty() {
         return Err(IronCrewError::Validation("No tasks in crew".into()));
     }
+
+    crew.eventbus.emit(CrewEvent::CrewStarted {
+        goal: crew.goal.clone(),
+        agent_count: crew.agents.len(),
+        task_count: crew.tasks.len(),
+        model: crew.provider_config.model.clone(),
+    });
 
     // Register all agents in the messagebus
     for agent in &crew.agents {
@@ -326,6 +341,7 @@ pub async fn run_crew(
                         task: task.name.clone(),
                         agent: agent.name.clone(),
                         error: foreach_result.output.clone(),
+                        duration_ms: foreach_result.duration_ms,
                     });
                     tracing::warn!(
                         "foreach source for task '{}' is not an array, skipping",
@@ -338,6 +354,15 @@ pub async fn run_crew(
                         agent: agent.name.clone(),
                         duration_ms: foreach_result.duration_ms,
                         success: foreach_result.success,
+                        output: foreach_result.output.clone(),
+                        token_usage: foreach_result.token_usage.as_ref().map(|u| {
+                            TokenUsageSummary {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                                total_tokens: u.total_tokens,
+                                cached_tokens: u.cached_tokens,
+                            }
+                        }),
                     });
                 }
 
@@ -391,6 +416,7 @@ pub async fn run_crew(
                 let start = Instant::now();
                 match execute_collaborative_task(
                     &collab_agents,
+                    &task.name,
                     &interpolate(&task.description, &results),
                     max_turns,
                     provider.clone(),
@@ -398,6 +424,7 @@ pub async fn run_crew(
                     &memory_context,
                     &collab_model,
                     &collab_synthesis_model,
+                    &crew.eventbus,
                 )
                 .await
                 {
@@ -408,6 +435,13 @@ pub async fn run_crew(
                             agent: task.collaborative_agents.join("+"),
                             duration_ms,
                             success: true,
+                            output: output.clone(),
+                            token_usage: collab_usage.as_ref().map(|u| TokenUsageSummary {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                                total_tokens: u.total_tokens,
+                                cached_tokens: u.cached_tokens,
+                            }),
                         });
                         tracing::info!(
                             "Collaborative task '{}' completed in {}ms",
@@ -524,6 +558,7 @@ pub async fn run_crew(
                             task: task.name.clone(),
                             agent: task.collaborative_agents.join("+"),
                             error: error_msg.clone(),
+                            duration_ms,
                         });
                         tracing::error!("Collaborative task '{}' failed: {}", task.name, e);
                         failed_tasks.insert(task.name.clone());
