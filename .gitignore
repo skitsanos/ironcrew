@@ -7,3 +7,4 @@
 .env.build
 docs/superpowers
 examples/clients
+Taskfile.yaml
