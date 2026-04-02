@@ -12,7 +12,7 @@
 local crew = Crew.new({
     goal = "Demonstrate Google Gemini as an LLM provider with structured output",
     provider = "openai",
-    model = env("GEMINI_MODEL") or "gemini-2.5-flash",
+    model = env("GEMINI_MODEL") or "gemini-3-flash-preview",
     base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
     api_key = env("GEMINI_API_KEY"),
 })
