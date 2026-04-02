@@ -76,8 +76,10 @@ impl Crew {
     }
 
     /// Create a RunRecord from execution results.
+    /// If `run_id` is provided, it is used; otherwise a new UUID is generated.
     pub fn create_run_record(
         &self,
+        run_id: Option<String>,
         results: &[TaskResult],
         started_at: &str,
         finished_at: &str,
@@ -105,7 +107,7 @@ impl Crew {
             .sum();
 
         RunRecord {
-            run_id: uuid::Uuid::new_v4().to_string(),
+            run_id: run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             flow_name: self.goal.clone(),
             status,
             started_at: started_at.to_string(),

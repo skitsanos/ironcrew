@@ -666,23 +666,8 @@ pub async fn run_crew(
     // Persist memory if using persistent backend
     crew.memory.save().await.ok();
 
-    // Emit run_complete event
-    let total_tokens: u32 = results
-        .values()
-        .filter_map(|r| r.token_usage.as_ref())
-        .map(|u| u.total_tokens)
-        .sum();
-    crew.eventbus.emit(CrewEvent::RunComplete {
-        run_id: String::new(), // caller sets the real run_id
-        status: if failed_tasks.is_empty() {
-            "success"
-        } else {
-            "partial_failure"
-        }
-        .into(),
-        duration_ms: 0, // caller computes actual duration
-        total_tokens,
-    });
+    // Note: RunComplete is NOT emitted here — the API handler is responsible
+    // for emitting it with the correct run_id after the Lua script fully completes.
 
     // Return results in phase order
     Ok(task_order

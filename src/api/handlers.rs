@@ -67,8 +67,9 @@ pub async fn run_flow(
 
         // Spawn the actual work as a child task so we can abort it on timeout
         let eventbus_inner = eventbus.clone();
+        let run_id_for_work = run_id_clone.clone();
         let mut work_handle = tokio::spawn(async move {
-            execute_crew_from_path_with_events(&flow_path, &eventbus_inner, input.as_ref()).await
+            execute_crew_from_path_with_events(&flow_path, &eventbus_inner, &run_id_for_work, input.as_ref()).await
         });
 
         // Race the work against the timeout
@@ -80,7 +81,7 @@ pub async fn run_flow(
                 match join_result {
                     Ok(Ok(response)) => {
                         eventbus.emit(CrewEvent::RunComplete {
-                            run_id: response.run_id.clone(),
+                            run_id: run_id_clone.clone(),
                             status: response.status.clone(),
                             duration_ms: response.duration_ms,
                             total_tokens: response.results.iter().map(|_| 0u32).sum(),
@@ -138,10 +139,11 @@ pub async fn run_flow(
     })))
 }
 
-/// Execute a crew from a flow path, injecting an EventBus and optional input context.
+/// Execute a crew from a flow path, injecting an EventBus, run_id, and optional input context.
 async fn execute_crew_from_path_with_events(
     flow_path: &std::path::Path,
     eventbus: &EventBus,
+    run_id: &str,
     input: Option<&serde_json::Value>,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
@@ -152,6 +154,9 @@ async fn execute_crew_from_path_with_events(
 
     // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
     lua.set_app_data(eventbus.clone());
+
+    // Store the run_id so LuaCrew::run() uses it for the RunRecord
+    lua.set_app_data(run_id.to_string());
 
     // Inject input as a global `input` table (from the HTTP request body)
     if let Some(input_value) = input {

@@ -367,8 +367,12 @@ impl UserData for LuaCrew {
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
 
             // Save run history before returning so API callers can resolve this exact run.
+            // If the API handler injected a run_id via app_data, use it for consistency.
+            let pre_assigned_run_id: Option<String> =
+                lua.app_data_ref::<String>().map(|r| r.clone());
             let store_dir = this.project_dir.join(".ironcrew").join("runs");
             let record = crew.create_run_record(
+                pre_assigned_run_id,
                 &results,
                 &run_start.to_rfc3339(),
                 &run_end.to_rfc3339(),
