@@ -136,13 +136,24 @@ impl OpenAiProvider {
         if !status.is_success() {
             // Handle different error formats across providers:
             // OpenAI: {"error": {"message": "..."}}
-            // Gemini: {"error": {"message": "...", "status": "..."}}
-            // Some: plain text or {"message": "..."}
-            let error_msg = resp_body["error"]["message"]
+            // Gemini: [{"error": {"message": "...", "status": "..."}}]  (array-wrapped!)
+            // Others: {"message": "..."} or plain {"error": "string"}
+            let error_root = if resp_body.is_array() {
+                // Gemini wraps errors in an array
+                resp_body.get(0).unwrap_or(&resp_body)
+            } else {
+                &resp_body
+            };
+            let error_msg = error_root["error"]["message"]
                 .as_str()
-                .or_else(|| resp_body["message"].as_str())
-                .or_else(|| resp_body["error"].as_str())
-                .unwrap_or("Unknown API error");
+                .or_else(|| error_root["message"].as_str())
+                .or_else(|| error_root["error"].as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let raw = serde_json::to_string(&resp_body).unwrap_or_default();
+                    tracing::debug!("Unknown error response body: {}", raw);
+                    raw
+                });
             return Err(IronCrewError::Provider(format!(
                 "HTTP {}: {}",
                 status, error_msg
