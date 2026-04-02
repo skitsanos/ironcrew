@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.idea/
+.env
+.env.build
+.DS_Store
+*.swp
+*.swo
+docs/
+Taskfile.yaml
+ironcrew-cover.jpg
