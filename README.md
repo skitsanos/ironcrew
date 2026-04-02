@@ -42,8 +42,8 @@ local results = crew:run()
 - **Parallel execution** - Independent tasks run concurrently within topological phases.
 - **Provider-agnostic** - Works with OpenAI, Groq, Ollama, Azure, or any OpenAI-compatible API.
 - **Structured output** - JSON Schema `response_format` forces LLMs to return valid structured data.
-- **Built-in tools** - file_read, file_write, web_scrape, shell, http_request, hash, template_render.
-- **Custom Lua tools** - Define tools in Lua with access to `llm`, `fs`, `env`, `regex`.
+- **Built-in tools** - file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema.
+- **Custom Lua tools** - Define tools in Lua with access to `fs`, `env`, `regex`, `validate_json`.
 - **Memory system** - Shared key-value store with TTL, relevance scoring, and persistent backend.
 - **MessageBus** - Agent-to-agent communication with directed and broadcast messaging.
 - **Collaborative tasks** - Multi-agent discussions with automatic synthesis.
@@ -53,8 +53,14 @@ local results = crew:run()
 - **Error recovery** - `on_error` routing to handler tasks with automatic recovery.
 - **Subworkflows** - Compose crews from separate Lua files with input/output mapping.
 - **Streaming** - Real-time LLM response output to stderr.
+- **Model Router** - Route different task types to different models for cost optimization.
+- **Token tracking** - Track prompt/completion/cached tokens per task and per run.
+- **Prompt caching** - OpenAI prompt cache key and retention support for cost savings.
 - **REST API** - Run crews via HTTP with run history and flow inspection.
+- **SSE events** - Real-time Server-Sent Events stream for monitoring crew execution.
 - **Run history** - Automatic persistence of run results with inspect/list/clean commands.
+- **Schema validation** - Validate LLM JSON output against JSON Schema via tool or Lua global.
+- **Foreach** - Iterate over lists and process each item as a task.
 - **Single binary** - No runtime dependencies. Lua is vendored and compiled in.
 
 ## Quick Start
@@ -136,6 +142,7 @@ crew:add_task({
     name = "research",
     description = "Research the topic: ${env.TOPIC}",
     agent = "researcher",              -- explicit assignment (or auto-selected)
+    model = "gpt-4o",                  -- per-task model override
     expected_output = "A summary",     -- hint for the LLM
     context = "Additional context",    -- injected into prompt
     depends_on = {"setup"},            -- task dependencies
@@ -155,13 +162,20 @@ local crew = Crew.new({
     goal = "Your crew's objective",
     provider = "openai",
     model = "gpt-4o-mini",
-    base_url = env("OPENAI_BASE_URL"),  -- for Groq, Ollama, etc.
-    api_key = env("GROQ_API_KEY"),      -- per-crew API key override
-    stream = true,                       -- stream all tasks
-    max_concurrent = 4,                  -- limit parallel tasks
-    memory = "persistent",               -- "ephemeral" (default) or "persistent"
-    max_memory_items = 100,              -- eviction limit
-    max_memory_tokens = 10000,           -- token-based eviction
+    base_url = env("OPENAI_BASE_URL"),     -- for Groq, Ollama, etc.
+    api_key = env("GROQ_API_KEY"),         -- per-crew API key override
+    stream = true,                          -- stream all tasks
+    max_concurrent = 4,                     -- limit parallel tasks
+    memory = "persistent",                  -- "ephemeral" (default) or "persistent"
+    max_memory_items = 100,                 -- eviction limit
+    max_memory_tokens = 10000,              -- token-based eviction
+    prompt_cache_key = "my-project-v1",     -- OpenAI prompt cache routing key
+    prompt_cache_retention = "24h",         -- "in_memory" (default) or "24h"
+    models = {                              -- Model Router: route by purpose
+        task_execution = "gpt-4o-mini",
+        collaboration = "gpt-4o",
+        collaboration_synthesis = "gpt-4o",
+    },
 })
 ```
 
@@ -238,6 +252,122 @@ local result = crew:subworkflow("sub/analysis.lua", {
 })
 ```
 
+## Foreach
+
+Iterate over a list and process each item:
+
+```lua
+crew:memory_set("topics", json_stringify({"Rust", "Python", "Go"}))
+
+crew:add_foreach_task({
+    name = "analyze_each",
+    description = "Describe the main strength of ${item}",
+    foreach = "topics",
+    foreach_as = "item",
+})
+```
+
+## Schema Validation
+
+Validate LLM JSON output against a schema:
+
+```lua
+local results = crew:run()
+
+for _, result in ipairs(results) do
+    if result.task == "extract" and result.success then
+        local check = validate_json(result.output, {
+            type = "object",
+            required = {"name", "findings"},
+            properties = {
+                name = { type = "string" },
+                findings = { type = "array" },
+            },
+        })
+        if not check.valid then
+            log("warn", "Validation failed: " .. #check.errors .. " errors")
+        end
+    end
+end
+```
+
+## Model Router
+
+Route different task types to different models for cost optimization:
+
+```lua
+local crew = Crew.new({
+    model = "gpt-4o-mini",           -- default for most tasks
+    models = {
+        task_execution = "gpt-4o-mini",
+        collaboration = "gpt-4o",     -- use capable model for debates
+        collaboration_synthesis = "gpt-4o",
+    },
+})
+
+-- Per-task model override
+crew:add_task({
+    name = "complex_analysis",
+    description = "...",
+    model = "gpt-4o",  -- override for this task only
+})
+```
+
+Model resolution priority: agent `model` > task `model` > router purpose > crew default.
+
+## SSE Event Streaming
+
+Monitor crew execution in real-time via Server-Sent Events:
+
+```bash
+# Start a run (returns immediately)
+curl -X POST http://localhost:3000/flows/simple/run
+# {"run_id":"abc-123","status":"started","events_url":"/flows/simple/events/abc-123"}
+
+# Subscribe to real-time events
+curl -N http://localhost:3000/flows/simple/events/abc-123
+```
+
+Event types:
+
+| Event | Description |
+|-------|-------------|
+| `phase_start` | New execution phase begins |
+| `task_assigned` | Task assigned to an agent |
+| `task_completed` | Task finished successfully |
+| `task_failed` | Task failed with error |
+| `task_skipped` | Task skipped (condition/dependency) |
+| `tool_call` | Agent invoked a tool |
+| `log` | Lua `log()` call |
+| `run_complete` | Crew run finished |
+
+## Token Usage & Prompt Caching
+
+Track API costs and leverage OpenAI prompt caching:
+
+```lua
+local crew = Crew.new({
+    prompt_cache_key = "my-project-v1",  -- consistent routing for cache hits
+    prompt_cache_retention = "24h",       -- extended caching on supported models
+})
+
+local results = crew:run()
+
+-- Token usage available per task
+for _, r in ipairs(results) do
+    if r.token_usage then
+        print(r.task .. ": " .. r.token_usage.total_tokens .. " tokens ("
+              .. r.token_usage.cached_tokens .. " cached)")
+    end
+end
+```
+
+Inspect aggregated token usage via CLI:
+```bash
+ironcrew inspect <run_id> -p .
+# Tokens: 1542 total (1024 cached)
+```
+
 ## Custom Tools
 
 ```lua
@@ -280,18 +410,21 @@ Available in all Lua contexts:
 | `regex.replace(pat, text, repl)` | Replace first |
 | `regex.replace_all(pat, text, repl)` | Replace all |
 | `regex.split(pat, text)` | Split by pattern |
+| `validate_json(str, schema)` | Validate JSON against a JSON Schema |
 
 ## Built-in Tools
 
 | Tool | Description |
 |------|-------------|
 | `file_read` | Read file contents |
+| `file_read_glob` | Read multiple files by glob pattern (e.g., `input/*.md`) |
 | `file_write` | Write to file (path validation, extension whitelist) |
 | `web_scrape` | Fetch URL and extract text |
 | `shell` | Execute shell commands (opt-in, disabled by default) |
 | `http_request` | HTTP client (GET/POST/PUT/DELETE/PATCH, auth, headers) |
 | `hash` | Compute MD5, SHA256, SHA512 |
 | `template_render` | Render Tera templates with JSON data |
+| `validate_schema` | Validate JSON data against a JSON Schema |
 
 ## CLI
 
@@ -316,7 +449,8 @@ ironcrew serve --flows-dir ./flows --port 3000
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/flows/{flow}/run` | Execute a crew |
+| POST | `/flows/{flow}/run` | Execute a crew (async, returns `run_id`) |
+| GET | `/flows/{flow}/events/{run_id}` | SSE event stream for real-time monitoring |
 | GET | `/flows/{flow}/runs` | List runs |
 | GET | `/flows/{flow}/runs/{id}` | Get run details |
 | DELETE | `/flows/{flow}/runs/{id}` | Delete a run |
@@ -360,6 +494,7 @@ See the [`examples/`](examples/) directory:
 | `foreach` | Iterating over lists |
 | `streaming` | Real-time LLM output |
 | `subworkflow` | Nested crew composition |
+| `model-router` | Purpose-based model routing |
 
 ## License
 
