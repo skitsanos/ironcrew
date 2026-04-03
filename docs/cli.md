@@ -45,6 +45,7 @@ ironcrew run . --input '{"topic": "Rust"}' --json 2>/dev/null | jq '.status'
 |------|-------------|
 | `--input <JSON>` | Pass JSON data as the `input` global in Lua |
 | `--json` | Output structured JSON run record instead of Lua print() |
+| `--tag <label>` | Tag this run (repeatable: `--tag v2 --tag experiment`) |
 
 - **Default path:** `.` (current directory)
 - Loads `.env` (CWD first, then project dir), discovers `agents/*.lua`,

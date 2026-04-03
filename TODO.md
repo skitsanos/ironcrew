@@ -41,7 +41,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 ## Medium Value, Low Effort
 
-- [ ] **Run tags/labels** — attach metadata to runs (`ironcrew run . --tag "v2-prompt"`) for filtering and comparison.
+- [x] **Run tags/labels** — `--tag` flag on run, tags in API input, stored in run record. Done in 2.0.0.
 
 - [x] **`ironcrew fmt`** — static Lua lint: syntax, agent/tool validation, unknown tool warnings. Done in 2.0.0.
 

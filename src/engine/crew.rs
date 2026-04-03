@@ -118,6 +118,7 @@ impl Crew {
             task_count: self.tasks.len(),
             total_tokens,
             cached_tokens,
+            tags: Vec::new(), // set by caller (CLI --tag or API input.tags)
         }
     }
 
