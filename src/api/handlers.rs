@@ -49,34 +49,37 @@ pub async fn run_flow(
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
 
-    // Store for SSE subscribers
-    state
-        .active_runs
-        .write()
+    // Spawn the actual work as a child task — store its AbortHandle for cancellation
+    let eventbus_inner = eventbus.clone();
+    let run_id_for_work = run_id.clone();
+    let work_handle = tokio::spawn(async move {
+        execute_crew_from_path_with_events(
+            &flow_path,
+            &eventbus_inner,
+            &run_id_for_work,
+            input.as_ref(),
+        )
         .await
-        .insert(run_id.clone(), eventbus.clone());
+    });
+    let abort_handle = work_handle.abort_handle();
+
+    // Store eventbus + abort handle for SSE subscribers and abort endpoint
+    state.active_runs.write().await.insert(
+        run_id.clone(),
+        super::ActiveRun {
+            eventbus: eventbus.clone(),
+            abort_handle,
+        },
+    );
 
     let run_id_clone = run_id.clone();
     let state_clone = state.clone();
     let flow_clone = flow.clone();
 
-    // Spawn execution in background
+    // Monitor the work handle: emit RunComplete on finish, timeout, or abort
     tokio::spawn(async move {
-        // Maximum run lifetime: 30 minutes
         let max_lifetime = std::time::Duration::from_secs(30 * 60);
-
-        // Spawn the actual work as a child task so we can abort it on timeout
-        let eventbus_inner = eventbus.clone();
-        let run_id_for_work = run_id_clone.clone();
-        let mut work_handle = tokio::spawn(async move {
-            execute_crew_from_path_with_events(
-                &flow_path,
-                &eventbus_inner,
-                &run_id_for_work,
-                input.as_ref(),
-            )
-            .await
-        });
+        let mut work_handle = work_handle;
 
         // Race the work against the timeout
         tokio::select! {
@@ -101,6 +104,15 @@ pub async fn run_flow(
                         eventbus.emit(CrewEvent::RunComplete {
                             run_id: run_id_clone.clone(),
                             status: "failed".into(),
+                            duration_ms: 0,
+                            total_tokens: 0,
+                        });
+                    }
+                    Err(join_err) if join_err.is_cancelled() => {
+                        // Aborted via the abort endpoint
+                        eventbus.emit(CrewEvent::RunComplete {
+                            run_id: run_id_clone.clone(),
+                            status: "aborted".into(),
                             duration_ms: 0,
                             total_tokens: 0,
                         });
@@ -275,6 +287,31 @@ pub async fn execute_crew_from_path(
 }
 
 // ---------------------------------------------------------------------------
+// Abort a running crew
+// ---------------------------------------------------------------------------
+
+pub async fn abort_run(
+    State(state): State<Arc<AppState>>,
+    Path((_flow, run_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let active_runs = state.active_runs.read().await;
+    let active_run = active_runs.get(&run_id).ok_or_else(|| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found or already completed", run_id),
+        )
+    })?;
+
+    active_run.abort_handle.abort();
+    tracing::info!("Run {} aborted by client", run_id);
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id,
+        "status": "aborted",
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // SSE event stream
 // ---------------------------------------------------------------------------
 
@@ -309,7 +346,7 @@ pub async fn flow_events(
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
 
     let active_runs = state.active_runs.read().await;
-    let eventbus = active_runs.get(&run_id).ok_or_else(|| {
+    let active_run = active_runs.get(&run_id).ok_or_else(|| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("Run '{}' not found or already completed", run_id),
@@ -317,8 +354,8 @@ pub async fn flow_events(
     })?;
 
     // Get replay buffer and live subscription
-    let replay = eventbus.replay().await;
-    let mut rx = eventbus.subscribe();
+    let replay = active_run.eventbus.replay().await;
+    let mut rx = active_run.eventbus.subscribe();
     drop(active_runs);
 
     let stream = async_stream::stream! {

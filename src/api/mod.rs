@@ -14,10 +14,16 @@ use tokio::sync::RwLock;
 
 use crate::engine::eventbus::EventBus;
 
+/// A running crew: its event bus and an abort handle to cancel it.
+pub struct ActiveRun {
+    pub eventbus: EventBus,
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
-    pub active_runs: Arc<RwLock<HashMap<String, EventBus>>>,
+    pub active_runs: Arc<RwLock<HashMap<String, ActiveRun>>>,
 }
 
 /// Response from running a crew
@@ -116,6 +122,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/flows/{flow}/run", post(run_flow))
+        .route("/flows/{flow}/abort/{run_id}", post(abort_run))
         .route("/flows/{flow}/runs", get(list_runs))
         .route("/flows/{flow}/runs/{id}", get(get_run))
         .route("/flows/{flow}/runs/{id}", delete(delete_run))
