@@ -110,6 +110,28 @@ ironcrew serve --host 0.0.0.0 --port 8080 --flows-dir ./flows
 | GET    | `/flows/{flow}/agents`           | List agents in a flow |
 | GET    | `/nodes`                         | List built-in tools |
 
+### fmt
+
+Lint and check Lua crew files for common issues without executing anything.
+
+```
+ironcrew fmt
+ironcrew fmt path/to/project
+```
+
+Performs static analysis on the project:
+
+| Check | Description |
+|-------|-------------|
+| Syntax | Parses `crew.lua`, `agents/*.lua`, and `tools/*.lua` for Lua syntax errors |
+| Agent summary | Lists agents with their capabilities and tool references |
+| Tool summary | Lists custom tools alongside the 9 built-in tools |
+| Unknown tools | Warns when an agent references a tool that is neither built-in nor in `tools/` |
+
+Since tasks are defined programmatically in `crew.lua` (via `crew:add_task()`),
+they cannot be statically extracted. The fmt command checks `crew.lua` syntax
+only and reports what it can verify without execution.
+
 ### doctor
 
 Diagnose project health: check environment variables, project structure,

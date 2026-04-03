@@ -91,11 +91,26 @@ enum Commands {
         #[arg(long, default_value = ".")]
         flows_dir: PathBuf,
     },
+    /// Lint and check Lua crew files for common issues
+    Fmt {
+        /// Path to project directory or crew.lua file
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Check environment, API keys, and project health
     Doctor {
         /// Project path to diagnose
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Export a flow as a standalone package for sharing
+    Export {
+        /// Path to project directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output directory path (default: <project-name>-export)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// List past runs
     Runs {
@@ -128,7 +143,9 @@ async fn main() {
             port,
             flows_dir,
         } => cli::server::cmd_serve(&host, port, &flows_dir).await,
+        Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
         Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
+        Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
         Commands::Runs { status, project } => cli::history::cmd_runs(&project, status.as_deref()),
     };
 
