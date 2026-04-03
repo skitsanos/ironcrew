@@ -198,6 +198,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_TOOL_TIMEOUT` | Max seconds a single tool execution may run (default: `60`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
+| `IRONCREW_API_TOKEN` | Bearer token for REST API auth (disabled by default, `/health` always public) |
 
 ### .env File Loading
 

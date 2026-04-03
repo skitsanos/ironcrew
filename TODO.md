@@ -17,7 +17,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [x] **Task output truncation in SSE** — `IRONCREW_SSE_OUTPUT_MAX_CHARS` env var (disabled by default). Done in 1.9.7.
 
-- [ ] **Bearer authentication for REST API** — `IRONCREW_API_TOKEN` env var. When set, all API endpoints require `Authorization: Bearer <token>` header. Protects the serve endpoint in production deployments.
+- [x] **Bearer authentication for REST API** — `IRONCREW_API_TOKEN` env var. `/health` stays public. Done in 1.9.8.
 
 - [x] **`ironcrew doctor`** — diagnostic command checking env vars, project structure, Lua syntax. Done in 1.9.7.
 
