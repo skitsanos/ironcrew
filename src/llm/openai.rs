@@ -11,6 +11,33 @@ pub struct OpenAiProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    rate_limit: Option<RateLimiter>,
+}
+
+/// Simple token-bucket rate limiter for LLM API calls.
+struct RateLimiter {
+    min_interval: Duration,
+    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
+}
+
+impl RateLimiter {
+    fn new(min_interval_ms: u64) -> Self {
+        Self {
+            min_interval: Duration::from_millis(min_interval_ms),
+            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::time::Instant::now() - Duration::from_secs(60),
+            )),
+        }
+    }
+
+    async fn wait(&self) {
+        let mut last = self.last_call.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < self.min_interval {
+            tokio::time::sleep(self.min_interval - elapsed).await;
+        }
+        *last = std::time::Instant::now();
+    }
 }
 
 impl OpenAiProvider {
@@ -20,10 +47,25 @@ impl OpenAiProvider {
             .build()
             .expect("Failed to build HTTP client");
 
+        // Optional rate limiting via env var (milliseconds between calls)
+        let rate_limit = std::env::var("IRONCREW_RATE_LIMIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(RateLimiter::new);
+
+        if rate_limit.is_some() {
+            tracing::info!(
+                "LLM rate limiting enabled: {}ms between calls",
+                std::env::var("IRONCREW_RATE_LIMIT_MS").unwrap_or_default()
+            );
+        }
+
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             api_key,
+            rate_limit,
         }
     }
 
@@ -117,6 +159,12 @@ impl OpenAiProvider {
 
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
         self.ensure_api_key()?;
+
+        // Rate limit: wait if needed
+        if let Some(ref limiter) = self.rate_limit {
+            limiter.wait().await;
+        }
+
         let url = format!("{}/chat/completions", self.base_url);
 
         let resp = self
@@ -201,6 +249,11 @@ impl OpenAiProvider {
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
         self.ensure_api_key()?;
+
+        if let Some(ref limiter) = self.rate_limit {
+            limiter.wait().await;
+        }
+
         body["stream"] = json!(true);
 
         let url = format!("{}/chat/completions", self.base_url);

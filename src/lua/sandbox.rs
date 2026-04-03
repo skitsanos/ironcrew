@@ -92,13 +92,16 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // Override print() to also emit to EventBus as a log event
     let print_fn = lua.create_function(|lua, args: mlua::Variadic<String>| {
         let message = args.into_iter().collect::<Vec<_>>().join("\t");
-        println!("{}", message);
 
         if let Some(eventbus) = lua.app_data_ref::<crate::engine::eventbus::EventBus>() {
+            // API mode: send to SSE only, don't pollute server stdout
             eventbus.emit(crate::engine::eventbus::CrewEvent::Log {
                 level: "info".into(),
                 message,
             });
+        } else {
+            // CLI mode: print to stdout
+            println!("{}", message);
         }
 
         Ok(())

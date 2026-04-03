@@ -32,6 +32,9 @@ enum Commands {
         /// Path to project directory or crew.lua file
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// JSON input passed as the `input` global in Lua
+        #[arg(short, long)]
+        input: Option<String>,
     },
     /// Validate Lua files without executing
     Validate {
@@ -102,7 +105,7 @@ async fn main() {
     utils::logger::init(cli.verbose);
 
     let result = match cli.command {
-        Commands::Run { path } => cli::commands::cmd_run(&path).await,
+        Commands::Run { path, input } => cli::commands::cmd_run(&path, input.as_deref()).await,
         Commands::Validate { path } => cli::commands::cmd_validate(&path),
         Commands::List { path } => cli::commands::cmd_list(&path),
         Commands::Init { name } => cli::commands::cmd_init(&name),
