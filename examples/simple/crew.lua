@@ -1,3 +1,10 @@
+--[[
+    Simple Example
+
+    The simplest IronCrew flow: one agent, one task.
+    Run: ironcrew run examples/simple
+]]
+
 local crew = Crew.new({
     goal = "Answer a simple question about Rust programming",
     provider = "openai",
