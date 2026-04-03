@@ -78,7 +78,11 @@ pub async fn run_flow(
 
     // Monitor the work handle: emit RunComplete on finish, timeout, or abort
     tokio::spawn(async move {
-        let max_lifetime = std::time::Duration::from_secs(30 * 60);
+        let max_lifetime_secs: u64 = std::env::var("IRONCREW_MAX_RUN_LIFETIME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30 * 60);
+        let max_lifetime = std::time::Duration::from_secs(max_lifetime_secs);
         let mut work_handle = work_handle;
 
         // Race the work against the timeout

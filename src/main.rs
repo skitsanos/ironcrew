@@ -35,6 +35,9 @@ enum Commands {
         /// JSON input passed as the `input` global in Lua
         #[arg(short, long)]
         input: Option<String>,
+        /// Output structured JSON instead of Lua print() statements
+        #[arg(long)]
+        json: bool,
     },
     /// Validate Lua files without executing
     Validate {
@@ -105,7 +108,9 @@ async fn main() {
     utils::logger::init(cli.verbose);
 
     let result = match cli.command {
-        Commands::Run { path, input } => cli::commands::cmd_run(&path, input.as_deref()).await,
+        Commands::Run { path, input, json } => {
+            cli::commands::cmd_run(&path, input.as_deref(), json).await
+        }
         Commands::Validate { path } => cli::commands::cmd_validate(&path),
         Commands::List { path } => cli::commands::cmd_list(&path),
         Commands::Init { name } => cli::commands::cmd_init(&name),
