@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::engine::task::TaskResult;
+use crate::lua::json::json_value_to_lua;
 
 pub fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>) -> bool {
     let lua = mlua::Lua::new();
@@ -15,6 +16,21 @@ pub fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>
         let _ = entry.set("output", result.output.clone());
         let _ = entry.set("success", result.success);
         let _ = entry.set("agent", result.agent.clone());
+
+        // If the output is valid JSON, parse it and merge top-level fields
+        // into the entry table so conditions can access nested fields directly:
+        //   results.parse.hasUnknowns  (parsed field)
+        //   results.parse.output       (raw string, still available)
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&result.output)
+        {
+            for (key, value) in map {
+                if let Ok(lua_val) = json_value_to_lua(&lua, &value) {
+                    let _ = entry.set(key.as_str(), lua_val);
+                }
+            }
+        }
+
         let _ = ctx.set(name.as_str(), entry);
     }
     let _ = lua.globals().set("results", ctx);

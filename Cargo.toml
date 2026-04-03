@@ -1,8 +1,8 @@
 [package]
 name = "ironcrew"
-version = "1.9.3"
+version = "1.9.4"
 edition = "2024"
-description = "A compiled Rust runtime for Lua-defined AI agent crews"
+description = "A rruntime for Lua-defined AI agent crews"
 license = "MIT"
 repository = "https://github.com/skitsanos/ironcrew"
 keywords = ["ai", "agents", "lua", "crew", "llm"]
