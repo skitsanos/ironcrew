@@ -55,8 +55,8 @@ text is returned. Output is truncated to 10 000 characters.
 ### shell
 
 Execute a shell command via `sh -c` and return stdout/stderr. **Disabled by
-default** -- the shell tool is intentionally not registered in the runtime's
-tool registry. Enable it programmatically with `runtime.enable_shell_tool()`.
+default** — enable with `IRONCREW_ALLOW_SHELL=1` environment variable.
+See [Shell Tool Safety](#shell-tool-safety) below.
 
 - **Parameters:** `command` (string, required)
 
@@ -172,6 +172,29 @@ The following functions and namespaces are available in all Lua contexts
 | `base64_decode(str)` | string   | Decode a base64 string |
 | `log(level, msg)`    | nil      | Emit a log message (levels: trace, debug, info, warn, error) |
 | `validate_json(json_str, schema_table)` | table | Validate JSON against a schema; returns `{valid, errors}` |
+| `template(tpl_str, data_table)` | string | Render a Tera template with data (variables, loops, conditionals) |
+
+### Template Rendering
+
+The `template()` global renders [Tera](https://keats.github.io/tera/) templates directly in Lua — no LLM call needed:
+
+```lua
+-- Variables
+local msg = template("Hello {{ name }}!", {name = "Alice"})
+
+-- Loops
+local list = template("{% for item in items %}- {{ item }}\n{% endfor %}", {
+    items = {"Rust", "Python", "Go"}
+})
+
+-- Render structured LLM output into a document
+local report = template([[
+# {{ title }}
+{% for f in findings %}
+- {{ f.name }}: {{ f.description }}
+{% endfor %}
+]], json_parse(results.extract.output))
+```
 
 ### Regex Namespace
 
@@ -240,8 +263,20 @@ end
 ## Shell Tool Safety
 
 The `shell` tool is **not registered by default**. This is a deliberate safety
-decision -- unrestricted shell access could allow an LLM to execute arbitrary
-commands. The tool exists in the codebase but must be explicitly enabled via
-`runtime.enable_shell_tool()`. When listed by agents in their `tools` array,
-the engine will report an unknown-tool validation warning unless it has been
-enabled.
+decision — unrestricted shell access allows an LLM to execute arbitrary commands.
+
+Enable it by setting the `IRONCREW_ALLOW_SHELL` environment variable:
+
+```bash
+# Via env var
+IRONCREW_ALLOW_SHELL=1 ironcrew run .
+
+# Or in .env
+IRONCREW_ALLOW_SHELL=true
+
+# In Docker
+docker run -e IRONCREW_ALLOW_SHELL=1 ...
+```
+
+When enabled, a warning is logged: `Shell tool enabled via IRONCREW_ALLOW_SHELL`.
+When not set, agents listing `shell` in their tools get an unknown-tool validation warning.
