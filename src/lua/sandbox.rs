@@ -99,6 +99,11 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
                 level: "info".into(),
                 message,
             });
+        } else if lua
+            .app_data_ref::<crate::cli::commands::JsonOutputMode>()
+            .is_some()
+        {
+            // --json mode: suppress print, structured output comes from run record
         } else {
             // CLI mode: print to stdout
             println!("{}", message);

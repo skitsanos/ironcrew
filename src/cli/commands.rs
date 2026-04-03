@@ -6,9 +6,14 @@ use crate::utils::error::{IronCrewError, Result};
 
 use super::project::{load_project, setup_crew_runtime};
 
-pub async fn cmd_run(path: &Path, input_json: Option<&str>) -> Result<()> {
+pub async fn cmd_run(path: &Path, input_json: Option<&str>, json_output: bool) -> Result<()> {
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
+
+    // In --json mode, suppress Lua print() by marking via app_data
+    if json_output {
+        lua.set_app_data(JsonOutputMode);
+    }
 
     // Inject input as a global `input` table (from --input CLI flag)
     if let Some(json_str) = input_json {
@@ -34,8 +39,25 @@ pub async fn cmd_run(path: &Path, input_json: Option<&str>) -> Result<()> {
         .await
         .map_err(IronCrewError::Lua)?;
 
+    // In --json mode, read the run record and output structured JSON
+    if json_output {
+        let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
+        let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
+        if let Some(run_id) = run_id
+            && let Ok(history) = crate::engine::run_history::RunHistory::new(runs_dir)
+            && let Ok(record) = history.get(&run_id)
+        {
+            let json = serde_json::to_string_pretty(&record).unwrap_or_else(|_| "{}".into());
+            println!("{}", json);
+            return Ok(());
+        }
+    }
+
     Ok(())
 }
+
+/// Marker type stored in Lua app_data to signal --json mode (suppress print).
+pub struct JsonOutputMode;
 
 pub fn cmd_validate(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
