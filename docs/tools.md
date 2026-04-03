@@ -260,6 +260,25 @@ end
 
 ---
 
+## Tool Execution Timeout
+
+Every tool invocation is wrapped in a timeout to prevent runaway executions.
+The default timeout is **60 seconds**. Override it with the
+`IRONCREW_TOOL_TIMEOUT` environment variable (value in seconds):
+
+```bash
+# Allow tools up to 120 seconds
+IRONCREW_TOOL_TIMEOUT=120 ironcrew run .
+
+# Or in .env
+IRONCREW_TOOL_TIMEOUT=120
+```
+
+If a tool exceeds the timeout, the tool call returns an error message
+(`Tool timed out after Ns`) and the LLM continues with that error context.
+
+---
+
 ## Shell Tool Safety
 
 The `shell` tool is **not registered by default**. This is a deliberate safety

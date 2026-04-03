@@ -195,6 +195,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_LOG`    | Log level filter (e.g., `info`, `debug`, `trace`, `warn`, `error`) |
 | `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
 | `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls (e.g., `200` for 5 req/sec) |
+| `IRONCREW_TOOL_TIMEOUT` | Max seconds a single tool execution may run (default: `60`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 
 ### .env File Loading

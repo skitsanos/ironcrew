@@ -174,10 +174,25 @@ impl<'a> TaskExecutionContext<'a> {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                let tool_result = self
-                    .tool_registry
-                    .execute(&tool_call.function.name, args)
-                    .await;
+                let tool_timeout = std::time::Duration::from_secs(
+                    std::env::var("IRONCREW_TOOL_TIMEOUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(60),
+                );
+
+                let tool_result = match tokio::time::timeout(
+                    tool_timeout,
+                    self.tool_registry.execute(&tool_call.function.name, args),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(IronCrewError::ToolExecution {
+                        tool: tool_call.function.name.clone(),
+                        message: format!("Tool timed out after {}s", tool_timeout.as_secs()),
+                    }),
+                };
 
                 let result_text = match tool_result {
                     Ok(output) => output,

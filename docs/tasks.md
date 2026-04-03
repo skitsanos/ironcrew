@@ -34,6 +34,7 @@ The `name` and `description` fields are required. Everything else is optional.
 | `stream`             | boolean         | no       | false       | Stream LLM response to stderr in real-time               |
 | `foreach`            | string          | no       | nil         | Key in results/memory to iterate over (JSON array)       |
 | `foreach_as`         | string          | no       | `"item"`    | Variable name for the current iteration item             |
+| `foreach_parallel`   | boolean         | no       | false       | Process foreach items concurrently instead of sequentially |
 | `task_type`          | string          | no       | `"standard"` | Set to `"collaborative"` for multi-agent discussion     |
 | `agents`             | list of strings | no       | `{}`        | Agent names for collaborative tasks (min 2)              |
 | `max_turns`          | integer         | no       | 3           | Max conversation turns for collaborative tasks           |
@@ -179,11 +180,29 @@ crew:add_foreach_task({
 - `foreach_as` (default: `"item"`) sets the variable name used in `${item}` substitution
 - Each iteration gets `${item}` replaced with the current array element
 - Additional context is injected: `"Processing item 1/3: Rust"`
-- Items are processed sequentially
+- Items are processed sequentially by default
+- Set `foreach_parallel = true` to process all items concurrently
 - The final output is a JSON array of individual results
 - If any item fails, the overall task still completes but with `success = false`
 
 The source can be a task output (if the output is a JSON array) or a memory key.
+
+### Parallel Foreach
+
+Add `foreach_parallel = true` to process all items concurrently instead of one
+at a time. This can significantly speed up foreach tasks when items are
+independent:
+
+```lua
+crew:add_foreach_task({
+    name = "analyze_topics",
+    description = "Describe the main strength of ${item} as a programming language.",
+    foreach = "topics",
+    foreach_as = "item",
+    foreach_parallel = true,
+    agent = "analyst",
+})
+```
 
 ## Collaborative Tasks
 
