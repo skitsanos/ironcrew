@@ -2,7 +2,7 @@
 name = "ironcrew"
 version = "1.9.6"
 edition = "2024"
-description = "A rruntime for Lua-defined AI agent crews"
+description = "A runtime for Lua-defined AI agent crews"
 license = "MIT"
 repository = "https://github.com/skitsanos/ironcrew"
 keywords = ["ai", "agents", "lua", "crew", "llm"]
