@@ -36,11 +36,22 @@ Execute a crew from a project directory or a single Lua file.
 ironcrew run .
 ironcrew run path/to/project
 ironcrew run standalone.lua
+ironcrew run . --input '{"topic": "Rust", "max_length": 500}'
+ironcrew run . --json
+ironcrew run . --input '{"topic": "Rust"}' --json 2>/dev/null | jq '.status'
 ```
 
+| Flag | Description |
+|------|-------------|
+| `--input <JSON>` | Pass JSON data as the `input` global in Lua |
+| `--json` | Output structured JSON run record instead of Lua print() |
+
 - **Default path:** `.` (current directory)
-Loads `.env` (CWD first, then project dir), discovers `agents/*.lua`,
+- Loads `.env` (CWD first, then project dir), discovers `agents/*.lua`,
 `tools/*.lua`, and `crew.lua`. Run history is saved to `.ironcrew/runs/`.
+- In `--json` mode, Lua `print()` calls are suppressed and the full run record
+(status, tasks, token usage) is written to stdout as JSON. Tracing logs go to
+stderr, so piping works cleanly.
 
 ### validate
 
@@ -162,6 +173,8 @@ be set in the shell or in `.env` files.
 | `ANTHROPIC_API_KEY` | Auto-resolved when `base_url` contains `anthropic.com` |
 | `IRONCREW_LOG`    | Log level filter (e.g., `info`, `debug`, `trace`, `warn`, `error`) |
 | `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
+| `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls (e.g., `200` for 5 req/sec) |
+| `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 
 ### .env File Loading
 
