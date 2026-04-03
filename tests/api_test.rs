@@ -382,3 +382,33 @@ fn test_validate_json_lua_invalid() {
         .unwrap();
     assert!(!result);
 }
+
+#[test]
+fn test_template_global() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return template("Hello {{ name }}, you have {{ count }} items.", {name = "Alice", count = 42})"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "Hello Alice, you have 42 items.");
+}
+
+#[test]
+fn test_template_with_loop() {
+    let lua = create_crew_lua().unwrap();
+    let result: String = lua
+        .load(r#"return template("{% for item in items %}{{ item }},{% endfor %}", {items = {"a", "b", "c"}})"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "a,b,c,");
+}
+
+#[test]
+fn test_template_available_in_tool_lua() {
+    let lua = create_tool_lua().unwrap();
+    let result: String = lua
+        .load(r#"return template("{{ x }} + {{ y }}", {x = 1, y = 2})"#)
+        .eval()
+        .unwrap();
+    assert_eq!(result, "1 + 2");
+}
