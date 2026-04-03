@@ -6,9 +6,20 @@ use crate::utils::error::{IronCrewError, Result};
 
 use super::project::{load_project, setup_crew_runtime};
 
-pub async fn cmd_run(path: &Path) -> Result<()> {
+pub async fn cmd_run(path: &Path, input_json: Option<&str>) -> Result<()> {
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
+
+    // Inject input as a global `input` table (from --input CLI flag)
+    if let Some(json_str) = input_json {
+        let value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| IronCrewError::Validation(format!("Invalid --input JSON: {}", e)))?;
+        let lua_input =
+            crate::lua::api::json_value_to_lua(&lua, &value).map_err(IronCrewError::Lua)?;
+        lua.globals()
+            .set("input", lua_input)
+            .map_err(IronCrewError::Lua)?;
+    }
 
     // Execute entrypoint
     let entrypoint = loader
