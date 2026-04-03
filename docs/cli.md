@@ -161,6 +161,7 @@ be set in the shell or in `.env` files.
 | `GROQ_API_KEY`    | Auto-resolved when `base_url` contains `groq.com` |
 | `ANTHROPIC_API_KEY` | Auto-resolved when `base_url` contains `anthropic.com` |
 | `IRONCREW_LOG`    | Log level filter (e.g., `info`, `debug`, `trace`, `warn`, `error`) |
+| `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
 
 ### .env File Loading
 

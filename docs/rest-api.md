@@ -24,6 +24,7 @@ set there are available to all flows.
 |----------|-----------------------------------|------------------------------------|
 | GET      | `/health`                         | Health check (returns version)     |
 | POST     | `/flows/{flow}/run`               | Start a crew run (async)           |
+| POST     | `/flows/{flow}/abort/{run_id}`    | Abort a running crew               |
 | GET      | `/flows/{flow}/events/{run_id}`   | SSE event stream for a run         |
 | GET      | `/flows/{flow}/runs`              | List past runs for a flow          |
 | GET      | `/flows/{flow}/runs/{id}`         | Get a specific run record          |
@@ -62,6 +63,24 @@ persisted run record. Use the `events_url` to subscribe to real-time progress.
 
 Each run has a maximum lifetime of 30 minutes. If execution exceeds this limit,
 the run is aborted and a `run_complete` event is emitted with status `timeout`.
+
+## Aborting a Run
+
+Cancel a running crew by calling the abort endpoint:
+
+```bash
+curl -X POST http://localhost:3000/flows/my-crew/abort/abc-123
+# {"run_id":"abc-123","status":"aborted"}
+```
+
+This immediately cancels all in-flight LLM calls and drops pending tasks.
+The SSE stream receives a `run_complete` event with `status: "aborted"`.
+The run is cleaned up after 30 seconds.
+
+A run can end with one of these statuses:
+- `success` / `partial_failure` / `failed` — normal completion
+- `timeout` — 30-minute lifetime exceeded
+- `aborted` — cancelled via this endpoint
 
 ## SSE Event Stream
 

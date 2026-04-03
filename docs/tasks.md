@@ -90,15 +90,23 @@ You do not need `${results...}` for simple chaining -- dependencies are always v
 ### The `condition` field
 
 A Lua expression evaluated at runtime. The task only executes if it returns a truthy
-value. The expression has access to a `results` table with `output`, `success`, and
-`agent` fields for each completed task.
+value. The expression has access to a `results` table where each completed task entry
+has `output` (raw string), `success` (boolean), and `agent` (string) fields.
+
+If a task's output is valid JSON, its top-level fields are automatically parsed and
+merged into the entry — so you can access nested fields directly:
 
 ```lua
+-- Task "parse" returned: {"hasUnknowns": true, "speakers": [...]}
+-- Both of these work:
+condition = "results.parse.success"           -- standard field
+condition = "results.parse.hasUnknowns"       -- parsed from JSON output
+
 crew:add_task({
-    name = "detailed_report",
-    description = "Write a detailed report based on the analysis.",
-    condition = "results.analyze and results.analyze.success",
-    depends_on = {"analyze"},
+    name = "resolve_unknowns",
+    description = "Resolve unknown speakers",
+    condition = "results.parse.hasUnknowns",  -- skips if no unknowns
+    depends_on = {"parse"},
 })
 ```
 
