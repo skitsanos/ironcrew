@@ -342,6 +342,52 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
     }
 }
 
+/// Optionally truncate output fields in SSE events.
+/// Returns the event with output capped at max_chars (if configured).
+/// When disabled (default), returns the event unchanged.
+fn truncate_event_output(event: CrewEvent, max_chars: Option<usize>) -> CrewEvent {
+    let Some(max) = max_chars else {
+        return event;
+    };
+    match event {
+        CrewEvent::TaskCompleted {
+            task,
+            agent,
+            duration_ms,
+            success,
+            output,
+            token_usage,
+        } if output.len() > max => CrewEvent::TaskCompleted {
+            task,
+            agent,
+            duration_ms,
+            success,
+            output: format!(
+                "{}... [truncated, {} total chars]",
+                &output[..max],
+                output.len()
+            ),
+            token_usage,
+        },
+        CrewEvent::CollaborationTurn {
+            task,
+            agent,
+            turn,
+            content,
+        } if content.len() > max => CrewEvent::CollaborationTurn {
+            task,
+            agent,
+            turn,
+            content: format!(
+                "{}... [truncated, {} total chars]",
+                &content[..max],
+                content.len()
+            ),
+        },
+        other => other,
+    }
+}
+
 pub async fn flow_events(
     State(state): State<Arc<AppState>>,
     Path((flow, run_id)): Path<(String, String)>,
@@ -366,9 +412,16 @@ pub async fn flow_events(
     let mut rx = active_run.eventbus.subscribe();
     drop(active_runs);
 
+    // Optional output truncation (disabled by default)
+    let sse_max_chars: Option<usize> = std::env::var("IRONCREW_SSE_OUTPUT_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
+
     let stream = async_stream::stream! {
         // First: replay all past events for late subscribers
         for event in replay {
+            let event = truncate_event_output(event, sse_max_chars);
             let event_type = event_type_str(&event);
             let data = serde_json::to_string(&event).unwrap_or_default();
             yield Ok(Event::default().event(event_type).data(data));
@@ -382,6 +435,7 @@ pub async fn flow_events(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    let event = truncate_event_output(event, sse_max_chars);
                     let event_type = event_type_str(&event);
                     let data = serde_json::to_string(&event).unwrap_or_default();
                     yield Ok(Event::default().event(event_type).data(data));
