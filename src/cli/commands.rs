@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::lua::api::{load_agents_from_files, load_tool_defs_from_files};
 use crate::lua::sandbox::create_tool_lua;
@@ -524,6 +524,169 @@ fn mask_key(key: &str) -> String {
     }
 }
 
+pub fn cmd_fmt(path: &Path) -> Result<()> {
+    let loader = load_project(path)?;
+    let project_dir = loader.project_dir();
+
+    println!("IronCrew Fmt\n");
+    println!("Project: {}\n", project_dir.display());
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // --- Syntax checks ---
+    println!("  Syntax:");
+
+    // Entrypoint
+    if let Some(entrypoint) = loader.entrypoint() {
+        let label = entrypoint.file_name().unwrap_or_default().to_string_lossy();
+        let script = std::fs::read_to_string(entrypoint)?;
+        let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+        let dots = ".".repeat(30usize.saturating_sub(label.len()));
+        match lua.load(&script).into_function() {
+            Ok(_) => println!("    {} {} ok", label, dots),
+            Err(e) => {
+                let msg = format!("{}", e);
+                println!("    {} {} ERROR", label, dots);
+                warnings.push(format!("{} .. syntax error: {}", label, msg));
+            }
+        }
+    }
+
+    // Agents
+    let mut agents = Vec::new();
+    for file in loader.agent_files() {
+        let label = format!(
+            "agents/{}",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let dots = ".".repeat(30usize.saturating_sub(label.len()));
+        match load_agents_from_files(std::slice::from_ref(file)) {
+            Ok(mut parsed) => {
+                println!("    {} {} ok", label, dots);
+                agents.append(&mut parsed);
+            }
+            Err(e) => {
+                println!("    {} {} ERROR", label, dots);
+                warnings.push(format!("{} .. {}", label, e));
+            }
+        }
+    }
+
+    // Tools
+    let mut custom_tools = Vec::new();
+    for file in loader.tool_files() {
+        let label = format!(
+            "tools/{}",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let dots = ".".repeat(30usize.saturating_sub(label.len()));
+        match load_tool_defs_from_files(std::slice::from_ref(file)) {
+            Ok(mut parsed) => {
+                println!("    {} {} ok", label, dots);
+                custom_tools.append(&mut parsed);
+            }
+            Err(e) => {
+                println!("    {} {} ERROR", label, dots);
+                warnings.push(format!("{} .. {}", label, e));
+            }
+        }
+    }
+    println!();
+
+    // --- Agents summary ---
+    println!("  Agents ({}):", agents.len());
+    for agent in &agents {
+        let mut details = Vec::new();
+        if !agent.capabilities.is_empty() {
+            details.push(format!("capabilities: [{}]", agent.capabilities.join(", ")));
+        }
+        if !agent.tools.is_empty() {
+            details.push(format!("tools: [{}]", agent.tools.join(", ")));
+        }
+        let detail_str = if details.is_empty() {
+            String::new()
+        } else {
+            details.join(", ")
+        };
+        let label = format!("{} ", agent.name);
+        let dots = ".".repeat(30usize.saturating_sub(label.len()));
+        println!("    {}{} {}", label, dots, detail_str);
+    }
+    if agents.is_empty() {
+        println!("    (none)");
+    }
+    println!();
+
+    // --- Tools summary ---
+    let builtin_tools = [
+        "file_read",
+        "file_read_glob",
+        "file_write",
+        "web_scrape",
+        "shell",
+        "http_request",
+        "hash",
+        "template_render",
+        "validate_schema",
+    ];
+    println!(
+        "  Tools ({} custom + {} built-in):",
+        custom_tools.len(),
+        builtin_tools.len()
+    );
+    for tool in &custom_tools {
+        let label = format!("{} ", tool.name);
+        let dots = ".".repeat(30usize.saturating_sub(label.len()));
+        println!(
+            "    {}{} custom ({})",
+            label,
+            dots,
+            tool.source_path
+                .strip_prefix(project_dir)
+                .unwrap_or(&tool.source_path)
+                .display()
+        );
+    }
+    if custom_tools.is_empty() {
+        println!("    (no custom tools)");
+    }
+    println!();
+
+    // --- Cross-reference checks ---
+    let known_tool_names: Vec<&str> = builtin_tools
+        .iter()
+        .copied()
+        .chain(custom_tools.iter().map(|t| t.name.as_str()))
+        .collect();
+
+    for agent in &agents {
+        for tool_name in &agent.tools {
+            if !known_tool_names.contains(&tool_name.as_str()) {
+                warnings.push(format!(
+                    "{} .. references unknown tool '{}'",
+                    agent.name, tool_name
+                ));
+            }
+        }
+    }
+
+    // --- Warnings ---
+    println!("  Warnings:");
+    if warnings.is_empty() {
+        println!("    (none)");
+        println!();
+        println!("  All checks passed.");
+    } else {
+        for w in &warnings {
+            println!("    {}", w);
+        }
+        println!();
+        println!("  {} issue(s) found.", warnings.len());
+    }
+
+    Ok(())
+}
+
 pub fn cmd_list(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
 
@@ -580,6 +743,100 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     if let Some(ep) = loader.entrypoint() {
         println!("Entrypoint: {}", ep.display());
     }
+
+    Ok(())
+}
+
+pub fn cmd_export(path: &Path, output: Option<&Path>) -> Result<()> {
+    let loader = load_project(path)?;
+
+    let project_name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "ironcrew-export".into());
+
+    let output_dir = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(format!("{}-export", project_name)));
+
+    if output_dir.exists() {
+        return Err(IronCrewError::Validation(format!(
+            "Output directory '{}' already exists",
+            output_dir.display()
+        )));
+    }
+
+    println!("Exporting project: {}", loader.project_dir().display());
+    println!();
+
+    // Create directory structure
+    std::fs::create_dir_all(output_dir.join("agents"))?;
+    std::fs::create_dir_all(output_dir.join("tools"))?;
+
+    // Copy entrypoint
+    if let Some(ep) = loader.entrypoint() {
+        std::fs::copy(ep, output_dir.join("crew.lua"))?;
+        println!("  crew.lua");
+    }
+
+    // Copy agents
+    let mut agent_count = 0;
+    for agent_file in loader.agent_files() {
+        if let Some(filename) = agent_file.file_name() {
+            std::fs::copy(agent_file, output_dir.join("agents").join(filename))?;
+            println!("  agents/{}", filename.to_string_lossy());
+            agent_count += 1;
+        }
+    }
+
+    // Copy tools
+    let mut tool_count = 0;
+    for tool_file in loader.tool_files() {
+        if let Some(filename) = tool_file.file_name() {
+            std::fs::copy(tool_file, output_dir.join("tools").join(filename))?;
+            println!("  tools/{}", filename.to_string_lossy());
+            tool_count += 1;
+        }
+    }
+
+    // Generate .env.template from .env (sanitize values)
+    let env_file = loader.project_dir().join(".env");
+    if env_file.exists() {
+        let content = std::fs::read_to_string(&env_file)?;
+        let template: String = content
+            .lines()
+            .map(|line| {
+                if line.trim().starts_with('#') || line.trim().is_empty() {
+                    line.to_string()
+                } else if let Some(key) = line.split('=').next() {
+                    format!("{}=<YOUR_VALUE_HERE>", key.trim())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(output_dir.join(".env.template"), template)?;
+        println!("  .env.template");
+    }
+
+    // Generate .gitignore
+    std::fs::write(
+        output_dir.join(".gitignore"),
+        "/output\n.env\n.DS_Store\n.ironcrew/\n",
+    )?;
+    println!("  .gitignore");
+
+    println!();
+    println!("Exported to: {}", output_dir.display());
+    println!("  {} agent(s), {} tool(s)", agent_count, tool_count);
+    println!();
+    println!("Next steps:");
+    println!("  1. cd {}", output_dir.display());
+    println!("  2. cp .env.template .env");
+    println!("  3. Edit .env with your API keys");
+    println!("  4. ironcrew run .");
 
     Ok(())
 }
