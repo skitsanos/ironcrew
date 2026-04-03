@@ -36,6 +36,8 @@ pub struct Task {
     #[serde(default)]
     pub foreach_as: Option<String>, // variable name for the current item (default: "item")
     #[serde(default)]
+    pub foreach_parallel: bool, // if true, process foreach items concurrently
+    #[serde(default)]
     pub stream: bool, // if true, stream LLM response to stderr in real-time
     #[serde(default)]
     pub model: Option<String>, // per-task model override

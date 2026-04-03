@@ -129,6 +129,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
     let max_turns: Option<usize> = table.get::<Option<usize>>("max_turns")?.or(None);
     let foreach_source: Option<String> = table.get::<Option<String>>("foreach")?.or(None);
     let foreach_as: Option<String> = table.get::<Option<String>>("foreach_as")?.or(None);
+    let foreach_parallel: bool = table.get::<bool>("foreach_parallel").unwrap_or(false);
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
     let model: Option<String> = table.get::<Option<String>>("model")?.or(None);
 
@@ -149,6 +150,7 @@ pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
         max_turns,
         foreach_source,
         foreach_as,
+        foreach_parallel,
         stream,
         model,
     })

@@ -270,4 +270,17 @@ fn test_task_foreach_fields_default_to_none() {
     };
     assert_eq!(task.foreach_source, None);
     assert_eq!(task.foreach_as, None);
+    assert!(!task.foreach_parallel);
+}
+
+#[test]
+fn test_task_foreach_parallel_field() {
+    let task = Task {
+        name: "test".into(),
+        description: "test".into(),
+        foreach_source: Some("items".into()),
+        foreach_parallel: true,
+        ..Default::default()
+    };
+    assert!(task.foreach_parallel);
 }

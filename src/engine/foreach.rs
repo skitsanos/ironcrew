@@ -10,6 +10,37 @@ use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::Result;
 
+/// Build a per-item task from the parent foreach task.
+fn build_item_task(
+    task: &Task,
+    item_var: &str,
+    idx: usize,
+    total: usize,
+    item: &serde_json::Value,
+) -> Task {
+    let item_str = match item {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+
+    let mut item_task = task.clone();
+    let item_context = format!(
+        "Processing {} {}/{}: {}",
+        item_var,
+        idx + 1,
+        total,
+        item_str
+    );
+    item_task.context = Some(match &task.context {
+        Some(existing) => format!("{}\n\n{}", existing, item_context),
+        None => item_context,
+    });
+    item_task.description = item_task
+        .description
+        .replace(&format!("${{{}}}", item_var), &item_str);
+    item_task
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_foreach_task(
     task: &Task,
@@ -69,85 +100,139 @@ pub async fn execute_foreach_task(
     }
 
     tracing::info!(
-        "Running foreach task '{}' with {} items",
+        "Running foreach task '{}' with {} items{}",
         task.name,
-        items.len()
+        items.len(),
+        if task.foreach_parallel {
+            " (parallel)"
+        } else {
+            ""
+        }
     );
 
-    // Run each item sequentially, collecting individual results
     let mut foreach_outputs: Vec<String> = Vec::new();
     let mut all_success = true;
     let mut accumulated_usage = TaskTokenUsage::default();
     let start = Instant::now();
 
-    for (idx, item) in items.iter().enumerate() {
-        let item_str = match item {
-            serde_json::Value::String(s) => s.clone(),
-            other => serde_json::to_string(other).unwrap_or_default(),
-        };
+    if task.foreach_parallel {
+        // Pre-build all item tasks
+        let item_tasks: Vec<Task> = items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| build_item_task(task, &item_var, idx, items.len(), item))
+            .collect();
 
-        // Create a modified task with the item injected into context
-        let mut item_task = task.clone();
-        let item_context = format!(
-            "Processing {} {}/{}: {}",
-            item_var,
-            idx + 1,
-            items.len(),
-            item_str
-        );
-        item_task.context = Some(match &task.context {
-            Some(existing) => format!("{}\n\n{}", existing, item_context),
-            None => item_context,
-        });
-        // Interpolate the description with the item
-        item_task.description = item_task
-            .description
-            .replace(&format!("${{{}}}", item_var), &item_str);
+        // Build futures that borrow shared state — join_all runs them concurrently
+        // on the current task without spawning, so shared references are valid.
+        let futs: Vec<_> = item_tasks
+            .iter()
+            .map(|item_task| async {
+                let mem_ctx = memory.build_context(&item_task.description, 3).await;
+                let msgs = messagebus.receive(&agent.name).await;
+                let msg_ctx = if msgs.is_empty() {
+                    String::new()
+                } else {
+                    let strs: Vec<String> = msgs
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "[Message from {} ({:?})]: {}",
+                                m.from, m.message_type, m.content
+                            )
+                        })
+                        .collect();
+                    format!("Messages from other agents:\n{}", strs.join("\n"))
+                };
+                execute_task_standalone(
+                    item_task,
+                    agent,
+                    provider,
+                    tool_registry,
+                    results,
+                    model,
+                    max_tool_rounds,
+                    &mem_ctx,
+                    &msg_ctx,
+                    task.stream || stream,
+                )
+                .await
+            })
+            .collect();
 
-        let memory_context = memory.build_context(&item_task.description, 3).await;
-        let messages_context = messagebus.receive(&agent.name).await;
-        let msg_ctx = if messages_context.is_empty() {
-            String::new()
-        } else {
-            let strs: Vec<String> = messages_context
-                .iter()
-                .map(|m| {
-                    format!(
-                        "[Message from {} ({:?})]: {}",
-                        m.from, m.message_type, m.content
-                    )
-                })
-                .collect();
-            format!("Messages from other agents:\n{}", strs.join("\n"))
-        };
+        let parallel_results = futures::future::join_all(futs).await;
 
-        match execute_task_standalone(
-            &item_task,
-            agent,
-            provider,
-            tool_registry,
-            results,
-            model,
-            max_tool_rounds,
-            &memory_context,
-            &msg_ctx,
-            task.stream || stream,
-        )
-        .await
-        {
-            Ok((output, item_usage)) => {
-                if let Some(u) = &item_usage {
-                    accumulated_usage.prompt_tokens += u.prompt_tokens;
-                    accumulated_usage.completion_tokens += u.completion_tokens;
-                    accumulated_usage.total_tokens += u.total_tokens;
-                    accumulated_usage.cached_tokens += u.cached_tokens;
+        // Resize output vec to match items count
+        foreach_outputs.resize(items.len(), String::new());
+
+        for (idx, result) in parallel_results.into_iter().enumerate() {
+            match result {
+                Ok((output, item_usage)) => {
+                    if let Some(u) = &item_usage {
+                        accumulated_usage.prompt_tokens += u.prompt_tokens;
+                        accumulated_usage.completion_tokens += u.completion_tokens;
+                        accumulated_usage.total_tokens += u.total_tokens;
+                        accumulated_usage.cached_tokens += u.cached_tokens;
+                    }
+                    foreach_outputs[idx] = output;
                 }
-                foreach_outputs.push(output);
+                Err(e) => {
+                    tracing::warn!("foreach item {}/{} failed: {}", idx + 1, items.len(), e);
+                    foreach_outputs[idx] = format!("Error: {}", e);
+                    all_success = false;
+                }
             }
-            Err(e) => {
-                tracing::warn!("foreach item {}/{} failed: {}", idx + 1, items.len(), e);
-                foreach_outputs.push(format!("Error: {}", e));
-                all_success = false;
+        }
+    } else {
+        // Sequential: existing behavior
+        for (idx, item) in items.iter().enumerate() {
+            let item_task = build_item_task(task, &item_var, idx, items.len(), item);
+
+            let memory_context = memory.build_context(&item_task.description, 3).await;
+            let messages_context = messagebus.receive(&agent.name).await;
+            let msg_ctx = if messages_context.is_empty() {
+                String::new()
+            } else {
+                let strs: Vec<String> = messages_context
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "[Message from {} ({:?})]: {}",
+                            m.from, m.message_type, m.content
+                        )
+                    })
+                    .collect();
+                format!("Messages from other agents:\n{}", strs.join("\n"))
+            };
+
+            match execute_task_standalone(
+                &item_task,
+                agent,
+                provider,
+                tool_registry,
+                results,
+                model,
+                max_tool_rounds,
+                &memory_context,
+                &msg_ctx,
+                task.stream || stream,
+            )
+            .await
+            {
+                Ok((output, item_usage)) => {
+                    if let Some(u) = &item_usage {
+                        accumulated_usage.prompt_tokens += u.prompt_tokens;
+                        accumulated_usage.completion_tokens += u.completion_tokens;
+                        accumulated_usage.total_tokens += u.total_tokens;
+                        accumulated_usage.cached_tokens += u.cached_tokens;
+                    }
+                    foreach_outputs.push(output);
+                }
+                Err(e) => {
+                    tracing::warn!("foreach item {}/{} failed: {}", idx + 1, items.len(), e);
+                    foreach_outputs.push(format!("Error: {}", e));
+                    all_success = false;
+                }
             }
         }
     }
