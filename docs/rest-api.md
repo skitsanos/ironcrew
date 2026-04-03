@@ -61,8 +61,9 @@ Response:
 The `run_id` is consistent across the initial response, SSE events, and the
 persisted run record. Use the `events_url` to subscribe to real-time progress.
 
-Each run has a maximum lifetime of 30 minutes. If execution exceeds this limit,
-the run is aborted and a `run_complete` event is emitted with status `timeout`.
+Each run has a maximum lifetime (default: 30 minutes). If execution exceeds this
+limit, the run is aborted and a `run_complete` event is emitted with `status: "timeout"`.
+Configure via `IRONCREW_MAX_RUN_LIFETIME` env var (seconds).
 
 ## Aborting a Run
 
