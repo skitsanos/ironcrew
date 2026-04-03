@@ -43,9 +43,9 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [ ] **Run tags/labels** — attach metadata to runs (`ironcrew run . --tag "v2-prompt"`) for filtering and comparison.
 
-- [ ] **`ironcrew fmt`** — lint Lua crew files. Check for common issues: missing `depends_on`, unused agents, unreachable tasks.
+- [x] **`ironcrew fmt`** — static Lua lint: syntax, agent/tool validation, unknown tool warnings. Done in 2.0.0.
 
-- [ ] **`ironcrew export`** — export a flow as a standalone package (crew.lua + agents + tools + .env template) for sharing.
+- [x] **`ironcrew export`** — package flow as standalone directory with .env.template. Done in 2.0.0.
 
 ---
 
