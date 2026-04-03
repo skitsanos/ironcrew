@@ -132,6 +132,43 @@ Since tasks are defined programmatically in `crew.lua` (via `crew:add_task()`),
 they cannot be statically extracted. The fmt command checks `crew.lua` syntax
 only and reports what it can verify without execution.
 
+### export
+
+Package a flow as a standalone directory for sharing. Copies the entrypoint,
+agents, and tools into a clean output directory. Secrets are never copied;
+instead a `.env.template` is generated with placeholder values.
+
+```
+ironcrew export .
+ironcrew export path/to/project
+ironcrew export . -o my-flow-export
+```
+
+| Flag           | Default                      | Description |
+|----------------|------------------------------|-------------|
+| `-o, --output` | `<project-name>-export`      | Output directory path |
+
+**Included files:**
+- `crew.lua` (entrypoint)
+- `agents/*.lua` (all agent definitions)
+- `tools/*.lua` (all custom tools)
+- `.env.template` (sanitized copy of `.env` with values replaced by `<YOUR_VALUE_HERE>`)
+- `.gitignore`
+
+**Excluded (never copied):**
+- `.env` (contains secrets)
+- `.ironcrew/` (run history and memory)
+- `output/` (generated files)
+
+After exporting, recipients can get started with:
+
+```
+cd my-project-export
+cp .env.template .env
+# Edit .env with API keys
+ironcrew run .
+```
+
 ### doctor
 
 Diagnose project health: check environment variables, project structure,
