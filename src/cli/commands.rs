@@ -6,13 +6,23 @@ use crate::utils::error::{IronCrewError, Result};
 
 use super::project::{load_project, setup_crew_runtime};
 
-pub async fn cmd_run(path: &Path, input_json: Option<&str>, json_output: bool) -> Result<()> {
+pub async fn cmd_run(
+    path: &Path,
+    input_json: Option<&str>,
+    json_output: bool,
+    tags: Vec<String>,
+) -> Result<()> {
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
     // In --json mode, suppress Lua print() by marking via app_data
     if json_output {
         lua.set_app_data(JsonOutputMode);
+    }
+
+    // Store tags so LuaCrew::run() can attach them to the run record
+    if !tags.is_empty() {
+        lua.set_app_data(tags);
     }
 
     // Inject input as a global `input` table (from --input CLI flag)

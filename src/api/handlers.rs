@@ -182,6 +182,17 @@ async fn execute_crew_from_path_with_events(
 
     // Inject input as a global `input` table (from the HTTP request body)
     if let Some(input_value) = input {
+        // Extract tags from input if present (e.g., {"tags": ["v2", "experiment"], ...})
+        if let Some(tags) = input_value.get("tags").and_then(|v| v.as_array()) {
+            let tag_strings: Vec<String> = tags
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !tag_strings.is_empty() {
+                lua.set_app_data(tag_strings);
+            }
+        }
+
         let lua_input = json_value_to_lua(&lua, input_value).map_err(IronCrewError::Lua)?;
         lua.globals()
             .set("input", lua_input)

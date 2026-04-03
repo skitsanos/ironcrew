@@ -371,13 +371,18 @@ impl UserData for LuaCrew {
             let pre_assigned_run_id: Option<String> =
                 lua.app_data_ref::<String>().map(|r| r.clone());
             let store_dir = this.project_dir.join(".ironcrew").join("runs");
-            let record = crew.create_run_record(
+            let mut record = crew.create_run_record(
                 pre_assigned_run_id,
                 &results,
                 &run_start.to_rfc3339(),
                 &run_end.to_rfc3339(),
                 total_ms,
             );
+
+            // Attach tags from CLI --tag flags or API input
+            if let Some(tags) = lua.app_data_ref::<Vec<String>>() {
+                record.tags = tags.clone();
+            }
             let run_id =
                 tokio::task::spawn_blocking(move || -> crate::utils::error::Result<String> {
                     let history = crate::engine::run_history::RunHistory::new(store_dir)?;

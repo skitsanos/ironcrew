@@ -19,6 +19,8 @@ pub struct RunRecord {
     pub total_tokens: u32,
     #[serde(default)]
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -25,6 +25,7 @@ fn test_save_and_load_run() {
         task_count: 1,
         total_tokens: 0,
         cached_tokens: 0,
+        tags: vec![],
     };
 
     history.save(&record).unwrap();
@@ -57,6 +58,7 @@ fn test_list_runs() {
             task_count: 1,
             total_tokens: 0,
             cached_tokens: 0,
+            tags: vec![],
         };
         history.save(&record).unwrap();
     }
@@ -88,6 +90,7 @@ fn test_delete_run() {
         task_count: 0,
         total_tokens: 0,
         cached_tokens: 0,
+        tags: vec![],
     };
     history.save(&record).unwrap();
 
