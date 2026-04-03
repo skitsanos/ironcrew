@@ -1,6 +1,6 @@
 # Best Practices
 
-Guidelines for building reliable, cost-effective, and maintainable IronCrew flows.
+Patterns and tips for building crews that are reliable, fast, and cost-effective in production.
 
 ## Project Structure
 

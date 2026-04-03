@@ -1,7 +1,6 @@
 # Agents
 
-Agents are the workers in an IronCrew crew. Each agent has a name, goal, and
-optional configuration that controls how it interacts with the LLM.
+Agents are your AI specialists — each with a focused role, capabilities, and personality. You tell them *what* they're good at; IronCrew figures out *when* to use them.
 
 ## Defining Agents
 

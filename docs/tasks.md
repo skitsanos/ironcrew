@@ -1,7 +1,6 @@
 # Tasks
 
-Tasks are the units of work in an IronCrew crew. Each task has a description that
-is sent to the LLM, and optional configuration for dependencies, retries, error
+Tasks define what your crew actually does. Each task is a prompt sent to an agent, with options for dependencies, retries, conditions, error
 handling, and more.
 
 ## Basic Task

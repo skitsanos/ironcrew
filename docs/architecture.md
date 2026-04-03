@@ -1,7 +1,6 @@
 # Architecture
 
-IronCrew is a Rust runtime for executing AI agent crews defined in Lua scripts.
-It follows a three-layer design that separates system concerns from workflow logic.
+IronCrew separates the heavy lifting (LLM calls, HTTP, parallel scheduling, tool execution) from your workflow logic (agents, tasks, orchestration). You write Lua — IronCrew compiles to a single native binary that runs it. This page explains how the pieces fit together.
 
 ## Three-Layer Design
 
