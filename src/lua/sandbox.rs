@@ -232,6 +232,19 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         })?;
     lua.globals().set("validate_json", validate_json_fn)?;
 
+    // template(template_string, data_table) -> rendered string
+    let template_fn = lua.create_function(|_, (tpl, data): (String, mlua::Table)| {
+        let json_data = lua_table_to_json(&data)?;
+        let mut tera = tera::Tera::default();
+        tera.add_raw_template("inline", &tpl)
+            .map_err(|e| mlua::Error::external(format!("Template error: {}", e)))?;
+        let context = tera::Context::from_serialize(&json_data)
+            .map_err(|e| mlua::Error::external(format!("Template context error: {}", e)))?;
+        tera.render("inline", &context)
+            .map_err(|e| mlua::Error::external(format!("Template render error: {}", e)))
+    })?;
+    lua.globals().set("template", template_fn)?;
+
     // http namespace — async HTTP client for Lua scripts
     let http_table = lua.create_table()?;
 
