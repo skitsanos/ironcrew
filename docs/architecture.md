@@ -1,6 +1,6 @@
 # Architecture
 
-IronCrew separates the heavy lifting (LLM calls, HTTP, parallel scheduling, tool execution) from your workflow logic (agents, tasks, orchestration). You write Lua — IronCrew compiles to a single native binary that runs it. This page explains how the pieces fit together.
+IronCrew separates the heavy lifting (LLM calls, HTTP, parallel scheduling, tool execution) from your workflow logic (agents, tasks, orchestration). You write Lua - IronCrew compiles to a single native binary that runs it. This page explains how the pieces fit together.
 
 ## Three-Layer Design
 
@@ -17,16 +17,11 @@ IronCrew separates the heavy lifting (LLM calls, HTTP, parallel scheduling, tool
 +--------------------------+
 ```
 
-**Rust Core** (`src/engine/`, `src/llm/`, `src/tools/`) -- Handles orchestration,
-LLM communication, tool execution, dependency resolution, retry logic, and memory.
-All concurrency and I/O lives here.
+**Rust Core** (`src/engine/`, `src/llm/`, `src/tools/`) -- Handles orchestration, LLM communication, tool execution, dependency resolution, retry logic, and memory. All concurrency and I/O lives here.
 
-**Lua Bridge** (`src/lua/`) -- Exposes Rust functionality to Lua as globals
-(`Crew`, `Agent`) and methods (`crew:add_task()`, `crew:run()`). Parses Lua tables
-into Rust structs, registers constructors, and manages the sandboxed Lua environment.
+**Lua Bridge** (`src/lua/`) -- Exposes Rust functionality to Lua as globals (`Crew`, `Agent`) and methods (`crew:add_task()`, `crew:run()`). Parses Lua tables into Rust structs, registers constructors, and manages the sandboxed Lua environment.
 
-**Lua Scripts** -- User-authored workflow definitions. The entrypoint is `crew.lua`,
-with optional `agents/` and `tools/` directories for declarative definitions.
+**Lua Scripts** -- User-authored workflow definitions. The entrypoint is `crew.lua`, with optional `agents/` and `tools/` directories for declarative definitions.
 
 ## Project Structure
 
@@ -93,9 +88,7 @@ Tasks a, b, and c land in Phase 0 (parallel). The summary task lands in Phase 1.
 
 ### Parallel Execution
 
-Within each phase, standard tasks run concurrently using `FuturesUnordered`.
-This keeps all futures on the current Tokio task (no `tokio::spawn`), so when the
-orchestrator is cancelled, all in-flight work is dropped immediately.
+Within each phase, standard tasks run concurrently using `FuturesUnordered`. This keeps all futures on the current Tokio task (no `tokio::spawn`), so when the orchestrator is cancelled, all in-flight work is dropped immediately.
 
 Concurrency can be bounded with `max_concurrent` in `Crew.new()`:
 
@@ -190,19 +183,16 @@ When executing a task, the model is resolved through a priority chain:
 
 ```lua
 local crew = Crew.new({
-    model = "gpt-4o-mini",        -- default fallback
+    model = "gpt-4.1-mini",        -- default fallback
     models = {
         task_execution = "gpt-4o",
-        collaboration = "gpt-4o-mini",
+        collaboration = "gpt-4.1-mini",
     },
 })
 ```
 
 ## Event System and Run History
 
-The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`,
-`TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `CollaborationTurn`).
-These power the REST API's Server-Sent Events stream and structured logging.
+The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `CollaborationTurn`). These power the REST API's Server-Sent Events stream and structured logging.
 
-Each `crew:run()` saves a `RunRecord` to `.ironcrew/runs/` with task results,
-token usage, timing, and status (success, partial failure, or failed).
+Each `crew:run()` saves a `RunRecord` to `.ironcrew/runs/` with task results, token usage, timing, and status (success, partial failure, or failed).

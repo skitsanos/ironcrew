@@ -1,6 +1,6 @@
 # Agents
 
-Agents are your AI specialists — each with a focused role, capabilities, and personality. You tell them *what* they're good at; IronCrew figures out *when* to use them.
+Agents are your AI specialists - each with a focused role, capabilities, and personality. You tell them *what* they're good at; IronCrew figures out *when* to use them.
 
 ## Defining Agents
 
@@ -136,7 +136,7 @@ resolution chain):
 crew:add_agent(Agent.new({
     name = "deep_thinker",
     goal = "Perform complex reasoning tasks",
-    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-4o-mini
+    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-4.1-mini
     temperature = 0.2,
 }))
 ```

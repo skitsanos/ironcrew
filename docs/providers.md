@@ -8,11 +8,11 @@ endpoint can be used as a backend.
 
 By default, IronCrew connects to the OpenAI API:
 
-| Environment Variable | Default                        | Description         |
-|----------------------|--------------------------------|---------------------|
-| `OPENAI_API_KEY`     | (required)                     | API key             |
-| `OPENAI_BASE_URL`    | `https://api.openai.com/v1`    | API base URL        |
-| `OPENAI_MODEL`       | `gpt-4o-mini`                  | Default model       |
+| Environment Variable | Default                     | Description   |
+| -------------------- | --------------------------- | ------------- |
+| `OPENAI_API_KEY`     | (required)                  | API key       |
+| `OPENAI_BASE_URL`    | `https://api.openai.com/v1` | API base URL  |
+| `OPENAI_MODEL`       | `gpt-4.1-mini`              | Default model |
 
 Set these in a `.env` file in your project directory or export them in your shell.
 
@@ -26,7 +26,7 @@ No extra configuration needed beyond setting `OPENAI_API_KEY`.
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-4o-mini",
+    model = "gpt-4.1-mini",
 })
 ```
 
@@ -124,10 +124,10 @@ the same crew, optimizing cost and performance.
 local crew = Crew.new({
     goal = "Cost-optimized crew",
     provider = "openai",
-    model = "gpt-4o-mini",           -- default fallback
+    model = "gpt-4.1-mini",           -- default fallback
     models = {
-        task_execution = "gpt-4o-mini",
-        collaboration = "gpt-4o-mini",
+        task_execution = "gpt-4.1-mini",
+        collaboration = "gpt-4.1-mini",
         collaboration_synthesis = "gpt-4o",
     },
 })
@@ -164,7 +164,7 @@ local crew = Crew.new({
 
 ## Tips
 
-- Use `gpt-4o-mini` or `gemini-2.5-flash` for simple extraction and routing tasks.
+- Use `gpt-4.1-mini` or `gemini-2.5-flash` for simple extraction and routing tasks.
   Reserve `gpt-4o` or larger models for tasks requiring deep reasoning.
 - Set model overrides at the task level when a single task needs more capability
   than the rest of the crew.

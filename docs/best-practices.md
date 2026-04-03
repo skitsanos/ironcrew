@@ -80,7 +80,7 @@ with a false condition emits a `task_skipped` event and does not count as failed
 Tasks in the same dependency phase execute in parallel. Use `max_concurrent` on
 the crew to limit parallelism if needed.
 
-**Model routing.** Use cheap models (`gpt-4o-mini`, `gemini-2.5-flash`) for simple
+**Model routing.** Use cheap models (`gpt-4.1-mini`, `gemini-2.5-flash`) for simple
 tasks and reserve capable models for reasoning. Set `models` on the crew or
 `model` on individual agents and tasks.
 

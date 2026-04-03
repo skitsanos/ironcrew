@@ -9,7 +9,7 @@ memory, and messaging into a single runnable workflow defined in Lua.
 local crew = Crew.new({
     goal            = "Analyze customer feedback and produce a report",
     provider        = "openai",               -- only "openai" supported (works with any OpenAI-compatible API)
-    model           = "gpt-4o-mini",          -- default model for all tasks
+    model           = "gpt-4.1-mini",          -- default model for all tasks
     base_url        = "https://api.openai.com/v1",  -- optional, overrides OPENAI_BASE_URL
     api_key         = env("OPENAI_API_KEY"),  -- optional, overrides OPENAI_API_KEY
     stream          = false,                  -- enable streaming output (default false)
@@ -23,10 +23,10 @@ local crew = Crew.new({
     -- Model router (see below)
     models = {
         task_execution         = "gpt-4o",
-        tool_synthesis         = "gpt-4o-mini",
+        tool_synthesis         = "gpt-4.1-mini",
         final_response         = "gpt-4o",
         collaboration          = "gpt-4o",
-        collaboration_synthesis = "gpt-4o-mini",
+        collaboration_synthesis = "gpt-4.1-mini",
     },
 })
 ```
@@ -37,7 +37,7 @@ local crew = Crew.new({
 |--------------------------|----------|--------------------|-------------|
 | `goal`                   | string   | *required*         | High-level objective shown in the system prompt |
 | `provider`               | string   | `"openai"`         | LLM provider (must be `"openai"`) |
-| `model`                  | string   | `"gpt-4o-mini"`    | Default model for task execution |
+| `model`                  | string   | `"gpt-4.1-mini"`    | Default model for task execution |
 | `base_url`               | string   | env `OPENAI_BASE_URL` | API endpoint (supports Gemini, Groq, etc.) |
 | `api_key`                | string   | env `OPENAI_API_KEY`  | API key; auto-resolved from provider-specific env vars |
 | `stream`                 | bool     | `false`            | Stream LLM responses token-by-token |
@@ -161,13 +161,13 @@ without changing agent or task definitions.
 ```lua
 local crew = Crew.new({
     goal  = "Multi-model workflow",
-    model = "gpt-4o-mini",         -- fallback for unrouted purposes
+    model = "gpt-4.1-mini",         -- fallback for unrouted purposes
     models = {
         task_execution          = "gpt-4o",
-        tool_synthesis          = "gpt-4o-mini",
+        tool_synthesis          = "gpt-4.1-mini",
         final_response          = "gpt-4o",
         collaboration           = "gpt-4o",
-        collaboration_synthesis = "gpt-4o-mini",
+        collaboration_synthesis = "gpt-4.1-mini",
     },
 })
 ```

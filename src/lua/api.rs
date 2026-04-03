@@ -75,7 +75,7 @@ pub fn register_crew_constructor(
             .unwrap_or_else(|_| "openai".into());
         let model: String = table
             .get::<String>("model")
-            .unwrap_or_else(|_| "gpt-4o-mini".into());
+            .unwrap_or_else(|_| "gpt-4.1-mini".into());
         let base_url: Option<String> = table.get("base_url").ok();
         let api_key: Option<String> = table.get("api_key").ok();
         let max_concurrent: Option<usize> =

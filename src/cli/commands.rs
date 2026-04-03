@@ -161,7 +161,7 @@ pub fn cmd_init(name: &str) -> Result<()> {
         "# IronCrew Environment Configuration\n\
          OPENAI_API_KEY=your-api-key-here\n\
          OPENAI_BASE_URL=https://api.openai.com/v1\n\
-         OPENAI_MODEL=gpt-4o-mini\n\
+         OPENAI_MODEL=gpt-4.1-mini\n\
          IRONCREW_LOG=info\n",
     )?;
 
@@ -200,7 +200,7 @@ pub fn cmd_init(name: &str) -> Result<()> {
 local crew = Crew.new({{
     goal = "Your crew goal here",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-4.1-mini",
     base_url = env("OPENAI_BASE_URL"),
 }})
 
