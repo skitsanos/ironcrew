@@ -85,7 +85,7 @@ ironcrew run .
 
 See [`examples/`](examples/) for working demos:
 
-`simple` · `research-crew` · `json-output` · `gemini` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `groq-json`
+`simple` · `research-crew` · `json-output` · `gemini` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `groq-json` · `http-api` · `batch-processing`
 
 ## License
 

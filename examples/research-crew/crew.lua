@@ -1,3 +1,12 @@
+--[[
+    Research Crew Example
+
+    Demonstrates:
+    - Multi-agent crew with auto-discovered agents from agents/ directory
+    - Task dependencies (research → write_summary)
+    - Context interpolation with ${results.research.output}
+]]
+
 local crew = Crew.new({
     goal = "Produce a brief report on a topic",
     provider = "openai",

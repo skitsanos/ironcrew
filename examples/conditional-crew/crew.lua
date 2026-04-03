@@ -1,3 +1,12 @@
+--[[
+    Conditional Crew Example
+
+    Demonstrates:
+    - Conditional task execution (add_task_if)
+    - on_error routing to handler tasks
+    - Error recovery
+]]
+
 local crew = Crew.new({
     goal = "Demonstrate conditional tasks and error handling",
     provider = "openai",
