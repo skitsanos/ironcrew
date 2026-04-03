@@ -98,6 +98,20 @@ The replay buffer holds up to 1000 events. If a run has already completed by the
 time you connect, you receive the full history (including `run_complete`) and the
 stream closes immediately.
 
+### Output Truncation
+
+By default, SSE events include the full task output. For flows that produce
+large outputs (e.g., VTT transcripts), set `IRONCREW_SSE_OUTPUT_MAX_CHARS`
+to cap the output field in `task_completed` and `collaboration_turn` events:
+
+```bash
+IRONCREW_SSE_OUTPUT_MAX_CHARS=500 ironcrew serve --flows-dir ./flows
+```
+
+When truncated, the output ends with `... [truncated, N total chars]`.
+Run history and the `/flows/{flow}/runs/{id}` endpoint always return the
+full untruncated output.
+
 ### Event Types
 
 | Event                | Fields                                                        | Description                                  |
