@@ -1,6 +1,8 @@
 # IronCrew
 
-A compiled Rust runtime for Lua-defined AI agent crews. Define agents, tasks, and orchestration logic in Lua — execute with a single native binary.
+**Build AI agent teams that work together.** IronCrew is a lightweight, high-performance framework for orchestrating multi-agent AI workflows. Write your agents, tasks, and logic in Lua — IronCrew handles parallel execution, tool calling, memory, and inter-agent communication in a single self-contained binary.
+
+Works with OpenAI, Google Gemini, Groq, Ollama, and any OpenAI-compatible API. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
 ```lua
 local crew = Crew.new({
