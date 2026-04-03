@@ -34,7 +34,17 @@ impl Runtime {
         tool_registry.register(Box::new(HashTool::new()));
         tool_registry.register(Box::new(TemplateRenderTool::new()));
         tool_registry.register(Box::new(ValidateSchemaTool::new()));
-        // Shell tool intentionally NOT registered by default
+
+        // Shell tool only registered when explicitly opted in via env var
+        if std::env::var("IRONCREW_ALLOW_SHELL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                "Shell tool enabled via IRONCREW_ALLOW_SHELL — agents can execute arbitrary commands"
+            );
+            tool_registry.register(Box::new(ShellTool::new()));
+        }
 
         Self {
             tool_registry,
