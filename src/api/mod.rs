@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod handlers;
 
 use axum::{
@@ -119,8 +120,11 @@ pub fn resolve_runs_dir(state: &AppState, flow: &str) -> crate::utils::error::Re
 pub fn create_router(state: Arc<AppState>) -> Router {
     use handlers::*;
 
-    Router::new()
-        .route("/health", get(health))
+    // Public routes (no auth required)
+    let public = Router::new().route("/health", get(health));
+
+    // Protected routes (auth required when IRONCREW_API_TOKEN is set)
+    let protected = Router::new()
         .route("/flows/{flow}/run", post(run_flow))
         .route("/flows/{flow}/abort/{run_id}", post(abort_run))
         .route("/flows/{flow}/runs", get(list_runs))
@@ -130,5 +134,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/agents", get(list_agents))
         .route("/flows/{flow}/events/{run_id}", get(flow_events))
         .route("/nodes", get(list_nodes))
-        .with_state(state)
+        .layer(axum::middleware::from_fn(auth::bearer_auth));
+
+    public.merge(protected).with_state(state)
 }

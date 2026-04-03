@@ -226,6 +226,34 @@ curl http://localhost:3000/health
 }
 ```
 
+## Authentication
+
+Set `IRONCREW_API_TOKEN` to require Bearer token authentication on all endpoints
+except `/health`:
+
+```bash
+IRONCREW_API_TOKEN=my-secret-token ironcrew serve --flows-dir ./flows
+```
+
+Callers must include the token in the `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer my-secret-token" \
+  http://localhost:3000/flows/simple/run -X POST
+```
+
+| Scenario | Result |
+|----------|--------|
+| `IRONCREW_API_TOKEN` not set | All requests pass (no auth) |
+| Token set, no header | `401 {"error":"Missing Authorization header"}` |
+| Token set, wrong token | `401 {"error":"Invalid token"}` |
+| Token set, correct token | Request proceeds normally |
+| `/health` endpoint | Always public, no token needed |
+
+Authentication priority (for future extensibility):
+1. `IRONCREW_API_TOKEN` — static token, checked locally (highest priority)
+2. (Future) Remote token validation service via external URL
+
 ## CORS
 
 CORS is enabled by default using a permissive policy (`CorsLayer::permissive()`),
