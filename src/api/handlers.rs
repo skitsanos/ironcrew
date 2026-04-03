@@ -184,17 +184,16 @@ async fn execute_crew_from_path_with_events(
             .map_err(IronCrewError::Lua)?;
     }
 
-    // Execute
+    // Execute the Lua script
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
     let script = std::fs::read_to_string(entrypoint)?;
 
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(IronCrewError::Lua)?;
+    let exec_err = lua.load(&script).exec_async().await.err();
 
+    // Even if post-run Lua code failed (e.g., json_parse on skipped output),
+    // the crew may have completed successfully. Check the run record first.
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
     // Read the recorded run directly so concurrent executions cannot swap results.
@@ -219,6 +218,11 @@ async fn execute_crew_from_path_with_events(
                 })
                 .collect(),
         });
+    }
+
+    // No run record found — if the Lua script failed, propagate the error
+    if let Some(err) = exec_err {
+        return Err(IronCrewError::Lua(err));
     }
 
     Ok(RunCrewResponse {
