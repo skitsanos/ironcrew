@@ -110,6 +110,27 @@ ironcrew serve --host 0.0.0.0 --port 8080 --flows-dir ./flows
 | GET    | `/flows/{flow}/agents`           | List agents in a flow |
 | GET    | `/nodes`                         | List built-in tools |
 
+### doctor
+
+Diagnose project health: check environment variables, project structure,
+Lua syntax, and run history at a glance.
+
+```
+ironcrew doctor
+ironcrew doctor path/to/project
+```
+
+Checks performed:
+
+| Category | Details |
+|----------|---------|
+| Environment | `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_MODEL`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY` |
+| IronCrew config | `IRONCREW_LOG`, `IRONCREW_ALLOW_SHELL`, `IRONCREW_RATE_LIMIT_MS`, `IRONCREW_MAX_RUN_LIFETIME` |
+| Project | `.env` presence, `crew.lua` existence and syntax, `agents/` count, `tools/` count |
+| Run history | Number of past runs in `.ironcrew/runs/` |
+
+API keys are masked in output (only the first 8 characters are shown).
+
 ### runs
 
 List past run history for a project.

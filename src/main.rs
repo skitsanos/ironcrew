@@ -91,6 +91,12 @@ enum Commands {
         #[arg(long, default_value = ".")]
         flows_dir: PathBuf,
     },
+    /// Check environment, API keys, and project health
+    Doctor {
+        /// Project path to diagnose
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// List past runs
     Runs {
         /// Filter by status: success, partial_failure, failed
@@ -122,6 +128,7 @@ async fn main() {
             port,
             flows_dir,
         } => cli::server::cmd_serve(&host, port, &flows_dir).await,
+        Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
         Commands::Runs { status, project } => cli::history::cmd_runs(&project, status.as_deref()),
     };
 

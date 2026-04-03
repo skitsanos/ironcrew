@@ -328,6 +328,202 @@ pub fn cmd_nodes() -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_doctor(path: &Path) -> Result<()> {
+    // Load .env first so env vars are available
+    let _ = load_project(path);
+
+    let project_dir = if path.is_file() {
+        path.parent().unwrap_or(Path::new("."))
+    } else {
+        path
+    };
+
+    println!("IronCrew Doctor\n");
+    println!("Project: {}\n", project_dir.display());
+
+    let mut issues = 0;
+
+    // --- Environment ---
+    println!("  Environment:");
+
+    let env_checks: &[(&str, bool)] = &[
+        ("OPENAI_API_KEY", true),
+        ("OPENAI_BASE_URL", false),
+        ("OPENAI_MODEL", false),
+        ("GEMINI_API_KEY", false),
+        ("GROQ_API_KEY", false),
+        ("ANTHROPIC_API_KEY", false),
+    ];
+
+    for (name, required) in env_checks {
+        let label = format!("{} ", name);
+        let dots = ".".repeat(25usize.saturating_sub(label.len()));
+        match std::env::var(name) {
+            Ok(val) if !val.is_empty() => {
+                let display = mask_key(&val);
+                println!("    {}{} set ({})", label, dots, display);
+            }
+            _ => {
+                let status = if *required {
+                    "NOT SET (required)"
+                } else {
+                    "not set"
+                };
+                println!("    {}{} {}", label, dots, status);
+                if *required {
+                    issues += 1;
+                }
+            }
+        }
+    }
+
+    // IronCrew-specific config vars
+    let config_vars: &[(&str, Option<&str>)] = &[
+        ("IRONCREW_LOG", None),
+        ("IRONCREW_ALLOW_SHELL", None),
+        ("IRONCREW_RATE_LIMIT_MS", None),
+        ("IRONCREW_MAX_RUN_LIFETIME", Some("default: 1800s")),
+    ];
+
+    for (name, default_hint) in config_vars {
+        let label = format!("{} ", name);
+        let dots = ".".repeat(25usize.saturating_sub(label.len()));
+        match std::env::var(name) {
+            Ok(val) if !val.is_empty() => {
+                let display = match *name {
+                    "IRONCREW_ALLOW_SHELL" => {
+                        if val == "1" || val.eq_ignore_ascii_case("true") {
+                            "enabled".to_string()
+                        } else {
+                            "disabled".to_string()
+                        }
+                    }
+                    _ => val,
+                };
+                println!("    {}{} {}", label, dots, display);
+            }
+            _ => {
+                let hint =
+                    default_hint.map_or("not set".to_string(), |d| format!("not set ({})", d));
+                println!("    {}{} {}", label, dots, hint);
+            }
+        }
+    }
+
+    println!();
+
+    // --- Project structure ---
+    println!("  Project:");
+
+    // .env
+    let env_path = project_dir.join(".env");
+    let dot_label = ".env ";
+    let dot_dots = ".".repeat(25usize.saturating_sub(dot_label.len()));
+    if env_path.exists() {
+        println!("    {}{} found", dot_label, dot_dots);
+    } else {
+        println!("    {}{} not found", dot_label, dot_dots);
+    }
+
+    // crew.lua
+    let crew_path = project_dir.join("crew.lua");
+    let crew_label = "crew.lua ";
+    let crew_dots = ".".repeat(25usize.saturating_sub(crew_label.len()));
+    if crew_path.exists() {
+        // Check syntax
+        let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+        let script = std::fs::read_to_string(&crew_path)?;
+        match lua.load(&script).into_function() {
+            Ok(_) => println!("    {}{} found (valid syntax)", crew_label, crew_dots),
+            Err(e) => {
+                println!(
+                    "    {}{} found (SYNTAX ERROR: {})",
+                    crew_label, crew_dots, e
+                );
+                issues += 1;
+            }
+        }
+    } else {
+        println!("    {}{} NOT FOUND", crew_label, crew_dots);
+        issues += 1;
+    }
+
+    // agents/
+    let agents_dir = project_dir.join("agents");
+    let agents_label = "agents/ ";
+    let agents_dots = ".".repeat(25usize.saturating_sub(agents_label.len()));
+    if agents_dir.is_dir() {
+        let count = std::fs::read_dir(&agents_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("lua"))
+            .count();
+        println!("    {}{} {} agent(s)", agents_label, agents_dots, count);
+    } else {
+        println!("    {}{} not found", agents_label, agents_dots);
+    }
+
+    // tools/
+    let tools_dir = project_dir.join("tools");
+    let tools_label = "tools/ ";
+    let tools_dots = ".".repeat(25usize.saturating_sub(tools_label.len()));
+    if tools_dir.is_dir() {
+        let count = std::fs::read_dir(&tools_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("lua"))
+            .count();
+        println!("    {}{} {} tool(s)", tools_label, tools_dots, count);
+    } else {
+        println!("    {}{} not found", tools_label, tools_dots);
+    }
+
+    println!();
+
+    // --- Run history ---
+    println!("  Run History:");
+    let runs_dir = project_dir.join(".ironcrew").join("runs");
+    let runs_label = ".ironcrew/runs/ ";
+    let runs_dots = ".".repeat(25usize.saturating_sub(runs_label.len()));
+    if runs_dir.is_dir() {
+        let count = std::fs::read_dir(&runs_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|ext| ext == "json")
+            })
+            .count();
+        println!("    {}{} {} run(s)", runs_label, runs_dots, count);
+    } else {
+        println!("    {}{} no runs yet", runs_label, runs_dots);
+    }
+
+    println!();
+
+    if issues == 0 {
+        println!("  All checks passed.");
+    } else {
+        println!("  {} issue(s) found.", issues);
+    }
+
+    Ok(())
+}
+
+/// Mask an API key, showing only the first 8 characters.
+fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        key.to_string()
+    } else {
+        format!("{}...", &key[..8])
+    }
+}
+
 pub fn cmd_list(path: &Path) -> Result<()> {
     let loader = load_project(path)?;
 
