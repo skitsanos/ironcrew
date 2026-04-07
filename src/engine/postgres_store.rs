@@ -29,7 +29,7 @@ impl PostgresStore {
 
         let table_name = format!("{}runs", table_prefix);
 
-        // Create table if not exists
+        // Create table if not exists — uses JSONB for task_results and tags
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 run_id        TEXT PRIMARY KEY,
@@ -38,12 +38,12 @@ impl PostgresStore {
                 started_at    TEXT NOT NULL,
                 finished_at   TEXT NOT NULL,
                 duration_ms   BIGINT NOT NULL,
-                task_results  TEXT NOT NULL,
+                task_results  JSONB NOT NULL DEFAULT '[]',
                 agent_count   INTEGER NOT NULL,
                 task_count    INTEGER NOT NULL,
                 total_tokens  INTEGER DEFAULT 0,
                 cached_tokens INTEGER DEFAULT 0,
-                tags          TEXT DEFAULT '[]',
+                tags          JSONB DEFAULT '[]',
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             )",
             table_name
@@ -69,7 +69,7 @@ impl StateStore for PostgresStore {
 
         let sql = format!(
             "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb)
              ON CONFLICT (run_id) DO UPDATE SET
                 flow_name = EXCLUDED.flow_name,
                 status = EXCLUDED.status,
@@ -108,7 +108,7 @@ impl StateStore for PostgresStore {
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let sql = format!(
-            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
+            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
              FROM {} WHERE run_id = $1",
             self.table_name
         );
@@ -126,7 +126,7 @@ impl StateStore for PostgresStore {
     async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
         let rows = if let Some(filter) = status_filter {
             let sql = format!(
-                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
+                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
                  FROM {} WHERE status = $1 ORDER BY started_at DESC",
                 self.table_name
             );
@@ -136,7 +136,7 @@ impl StateStore for PostgresStore {
                 .await
         } else {
             let sql = format!(
-                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
+                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
                  FROM {} ORDER BY started_at DESC",
                 self.table_name
             );

@@ -138,8 +138,10 @@ IRONCREW_STORE_PATH=./data/production.db
 PostgreSQL support is behind a feature flag to keep the default binary lean.
 Build with the `postgres` feature:
 
+PostgreSQL is included by default in standard builds. To build without it:
+
 ```bash
-cargo build --release --features postgres
+cargo build --release --no-default-features
 ```
 
 Then configure:
@@ -151,18 +153,19 @@ DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
 
 **Advantages:**
 - Shared state across multiple IronCrew instances
-- Full SQL querying power (joins, aggregation, full-text search)
+- **JSONB columns** for `task_results` and `tags` — query into JSON natively with SQL
+- Full SQL querying power (joins, aggregation, GIN indexes on JSONB)
 - Production-grade durability and replication
 - Async I/O — non-blocking database operations via `sqlx`
 
 **Limitations:**
 - Requires an external PostgreSQL server
 - Adds compile-time dependency on `sqlx`
-- Build with `--features postgres` required
 
 ### Schema
 
-The table is auto-created on first connection:
+The table is auto-created on first connection. Uses **JSONB** for `task_results`
+and `tags`, enabling native PostgreSQL JSON queries:
 
 ```sql
 CREATE TABLE IF NOT EXISTS runs (
@@ -172,14 +175,42 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at    TEXT NOT NULL,
     finished_at   TEXT NOT NULL,
     duration_ms   BIGINT NOT NULL,
-    task_results  TEXT NOT NULL,
+    task_results  JSONB NOT NULL DEFAULT '[]',
     agent_count   INTEGER NOT NULL,
     task_count    INTEGER NOT NULL,
     total_tokens  INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
-    tags          TEXT DEFAULT '[]',
+    tags          JSONB DEFAULT '[]',
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
+```
+
+### Querying JSONB data
+
+Other applications can query run data directly with SQL, without going through
+IronCrew's API:
+
+```sql
+-- Find runs tagged with "v2-prompt"
+SELECT run_id, flow_name, status FROM runs
+WHERE tags @> '["v2-prompt"]';
+
+-- Find runs where a specific task failed
+SELECT run_id FROM runs
+WHERE task_results @> '[{"task":"research","success":false}]';
+
+-- Count tokens per flow
+SELECT flow_name, SUM(total_tokens) as total
+FROM runs GROUP BY flow_name;
+
+-- Get runs from the last 24 hours
+SELECT * FROM runs
+WHERE created_at > NOW() - INTERVAL '24 hours'
+ORDER BY started_at DESC;
+
+-- Add a GIN index for fast JSONB queries
+CREATE INDEX idx_runs_tags ON runs USING GIN (tags);
+CREATE INDEX idx_runs_task_results ON runs USING GIN (task_results);
 ```
 
 ### Docker with PostgreSQL
