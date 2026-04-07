@@ -1,14 +1,65 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mlua::{Lua, Result as LuaResult, StdLib, Value};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::lua::api::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
 
+// Thread-local regex cache — avoids recompiling the same pattern on repeated calls.
+// Capped at 256 entries to prevent unbounded growth.
+const REGEX_CACHE_MAX: usize = 256;
+
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
+}
+
+/// Get a cached compiled regex or compile and cache it.
+fn get_or_compile_regex(pattern: &str) -> mlua::Result<regex::Regex> {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(pattern) {
+            return Ok(re.clone());
+        }
+        let re = regex::Regex::new(pattern).map_err(mlua::Error::external)?;
+        if cache.len() >= REGEX_CACHE_MAX {
+            // Evict all when full (simple reset — patterns are cheap to rebuild)
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), re.clone());
+        Ok(re)
+    })
+}
+
 /// Register utility global functions available in all Lua sandboxes.
 pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
-    // env()
-    let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
+    // env() — blocks sensitive variables by default.
+    // IRONCREW_ENV_BLOCKLIST can override (comma-separated patterns).
+    let env_fn = lua.create_function(|_, name: String| {
+        const DEFAULT_BLOCKED: &[&str] = &[
+            "DATABASE_URL",
+            "IRONCREW_API_TOKEN",
+            "IRONCREW_PG_TABLE_PREFIX",
+        ];
+        const BLOCKED_SUFFIXES: &[&str] = &["_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD"];
+
+        let upper = name.to_uppercase();
+
+        // Check custom blocklist from env (comma-separated exact names)
+        let custom_blocked = std::env::var("IRONCREW_ENV_BLOCKLIST").unwrap_or_default();
+        let custom: Vec<&str> = custom_blocked.split(',').map(|s| s.trim()).collect();
+
+        if DEFAULT_BLOCKED.contains(&upper.as_str())
+            || custom.iter().any(|b| b.eq_ignore_ascii_case(&name))
+            || BLOCKED_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        {
+            tracing::warn!("Lua env() blocked access to '{}'", name);
+            return Ok(None);
+        }
+
+        Ok(std::env::var(&name).ok())
+    })?;
     lua.globals().set("env", env_fn)?;
 
     // uuid4()
@@ -113,26 +164,26 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     })?;
     lua.globals().set("print", print_fn)?;
 
-    // regex namespace — Rust regex engine exposed to Lua
+    // regex namespace — Rust regex engine exposed to Lua (with compiled pattern caching)
     let regex_table = lua.create_table()?;
 
     // regex.match(pattern, text) -> bool
     let regex_match = lua.create_function(|_, (pattern, text): (String, String)| {
-        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let re = get_or_compile_regex(&pattern)?;
         Ok(re.is_match(&text))
     })?;
     regex_table.set("match", regex_match)?;
 
     // regex.find(pattern, text) -> string|nil (first match)
     let regex_find = lua.create_function(|_, (pattern, text): (String, String)| {
-        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let re = get_or_compile_regex(&pattern)?;
         Ok(re.find(&text).map(|m| m.as_str().to_string()))
     })?;
     regex_table.set("find", regex_find)?;
 
     // regex.find_all(pattern, text) -> table of strings (all matches)
     let regex_find_all = lua.create_function(|lua, (pattern, text): (String, String)| {
-        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let re = get_or_compile_regex(&pattern)?;
         let matches: Vec<String> = re
             .find_iter(&text)
             .map(|m| m.as_str().to_string())
@@ -147,7 +198,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
     // regex.captures(pattern, text) -> table of capture groups|nil
     let regex_captures = lua.create_function(|lua, (pattern, text): (String, String)| {
-        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let re = get_or_compile_regex(&pattern)?;
         match re.captures(&text) {
             Some(caps) => {
                 let table = lua.create_table()?;
@@ -172,7 +223,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // regex.replace(pattern, text, replacement) -> string (first match)
     let regex_replace = lua.create_function(
         |_, (pattern, text, replacement): (String, String, String)| {
-            let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+            let re = get_or_compile_regex(&pattern)?;
             Ok(re.replace(&text, replacement.as_str()).into_owned())
         },
     )?;
@@ -181,7 +232,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // regex.replace_all(pattern, text, replacement) -> string
     let regex_replace_all = lua.create_function(
         |_, (pattern, text, replacement): (String, String, String)| {
-            let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+            let re = get_or_compile_regex(&pattern)?;
             Ok(re.replace_all(&text, replacement.as_str()).into_owned())
         },
     )?;
@@ -189,7 +240,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
     // regex.split(pattern, text) -> table of strings
     let regex_split = lua.create_function(|lua, (pattern, text): (String, String)| {
-        let re = regex::Regex::new(&pattern).map_err(mlua::Error::external)?;
+        let re = get_or_compile_regex(&pattern)?;
         let parts: Vec<&str> = re.split(&text).collect();
         let table = lua.create_table()?;
         for (i, part) in parts.iter().enumerate() {
@@ -256,12 +307,8 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // http namespace — async HTTP client for Lua scripts
     let http_table = lua.create_table()?;
 
-    // Shared reqwest client for all http.* calls
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("IronCrew/Lua")
-        .build()
-        .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {}", e)))?;
+    // Shared reqwest client (singleton) for all http.* calls
+    let client = crate::tools::http_request::SHARED_HTTP_CLIENT.clone();
 
     // http.get(url, options?) -> {status, headers, body}
     let client_get = client.clone();
@@ -269,6 +316,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_get.clone();
             async move {
+                validate_lua_url(&url)?;
                 let mut req = client.get(&url);
                 req = apply_http_options(req, &options)?;
                 execute_http_request(lua, req).await
@@ -282,6 +330,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_post.clone();
             async move {
+                validate_lua_url(&url)?;
                 let mut req = client.post(&url);
                 req = apply_http_options(req, &options)?;
                 if let Some(ref opts) = options {
@@ -298,6 +347,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_put.clone();
             async move {
+                validate_lua_url(&url)?;
                 let mut req = client.put(&url);
                 req = apply_http_options(req, &options)?;
                 if let Some(ref opts) = options {
@@ -314,6 +364,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_delete.clone();
             async move {
+                validate_lua_url(&url)?;
                 let mut req = client.delete(&url);
                 req = apply_http_options(req, &options)?;
                 execute_http_request(lua, req).await
@@ -327,6 +378,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
         move |lua, (method, url, options): (String, String, Option<mlua::Table>)| {
             let client = client_any.clone();
             async move {
+                validate_lua_url(&url)?;
                 let mut req = match method.to_uppercase().as_str() {
                     "GET" => client.get(&url),
                     "POST" => client.post(&url),
@@ -400,6 +452,12 @@ fn apply_http_body(
     Ok(req)
 }
 
+/// Validate a URL for SSRF before making a request from Lua.
+fn validate_lua_url(url: &str) -> mlua::Result<()> {
+    crate::utils::network::validate_url_not_private(url)
+        .map_err(|e| mlua::Error::external(format!("SSRF blocked: {}", e)))
+}
+
 /// Execute an HTTP request and return the result as a Lua table.
 async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::Result<mlua::Table> {
     let resp = req.send().await.map_err(mlua::Error::external)?;
@@ -410,6 +468,20 @@ async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::R
         if let Ok(v) = value.to_str() {
             headers_table.set(key.as_str(), v.to_string())?;
         }
+    }
+
+    // Check Content-Length before reading body
+    let max_response_size: u64 = std::env::var("IRONCREW_MAX_RESPONSE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50 * 1024 * 1024);
+    if let Some(len) = resp.content_length()
+        && len > max_response_size
+    {
+        return Err(mlua::Error::external(format!(
+            "Response too large: {} bytes (limit: {} bytes)",
+            len, max_response_size
+        )));
     }
 
     let body_text = resp.text().await.map_err(mlua::Error::external)?;

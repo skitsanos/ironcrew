@@ -25,6 +25,34 @@ fn flow_status(err: &IronCrewError) -> StatusCode {
     }
 }
 
+/// Sanitize an error for API responses: log the full detail, return a safe message.
+/// Strips filesystem paths and internal details that could leak server structure.
+fn sanitize_error(err: &IronCrewError) -> String {
+    let full = err.to_string();
+    tracing::warn!("API error: {}", full);
+
+    // Keep validation messages that don't contain paths
+    match err {
+        IronCrewError::Validation(msg) => {
+            // Strip anything that looks like an absolute path
+            if msg.contains('/') || msg.contains('\\') {
+                // Return just the high-level message
+                if msg.contains("not found") {
+                    "Resource not found".into()
+                } else if msg.contains("Invalid flow") {
+                    "Invalid flow identifier".into()
+                } else {
+                    "Invalid request".into()
+                }
+            } else {
+                msg.clone()
+            }
+        }
+        IronCrewError::Io(_) => "Internal storage error".into(),
+        _ => "Internal server error".into(),
+    }
+}
+
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
@@ -42,7 +70,7 @@ pub async fn run_flow(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
 
     let input = body.map(|Json(v)| v);
 
@@ -149,8 +177,8 @@ pub async fn run_flow(
             }
         }
 
-        // Clean up after a delay to allow SSE clients to receive the final event
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        // Clean up after a short delay to allow SSE clients to receive the final event
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         state_clone.active_runs.write().await.remove(&run_id_clone);
     });
 
@@ -214,7 +242,7 @@ async fn execute_crew_from_path_with_events(
     // Read the recorded run directly so concurrent executions cannot swap results.
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
-        let store = create_store(ironcrew_dir)?;
+        let store = create_store(ironcrew_dir).await?;
         let run = store.get_run(&run_id).await?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
@@ -275,7 +303,7 @@ pub async fn execute_crew_from_path(
     // Read the recorded run directly so concurrent executions cannot swap results.
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
-        let store = create_store(ironcrew_dir)?;
+        let store = create_store(ironcrew_dir).await?;
         let run = store.get_run(&run_id).await?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
@@ -354,12 +382,9 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
 }
 
 /// Optionally truncate output fields in SSE events.
-/// Returns the event with output capped at max_chars (if configured).
-/// When disabled (default), returns the event unchanged.
-fn truncate_event_output(event: CrewEvent, max_chars: Option<usize>) -> CrewEvent {
-    let Some(max) = max_chars else {
-        return event;
-    };
+/// Works with Arc<CrewEvent> — returns a new owned event only when truncation is needed.
+fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<CrewEvent> {
+    let max = max_chars?;
     match event {
         CrewEvent::TaskCompleted {
             task,
@@ -368,34 +393,34 @@ fn truncate_event_output(event: CrewEvent, max_chars: Option<usize>) -> CrewEven
             success,
             output,
             token_usage,
-        } if output.len() > max => CrewEvent::TaskCompleted {
-            task,
-            agent,
-            duration_ms,
-            success,
+        } if output.len() > max => Some(CrewEvent::TaskCompleted {
+            task: task.clone(),
+            agent: agent.clone(),
+            duration_ms: *duration_ms,
+            success: *success,
             output: format!(
                 "{}... [truncated, {} total chars]",
                 &output[..max],
                 output.len()
             ),
-            token_usage,
-        },
+            token_usage: token_usage.clone(),
+        }),
         CrewEvent::CollaborationTurn {
             task,
             agent,
             turn,
             content,
-        } if content.len() > max => CrewEvent::CollaborationTurn {
-            task,
-            agent,
-            turn,
+        } if content.len() > max => Some(CrewEvent::CollaborationTurn {
+            task: task.clone(),
+            agent: agent.clone(),
+            turn: *turn,
             content: format!(
                 "{}... [truncated, {} total chars]",
                 &content[..max],
                 content.len()
             ),
-        },
-        other => other,
+        }),
+        _ => None,
     }
 }
 
@@ -408,7 +433,7 @@ pub async fn flow_events(
 > {
     // Validate flow exists
     let _ = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
 
     let active_runs = state.active_runs.read().await;
     let active_run = active_runs.get(&run_id).ok_or_else(|| {
@@ -432,12 +457,13 @@ pub async fn flow_events(
     let stream = async_stream::stream! {
         // First: replay all past events for late subscribers
         for event in replay {
-            let event = truncate_event_output(event, sse_max_chars);
-            let event_type = event_type_str(&event);
-            let data = serde_json::to_string(&event).unwrap_or_default();
+            let effective = maybe_truncate_event(&event, sse_max_chars);
+            let ev = effective.as_ref().unwrap_or(&event);
+            let event_type = event_type_str(ev);
+            let data = serde_json::to_string(ev).unwrap_or_default();
             yield Ok(Event::default().event(event_type).data(data));
 
-            if matches!(event, CrewEvent::RunComplete { .. }) {
+            if matches!(ev, CrewEvent::RunComplete { .. }) {
                 return; // Run already finished, no need for live stream
             }
         }
@@ -446,12 +472,13 @@ pub async fn flow_events(
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    let event = truncate_event_output(event, sse_max_chars);
-                    let event_type = event_type_str(&event);
-                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    let effective = maybe_truncate_event(&event, sse_max_chars);
+                    let ev = effective.as_ref().unwrap_or(&event);
+                    let event_type = event_type_str(ev);
+                    let data = serde_json::to_string(ev).unwrap_or_default();
                     yield Ok(Event::default().event(event_type).data(data));
 
-                    if matches!(event, CrewEvent::RunComplete { .. }) {
+                    if matches!(ev, CrewEvent::RunComplete { .. }) {
                         break;
                     }
                 }
@@ -481,8 +508,9 @@ pub async fn list_runs(
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<crate::engine::run_history::RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
     let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
     let store = create_store(ironcrew_dir)
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let runs = store
@@ -498,8 +526,9 @@ pub async fn get_run(
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
     let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
     let store = create_store(ironcrew_dir)
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let record = store
@@ -515,8 +544,9 @@ pub async fn delete_run(
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
     let store = create_store(ironcrew_dir)
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     store
@@ -536,7 +566,7 @@ pub async fn validate_flow(
     Path(flow): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
 
     use crate::lua::api::*;
     use crate::lua::loader::ProjectLoader;
@@ -587,7 +617,7 @@ pub async fn list_agents(
     Path(flow): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
+        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
 
     use crate::lua::api::*;
     use crate::lua::loader::ProjectLoader;

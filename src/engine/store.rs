@@ -19,7 +19,8 @@ pub trait StateStore: Send + Sync {
 /// `IRONCREW_STORE=postgres` — PostgreSQL (requires `postgres` feature)
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
-pub fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStore>> {
+/// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases
+pub async fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStore>> {
     let store_type = std::env::var("IRONCREW_STORE").unwrap_or_else(|_| "json".into());
 
     match store_type.to_lowercase().as_str() {
@@ -29,6 +30,12 @@ pub fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStor
                 .unwrap_or_else(|_| default_dir.join("ironcrew.db"));
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
             }
             Ok(Box::new(super::sqlite_store::SqliteStore::new(db_path)?))
         }
@@ -40,11 +47,8 @@ pub fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStor
                 )
             })?;
             let table_prefix = std::env::var("IRONCREW_PG_TABLE_PREFIX").unwrap_or_default();
-            let rt = tokio::runtime::Handle::current();
-            let store = rt.block_on(super::postgres_store::PostgresStore::new(
-                &database_url,
-                &table_prefix,
-            ))?;
+            let store =
+                super::postgres_store::PostgresStore::new(&database_url, &table_prefix).await?;
             Ok(Box::new(store))
         }
         #[cfg(not(feature = "postgres"))]

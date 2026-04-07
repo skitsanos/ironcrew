@@ -84,6 +84,11 @@ authentication. Supports bearer, basic, and API-key auth.
 { "url": "https://api.example.com/data", "method": "POST", "body": "{\"q\": \"test\"}", "auth_type": "bearer", "auth_token": "sk-..." }
 ```
 
+**Security:** Requests to private/internal IP addresses (loopback, RFC1918,
+link-local, CGNAT) are blocked by default to prevent SSRF attacks. Override with
+`IRONCREW_ALLOW_PRIVATE_IPS=1`. Response bodies larger than 50MB (configurable
+via `IRONCREW_MAX_RESPONSE_SIZE`) are rejected before reading.
+
 ### hash
 
 Compute a hash of the input text. Supported algorithms: `md5`, `sha256`,
@@ -162,7 +167,7 @@ The following functions and namespaces are available in all Lua contexts
 
 | Function             | Returns  | Description |
 |----------------------|----------|-------------|
-| `env(name)`          | string or nil | Read an environment variable |
+| `env(name)`          | string or nil | Read an environment variable (see security note below) |
 | `uuid4()`            | string   | Generate a random UUID v4 |
 | `now_rfc3339()`      | string   | Current UTC time in RFC 3339 format |
 | `now_unix_ms()`      | number   | Current UTC time as Unix milliseconds |
@@ -173,6 +178,12 @@ The following functions and namespaces are available in all Lua contexts
 | `log(level, msg)`    | nil      | Emit a log message (levels: trace, debug, info, warn, error) |
 | `validate_json(json_str, schema_table)` | table | Validate JSON against a schema; returns `{valid, errors}` |
 | `template(tpl_str, data_table)` | string | Render a Tera template with data (variables, loops, conditionals) |
+
+**`env()` security:** Sensitive environment variables are blocked by default to
+prevent Lua scripts from exfiltrating secrets. Blocked variables:
+- `DATABASE_URL`, `IRONCREW_API_TOKEN`, `IRONCREW_PG_TABLE_PREFIX`
+- Any variable ending with `_API_KEY`, `_SECRET`, `_TOKEN`, or `_PASSWORD`
+- Custom names listed in `IRONCREW_ENV_BLOCKLIST` (comma-separated)
 
 ### Template Rendering
 
@@ -198,7 +209,9 @@ local report = template([[
 
 ### Regex Namespace
 
-Rust's regex engine exposed to Lua.
+Rust's regex engine exposed to Lua. Compiled patterns are cached in a
+thread-local cache (up to 256 entries), so repeated calls with the same pattern
+avoid recompilation.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
@@ -213,7 +226,12 @@ Rust's regex engine exposed to Lua.
 ### HTTP Namespace
 
 Async HTTP client available in crew.lua scripts. All methods return a response
-table.
+table. Uses a shared connection pool (singleton `reqwest::Client`) across all
+Lua sandboxes.
+
+**Security:** All `http.*` calls enforce SSRF protection — requests to
+private/loopback IPs are blocked by default (override: `IRONCREW_ALLOW_PRIVATE_IPS=1`).
+Response bodies exceeding `IRONCREW_MAX_RESPONSE_SIZE` (default 50MB) are rejected.
 
 ```lua
 local resp = http.get("https://api.example.com/data", {

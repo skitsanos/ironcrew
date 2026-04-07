@@ -244,6 +244,8 @@ also deleted.
 IronCrew reads environment variables for LLM provider configuration. These can
 be set in the shell or in `.env` files.
 
+**Provider & Runtime:**
+
 | Variable          | Description |
 |-------------------|-------------|
 | `OPENAI_API_KEY`  | Default API key for the OpenAI-compatible provider |
@@ -256,13 +258,37 @@ be set in the shell or in `.env` files.
 | `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
 | `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls (e.g., `200` for 5 req/sec) |
 | `IRONCREW_TOOL_TIMEOUT` | Max seconds a single tool execution may run (default: `60`) |
+| `IRONCREW_DEFAULT_MAX_CONCURRENT` | Default max parallel tasks per phase when not set in crew config (default: `10`) |
+| `IRONCREW_MAX_PROMPT_CHARS` | Max user prompt size in characters (default: `102400` = 100KB). Truncates with warning |
+| `IRONCREW_MAX_EVENTS` | Max events in the EventBus replay buffer (default: `1000`) |
+
+**API Server:**
+
+| Variable          | Description |
+|-------------------|-------------|
+| `IRONCREW_API_TOKEN` | Bearer token for REST API auth (disabled by default, `/health` always public) |
+| `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). Set to `*` for permissive. Absent = deny all |
+| `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10MB) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
-| `IRONCREW_API_TOKEN` | Bearer token for REST API auth (disabled by default, `/health` always public) |
+
+**Security:**
+
+| Variable          | Description |
+|-------------------|-------------|
+| `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` to allow HTTP requests to private/loopback IPs (SSRF protection disabled) |
+| `IRONCREW_ENV_BLOCKLIST` | Comma-separated additional env var names to block from Lua `env()` |
+| `IRONCREW_MAX_RESPONSE_SIZE` | Max HTTP response body size in bytes (default: `52428800` = 50MB) |
+
+**Storage:**
+
+| Variable          | Description |
+|-------------------|-------------|
 | `IRONCREW_STORE`    | Storage backend: `json` (default), `sqlite`, or `postgres` |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
 | `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) |
-| `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`) |
+| `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`). Only alphanumeric and underscore allowed |
+| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (default: `10`) |
 
 ### .env File Loading
 

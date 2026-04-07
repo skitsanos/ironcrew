@@ -76,7 +76,7 @@ curl -X POST http://localhost:3000/flows/my-crew/abort/abc-123
 
 This immediately cancels all in-flight LLM calls and drops pending tasks.
 The SSE stream receives a `run_complete` event with `status: "aborted"`.
-The run is cleaned up after 30 seconds.
+The run is cleaned up after 5 seconds.
 
 A run can end with one of these statuses:
 - `success` / `partial_failure` / `failed` — normal completion
@@ -268,9 +268,43 @@ Authentication priority (for future extensibility):
 
 ## CORS
 
-CORS is enabled by default using a permissive policy (`CorsLayer::permissive()`),
-allowing requests from any origin. This makes it straightforward to call the API
-from browser-based frontends during development.
+CORS is configured via the `IRONCREW_CORS_ORIGINS` environment variable:
+
+| Value | Behavior |
+|-------|----------|
+| Absent (default) | No origins allowed (API not accessible from browsers) |
+| `*` | Permissive — all origins allowed (development only) |
+| Comma-separated URLs | Only listed origins allowed |
+
+```bash
+# Allow specific origins
+IRONCREW_CORS_ORIGINS=https://app.example.com,https://admin.example.com
+
+# Allow all (development only)
+IRONCREW_CORS_ORIGINS=*
+```
+
+Allowed methods: GET, POST, DELETE, OPTIONS. Allowed headers: `Authorization`, `Content-Type`.
+
+## Request Size Limits
+
+The server enforces a maximum request body size (default 10MB). Override with
+`IRONCREW_MAX_BODY_SIZE` (in bytes):
+
+```bash
+IRONCREW_MAX_BODY_SIZE=52428800  # 50MB
+```
+
+## Error Responses
+
+API error responses are sanitized to prevent leaking internal filesystem paths
+or server structure. Full error details are logged server-side.
+
+## Graceful Shutdown
+
+The server handles `SIGTERM` and `Ctrl+C` for graceful shutdown. In-flight
+requests are allowed to complete before the process exits. This is essential for
+Kubernetes rolling updates and Railway deployments.
 
 ## Docker Deployment
 
@@ -280,6 +314,8 @@ Build and run with Docker:
 docker build -t ironcrew .
 docker run -p 3000:3000 \
   --env-file .env \
+  -e IRONCREW_CORS_ORIGINS=https://app.example.com \
+  -e IRONCREW_API_TOKEN=your-secret-token \
   -v ./flows:/app/flows \
   ironcrew serve --host 0.0.0.0 --port 3000 --flows-dir /app/flows
 ```

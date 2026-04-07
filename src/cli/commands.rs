@@ -52,14 +52,15 @@ pub async fn cmd_run(
     // In --json mode, read the run record and output structured JSON
     if json_output {
         let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
-        let ironcrew_dir = loader.project_dir().join(".ironcrew");
-        if let Some(run_id) = run_id
-            && let Ok(store) = crate::engine::store::create_store(ironcrew_dir)
-            && let Ok(record) = store.get_run(&run_id).await
-        {
-            let json = serde_json::to_string_pretty(&record).unwrap_or_else(|_| "{}".into());
-            println!("{}", json);
-            return Ok(());
+        if let Some(run_id) = run_id {
+            let ironcrew_dir = loader.project_dir().join(".ironcrew");
+            if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await
+                && let Ok(record) = store.get_run(&run_id).await
+            {
+                let json = serde_json::to_string_pretty(&record).unwrap_or_else(|_| "{}".into());
+                println!("{}", json);
+                return Ok(());
+            }
         }
     }
 
