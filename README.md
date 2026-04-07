@@ -78,6 +78,7 @@ ironcrew run .
 | [Tools](docs/tools.md) | Built-in tools, custom Lua tools, Lua globals and HTTP namespace |
 | [CLI Reference](docs/cli.md) | All commands — run, validate, list, init, serve, inspect, clean |
 | [REST API](docs/rest-api.md) | Endpoints, SSE events, input parameters, Docker deployment |
+| [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Gemini, Groq, Ollama — configuration and tips |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
 
