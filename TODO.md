@@ -33,7 +33,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [x] **Tool timeout** — `IRONCREW_TOOL_TIMEOUT` env var (default 60s). Done in 1.9.7.
 
-- [x] **Pluggable storage backends** — `StateStore` trait with JSON files (default) and SQLite backends. `IRONCREW_STORE=sqlite`. Done in 2.0.1.
+- [x] **Pluggable storage backends** — `StateStore` async trait with JSON files (default), SQLite, and PostgreSQL (feature-gated). Done in 2.0.1.
 
 - [ ] **Flow variables / config** — a `config.lua` or `flow.toml` file per project for default settings (model, timeouts, memory limits) so `crew.lua` stays focused on logic.
 

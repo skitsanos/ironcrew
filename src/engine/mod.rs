@@ -10,6 +10,8 @@ pub mod memory;
 pub mod messagebus;
 pub mod model_router;
 pub mod orchestrator;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 pub mod run_history;
 pub mod runtime;
 pub mod sqlite_store;
