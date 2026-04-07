@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -54,8 +55,9 @@ impl JsonFileStore {
     }
 }
 
+#[async_trait]
 impl StateStore for JsonFileStore {
-    fn save_run(&self, record: &RunRecord) -> Result<String> {
+    async fn save_run(&self, record: &RunRecord) -> Result<String> {
         let filename = format!("{}.json", record.run_id);
         let path = self.store_dir.join(&filename);
         let json = serde_json::to_string_pretty(record)
@@ -65,7 +67,7 @@ impl StateStore for JsonFileStore {
         Ok(record.run_id.clone())
     }
 
-    fn get_run(&self, run_id: &str) -> Result<RunRecord> {
+    async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let filename = format!("{}.json", run_id);
         let path = self.store_dir.join(&filename);
         if !path.exists() {
@@ -80,7 +82,7 @@ impl StateStore for JsonFileStore {
         Ok(record)
     }
 
-    fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
+    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
         let mut runs = Vec::new();
         for entry in std::fs::read_dir(&self.store_dir)? {
             let entry = entry?;
@@ -102,7 +104,7 @@ impl StateStore for JsonFileStore {
         Ok(runs)
     }
 
-    fn delete_run(&self, run_id: &str) -> Result<()> {
+    async fn delete_run(&self, run_id: &str) -> Result<()> {
         let filename = format!("{}.json", run_id);
         let path = self.store_dir.join(&filename);
         if !path.exists() {

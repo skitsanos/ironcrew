@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -42,8 +43,9 @@ impl SqliteStore {
     }
 }
 
+#[async_trait]
 impl StateStore for SqliteStore {
-    fn save_run(&self, record: &RunRecord) -> Result<String> {
+    async fn save_run(&self, record: &RunRecord) -> Result<String> {
         let conn = self
             .conn
             .lock()
@@ -79,7 +81,7 @@ impl StateStore for SqliteStore {
         Ok(record.run_id.clone())
     }
 
-    fn get_run(&self, run_id: &str) -> Result<RunRecord> {
+    async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let conn = self
             .conn
             .lock()
@@ -126,7 +128,7 @@ impl StateStore for SqliteStore {
         Ok(record)
     }
 
-    fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
+    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
         let conn = self
             .conn
             .lock()
@@ -187,7 +189,7 @@ impl StateStore for SqliteStore {
         Ok(records)
     }
 
-    fn delete_run(&self, run_id: &str) -> Result<()> {
+    async fn delete_run(&self, run_id: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()

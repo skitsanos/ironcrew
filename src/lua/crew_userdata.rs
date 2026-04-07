@@ -399,18 +399,11 @@ impl UserData for LuaCrew {
             if let Some(tags) = lua.app_data_ref::<Vec<String>>() {
                 record.tags = tags.clone();
             }
-            let run_id =
-                tokio::task::spawn_blocking(move || -> crate::utils::error::Result<String> {
-                    let store = crate::engine::store::create_store(ironcrew_dir)?;
-                    store.save_run(&record)
-                })
+            let store =
+                crate::engine::store::create_store(ironcrew_dir).map_err(mlua::Error::external)?;
+            let run_id = store
+                .save_run(&record)
                 .await
-                .map_err(|e| {
-                    mlua::Error::external(IronCrewError::Task {
-                        task: "run_history".into(),
-                        message: format!("Failed to join run history task: {}", e),
-                    })
-                })?
                 .map_err(mlua::Error::external)?;
             lua.globals().set("__ironcrew_last_run_id", run_id)?;
 

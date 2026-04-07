@@ -215,7 +215,7 @@ async fn execute_crew_from_path_with_events(
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
         let store = create_store(ironcrew_dir)?;
-        let run = store.get_run(&run_id)?;
+        let run = store.get_run(&run_id).await?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
             flow_name: run.flow_name.clone(),
@@ -276,7 +276,7 @@ pub async fn execute_crew_from_path(
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
         let store = create_store(ironcrew_dir)?;
-        let run = store.get_run(&run_id)?;
+        let run = store.get_run(&run_id).await?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
             flow_name: run.flow_name.clone(),
@@ -487,6 +487,7 @@ pub async fn list_runs(
 
     let runs = store
         .list_runs(params.status.as_deref())
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(runs))
@@ -503,6 +504,7 @@ pub async fn get_run(
 
     let record = store
         .get_run(&id)
+        .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(record))
@@ -519,6 +521,7 @@ pub async fn delete_run(
 
     store
         .delete_run(&id)
+        .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(serde_json::json!({"deleted": id})))

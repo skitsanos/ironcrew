@@ -4,10 +4,10 @@ use crate::engine::run_history::RunStatus;
 use crate::engine::store::create_store;
 use crate::utils::error::Result;
 
-pub fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()> {
+pub async fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()> {
     let ironcrew_dir = project.join(".ironcrew");
     let store = create_store(ironcrew_dir)?;
-    let runs = store.list_runs(status_filter)?;
+    let runs = store.list_runs(status_filter).await?;
 
     if runs.is_empty() {
         println!("No runs found.");
@@ -49,10 +49,10 @@ pub fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
+pub async fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
     let ironcrew_dir = project.join(".ironcrew");
     let store = create_store(ironcrew_dir)?;
-    let record = store.get_run(run_id)?;
+    let record = store.get_run(run_id).await?;
 
     println!("Run: {}", record.run_id);
     println!("Flow: {}", record.flow_name);
@@ -96,7 +96,7 @@ pub fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
+pub async fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
     let ironcrew_dir = project.join(".ironcrew");
 
     if !ironcrew_dir.exists() {
@@ -105,7 +105,7 @@ pub fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
     }
 
     let store = create_store(ironcrew_dir)?;
-    let runs = store.list_runs(None)?;
+    let runs = store.list_runs(None).await?;
 
     if runs.is_empty() {
         println!("No runs to clean.");
@@ -116,7 +116,7 @@ pub fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
         // Delete everything
         let count = runs.len();
         for run in &runs {
-            store.delete_run(&run.run_id)?;
+            store.delete_run(&run.run_id).await?;
         }
         println!("Deleted all {} run(s).", count);
 
@@ -141,7 +141,7 @@ pub fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
         let to_delete = &runs[keep..];
         let count = to_delete.len();
         for run in to_delete {
-            store.delete_run(&run.run_id)?;
+            store.delete_run(&run.run_id).await?;
         }
         println!("Deleted {} old run(s), kept {} most recent.", count, keep);
     }

@@ -2,8 +2,8 @@ use ironcrew::engine::run_history::{RunHistory, RunRecord, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
 
-#[test]
-fn test_save_and_load_run() {
+#[tokio::test]
+async fn test_save_and_load_run() {
     let dir = tempfile::tempdir().unwrap();
     let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
 
@@ -29,16 +29,16 @@ fn test_save_and_load_run() {
         tags: vec![],
     };
 
-    history.save_run(&record).unwrap();
+    history.save_run(&record).await.unwrap();
 
-    let loaded = history.get_run("test-run-123").unwrap();
+    let loaded = history.get_run("test-run-123").await.unwrap();
     assert_eq!(loaded.run_id, "test-run-123");
     assert_eq!(loaded.status, RunStatus::Success);
     assert_eq!(loaded.task_results.len(), 1);
 }
 
-#[test]
-fn test_list_runs() {
+#[tokio::test]
+async fn test_list_runs() {
     let dir = tempfile::tempdir().unwrap();
     let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
 
@@ -61,21 +61,21 @@ fn test_list_runs() {
             cached_tokens: 0,
             tags: vec![],
         };
-        history.save_run(&record).unwrap();
+        history.save_run(&record).await.unwrap();
     }
 
-    let all = history.list_runs(None).unwrap();
+    let all = history.list_runs(None).await.unwrap();
     assert_eq!(all.len(), 3);
 
-    let success_only = history.list_runs(Some("success")).unwrap();
+    let success_only = history.list_runs(Some("success")).await.unwrap();
     assert_eq!(success_only.len(), 2);
 
-    let failed_only = history.list_runs(Some("failed")).unwrap();
+    let failed_only = history.list_runs(Some("failed")).await.unwrap();
     assert_eq!(failed_only.len(), 1);
 }
 
-#[test]
-fn test_delete_run() {
+#[tokio::test]
+async fn test_delete_run() {
     let dir = tempfile::tempdir().unwrap();
     let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
 
@@ -93,15 +93,15 @@ fn test_delete_run() {
         cached_tokens: 0,
         tags: vec![],
     };
-    history.save_run(&record).unwrap();
+    history.save_run(&record).await.unwrap();
 
-    history.delete_run("to-delete").unwrap();
-    assert!(history.get_run("to-delete").is_err());
+    history.delete_run("to-delete").await.unwrap();
+    assert!(history.get_run("to-delete").await.is_err());
 }
 
-#[test]
-fn test_get_nonexistent_run() {
+#[tokio::test]
+async fn test_get_nonexistent_run() {
     let dir = tempfile::tempdir().unwrap();
     let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
-    assert!(history.get_run("nonexistent").is_err());
+    assert!(history.get_run("nonexistent").await.is_err());
 }

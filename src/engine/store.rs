@@ -1,12 +1,15 @@
+use async_trait::async_trait;
+
 use crate::engine::run_history::RunRecord;
 use crate::utils::error::Result;
 
 /// Pluggable storage backend for run records.
+#[async_trait]
 pub trait StateStore: Send + Sync {
-    fn save_run(&self, record: &RunRecord) -> Result<String>;
-    fn get_run(&self, run_id: &str) -> Result<RunRecord>;
-    fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
-    fn delete_run(&self, run_id: &str) -> Result<()>;
+    async fn save_run(&self, record: &RunRecord) -> Result<String>;
+    async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
+    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
+    async fn delete_run(&self, run_id: &str) -> Result<()>;
 }
 
 /// Create a StateStore based on environment configuration.

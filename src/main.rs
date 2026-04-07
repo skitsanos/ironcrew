@@ -142,8 +142,10 @@ async fn main() {
         Commands::List { path } => cli::commands::cmd_list(&path),
         Commands::Init { name } => cli::commands::cmd_init(&name),
         Commands::Nodes => cli::commands::cmd_nodes(),
-        Commands::Inspect { run_id, project } => cli::history::cmd_inspect(&project, &run_id),
-        Commands::Clean { project, keep, all } => cli::history::cmd_clean(&project, keep, all),
+        Commands::Inspect { run_id, project } => cli::history::cmd_inspect(&project, &run_id).await,
+        Commands::Clean { project, keep, all } => {
+            cli::history::cmd_clean(&project, keep, all).await
+        }
         Commands::Serve {
             host,
             port,
@@ -152,7 +154,9 @@ async fn main() {
         Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
         Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
         Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
-        Commands::Runs { status, project } => cli::history::cmd_runs(&project, status.as_deref()),
+        Commands::Runs { status, project } => {
+            cli::history::cmd_runs(&project, status.as_deref()).await
+        }
     };
 
     if let Err(e) = result {
