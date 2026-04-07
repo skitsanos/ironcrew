@@ -42,7 +42,8 @@ fn check_ip(ip: IpAddr) -> Result<(), String> {
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // CGNAT
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+            // CGNAT
             {
                 return Err(format!(
                     "Blocked: request to private/internal IP {} is not allowed",
