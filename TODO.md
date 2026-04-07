@@ -27,7 +27,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [ ] **Anthropic Claude provider** — native Claude API support. Claude uses a different message format (`human`/`assistant` roles, system as top-level param). Would need a second provider implementation.
 
-- [ ] **Agent hooks** — `before_task` and `after_task` Lua callbacks on agents. Let agents prepare context or post-process output without extra tasks.
+- [x] **Agent hooks** — `before_task` and `after_task` Lua callbacks stored as bytecode. Done in 2.0.1.
 
 - [x] **Parallel foreach** — `foreach_parallel = true`. Done in 1.9.7.
 
