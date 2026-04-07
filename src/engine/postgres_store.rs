@@ -29,9 +29,23 @@ impl PostgresStore {
 
         let table_name = format!("{}runs", table_prefix);
 
-        // Create table if not exists — uses JSONB for task_results and tags
+        let store = Self {
+            pool,
+            table_name: table_name.clone(),
+        };
+        store.bootstrap().await?;
+
+        tracing::info!("PostgreSQL store ready (table: {})", table_name);
+        Ok(store)
+    }
+
+    /// Bootstrap the database: create table, add missing columns, fix types, create indexes.
+    async fn bootstrap(&self) -> Result<()> {
+        let t = &self.table_name;
+
+        // 1. Create table if not exists
         let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
+            "CREATE TABLE IF NOT EXISTS {t} (
                 run_id        TEXT PRIMARY KEY,
                 flow_name     TEXT NOT NULL,
                 status        TEXT NOT NULL,
@@ -45,16 +59,97 @@ impl PostgresStore {
                 cached_tokens INTEGER DEFAULT 0,
                 tags          JSONB DEFAULT '[]',
                 created_at    TIMESTAMPTZ DEFAULT NOW()
-            )",
-            table_name
+            )"
         );
+        sqlx::query(&create_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("Failed to create {t} table: {e}")))?;
 
-        sqlx::query(&create_sql).execute(&pool).await.map_err(|e| {
-            IronCrewError::Validation(format!("Failed to create {} table: {}", table_name, e))
-        })?;
+        // 2. Add missing columns (heal older schema versions)
+        let migrations: &[(&str, &str)] = &[
+            (
+                "total_tokens",
+                &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0"),
+            ),
+            (
+                "cached_tokens",
+                &format!(
+                    "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS cached_tokens INTEGER DEFAULT 0"
+                ),
+            ),
+            (
+                "tags",
+                &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'"),
+            ),
+            (
+                "created_at",
+                &format!(
+                    "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
+                ),
+            ),
+        ];
 
-        tracing::info!("PostgreSQL store connected (table: {})", table_name);
-        Ok(Self { pool, table_name })
+        for (col, sql) in migrations {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Migration for column '{}': {}", col, e);
+            }
+        }
+
+        // 3. Heal column types — upgrade TEXT to JSONB if needed
+        let type_fixes: &[(&str, &str)] = &[
+            ("task_results", &format!(
+                "DO $$ BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = '{t}' AND column_name = 'task_results' AND data_type = 'text'
+                    ) THEN
+                        ALTER TABLE {t} ALTER COLUMN task_results TYPE JSONB USING task_results::jsonb;
+                        RAISE NOTICE 'Upgraded task_results from TEXT to JSONB';
+                    END IF;
+                END $$"
+            )),
+            ("tags", &format!(
+                "DO $$ BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = '{t}' AND column_name = 'tags' AND data_type = 'text'
+                    ) THEN
+                        ALTER TABLE {t} ALTER COLUMN tags TYPE JSONB USING tags::jsonb;
+                        RAISE NOTICE 'Upgraded tags from TEXT to JSONB';
+                    END IF;
+                END $$"
+            )),
+        ];
+
+        for (col, sql) in type_fixes {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Type fix for column '{}': {}", col, e);
+            }
+        }
+
+        // 4. Create indexes (IF NOT EXISTS — safe to run repeatedly)
+        let indexes: &[&str] = &[
+            &format!("CREATE INDEX IF NOT EXISTS idx_{t}_status ON {t} (status)"),
+            &format!("CREATE INDEX IF NOT EXISTS idx_{t}_started_at ON {t} (started_at DESC)"),
+            &format!("CREATE INDEX IF NOT EXISTS idx_{t}_flow_name ON {t} (flow_name)"),
+            &format!("CREATE INDEX IF NOT EXISTS idx_{t}_tags ON {t} USING GIN (tags)"),
+            &format!(
+                "CREATE INDEX IF NOT EXISTS idx_{t}_task_results ON {t} USING GIN (task_results)"
+            ),
+        ];
+
+        for sql in indexes {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Index creation: {}", e);
+            }
+        }
+
+        tracing::debug!(
+            "PostgreSQL bootstrap complete for table '{}'",
+            self.table_name
+        );
+        Ok(())
     }
 }
 
