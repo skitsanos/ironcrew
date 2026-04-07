@@ -101,6 +101,25 @@ Custom tools define their own parameter schemas, and built-in tools like
 environment variables, never in Lua scripts or HTTP bodies. Use `env("KEY")`
 in Lua. Add `.env` to `.gitignore` and `.dockerignore`.
 
+## Storage Backends
+
+**Default (JSON files).** By default, run records are stored as individual JSON
+files under `<flow>/.ironcrew/runs/`. This requires no extra dependencies and
+works well for development and moderate workloads.
+
+**SQLite backend.** Set `IRONCREW_STORE=sqlite` to store run records in a SQLite
+database instead. The database file defaults to `<flow>/.ironcrew/ironcrew.db`
+but can be overridden with `IRONCREW_STORE_PATH`. SQLite is a good choice when
+you have many runs and want faster queries or a single-file store.
+
+**Per-flow stores.** Each flow gets its own store instance based on its
+`.ironcrew` directory. This keeps data isolated between flows regardless of the
+backend.
+
+**Switching backends.** Changing `IRONCREW_STORE` does not migrate existing data.
+If you switch from `json` to `sqlite`, previously stored JSON runs remain in the
+`runs/` directory but will not appear in queries against the SQLite store.
+
 ## Memory Management
 
 **Default limits.** The memory store defaults to 500 items and 50,000 estimated

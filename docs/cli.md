@@ -185,7 +185,7 @@ Checks performed:
 | Category | Details |
 |----------|---------|
 | Environment | `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_MODEL`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY` |
-| IronCrew config | `IRONCREW_LOG`, `IRONCREW_ALLOW_SHELL`, `IRONCREW_RATE_LIMIT_MS`, `IRONCREW_MAX_RUN_LIFETIME` |
+| IronCrew config | `IRONCREW_LOG`, `IRONCREW_ALLOW_SHELL`, `IRONCREW_RATE_LIMIT_MS`, `IRONCREW_MAX_RUN_LIFETIME`, `IRONCREW_STORE`, `IRONCREW_STORE_PATH` |
 | Project | `.env` presence, `crew.lua` existence and syntax, `agents/` count, `tools/` count |
 | Run history | Number of past runs in `.ironcrew/runs/` |
 
@@ -259,6 +259,8 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
 | `IRONCREW_API_TOKEN` | Bearer token for REST API auth (disabled by default, `/health` always public) |
+| `IRONCREW_STORE`    | Storage backend: `json` (default) or `sqlite` |
+| `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
 
 ### .env File Loading
 

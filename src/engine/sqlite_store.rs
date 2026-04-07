@@ -1,0 +1,211 @@
+use rusqlite::Connection;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use super::run_history::{RunRecord, RunStatus};
+use super::store::StateStore;
+use crate::utils::error::{IronCrewError, Result};
+
+pub struct SqliteStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteStore {
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        let conn = Connection::open(&db_path).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to open SQLite database: {}", e))
+        })?;
+
+        // Create table if not exists
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                flow_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                task_results TEXT NOT NULL,
+                agent_count INTEGER NOT NULL,
+                task_count INTEGER NOT NULL,
+                total_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                tags TEXT DEFAULT '[]',
+                created_at TEXT DEFAULT (datetime('now'))
+            )",
+        )
+        .map_err(|e| IronCrewError::Validation(format!("Failed to create runs table: {}", e)))?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+}
+
+impl StateStore for SqliteStore {
+    fn save_run(&self, record: &RunRecord) -> Result<String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let task_results_json = serde_json::to_string(&record.task_results).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
+        })?;
+        let tags_json = serde_json::to_string(&record.tags)
+            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                record.run_id,
+                record.flow_name,
+                record.status.to_string(),
+                record.started_at,
+                record.finished_at,
+                record.duration_ms as i64,
+                task_results_json,
+                record.agent_count as i64,
+                record.task_count as i64,
+                record.total_tokens as i64,
+                record.cached_tokens as i64,
+                tags_json,
+            ],
+        )
+        .map_err(|e| IronCrewError::Validation(format!("SQLite insert error: {}", e)))?;
+
+        tracing::info!("Run saved to SQLite: {}", record.run_id);
+        Ok(record.run_id.clone())
+    }
+
+    fn get_run(&self, run_id: &str) -> Result<RunRecord> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE run_id = ?1",
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+        let record = stmt
+            .query_row(rusqlite::params![run_id], |row| {
+                let status_str: String = row.get(2)?;
+                let task_results_json: String = row.get(6)?;
+                let tags_json: String = row.get(11)?;
+
+                Ok(RunRecord {
+                    run_id: row.get(0)?,
+                    flow_name: row.get(1)?,
+                    status: match status_str.as_str() {
+                        "success" => RunStatus::Success,
+                        "partial_failure" => RunStatus::PartialFailure,
+                        _ => RunStatus::Failed,
+                    },
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    duration_ms: row.get::<_, i64>(5)? as u64,
+                    task_results: serde_json::from_str(&task_results_json).unwrap_or_default(),
+                    agent_count: row.get::<_, i64>(7)? as usize,
+                    task_count: row.get::<_, i64>(8)? as usize,
+                    total_tokens: row.get::<_, i64>(9)? as u32,
+                    cached_tokens: row.get::<_, i64>(10)? as u32,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    IronCrewError::Validation(format!("Run '{}' not found", run_id))
+                }
+                _ => IronCrewError::Validation(format!("SQLite query error: {}", e)),
+            })?;
+
+        Ok(record)
+    }
+
+    fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(filter) =
+            status_filter
+        {
+            (
+                    "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE status = ?1 ORDER BY started_at DESC".into(),
+                    vec![Box::new(filter.to_string())],
+                )
+        } else {
+            (
+                    "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs ORDER BY started_at DESC".into(),
+                    vec![],
+                )
+        };
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let status_str: String = row.get(2)?;
+                let task_results_json: String = row.get(6)?;
+                let tags_json: String = row.get(11)?;
+
+                Ok(RunRecord {
+                    run_id: row.get(0)?,
+                    flow_name: row.get(1)?,
+                    status: match status_str.as_str() {
+                        "success" => RunStatus::Success,
+                        "partial_failure" => RunStatus::PartialFailure,
+                        _ => RunStatus::Failed,
+                    },
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    duration_ms: row.get::<_, i64>(5)? as u64,
+                    task_results: serde_json::from_str(&task_results_json).unwrap_or_default(),
+                    agent_count: row.get::<_, i64>(7)? as usize,
+                    task_count: row.get::<_, i64>(8)? as usize,
+                    total_tokens: row.get::<_, i64>(9)? as u32,
+                    cached_tokens: row.get::<_, i64>(10)? as u32,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
+
+        let mut records = Vec::new();
+        for record in rows.flatten() {
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn delete_run(&self, run_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let affected = conn
+            .execute(
+                "DELETE FROM runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite delete error: {}", e)))?;
+
+        if affected == 0 {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found",
+                run_id
+            )));
+        }
+        Ok(())
+    }
+}

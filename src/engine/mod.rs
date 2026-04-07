@@ -12,5 +12,7 @@ pub mod model_router;
 pub mod orchestrator;
 pub mod run_history;
 pub mod runtime;
+pub mod sqlite_store;
+pub mod store;
 pub mod task;
 pub mod task_runner;
