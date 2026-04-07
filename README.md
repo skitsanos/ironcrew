@@ -8,7 +8,7 @@ Works with OpenAI, Google Gemini, Groq, Ollama, and any OpenAI-compatible API. N
 local crew = Crew.new({
     goal = "Research and summarize a topic",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-4.1-mini",
 })
 
 crew:add_agent(Agent.new({
