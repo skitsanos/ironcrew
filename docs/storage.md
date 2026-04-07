@@ -10,15 +10,17 @@ the `StateStore` trait. Each flow gets its own store instance based on its
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |
 | SQLite | `sqlite` | Single-server and Docker deployments, faster queries |
+| PostgreSQL | `postgres` | Production cloud, multi-instance, shared state |
 
 ## Configuration
 
-Two environment variables control storage:
+Environment variables control storage:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `IRONCREW_STORE` | Backend type: `json` or `sqlite` | `json` |
+| `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
+| `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) | — |
 
 Set them in your `.env` file, shell environment, or Docker config:
 
@@ -130,6 +132,79 @@ IRONCREW_STORE_PATH=/data/ironcrew-runs.db
 IRONCREW_STORE_PATH=./data/production.db
 ```
 
+## PostgreSQL Backend
+
+PostgreSQL support is behind a feature flag to keep the default binary lean.
+Build with the `postgres` feature:
+
+```bash
+cargo build --release --features postgres
+```
+
+Then configure:
+
+```bash
+IRONCREW_STORE=postgres
+DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
+```
+
+**Advantages:**
+- Shared state across multiple IronCrew instances
+- Full SQL querying power (joins, aggregation, full-text search)
+- Production-grade durability and replication
+- Async I/O — non-blocking database operations via `sqlx`
+
+**Limitations:**
+- Requires an external PostgreSQL server
+- Adds compile-time dependency on `sqlx`
+- Build with `--features postgres` required
+
+### Schema
+
+The table is auto-created on first connection:
+
+```sql
+CREATE TABLE IF NOT EXISTS runs (
+    run_id        TEXT PRIMARY KEY,
+    flow_name     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT NOT NULL,
+    duration_ms   BIGINT NOT NULL,
+    task_results  TEXT NOT NULL,
+    agent_count   INTEGER NOT NULL,
+    task_count    INTEGER NOT NULL,
+    total_tokens  INTEGER DEFAULT 0,
+    cached_tokens INTEGER DEFAULT 0,
+    tags          TEXT DEFAULT '[]',
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### Docker with PostgreSQL
+
+```dockerfile
+# Build with postgres support
+FROM rust:latest AS builder
+RUN cargo build --release --features postgres
+
+# Runtime
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/ironcrew /usr/local/bin/
+ENV IRONCREW_STORE=postgres
+ENV DATABASE_URL=postgres://user:pass@db:5432/ironcrew
+CMD ["ironcrew", "serve", "--host", "0.0.0.0"]
+```
+
+### Without the feature flag
+
+If you set `IRONCREW_STORE=postgres` on a binary built without `--features postgres`,
+you get a clear error:
+
+```
+Validation error: PostgreSQL backend requires building with --features postgres
+```
+
 ## How Stores Are Used
 
 All IronCrew features use the same store:
@@ -185,8 +260,10 @@ A future `ironcrew migrate` command may automate this.
 | Scenario | Recommended |
 |----------|-------------|
 | Local development | `json` (default) — zero setup |
-| Docker deployment | `sqlite` — single file, fast queries |
+| Docker deployment (single instance) | `sqlite` — single file, fast queries |
 | Many runs (100+) | `sqlite` — indexed, no file scanning |
 | Debugging runs | `json` — human-readable files |
 | CI/CD pipelines | `json` — ephemeral, no state needed |
-| Production API server | `sqlite` — handles concurrent reads well |
+| Production single-server | `sqlite` — handles concurrent reads well |
+| Production multi-instance | `postgres` — shared state, replication |
+| Cloud deployment (Railway, Fly.io) | `postgres` — managed database available |
