@@ -9,6 +9,7 @@ use crate::engine::crew::{Crew, ProviderConfig};
 use crate::engine::memory::{MemoryConfig, MemoryStore};
 use crate::engine::model_router::ModelRouter;
 use crate::engine::runtime::Runtime;
+use crate::llm::anthropic::{AnthropicConfig, AnthropicProvider, ServerTool};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::LlmProvider;
 use crate::utils::error::IronCrewError;
@@ -82,23 +83,76 @@ pub fn register_crew_constructor(
             table.get::<Option<usize>>("max_concurrent").ok().flatten();
         let normalized_provider = provider.to_lowercase();
 
-        if normalized_provider != "openai" {
+        if !matches!(normalized_provider.as_str(), "openai" | "anthropic") {
             return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                "Unsupported provider '{}'. Only 'openai' is supported.",
+                "Unsupported provider '{}'. Supported: 'openai', 'anthropic'.",
                 provider
             ))));
         }
 
-        // Create a custom provider if api_key or base_url differ from defaults
+        // Create a custom provider based on provider type
         let custom_provider: Option<Arc<dyn LlmProvider>> =
-            if api_key.is_some() || base_url.is_some() {
+            if normalized_provider == "anthropic" {
+                // Anthropic always creates a dedicated provider
+                let key = api_key
+                    .clone()
+                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .filter(|k| !k.trim().is_empty())
+                    .ok_or_else(|| {
+                        mlua::Error::external(IronCrewError::Validation(
+                            "Anthropic provider requires an api_key or ANTHROPIC_API_KEY env var"
+                                .to_string(),
+                        ))
+                    })?;
+
+                // Parse Anthropic-specific config
+                let thinking_budget: Option<u32> = table.get("thinking_budget").ok();
+
+                let server_tools_list: Vec<String> = table
+                    .get::<mlua::Table>("server_tools")
+                    .map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let web_search_max_uses: Option<u32> = table.get("web_search_max_uses").ok();
+
+                let server_tools: Vec<ServerTool> = server_tools_list
+                    .iter()
+                    .filter_map(|name| match name.as_str() {
+                        "web_search" => Some(ServerTool::WebSearch {
+                            max_uses: web_search_max_uses,
+                        }),
+                        "code_execution" => Some(ServerTool::CodeExecution),
+                        other => {
+                            tracing::warn!("Unknown Anthropic server tool: '{}'", other);
+                            None
+                        }
+                    })
+                    .collect();
+
+                let anthropic_config = AnthropicConfig {
+                    thinking_budget,
+                    server_tools,
+                };
+
+                Some(Arc::new(AnthropicProvider::new(
+                    key,
+                    base_url.clone(),
+                    anthropic_config,
+                )))
+            } else if api_key.is_some() || base_url.is_some() {
+                // OpenAI with custom settings
                 // Resolve API key: explicit > provider-specific env var > OPENAI_API_KEY
                 let key = match api_key
                     .clone()
                     .or_else(|| {
-                        // Try provider-specific env vars based on base_url
                         if let Some(ref url) = base_url {
-                            if url.contains("generativelanguage.googleapis.com") || url.contains("gemini") {
+                            if url.contains("generativelanguage.googleapis.com")
+                                || url.contains("gemini")
+                            {
                                 return std::env::var("GEMINI_API_KEY").ok();
                             }
                             if url.contains("groq.com") {
