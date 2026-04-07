@@ -21,6 +21,7 @@ Environment variables control storage:
 | `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
 | `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) | — |
+| `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases | `""` (table = `runs`) |
 
 Set them in your `.env` file, shell environment, or Docker config:
 
@@ -196,9 +197,35 @@ ENV DATABASE_URL=postgres://user:pass@db:5432/ironcrew
 CMD ["ironcrew", "serve", "--host", "0.0.0.0"]
 ```
 
+### Shared Database with Table Prefix
+
+Multiple IronCrew projects can share a single PostgreSQL database using
+`IRONCREW_PG_TABLE_PREFIX`:
+
+```bash
+# Project A
+IRONCREW_PG_TABLE_PREFIX=projecta_ ironcrew serve
+# → table: projecta_runs
+
+# Project B
+IRONCREW_PG_TABLE_PREFIX=projectb_ ironcrew serve
+# → table: projectb_runs
+
+# No prefix (default)
+# → table: runs
+```
+
+Each prefix gets its own table, fully isolated within the same database.
+
 ### Without the feature flag
 
-If you set `IRONCREW_STORE=postgres` on a binary built without `--features postgres`,
+PostgreSQL is included by default. To build without it (smaller binary):
+
+```bash
+cargo build --release --no-default-features
+```
+
+If you set `IRONCREW_STORE=postgres` on a binary built without the postgres feature,
 you get a clear error:
 
 ```

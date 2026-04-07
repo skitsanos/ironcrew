@@ -39,9 +39,12 @@ pub fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStor
                     "IRONCREW_STORE=postgres requires DATABASE_URL env var".into(),
                 )
             })?;
-            // PostgresStore::new is async — use a blocking approach in this sync factory
+            let table_prefix = std::env::var("IRONCREW_PG_TABLE_PREFIX").unwrap_or_default();
             let rt = tokio::runtime::Handle::current();
-            let store = rt.block_on(super::postgres_store::PostgresStore::new(&database_url))?;
+            let store = rt.block_on(super::postgres_store::PostgresStore::new(
+                &database_url,
+                &table_prefix,
+            ))?;
             Ok(Box::new(store))
         }
         #[cfg(not(feature = "postgres"))]

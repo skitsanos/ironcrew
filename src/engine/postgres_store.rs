@@ -10,10 +10,15 @@ use crate::utils::error::{IronCrewError, Result};
 
 pub struct PostgresStore {
     pool: PgPool,
+    table_name: String,
 }
 
 impl PostgresStore {
-    pub async fn new(database_url: &str) -> Result<Self> {
+    /// Create a new PostgreSQL store.
+    /// `table_prefix` allows sharing a database across projects:
+    ///   prefix = "myapp_" → table = "myapp_runs"
+    ///   prefix = "" → table = "runs" (default)
+    pub async fn new(database_url: &str, table_prefix: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
@@ -22,9 +27,11 @@ impl PostgresStore {
                 IronCrewError::Validation(format!("Failed to connect to PostgreSQL: {}", e))
             })?;
 
+        let table_name = format!("{}runs", table_prefix);
+
         // Create table if not exists
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS runs (
+        let create_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 run_id        TEXT PRIMARY KEY,
                 flow_name     TEXT NOT NULL,
                 status        TEXT NOT NULL,
@@ -39,13 +46,15 @@ impl PostgresStore {
                 tags          TEXT DEFAULT '[]',
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             )",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| IronCrewError::Validation(format!("Failed to create runs table: {}", e)))?;
+            table_name
+        );
 
-        tracing::info!("PostgreSQL store connected");
-        Ok(Self { pool })
+        sqlx::query(&create_sql).execute(&pool).await.map_err(|e| {
+            IronCrewError::Validation(format!("Failed to create {} table: {}", table_name, e))
+        })?;
+
+        tracing::info!("PostgreSQL store connected (table: {})", table_name);
+        Ok(Self { pool, table_name })
     }
 }
 
@@ -58,8 +67,8 @@ impl StateStore for PostgresStore {
         let tags_json = serde_json::to_string(&record.tags)
             .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
 
-        sqlx::query(
-            "INSERT INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+        let sql = format!(
+            "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (run_id) DO UPDATE SET
                 flow_name = EXCLUDED.flow_name,
@@ -73,57 +82,65 @@ impl StateStore for PostgresStore {
                 total_tokens = EXCLUDED.total_tokens,
                 cached_tokens = EXCLUDED.cached_tokens,
                 tags = EXCLUDED.tags",
-        )
-        .bind(&record.run_id)
-        .bind(&record.flow_name)
-        .bind(record.status.to_string())
-        .bind(&record.started_at)
-        .bind(&record.finished_at)
-        .bind(record.duration_ms as i64)
-        .bind(&task_results_json)
-        .bind(record.agent_count as i32)
-        .bind(record.task_count as i32)
-        .bind(record.total_tokens as i32)
-        .bind(record.cached_tokens as i32)
-        .bind(&tags_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| IronCrewError::Validation(format!("PostgreSQL insert error: {}", e)))?;
+            self.table_name
+        );
+
+        sqlx::query(&sql)
+            .bind(&record.run_id)
+            .bind(&record.flow_name)
+            .bind(record.status.to_string())
+            .bind(&record.started_at)
+            .bind(&record.finished_at)
+            .bind(record.duration_ms as i64)
+            .bind(&task_results_json)
+            .bind(record.agent_count as i32)
+            .bind(record.task_count as i32)
+            .bind(record.total_tokens as i32)
+            .bind(record.cached_tokens as i32)
+            .bind(&tags_json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL insert error: {}", e)))?;
 
         tracing::info!("Run saved to PostgreSQL: {}", record.run_id);
         Ok(record.run_id.clone())
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
-        let row = sqlx::query(
+        let sql = format!(
             "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
-             FROM runs WHERE run_id = $1",
-        )
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?
-        .ok_or_else(|| IronCrewError::Validation(format!("Run '{}' not found", run_id)))?;
+             FROM {} WHERE run_id = $1",
+            self.table_name
+        );
+
+        let row = sqlx::query(&sql)
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?
+            .ok_or_else(|| IronCrewError::Validation(format!("Run '{}' not found", run_id)))?;
 
         row_to_record(&row)
     }
 
     async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
         let rows = if let Some(filter) = status_filter {
-            sqlx::query(
+            let sql = format!(
                 "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
-                 FROM runs WHERE status = $1 ORDER BY started_at DESC",
-            )
-            .bind(filter)
-            .fetch_all(&self.pool)
-            .await
+                 FROM {} WHERE status = $1 ORDER BY started_at DESC",
+                self.table_name
+            );
+            sqlx::query(&sql)
+                .bind(filter)
+                .fetch_all(&self.pool)
+                .await
         } else {
-            sqlx::query(
+            let sql = format!(
                 "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags
-                 FROM runs ORDER BY started_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await
+                 FROM {} ORDER BY started_at DESC",
+                self.table_name
+            );
+            sqlx::query(&sql).fetch_all(&self.pool).await
         }
         .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?;
 
@@ -131,7 +148,9 @@ impl StateStore for PostgresStore {
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
-        let result = sqlx::query("DELETE FROM runs WHERE run_id = $1")
+        let sql = format!("DELETE FROM {} WHERE run_id = $1", self.table_name);
+
+        let result = sqlx::query(&sql)
             .bind(run_id)
             .execute(&self.pool)
             .await

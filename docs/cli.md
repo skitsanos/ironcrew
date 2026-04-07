@@ -259,9 +259,10 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
 | `IRONCREW_API_TOKEN` | Bearer token for REST API auth (disabled by default, `/health` always public) |
-| `IRONCREW_STORE`    | Storage backend: `json` (default), `sqlite`, or `postgres` (feature-gated) |
+| `IRONCREW_STORE`    | Storage backend: `json` (default), `sqlite`, or `postgres` |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
 | `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) |
+| `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`) |
 
 ### .env File Loading
 
