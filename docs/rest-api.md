@@ -173,6 +173,18 @@ Returns a full `RunRecord` with task results, token counts, and timing.
 curl -X DELETE http://localhost:3000/flows/research-crew/runs/a1b2c3d4-...
 ```
 
+### Storage Backend
+
+Run history uses the configured storage backend. By default, runs are stored
+as JSON files. Set `IRONCREW_STORE=sqlite` for SQLite:
+
+```bash
+IRONCREW_STORE=sqlite ironcrew serve --flows-dir ./flows
+```
+
+All run history endpoints (`list_runs`, `get_run`, `delete_run`) work
+identically regardless of backend. Each flow gets its own store instance.
+
 ## Flow Inspection
 
 ### Validate a Flow

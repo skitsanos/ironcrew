@@ -195,4 +195,14 @@ local crew = Crew.new({
 
 The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `CollaborationTurn`). These power the REST API's Server-Sent Events stream and structured logging.
 
-Each `crew:run()` saves a `RunRecord` to `.ironcrew/runs/` with task results, token usage, timing, and status (success, partial failure, or failed).
+Each `crew:run()` saves a `RunRecord` with task results, token usage, timing,
+tags, and status (success, partial failure, or failed).
+
+Run records are persisted via a pluggable `StateStore` trait:
+
+- **JSON files** (default) — individual `.json` files in `.ironcrew/runs/`
+- **SQLite** — single database file at `.ironcrew/ironcrew.db`
+
+Set `IRONCREW_STORE=sqlite` to switch backends. See [CLI Reference](cli.md) for
+all storage env vars and [Best Practices](best-practices.md) for guidance on
+choosing a backend.
