@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::agent::{Agent, AgentSelector};
-use crate::engine::executor::execute_task_standalone;
+use crate::engine::executor::{execute_task_standalone, execute_task_standalone_with_hooks};
 use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
@@ -27,6 +27,8 @@ pub async fn run_single_task(
     memory: &MemoryStore,
     messagebus: &MessageBus,
     should_stream: bool,
+    before_task_hook: Option<Vec<u8>>,
+    after_task_hook: Option<Vec<u8>>,
 ) -> (
     String,
     String,
@@ -68,7 +70,7 @@ pub async fn run_single_task(
 
     let mut attempt = 0u32;
     let (output, token_usage) = loop {
-        let result = execute_task_standalone(
+        let result = execute_task_standalone_with_hooks(
             &task_owned,
             &agent_owned,
             provider.as_ref(),
@@ -79,6 +81,10 @@ pub async fn run_single_task(
             &memory_context,
             &messages_context,
             should_stream,
+            None,
+            None,
+            before_task_hook.as_deref(),
+            after_task_hook.as_deref(),
         );
         match tokio::time::timeout(timeout_dur, result).await {
             Ok(Ok((out, usage))) => break (Ok(out), usage),

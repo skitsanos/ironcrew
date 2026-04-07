@@ -33,7 +33,23 @@ impl UserData for LuaCrew {
         // Use add_async_method for all methods to avoid block_on inside Tokio
         methods.add_async_method("add_agent", |_, this, table: Table| async move {
             let agent = agent_from_lua_table(&table)?;
-            this.crew.lock().await.add_agent(agent);
+            let agent_name = agent.name.clone();
+
+            let mut crew = this.crew.lock().await;
+
+            // Extract before_task hook if present and store as bytecode
+            if let Ok(func) = table.get::<mlua::Function>("before_task") {
+                let bytecode = func.dump(false);
+                crew.before_task_hooks.insert(agent_name.clone(), bytecode);
+            }
+
+            // Extract after_task hook if present and store as bytecode
+            if let Ok(func) = table.get::<mlua::Function>("after_task") {
+                let bytecode = func.dump(false);
+                crew.after_task_hooks.insert(agent_name.clone(), bytecode);
+            }
+
+            crew.add_agent(agent);
             Ok(())
         });
 

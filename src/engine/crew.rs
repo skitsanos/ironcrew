@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::engine::agent::Agent;
@@ -17,7 +18,9 @@ pub use crate::engine::collaborative::execute_collaborative_task;
 #[allow(unused_imports)]
 pub use crate::engine::condition::evaluate_condition;
 #[allow(unused_imports)]
-pub use crate::engine::executor::{TaskExecutionContext, execute_task_standalone};
+pub use crate::engine::executor::{
+    TaskExecutionContext, execute_task_standalone, execute_task_standalone_with_hooks,
+};
 #[allow(unused_imports)]
 pub use crate::engine::foreach::execute_foreach_task;
 #[allow(unused_imports)]
@@ -46,6 +49,10 @@ pub struct Crew {
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<String>,
     pub eventbus: EventBus,
+    /// Lua bytecode for before_task hooks, keyed by agent name.
+    pub before_task_hooks: HashMap<String, Vec<u8>>,
+    /// Lua bytecode for after_task hooks, keyed by agent name.
+    pub after_task_hooks: HashMap<String, Vec<u8>>,
 }
 
 impl Crew {
@@ -64,6 +71,8 @@ impl Crew {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             eventbus: EventBus::default(),
+            before_task_hooks: HashMap::new(),
+            after_task_hooks: HashMap::new(),
         }
     }
 

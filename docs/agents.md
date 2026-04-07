@@ -57,6 +57,8 @@ not need to call `crew:add_agent()` for file-based agents.
 | `model`           | string            | no       | nil (uses crew default)            | Per-agent model override (highest priority)            |
 | `expected_output` | string            | no       | nil                                | Description of what this agent should produce          |
 | `response_format` | table             | no       | nil                                | Controls LLM output format (see below)                |
+| `before_task`     | function          | no       | nil                                | Hook called before each task execution (see below)    |
+| `after_task`      | function          | no       | nil                                | Hook called after each task execution (see below)     |
 
 ## Response Format
 
@@ -140,6 +142,50 @@ crew:add_agent(Agent.new({
     temperature = 0.2,
 }))
 ```
+
+## Task Hooks
+
+Agents can define `before_task` and `after_task` callback functions that run
+around every task the agent executes. Hooks are useful for logging, metrics,
+input preprocessing, and output postprocessing.
+
+```lua
+crew:add_agent(Agent.new({
+    name = "researcher",
+    goal = "Research topics thoroughly",
+    before_task = function(task_name, task_description)
+        log("info", "Starting: " .. task_name)
+        return task_description  -- return modified description, or nil for no change
+    end,
+    after_task = function(task_name, output, success)
+        log("info", "Done: " .. task_name .. " (" .. (success and "ok" or "fail") .. ")")
+        return output  -- return modified output, or nil for no change
+    end,
+}))
+```
+
+### `before_task(task_name, task_description)`
+
+Called before the agent sends its prompt to the LLM. Receives the task name and
+interpolated description. Return a string to replace the description, or `nil`
+to keep it unchanged.
+
+### `after_task(task_name, output, success)`
+
+Called after the LLM returns its response. Receives the task name, the raw LLM
+output, and a boolean indicating success. Return a string to replace the output,
+or `nil` to keep it unchanged.
+
+### Notes
+
+- Hooks run in an isolated Lua VM per invocation (no access to the crew's
+  globals or memory).
+- Hook errors are logged as warnings and do **not** fail the task -- the
+  original description or output is used instead.
+- Hooks are stored as Lua bytecode on the `Crew`, so they work across all
+  execution modes: standard tasks, foreach tasks, and retry loops.
+- Hooks do **not** run for error handler tasks or collaborative task synthesis
+  calls.
 
 ## Best Practices
 

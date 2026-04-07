@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::engine::agent::Agent;
-use crate::engine::executor::execute_task_standalone;
+use crate::engine::executor::execute_task_standalone_with_hooks;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
 use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
@@ -53,6 +53,8 @@ pub async fn execute_foreach_task(
     model: &str,
     max_tool_rounds: usize,
     stream: bool,
+    before_task_hook: Option<&[u8]>,
+    after_task_hook: Option<&[u8]>,
 ) -> Result<TaskResult> {
     let item_var = task
         .foreach_as
@@ -144,7 +146,7 @@ pub async fn execute_foreach_task(
                         .collect();
                     format!("Messages from other agents:\n{}", strs.join("\n"))
                 };
-                execute_task_standalone(
+                execute_task_standalone_with_hooks(
                     item_task,
                     agent,
                     provider,
@@ -155,6 +157,10 @@ pub async fn execute_foreach_task(
                     &mem_ctx,
                     &msg_ctx,
                     task.stream || stream,
+                    None,
+                    None,
+                    before_task_hook,
+                    after_task_hook,
                 )
                 .await
             })
@@ -205,7 +211,7 @@ pub async fn execute_foreach_task(
                 format!("Messages from other agents:\n{}", strs.join("\n"))
             };
 
-            match execute_task_standalone(
+            match execute_task_standalone_with_hooks(
                 &item_task,
                 agent,
                 provider,
@@ -216,6 +222,10 @@ pub async fn execute_foreach_task(
                 &memory_context,
                 &msg_ctx,
                 task.stream || stream,
+                None,
+                None,
+                before_task_hook,
+                after_task_hook,
             )
             .await
             {
