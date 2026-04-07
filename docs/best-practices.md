@@ -68,8 +68,9 @@ due to transient issues (rate limits, network errors). The engine emits
 `task_retry` events so you can monitor retry behavior.
 
 **Timeouts.** Set `timeout_secs` on long-running tasks to prevent them from
-blocking the entire crew. The server also enforces a 30-minute maximum run
-lifetime.
+blocking the entire crew. The server enforces a 30-minute maximum run lifetime
+(`IRONCREW_MAX_RUN_LIFETIME`). The server handles `SIGTERM` and `Ctrl+C`
+gracefully, allowing in-flight requests to complete before shutdown.
 
 **Conditions.** Use `condition` to skip tasks based on previous results. A task
 with a false condition emits a `task_skipped` event and does not count as failed.
@@ -77,8 +78,9 @@ with a false condition emits a `task_skipped` event and does not count as failed
 ## Performance
 
 **Parallel execution.** Structure tasks so that independent work runs concurrently.
-Tasks in the same dependency phase execute in parallel. Use `max_concurrent` on
-the crew to limit parallelism if needed.
+Tasks in the same dependency phase execute in parallel. A concurrency semaphore
+always applies — crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env
+var > default of 10. This prevents resource exhaustion in phases with many tasks.
 
 **Model routing.** Use cheap models (`gpt-4.1-mini`, `gemini-2.5-flash`) for simple
 tasks and reserve capable models for reasoning. Set `models` on the crew or
@@ -89,17 +91,52 @@ LLM output as it arrives.
 
 ## Security
 
+**CORS.** The API server denies cross-origin requests by default. Set
+`IRONCREW_CORS_ORIGINS` to a comma-separated list of allowed origins, or `*`
+for permissive access (development only). In production, always list specific
+origins.
+
+**SSRF protection.** The `http_request` tool and all Lua `http.*` globals block
+requests to private/internal IP addresses (loopback, RFC1918, link-local, CGNAT)
+by default. This prevents Lua scripts from probing internal networks. Override
+with `IRONCREW_ALLOW_PRIVATE_IPS=1` if your agents legitimately need to reach
+internal services.
+
+**Environment variable security.** Lua `env()` blocks sensitive variables by
+default: `DATABASE_URL`, `IRONCREW_API_TOKEN`, and any variable ending with
+`_API_KEY`, `_SECRET`, `_TOKEN`, or `_PASSWORD`. Add custom names to
+`IRONCREW_ENV_BLOCKLIST` (comma-separated). This prevents Lua scripts from
+exfiltrating secrets into task output.
+
+**Request/response size limits.** The server enforces a max request body size
+(`IRONCREW_MAX_BODY_SIZE`, default 10MB). HTTP tools and Lua `http.*` enforce
+a max response body size (`IRONCREW_MAX_RESPONSE_SIZE`, default 50MB). These
+prevent memory exhaustion from oversized payloads.
+
+**Prompt size limit.** User prompts (task description + context + dependency
+results) are capped at `IRONCREW_MAX_PROMPT_CHARS` (default 100KB). Large
+prompts are truncated with a warning to prevent OOM from large intermediate
+outputs.
+
+**Error sanitization.** API error responses do not expose filesystem paths or
+internal server structure. Full details are logged server-side.
+
 **Path validation.** The API server rejects flow identifiers with path traversal
 components (`..`, absolute paths, multi-component paths). Only single directory
 names within `--flows-dir` are accepted.
 
 **Sandbox restrictions.** The Lua runtime operates in a sandboxed environment.
-Custom tools define their own parameter schemas, and built-in tools like
-`file_read` and `file_write` can be scoped to specific directories.
+`io`, `debug`, `loadfile`, and `dofile` are removed. Custom tools define their
+own parameter schemas, and built-in tools like `file_read` and `file_write` can
+be scoped to specific directories.
 
 **API keys in environment variables.** Store API keys in `.env` files or
 environment variables, never in Lua scripts or HTTP bodies. Use `env("KEY")`
 in Lua. Add `.env` to `.gitignore` and `.dockerignore`.
+
+**Directory permissions.** The `.ironcrew/` directory is created with `0o700`
+permissions on Unix, preventing other users from reading run history that may
+contain sensitive task output.
 
 ## Storage Backends
 
@@ -111,6 +148,12 @@ works well for development and moderate workloads.
 database instead. The database file defaults to `<flow>/.ironcrew/ironcrew.db`
 but can be overridden with `IRONCREW_STORE_PATH`. SQLite is a good choice when
 you have many runs and want faster queries or a single-file store.
+
+**PostgreSQL backend.** Set `IRONCREW_STORE=postgres` with `DATABASE_URL` for
+multi-instance cloud deployments. Pool size is configurable via
+`IRONCREW_DB_POOL_SIZE` (default 10). Table prefix (`IRONCREW_PG_TABLE_PREFIX`)
+allows sharing a database across projects — only alphanumeric and underscore are
+allowed.
 
 **Per-flow stores.** Each flow gets its own store instance based on its
 `.ironcrew` directory. This keeps data isolated between flows regardless of the
@@ -175,11 +218,18 @@ avoid leaking secrets in shell history:
 ```bash
 docker run -p 3000:3000 \
   --env-file .env \
+  -e IRONCREW_API_TOKEN=your-secret-token \
+  -e IRONCREW_CORS_ORIGINS=https://app.example.com \
   -v ./flows:/app/flows \
   ironcrew serve --host 0.0.0.0 --port 3000 --flows-dir /app/flows
 ```
 
-Bind to `0.0.0.0` inside the container so the port mapping works.
+Bind to `0.0.0.0` inside the container so the port mapping works. Always set
+`IRONCREW_API_TOKEN` and `IRONCREW_CORS_ORIGINS` in production deployments.
+
+**Kubernetes.** The server handles `SIGTERM` gracefully, completing in-flight
+requests before shutdown. Set `terminationGracePeriodSeconds` in your pod spec
+to allow sufficient time for long-running crew executions to finish.
 
 ## Cost Optimization
 
