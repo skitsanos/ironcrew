@@ -19,8 +19,24 @@ impl PostgresStore {
     ///   prefix = "myapp_" → table = "myapp_runs"
     ///   prefix = "" → table = "runs" (default)
     pub async fn new(database_url: &str, table_prefix: &str) -> Result<Self> {
+        // Validate table prefix to prevent SQL injection via env var
+        if !table_prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(IronCrewError::Validation(format!(
+                "Invalid IRONCREW_PG_TABLE_PREFIX '{}': only alphanumeric and underscore allowed",
+                table_prefix
+            )));
+        }
+
+        let max_conn: u32 = std::env::var("IRONCREW_DB_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_conn)
             .connect(database_url)
             .await
             .map_err(|e| {

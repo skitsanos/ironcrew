@@ -252,9 +252,14 @@ pub async fn run_crew(
         .filter_map(|t| t.on_error.as_deref())
         .collect();
 
-    let semaphore = crew
-        .max_concurrent_tasks
-        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    // Concurrency limit: crew config > env var > default (10)
+    let max_concurrent = crew.max_concurrent_tasks.unwrap_or_else(|| {
+        std::env::var("IRONCREW_DEFAULT_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    });
+    let semaphore = Some(Arc::new(tokio::sync::Semaphore::new(max_concurrent)));
 
     // Build a flat ordering of task names for final result ordering
     let task_order: Vec<&str> = phases
@@ -621,7 +626,9 @@ pub async fn run_crew(
             let agent_owned = agent.clone();
             let provider_clone = provider.clone();
             let tool_registry_clone = tool_registry.clone();
-            // Clone only the results this task depends on (not the full map)
+            // Share only the results this task depends on (not the full map).
+            // TaskResult is cloned here but within a phase, tasks only depend
+            // on results from prior phases, so this is typically 0-3 entries.
             let results_snapshot: HashMap<String, TaskResult> = task
                 .depends_on
                 .iter()

@@ -21,7 +21,11 @@ Environment variables control storage:
 | `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
 | `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) | — |
-| `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases | `""` (table = `runs`) |
+| `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases. Only alphanumeric and underscore allowed (`^[a-zA-Z0-9_]*$`) | `""` (table = `runs`) |
+| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size | `10` |
+
+**Note:** The `.ironcrew/` directory is created with `0o700` permissions on Unix
+to prevent other users from reading run history.
 
 Set them in your `.env` file, shell environment, or Docker config:
 

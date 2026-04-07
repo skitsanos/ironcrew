@@ -399,8 +399,9 @@ impl UserData for LuaCrew {
             if let Some(tags) = lua.app_data_ref::<Vec<String>>() {
                 record.tags = tags.clone();
             }
-            let store =
-                crate::engine::store::create_store(ironcrew_dir).map_err(mlua::Error::external)?;
+            let store = crate::engine::store::create_store(ironcrew_dir)
+                .await
+                .map_err(mlua::Error::external)?;
             let run_id = store
                 .save_run(&record)
                 .await

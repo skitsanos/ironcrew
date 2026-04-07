@@ -51,18 +51,18 @@ impl Message {
 #[derive(Clone)]
 pub struct MessageBus {
     /// Queued messages per agent name. Messages are consumed when delivered.
-    queues: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
-    /// History of all messages (for debugging/inspection).
-    history: Arc<RwLock<Vec<Message>>>,
+    queues: Arc<RwLock<HashMap<String, VecDeque<Arc<Message>>>>>,
+    /// History of all messages (for debugging/inspection), capped.
+    history: Arc<RwLock<VecDeque<Arc<Message>>>>,
     /// Pending broadcasts sent before agents were registered.
-    pending_broadcasts: Arc<RwLock<Vec<Message>>>,
+    pending_broadcasts: Arc<RwLock<Vec<Arc<Message>>>>,
 }
 
 impl MessageBus {
     pub fn new() -> Self {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
-            history: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             pending_broadcasts: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -74,18 +74,20 @@ impl MessageBus {
 
     /// Send a message to a specific agent or broadcast to all.
     pub async fn send(&self, message: Message) {
+        let message = Arc::new(message);
+
         let mut history = self.history.write().await;
-        history.push(message.clone());
-        // Cap history to last 500 messages
-        if history.len() > 500 {
-            let excess = history.len() - 500;
-            history.drain(..excess);
+        history.push_back(Arc::clone(&message));
+        // Cap history to last 500 messages (O(1) with VecDeque)
+        while history.len() > 500 {
+            history.pop_front();
         }
+        drop(history);
 
         let mut queues = self.queues.write().await;
 
         if message.to == "*" {
-            // Broadcast: add to all existing queues except sender
+            // Broadcast: add to all existing queues except sender (zero-copy via Arc)
             let agent_names: Vec<String> = queues.keys().cloned().collect();
             if agent_names.is_empty() {
                 // No agents registered yet — store for later delivery
@@ -95,7 +97,10 @@ impl MessageBus {
             }
             for name in agent_names {
                 if name != message.from {
-                    queues.entry(name).or_default().push_back(message.clone());
+                    queues
+                        .entry(name)
+                        .or_default()
+                        .push_back(Arc::clone(&message));
                 }
             }
         } else {
@@ -111,20 +116,20 @@ impl MessageBus {
         let mut queues = self.queues.write().await;
         queues.entry(name.to_string()).or_default();
 
-        // Deliver any pending broadcasts to this agent
+        // Deliver any pending broadcasts to this agent (zero-copy via Arc)
         let pending = self.pending_broadcasts.read().await;
         for msg in pending.iter() {
             if msg.from != name {
                 queues
                     .entry(name.to_string())
                     .or_default()
-                    .push_back(msg.clone());
+                    .push_back(Arc::clone(msg));
             }
         }
     }
 
     /// Retrieve and consume all pending messages for an agent.
-    pub async fn receive(&self, agent_name: &str) -> Vec<Message> {
+    pub async fn receive(&self, agent_name: &str) -> Vec<Arc<Message>> {
         let mut queues = self.queues.write().await;
         queues
             .get_mut(agent_name)
@@ -134,7 +139,7 @@ impl MessageBus {
 
     /// Peek at pending messages without consuming them.
     #[allow(dead_code)] // used in integration tests
-    pub async fn peek(&self, agent_name: &str) -> Vec<Message> {
+    pub async fn peek(&self, agent_name: &str) -> Vec<Arc<Message>> {
         let queues = self.queues.read().await;
         queues
             .get(agent_name)
@@ -150,9 +155,9 @@ impl MessageBus {
     }
 
     /// Get full message history.
-    pub async fn get_history(&self) -> Vec<Message> {
+    pub async fn get_history(&self) -> Vec<Arc<Message>> {
         let history = self.history.read().await;
-        history.clone()
+        history.iter().cloned().collect()
     }
 }
 

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
@@ -114,9 +115,9 @@ pub struct TokenUsageSummary {
 
 #[derive(Clone)]
 pub struct EventBus {
-    sender: Arc<broadcast::Sender<CrewEvent>>,
+    sender: Arc<broadcast::Sender<Arc<CrewEvent>>>,
     /// Replay buffer: emitted events stored for late subscribers (capped).
-    history: Arc<RwLock<Vec<CrewEvent>>>,
+    history: Arc<RwLock<VecDeque<Arc<CrewEvent>>>>,
     /// Maximum number of events to keep in the replay buffer.
     max_replay: usize,
 }
@@ -124,34 +125,38 @@ pub struct EventBus {
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
+        let max_replay: usize = std::env::var("IRONCREW_MAX_EVENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
         Self {
             sender: Arc::new(sender),
-            history: Arc::new(RwLock::new(Vec::new())),
-            max_replay: 1000,
+            history: Arc::new(RwLock::new(VecDeque::with_capacity(max_replay.min(2048)))),
+            max_replay,
         }
     }
 
     pub fn emit(&self, event: CrewEvent) {
+        let event = Arc::new(event);
         // Store in replay buffer
         if let Ok(mut history) = self.history.try_write() {
-            history.push(event.clone());
-            // Trim oldest if over cap
-            if history.len() > self.max_replay {
-                let excess = history.len() - self.max_replay;
-                history.drain(..excess);
+            if history.len() >= self.max_replay {
+                history.pop_front(); // O(1) with VecDeque
             }
+            history.push_back(Arc::clone(&event));
         }
         // Broadcast to live subscribers (ignore if none)
         let _ = self.sender.send(event);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<CrewEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<CrewEvent>> {
         self.sender.subscribe()
     }
 
     /// Get all events emitted so far (for replay to late subscribers).
-    pub async fn replay(&self) -> Vec<CrewEvent> {
-        self.history.read().await.clone()
+    /// Returns Arc-wrapped events to avoid deep cloning.
+    pub async fn replay(&self) -> Vec<Arc<CrewEvent>> {
+        self.history.read().await.iter().cloned().collect()
     }
 }
 

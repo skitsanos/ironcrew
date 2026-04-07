@@ -41,6 +41,25 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 ---
 
+## Production Readiness (Done)
+
+- [x] **CORS configuration** — `IRONCREW_CORS_ORIGINS` (deny-all default). Done in 2.1.0.
+- [x] **Graceful shutdown** — SIGTERM/Ctrl+C for Kubernetes. Done in 2.1.0.
+- [x] **SSRF protection** — blocks private IPs in HTTP tool + Lua http.*. Done in 2.1.0.
+- [x] **Request/response size limits** — `IRONCREW_MAX_BODY_SIZE`, `IRONCREW_MAX_RESPONSE_SIZE`. Done in 2.1.0.
+- [x] **Env var security** — `env()` blocks sensitive vars (`*_API_KEY`, `*_SECRET`, etc.). Done in 2.1.0.
+- [x] **Prompt size limit** — `IRONCREW_MAX_PROMPT_CHARS` (default 100KB). Done in 2.1.0.
+- [x] **Default concurrency cap** — always applies semaphore (default 10). Done in 2.1.0.
+- [x] **EventBus/MessageBus optimization** — Arc-wrapped events, VecDeque, configurable cap. Done in 2.1.0.
+- [x] **Lua VM pooling** — thread-local reuse for hooks and conditions. Done in 2.1.0.
+- [x] **Shared HTTP client** — singleton reqwest::Client. Done in 2.1.0.
+- [x] **Regex caching** — thread-local cache for Lua regex globals. Done in 2.1.0.
+- [x] **API error sanitization** — no filesystem paths in responses. Done in 2.1.0.
+- [x] **Directory permissions** — `.ironcrew/` set to 0o700 on Unix. Done in 2.1.0.
+- [x] **PG hardening** — table prefix validation, configurable pool size. Done in 2.1.0.
+
+---
+
 ## Medium Value, Low Effort
 
 - [x] **Run tags/labels** — `--tag` flag on run, tags in API input, stored in run record. Done in 2.0.0.

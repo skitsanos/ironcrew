@@ -2,11 +2,23 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use super::Tool;
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
+
+/// Shared HTTP client singleton — reused across all tool instances and Lua sandboxes.
+/// Connection pool is shared, reducing memory and improving connection reuse.
+pub static SHARED_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(format!("IronCrew/{}", env!("CARGO_PKG_VERSION")))
+        .pool_max_idle_per_host(10)
+        .build()
+        .expect("Failed to build HTTP client")
+});
 
 pub struct HttpRequestTool {
     client: Client,
@@ -20,12 +32,9 @@ impl Default for HttpRequestTool {
 
 impl HttpRequestTool {
     pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("IronCrew/0.1")
-            .build()
-            .expect("Failed to build HTTP client");
-        Self { client }
+        Self {
+            client: SHARED_HTTP_CLIENT.clone(),
+        }
     }
 }
 
@@ -66,6 +75,15 @@ impl Tool for HttpRequestTool {
                 tool: "http_request".into(),
                 message: "Missing 'url' argument".into(),
             })?;
+
+        // SSRF protection: block private/internal IPs
+        crate::utils::network::validate_url_not_private(url).map_err(|e| {
+            IronCrewError::ToolExecution {
+                tool: "http_request".into(),
+                message: e,
+            }
+        })?;
+
         let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
 
         // Build request
@@ -143,6 +161,24 @@ impl Tool for HttpRequestTool {
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
+
+        // Check Content-Length before reading body to prevent OOM
+        let max_response_size: u64 = std::env::var("IRONCREW_MAX_RESPONSE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50 * 1024 * 1024); // 50MB default
+        if let Some(len) = resp.content_length()
+            && len > max_response_size
+        {
+            return Err(IronCrewError::ToolExecution {
+                tool: "http_request".into(),
+                message: format!(
+                    "Response too large: {} bytes (limit: {} bytes)",
+                    len, max_response_size
+                ),
+            });
+        }
+
         let body_text = resp
             .text()
             .await

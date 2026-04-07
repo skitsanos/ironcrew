@@ -51,6 +51,12 @@ pub struct JsonFileStore {
 impl JsonFileStore {
     pub fn new(store_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&store_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Restrict .ironcrew/runs/ to owner-only (run history may contain sensitive output)
+            let _ = std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700));
+        }
         Ok(Self { store_dir })
     }
 }

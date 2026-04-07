@@ -13,7 +13,7 @@ local crew = Crew.new({
     base_url        = "https://api.openai.com/v1",  -- optional, overrides OPENAI_BASE_URL
     api_key         = env("OPENAI_API_KEY"),  -- optional, overrides OPENAI_API_KEY
     stream          = false,                  -- enable streaming output (default false)
-    max_concurrent  = 4,                      -- max parallel tasks (nil = sequential)
+    max_concurrent  = 4,                      -- max parallel tasks (default: IRONCREW_DEFAULT_MAX_CONCURRENT or 10)
     memory          = "ephemeral",            -- "ephemeral" (default) or "persistent"
     max_memory_items  = 500,                  -- eviction threshold (default 500)
     max_memory_tokens = 50000,                -- estimated token cap (default 50 000)

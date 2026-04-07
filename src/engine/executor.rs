@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::engine::agent::Agent;
@@ -7,64 +8,73 @@ use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
-/// Run a before_task hook in a fresh Lua VM.
-/// Returns the (possibly modified) task description.
-fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> String {
-    let lua = mlua::Lua::new();
-    let func = match lua.load(bytecode).into_function() {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                "before_task hook for task '{}' failed to load: {}",
-                task_name,
-                e
-            );
-            return task_description.to_string();
-        }
-    };
-
-    match func.call::<mlua::Value>((task_name, task_description)) {
-        Ok(mlua::Value::String(s)) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => task_description.to_string(),
-        },
-        Ok(mlua::Value::Nil) => task_description.to_string(),
-        Ok(_) => task_description.to_string(),
-        Err(e) => {
-            tracing::warn!("before_task hook for task '{}' failed: {}", task_name, e);
-            task_description.to_string()
-        }
-    }
+// Thread-local Lua VM reused for hook execution to avoid per-call allocation.
+thread_local! {
+    static HOOK_LUA: RefCell<mlua::Lua> = RefCell::new(mlua::Lua::new());
 }
 
-/// Run an after_task hook in a fresh Lua VM.
+/// Run a before_task hook using the thread-local Lua VM.
+/// Returns the (possibly modified) task description.
+fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> String {
+    HOOK_LUA.with(|cell| {
+        let lua = cell.borrow();
+        let func = match lua.load(bytecode).into_function() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "before_task hook for task '{}' failed to load: {}",
+                    task_name,
+                    e
+                );
+                return task_description.to_string();
+            }
+        };
+
+        match func.call::<mlua::Value>((task_name, task_description)) {
+            Ok(mlua::Value::String(s)) => match s.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => task_description.to_string(),
+            },
+            Ok(mlua::Value::Nil) => task_description.to_string(),
+            Ok(_) => task_description.to_string(),
+            Err(e) => {
+                tracing::warn!("before_task hook for task '{}' failed: {}", task_name, e);
+                task_description.to_string()
+            }
+        }
+    })
+}
+
+/// Run an after_task hook using the thread-local Lua VM.
 /// Returns the (possibly modified) output.
 fn run_after_hook(bytecode: &[u8], task_name: &str, output: &str, success: bool) -> String {
-    let lua = mlua::Lua::new();
-    let func = match lua.load(bytecode).into_function() {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                "after_task hook for task '{}' failed to load: {}",
-                task_name,
-                e
-            );
-            return output.to_string();
-        }
-    };
+    HOOK_LUA.with(|cell| {
+        let lua = cell.borrow();
+        let func = match lua.load(bytecode).into_function() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "after_task hook for task '{}' failed to load: {}",
+                    task_name,
+                    e
+                );
+                return output.to_string();
+            }
+        };
 
-    match func.call::<mlua::Value>((task_name, output, success)) {
-        Ok(mlua::Value::String(s)) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => output.to_string(),
-        },
-        Ok(mlua::Value::Nil) => output.to_string(),
-        Ok(_) => output.to_string(),
-        Err(e) => {
-            tracing::warn!("after_task hook for task '{}' failed: {}", task_name, e);
-            output.to_string()
+        match func.call::<mlua::Value>((task_name, output, success)) {
+            Ok(mlua::Value::String(s)) => match s.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => output.to_string(),
+            },
+            Ok(mlua::Value::Nil) => output.to_string(),
+            Ok(_) => output.to_string(),
+            Err(e) => {
+                tracing::warn!("after_task hook for task '{}' failed: {}", task_name, e);
+                output.to_string()
+            }
         }
-    }
+    })
 }
 
 pub struct TaskExecutionContext<'a> {
@@ -146,7 +156,25 @@ impl<'a> TaskExecutionContext<'a> {
             }
         }
 
-        messages.push(ChatMessage::user(&prompt_parts.join("\n\n")));
+        // Cap total prompt size to prevent OOM from large intermediate outputs
+        let max_prompt_chars: usize = std::env::var("IRONCREW_MAX_PROMPT_CHARS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100 * 1024); // 100KB default
+
+        let mut user_prompt = prompt_parts.join("\n\n");
+        if user_prompt.len() > max_prompt_chars {
+            tracing::warn!(
+                "Task '{}': prompt truncated from {} to {} chars",
+                self.task.name,
+                user_prompt.len(),
+                max_prompt_chars
+            );
+            user_prompt.truncate(max_prompt_chars);
+            user_prompt.push_str("\n\n[... prompt truncated due to size limit]");
+        }
+
+        messages.push(ChatMessage::user(&user_prompt));
 
         // Get tool schemas for this agent
         let tool_schemas = self.tool_registry.schemas_for(&self.agent.tools);
