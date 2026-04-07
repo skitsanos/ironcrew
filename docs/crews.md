@@ -41,7 +41,7 @@ local crew = Crew.new({
 | `base_url`               | string   | env `OPENAI_BASE_URL` | API endpoint (supports Gemini, Groq, etc.) |
 | `api_key`                | string   | env `OPENAI_API_KEY`  | API key; auto-resolved from provider-specific env vars |
 | `stream`                 | bool     | `false`            | Stream LLM responses token-by-token |
-| `max_concurrent`         | number   | `nil` (sequential) | Maximum tasks to run in parallel |
+| `max_concurrent`         | number   | `10`               | Maximum tasks to run in parallel per phase. Overrides `IRONCREW_DEFAULT_MAX_CONCURRENT` env var |
 | `memory`                 | string   | `"ephemeral"`      | `"ephemeral"` or `"persistent"` |
 | `max_memory_items`       | number   | `500`              | Maximum items before LRU eviction |
 | `max_memory_tokens`      | number   | `50000`            | Estimated token budget for memory |

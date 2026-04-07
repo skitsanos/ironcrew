@@ -139,16 +139,14 @@ IRONCREW_STORE_PATH=./data/production.db
 
 ## PostgreSQL Backend
 
-PostgreSQL support is behind a feature flag to keep the default binary lean.
-Build with the `postgres` feature:
-
-PostgreSQL is included by default in standard builds. To build without it:
+PostgreSQL is included by default in the standard binary. To build a minimal
+binary without PostgreSQL support:
 
 ```bash
 cargo build --release --no-default-features
 ```
 
-Then configure:
+Configure:
 
 ```bash
 IRONCREW_STORE=postgres
@@ -252,16 +250,16 @@ IRONCREW_PG_TABLE_PREFIX=projectb_ ironcrew serve
 
 Each prefix gets its own table, fully isolated within the same database.
 
-### Without the feature flag
+### Building without PostgreSQL
 
-PostgreSQL is included by default. To build without it (smaller binary):
+PostgreSQL is included by default. To build a smaller binary without it:
 
 ```bash
 cargo build --release --no-default-features
 ```
 
-If you set `IRONCREW_STORE=postgres` on a binary built without the postgres feature,
-you get a clear error:
+If you set `IRONCREW_STORE=postgres` on a binary built without PostgreSQL, you
+get a clear error:
 
 ```
 Validation error: PostgreSQL backend requires building with --features postgres

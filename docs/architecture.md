@@ -90,7 +90,9 @@ Tasks a, b, and c land in Phase 0 (parallel). The summary task lands in Phase 1.
 
 Within each phase, standard tasks run concurrently using `FuturesUnordered`. This keeps all futures on the current Tokio task (no `tokio::spawn`), so when the orchestrator is cancelled, all in-flight work is dropped immediately.
 
-Concurrency can be bounded with `max_concurrent` in `Crew.new()`:
+A Tokio semaphore always limits how many tasks execute at once. The limit is
+resolved as: crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env var
+> default of 10.
 
 ```lua
 local crew = Crew.new({
@@ -98,8 +100,6 @@ local crew = Crew.new({
     max_concurrent = 3,  -- at most 3 tasks running simultaneously
 })
 ```
-
-This uses a Tokio semaphore to limit how many tasks execute at once.
 
 ### Foreach and Collaborative Tasks
 
@@ -202,7 +202,8 @@ Run records are persisted via a pluggable `StateStore` trait:
 
 - **JSON files** (default) — individual `.json` files in `.ironcrew/runs/`
 - **SQLite** — single database file at `.ironcrew/ironcrew.db`
+- **PostgreSQL** — shared state for multi-instance cloud deployments, with JSONB columns for native SQL queries
 
-Set `IRONCREW_STORE=sqlite` to switch backends. See [CLI Reference](cli.md) for
-all storage env vars and [Best Practices](best-practices.md) for guidance on
-choosing a backend.
+Set `IRONCREW_STORE` to `sqlite` or `postgres` to switch backends. See
+[Storage](storage.md) for full configuration and [CLI Reference](cli.md) for
+all env vars.
