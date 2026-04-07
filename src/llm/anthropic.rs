@@ -148,10 +148,15 @@ impl AnthropicProvider {
         let merged = merge_consecutive_roles(anthropic_messages);
 
         // 4. Build request body
+        // When thinking is enabled, max_tokens must exceed the thinking budget
+        let default_max_tokens = match self.config.thinking_budget {
+            Some(budget) => budget + 4096, // budget + room for the actual response
+            None => 4096,
+        };
         let mut body = json!({
             "model": request.model,
             "messages": merged,
-            "max_tokens": request.max_tokens.unwrap_or(4096),
+            "max_tokens": request.max_tokens.unwrap_or(default_max_tokens),
         });
 
         // System prompt
