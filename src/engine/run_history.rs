@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use crate::engine::task::TaskResult;
 use crate::utils::error::{IronCrewError, Result};
 
+use super::store::StateStore;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
@@ -40,19 +42,20 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
-/// Store for persisting run records to disk.
-pub struct RunHistory {
+/// JSON file-based store for persisting run records to disk.
+pub struct JsonFileStore {
     store_dir: PathBuf,
 }
 
-impl RunHistory {
+impl JsonFileStore {
     pub fn new(store_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&store_dir)?;
         Ok(Self { store_dir })
     }
+}
 
-    /// Save a run record. Returns the run_id.
-    pub fn save(&self, record: &RunRecord) -> Result<String> {
+impl StateStore for JsonFileStore {
+    fn save_run(&self, record: &RunRecord) -> Result<String> {
         let filename = format!("{}.json", record.run_id);
         let path = self.store_dir.join(&filename);
         let json = serde_json::to_string_pretty(record)
@@ -62,8 +65,7 @@ impl RunHistory {
         Ok(record.run_id.clone())
     }
 
-    /// Load a run record by ID.
-    pub fn get(&self, run_id: &str) -> Result<RunRecord> {
+    fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let filename = format!("{}.json", run_id);
         let path = self.store_dir.join(&filename);
         if !path.exists() {
@@ -78,8 +80,7 @@ impl RunHistory {
         Ok(record)
     }
 
-    /// List all runs, optionally filtered by status.
-    pub fn list(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
+    fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
         let mut runs = Vec::new();
         for entry in std::fs::read_dir(&self.store_dir)? {
             let entry = entry?;
@@ -101,8 +102,7 @@ impl RunHistory {
         Ok(runs)
     }
 
-    /// Delete a run record.
-    pub fn delete(&self, run_id: &str) -> Result<()> {
+    fn delete_run(&self, run_id: &str) -> Result<()> {
         let filename = format!("{}.json", run_id);
         let path = self.store_dir.join(&filename);
         if !path.exists() {
@@ -115,3 +115,7 @@ impl RunHistory {
         Ok(())
     }
 }
+
+/// Backward-compatible alias for `JsonFileStore`.
+#[allow(dead_code)]
+pub type RunHistory = JsonFileStore;

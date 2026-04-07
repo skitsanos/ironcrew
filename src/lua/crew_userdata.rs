@@ -386,7 +386,7 @@ impl UserData for LuaCrew {
             // If the API handler injected a run_id via app_data, use it for consistency.
             let pre_assigned_run_id: Option<String> =
                 lua.app_data_ref::<String>().map(|r| r.clone());
-            let store_dir = this.project_dir.join(".ironcrew").join("runs");
+            let ironcrew_dir = this.project_dir.join(".ironcrew");
             let mut record = crew.create_run_record(
                 pre_assigned_run_id,
                 &results,
@@ -401,8 +401,8 @@ impl UserData for LuaCrew {
             }
             let run_id =
                 tokio::task::spawn_blocking(move || -> crate::utils::error::Result<String> {
-                    let history = crate::engine::run_history::RunHistory::new(store_dir)?;
-                    history.save(&record)
+                    let store = crate::engine::store::create_store(ironcrew_dir)?;
+                    store.save_run(&record)
                 })
                 .await
                 .map_err(|e| {

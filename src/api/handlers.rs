@@ -9,12 +9,12 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::engine::eventbus::{CrewEvent, EventBus};
-use crate::engine::run_history::RunHistory;
+use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
 
 use super::{
     AppState, ErrorResponse, ListRunsQuery, RunCrewResponse, TaskResultResponse, error_response,
-    resolve_flow_path, resolve_runs_dir,
+    resolve_flow_path, resolve_ironcrew_dir,
 };
 
 fn flow_status(err: &IronCrewError) -> StatusCode {
@@ -212,10 +212,10 @@ async fn execute_crew_from_path_with_events(
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
     // Read the recorded run directly so concurrent executions cannot swap results.
-    let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
+    let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
-        let history = RunHistory::new(runs_dir)?;
-        let run = history.get(&run_id)?;
+        let store = create_store(ironcrew_dir)?;
+        let run = store.get_run(&run_id)?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
             flow_name: run.flow_name.clone(),
@@ -273,10 +273,10 @@ pub async fn execute_crew_from_path(
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
     // Read the recorded run directly so concurrent executions cannot swap results.
-    let runs_dir = loader.project_dir().join(".ironcrew").join("runs");
+    let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
-        let history = RunHistory::new(runs_dir)?;
-        let run = history.get(&run_id)?;
+        let store = create_store(ironcrew_dir)?;
+        let run = store.get_run(&run_id)?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
             flow_name: run.flow_name.clone(),
@@ -480,13 +480,13 @@ pub async fn list_runs(
     Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<crate::engine::run_history::RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow)
+    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
-    let history = RunHistory::new(runs_dir)
+    let store = create_store(ironcrew_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let runs = history
-        .list(params.status.as_deref())
+    let runs = store
+        .list_runs(params.status.as_deref())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(runs))
@@ -496,13 +496,13 @@ pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow)
+    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
-    let history = RunHistory::new(runs_dir)
+    let store = create_store(ironcrew_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let record = history
-        .get(&id)
+    let record = store
+        .get_run(&id)
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(record))
@@ -512,13 +512,13 @@ pub async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let runs_dir = resolve_runs_dir(&state, &flow)
+    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), e.to_string()))?;
-    let history = RunHistory::new(runs_dir)
+    let store = create_store(ironcrew_dir)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    history
-        .delete(&id)
+    store
+        .delete_run(&id)
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(serde_json::json!({"deleted": id})))

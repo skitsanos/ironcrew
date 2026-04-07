@@ -109,11 +109,9 @@ pub fn resolve_flow_path(state: &AppState, flow: &str) -> crate::utils::error::R
     Ok(canonical)
 }
 
-/// Resolve the runs directory for a given flow.
-pub fn resolve_runs_dir(state: &AppState, flow: &str) -> crate::utils::error::Result<PathBuf> {
-    Ok(resolve_flow_path(state, flow)?
-        .join(".ironcrew")
-        .join("runs"))
+/// Resolve the `.ironcrew` directory for a given flow (used by `create_store`).
+pub fn resolve_ironcrew_dir(state: &AppState, flow: &str) -> crate::utils::error::Result<PathBuf> {
+    Ok(resolve_flow_path(state, flow)?.join(".ironcrew"))
 }
 
 /// Build the router
