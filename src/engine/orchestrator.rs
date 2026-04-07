@@ -319,6 +319,12 @@ pub async fn run_crew(
 
                 let model = resolve_model(task, agent, crew, "task_execution");
 
+                let before_hook = crew
+                    .before_task_hooks
+                    .get(&agent.name)
+                    .map(|v| v.as_slice());
+                let after_hook = crew.after_task_hooks.get(&agent.name).map(|v| v.as_slice());
+
                 let foreach_result = execute_foreach_task(
                     task,
                     agent,
@@ -330,6 +336,8 @@ pub async fn run_crew(
                     &model,
                     crew.max_tool_rounds,
                     crew.stream,
+                    before_hook,
+                    after_hook,
                 )
                 .await?;
 
@@ -625,6 +633,8 @@ pub async fn run_crew(
             let sem = semaphore.clone();
             let memory = crew.memory.clone();
             let messagebus = crew.messagebus.clone();
+            let before_hook = crew.before_task_hooks.get(&agent.name).cloned();
+            let after_hook = crew.after_task_hooks.get(&agent.name).cloned();
 
             futures.push(async move {
                 let _permit = match sem {
@@ -643,6 +653,8 @@ pub async fn run_crew(
                     &memory,
                     &messagebus,
                     should_stream,
+                    before_hook,
+                    after_hook,
                 )
                 .await
             });

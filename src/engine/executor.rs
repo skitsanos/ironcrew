@@ -7,6 +7,66 @@ use crate::llm::provider::*;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
+/// Run a before_task hook in a fresh Lua VM.
+/// Returns the (possibly modified) task description.
+fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> String {
+    let lua = mlua::Lua::new();
+    let func = match lua.load(bytecode).into_function() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                "before_task hook for task '{}' failed to load: {}",
+                task_name,
+                e
+            );
+            return task_description.to_string();
+        }
+    };
+
+    match func.call::<mlua::Value>((task_name, task_description)) {
+        Ok(mlua::Value::String(s)) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => task_description.to_string(),
+        },
+        Ok(mlua::Value::Nil) => task_description.to_string(),
+        Ok(_) => task_description.to_string(),
+        Err(e) => {
+            tracing::warn!("before_task hook for task '{}' failed: {}", task_name, e);
+            task_description.to_string()
+        }
+    }
+}
+
+/// Run an after_task hook in a fresh Lua VM.
+/// Returns the (possibly modified) output.
+fn run_after_hook(bytecode: &[u8], task_name: &str, output: &str, success: bool) -> String {
+    let lua = mlua::Lua::new();
+    let func = match lua.load(bytecode).into_function() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                "after_task hook for task '{}' failed to load: {}",
+                task_name,
+                e
+            );
+            return output.to_string();
+        }
+    };
+
+    match func.call::<mlua::Value>((task_name, output, success)) {
+        Ok(mlua::Value::String(s)) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => output.to_string(),
+        },
+        Ok(mlua::Value::Nil) => output.to_string(),
+        Ok(_) => output.to_string(),
+        Err(e) => {
+            tracing::warn!("after_task hook for task '{}' failed: {}", task_name, e);
+            output.to_string()
+        }
+    }
+}
+
 pub struct TaskExecutionContext<'a> {
     pub task: &'a Task,
     pub agent: &'a Agent,
@@ -20,10 +80,20 @@ pub struct TaskExecutionContext<'a> {
     pub should_stream: bool,
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<String>,
+    pub before_task_hook: Option<&'a [u8]>,
+    pub after_task_hook: Option<&'a [u8]>,
 }
 
 impl<'a> TaskExecutionContext<'a> {
     pub async fn execute(&self) -> Result<(String, Option<TaskTokenUsage>)> {
+        // Run before_task hook if present
+        let raw_description = interpolate(&self.task.description, self.completed_results);
+        let description = if let Some(bytecode) = self.before_task_hook {
+            run_before_hook(bytecode, &self.task.name, &raw_description)
+        } else {
+            raw_description
+        };
+
         let mut messages = Vec::new();
         let mut total_usage = TaskTokenUsage::default();
 
@@ -35,9 +105,6 @@ impl<'a> TaskExecutionContext<'a> {
             )
         });
         messages.push(ChatMessage::system(&system_content));
-
-        // Interpolate task fields with completed results
-        let description = interpolate(&self.task.description, self.completed_results);
         let expected_output = self
             .task
             .expected_output
@@ -143,10 +210,21 @@ impl<'a> TaskExecutionContext<'a> {
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
                 let has_usage = total_usage.total_tokens > 0;
-                return response
+                let content = response
                     .content
-                    .map(|c| (c, if has_usage { Some(total_usage) } else { None }))
-                    .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()));
+                    .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+
+                // Run after_task hook if present
+                let final_output = if let Some(bytecode) = self.after_task_hook {
+                    run_after_hook(bytecode, &self.task.name, &content, true)
+                } else {
+                    content
+                };
+
+                return Ok((
+                    final_output,
+                    if has_usage { Some(total_usage) } else { None },
+                ));
             }
 
             rounds += 1;
@@ -219,7 +297,7 @@ pub async fn execute_task_standalone(
     messages_context: &str,
     should_stream: bool,
 ) -> Result<(String, Option<TaskTokenUsage>)> {
-    execute_task_standalone_with_cache(
+    execute_task_standalone_with_hooks(
         task,
         agent,
         provider,
@@ -232,13 +310,15 @@ pub async fn execute_task_standalone(
         should_stream,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
 
-/// Execute a task with optional prompt cache configuration.
+/// Execute a task with optional prompt cache configuration and agent hooks.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_task_standalone_with_cache(
+pub async fn execute_task_standalone_with_hooks(
     task: &Task,
     agent: &Agent,
     provider: &dyn LlmProvider,
@@ -251,6 +331,8 @@ pub async fn execute_task_standalone_with_cache(
     should_stream: bool,
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<String>,
+    before_task_hook: Option<&[u8]>,
+    after_task_hook: Option<&[u8]>,
 ) -> Result<(String, Option<TaskTokenUsage>)> {
     let ctx = TaskExecutionContext {
         task,
@@ -265,6 +347,8 @@ pub async fn execute_task_standalone_with_cache(
         should_stream,
         prompt_cache_key,
         prompt_cache_retention,
+        before_task_hook,
+        after_task_hook,
     };
     ctx.execute().await
 }
