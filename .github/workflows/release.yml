@@ -75,6 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -89,49 +91,48 @@ jobs:
           cat release/*.sha256 >> release/checksums.txt
           cat release/checksums.txt
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Extract release notes from tag annotation
+        id: notes
+        run: |
+          # Use the annotated tag message as the release body. Falls back to a
+          # minimal body if the tag is lightweight (no annotation).
+          TAG_BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)')
+          if [ -z "$TAG_BODY" ]; then
+            TAG_BODY="IronCrew ${GITHUB_REF_NAME}"
+          fi
+          {
+            echo 'body<<RELEASE_EOF'
+            echo "$TAG_BODY"
+            echo ''
+            echo '---'
+            echo ''
+            echo '### Installation'
+            echo ''
+            echo '```bash'
+            echo '# macOS (Apple Silicon)'
+            echo 'tar xzf ironcrew-macos-arm64.tar.gz'
+            echo ''
+            echo '# macOS (Intel)'
+            echo 'tar xzf ironcrew-macos-amd64.tar.gz'
+            echo ''
+            echo '# Linux (x86_64)'
+            echo 'tar xzf ironcrew-linux-amd64.tar.gz'
+            echo ''
+            echo '# Linux (ARM64)'
+            echo 'tar xzf ironcrew-linux-arm64.tar.gz'
+            echo ''
+            echo '# Move to PATH'
+            echo 'chmod +x ironcrew'
+            echo 'sudo mv ironcrew /usr/local/bin/'
+            echo '```'
+            echo 'RELEASE_EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
           name: IronCrew ${{ github.ref_name }}
-          body: |
-            ## IronCrew ${{ github.ref_name }}
-
-            A compiled Rust runtime for Lua-defined AI agent crews.
-
-            ### Installation
-
-            Download the binary for your platform, extract, and add to your PATH:
-
-            ```bash
-            # macOS (Apple Silicon)
-            tar xzf ironcrew-macos-arm64.tar.gz
-
-            # macOS (Intel)
-            tar xzf ironcrew-macos-amd64.tar.gz
-
-            # Linux (x86_64)
-            tar xzf ironcrew-linux-amd64.tar.gz
-
-            # Linux (ARM64)
-            tar xzf ironcrew-linux-arm64.tar.gz
-
-            # Move to PATH
-            chmod +x ironcrew
-            sudo mv ironcrew /usr/local/bin/
-            ```
-
-            ### Quick start
-
-            ```bash
-            ironcrew init my-crew
-            cd my-crew
-            echo "OPENAI_API_KEY=sk-..." > .env
-            ironcrew run .
-            ```
+          body: ${{ steps.notes.outputs.body }}
           files: release/*
           draft: false
           prerelease: false
