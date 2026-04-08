@@ -29,46 +29,36 @@ use crate::llm::provider::{
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
-/// Which agent slot is the active speaker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DialogSpeaker {
-    A,
-    B,
-}
-
-impl DialogSpeaker {
-    fn other(self) -> Self {
-        match self {
-            DialogSpeaker::A => DialogSpeaker::B,
-            DialogSpeaker::B => DialogSpeaker::A,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DialogSpeaker::A => "a",
-            DialogSpeaker::B => "b",
-        }
+/// Convert a 0-based agent index into a stable positional label
+/// (`"a"`, `"b"`, ..., `"z"`). Used in SSE events for backward compatibility.
+fn speaker_label(index: usize) -> String {
+    if index < 26 {
+        ((b'a' + index as u8) as char).to_string()
+    } else {
+        format!("agent_{}", index)
     }
 }
 
 /// One turn in the dialog transcript.
+/// `speaker_index` is the position in the agents vec. The corresponding
+/// agent name is `agent_name`.
 #[derive(Debug, Clone)]
 pub struct DialogTurn {
     pub index: usize,
-    pub speaker: DialogSpeaker,
+    pub speaker_index: usize,
     pub agent_name: String,
     pub content: String,
     pub reasoning: Option<String>,
 }
 
-/// State of an agent-to-agent dialog.
+/// State of an N-agent dialog (N >= 2). Agents take turns in round-robin
+/// order starting from `starting_speaker`.
 pub struct AgentDialog {
     /// Stable identifier — included in every SSE event for this dialog.
     pub id: String,
 
-    pub agent_a: Agent,
-    pub agent_b: Agent,
+    /// Participants in turn order. Length must be >= 2.
+    pub agents: Vec<Agent>,
 
     pub provider: Arc<dyn LlmProvider>,
     pub tool_registry: ToolRegistry,
@@ -81,7 +71,8 @@ pub struct AgentDialog {
     pub max_history: Option<usize>,
     pub stream: bool,
     pub max_tool_rounds: usize,
-    pub starting_speaker: DialogSpeaker,
+    /// 0-based index into `agents` of the agent who speaks first.
+    pub starting_speaker: usize,
 
     /// The shared transcript — turns in chronological order.
     pub transcript: Mutex<Vec<DialogTurn>>,
@@ -98,10 +89,10 @@ pub struct AgentDialog {
 
 impl AgentDialog {
     /// Build a fresh dialog. Emits a `dialog_started` event.
+    /// Caller must ensure `agents.len() >= 2` and `starting_speaker < agents.len()`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        agent_a: Agent,
-        agent_b: Agent,
+        agents: Vec<Agent>,
         provider: Arc<dyn LlmProvider>,
         tool_registry: ToolRegistry,
         model: String,
@@ -110,22 +101,26 @@ impl AgentDialog {
         max_history: Option<usize>,
         stream: bool,
         max_tool_rounds: usize,
-        starting_speaker: DialogSpeaker,
+        starting_speaker: usize,
         eventbus: EventBus,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
+        let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
 
+        // For backward compat, the dialog_started event still has agent_a/agent_b
+        // fields when there are exactly 2 agents. For 3+ agents we use the
+        // first two as the canonical pair (older clients still get something
+        // useful) and the full list is reflected in dialog_turn events.
         eventbus.emit(CrewEvent::DialogStarted {
             dialog_id: id.clone(),
-            agent_a: agent_a.name.clone(),
-            agent_b: agent_b.name.clone(),
+            agent_a: agent_names[0].clone(),
+            agent_b: agent_names.get(1).cloned().unwrap_or_default(),
             max_turns,
         });
 
         Self {
             id,
-            agent_a,
-            agent_b,
+            agents,
             provider,
             tool_registry,
             model,
@@ -142,35 +137,22 @@ impl AgentDialog {
         }
     }
 
-    /// Returns the agent that should speak next, or None if the dialog is over.
-    async fn next_speaker(&self) -> Option<DialogSpeaker> {
+    /// Returns the index of the agent that should speak next, or None if the
+    /// dialog is over. Round-robin starting from `starting_speaker`.
+    async fn next_speaker(&self) -> Option<usize> {
         let next_idx = *self.next_index.lock().await;
         if next_idx >= self.max_turns {
             return None;
         }
-        // Even indices = starting_speaker, odd indices = the other.
-        let speaker = if next_idx % 2 == 0 {
-            self.starting_speaker
-        } else {
-            self.starting_speaker.other()
-        };
-        Some(speaker)
+        Some((self.starting_speaker + next_idx) % self.agents.len())
     }
 
-    fn agent_for(&self, speaker: DialogSpeaker) -> &Agent {
-        match speaker {
-            DialogSpeaker::A => &self.agent_a,
-            DialogSpeaker::B => &self.agent_b,
-        }
-    }
-
-    /// Build the message list from the perspective of `speaker`.
-    /// - System: that speaker's system prompt
+    /// Build the message list from the perspective of the agent at `speaker_index`.
+    /// - System: that agent's system prompt
     /// - Starter as user
-    /// - Their own past turns as assistant, opponent's as user with [name]: prefix
-    async fn build_messages(&self, speaker: DialogSpeaker) -> Vec<ChatMessage> {
-        let agent = self.agent_for(speaker);
-        let opponent = self.agent_for(speaker.other());
+    /// - Their own past turns as assistant, others' as user with `[name]:` prefix
+    async fn build_messages(&self, speaker_index: usize) -> Vec<ChatMessage> {
+        let agent = &self.agents[speaker_index];
 
         let system_content = agent
             .system_prompt
@@ -185,10 +167,10 @@ impl AgentDialog {
         // Walk transcript and assign roles based on perspective
         let transcript = self.transcript.lock().await;
         for turn in transcript.iter() {
-            if turn.speaker == speaker {
+            if turn.speaker_index == speaker_index {
                 messages.push(ChatMessage::assistant(Some(turn.content.clone()), None));
             } else {
-                let prefixed = format!("[{}]: {}", opponent.name, turn.content);
+                let prefixed = format!("[{}]: {}", turn.agent_name, turn.content);
                 messages.push(ChatMessage::user(&prefixed));
             }
         }
@@ -209,12 +191,12 @@ impl AgentDialog {
     /// Run a single turn (the next speaker's reply) and append it to the transcript.
     /// Returns `None` if the dialog has already reached max_turns.
     pub async fn run_one_turn(&self) -> Result<Option<DialogTurn>, IronCrewError> {
-        let Some(speaker) = self.next_speaker().await else {
+        let Some(speaker_index) = self.next_speaker().await else {
             return Ok(None);
         };
 
-        let agent = self.agent_for(speaker).clone();
-        let messages = self.build_messages(speaker).await;
+        let agent = self.agents[speaker_index].clone();
+        let messages = self.build_messages(speaker_index).await;
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
         let has_tools = !tool_schemas.is_empty();
 
@@ -295,7 +277,7 @@ impl AgentDialog {
 
         let turn = DialogTurn {
             index: next_index,
-            speaker,
+            speaker_index,
             agent_name: agent.name.clone(),
             content: accumulated_content,
             reasoning: if accumulated_reasoning.is_empty() {
@@ -308,10 +290,11 @@ impl AgentDialog {
         self.transcript.lock().await.push(turn.clone());
 
         // Emit SSE events for this turn
+        let speaker_str = speaker_label(speaker_index);
         self.eventbus.emit(CrewEvent::DialogTurn {
             dialog_id: self.id.clone(),
             turn_index: turn.index,
-            speaker: turn.speaker.label().to_string(),
+            speaker: speaker_str.clone(),
             agent: turn.agent_name.clone(),
             content: turn.content.clone(),
         });
@@ -320,7 +303,7 @@ impl AgentDialog {
             self.eventbus.emit(CrewEvent::DialogThinking {
                 dialog_id: self.id.clone(),
                 turn_index: turn.index,
-                speaker: turn.speaker.label().to_string(),
+                speaker: speaker_str.clone(),
                 agent: turn.agent_name.clone(),
                 content: r.clone(),
             });
@@ -445,9 +428,26 @@ impl UserData for AgentDialog {
             Ok(*this.next_index.lock().await)
         });
 
-        // dialog:current_speaker() — "a" or "b" or nil if dialog is finished
+        // dialog:current_speaker() — "a", "b", "c", ... or nil if finished
         methods.add_async_method("current_speaker", |_, this, ()| async move {
-            Ok(this.next_speaker().await.map(|s| s.label().to_string()))
+            Ok(this.next_speaker().await.map(speaker_label))
+        });
+
+        // dialog:current_agent() — name of the next agent to speak, or nil if finished
+        methods.add_async_method("current_agent", |_, this, ()| async move {
+            Ok(this
+                .next_speaker()
+                .await
+                .map(|idx| this.agents[idx].name.clone()))
+        });
+
+        // dialog:agents() — list of agent names participating in this dialog
+        methods.add_method("agents", |lua, this, ()| {
+            let table = lua.create_table()?;
+            for (i, a) in this.agents.iter().enumerate() {
+                table.set(i + 1, a.name.clone())?;
+            }
+            Ok(table)
         });
 
         // dialog:reset() — clear transcript and reset to turn 0
@@ -465,7 +465,7 @@ impl UserData for AgentDialog {
 fn turn_to_lua(lua: &mlua::Lua, turn: &DialogTurn) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("index", turn.index)?;
-    table.set("speaker", turn.speaker.label())?;
+    table.set("speaker", speaker_label(turn.speaker_index))?;
     table.set("agent", turn.agent_name.clone())?;
     table.set("content", turn.content.clone())?;
     if let Some(ref r) = turn.reasoning {
@@ -482,24 +482,50 @@ fn transcript_to_lua(lua: &mlua::Lua, transcript: &[DialogTurn]) -> mlua::Result
     Ok(table)
 }
 
-/// Build an AgentDialog from a Lua options table.
+/// Build an AgentDialog from a Lua options table. Accepts either a new
+/// `agents = {"name", ...}` array OR the legacy `agent_a` / `agent_b` form.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dialog(
     table: Table,
-    agents: &[Agent],
+    crew_agents: &[Agent],
     provider: Arc<dyn LlmProvider>,
     tool_registry: ToolRegistry,
     crew_default_model: &str,
     crew_max_tool_rounds: usize,
     eventbus: EventBus,
 ) -> mlua::Result<AgentDialog> {
-    let agent_a = resolve_agent(table.get::<Value>("agent_a")?, agents, "agent_a")?;
-    let agent_b = resolve_agent(table.get::<Value>("agent_b")?, agents, "agent_b")?;
+    // Resolve participants — prefer the new `agents` array if present.
+    let dialog_agents: Vec<Agent> = if let Ok(agents_table) = table.get::<Table>("agents") {
+        let mut out: Vec<Agent> = Vec::new();
+        for value in agents_table.sequence_values::<Value>() {
+            let value = value?;
+            out.push(resolve_agent(value, crew_agents, "agents")?);
+        }
+        out
+    } else {
+        // Legacy two-agent form
+        let agent_a = resolve_agent(table.get::<Value>("agent_a")?, crew_agents, "agent_a")?;
+        let agent_b = resolve_agent(table.get::<Value>("agent_b")?, crew_agents, "agent_b")?;
+        vec![agent_a, agent_b]
+    };
 
-    if agent_a.name == agent_b.name {
+    if dialog_agents.len() < 2 {
         return Err(mlua::Error::external(IronCrewError::Validation(
-            "Dialog requires two distinct agents".into(),
+            "Dialog requires at least 2 agents".into(),
         )));
+    }
+
+    // Reject duplicate names — each agent must be distinct
+    {
+        let mut seen = std::collections::HashSet::new();
+        for a in &dialog_agents {
+            if !seen.insert(a.name.as_str()) {
+                return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                    "Dialog: agent '{}' is listed more than once",
+                    a.name
+                ))));
+            }
+        }
     }
 
     let starter: String = table.get("starter").map_err(|_| {
@@ -508,13 +534,45 @@ pub fn build_dialog(
         ))
     })?;
 
-    let max_turns: usize = table.get::<usize>("max_turns").unwrap_or(4);
+    let max_turns: usize = table
+        .get::<usize>("max_turns")
+        .unwrap_or(dialog_agents.len() * 2);
     let max_history: Option<usize> = table.get("max_history").ok();
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
-    let starting_speaker = match table.get::<String>("starting_speaker").ok().as_deref() {
-        Some("b") | Some("B") => DialogSpeaker::B,
-        _ => DialogSpeaker::A,
+    // starting_speaker accepts:
+    //   - an agent name (preferred for multi-party)
+    //   - a positional letter "a", "b", "c", ...
+    //   - default: first agent (index 0)
+    let starting_speaker: usize = match table.get::<String>("starting_speaker").ok() {
+        Some(s) => {
+            // Try as agent name first
+            if let Some(idx) = dialog_agents.iter().position(|a| a.name == s) {
+                idx
+            } else if s.len() == 1 {
+                let c = s.chars().next().unwrap().to_ascii_lowercase();
+                if c.is_ascii_alphabetic() {
+                    let idx = (c as u8 - b'a') as usize;
+                    if idx < dialog_agents.len() {
+                        idx
+                    } else {
+                        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                            "Dialog: starting_speaker '{}' is out of range (only {} agents)",
+                            s,
+                            dialog_agents.len()
+                        ))));
+                    }
+                } else {
+                    0
+                }
+            } else {
+                return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                    "Dialog: starting_speaker '{}' does not match any agent in this dialog",
+                    s
+                ))));
+            }
+        }
+        None => 0,
     };
 
     let model: String = table
@@ -523,8 +581,7 @@ pub fn build_dialog(
         .unwrap_or_else(|| crew_default_model.to_string());
 
     Ok(AgentDialog::new(
-        agent_a,
-        agent_b,
+        dialog_agents,
         provider,
         tool_registry,
         model,

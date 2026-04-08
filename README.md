@@ -42,7 +42,7 @@ local results = crew:run()
 
 - **Lua scripting** — agents, tasks, tools, and orchestration defined in Lua
 - **Project defaults via `config.lua`** — set provider, model, limits, and routing once per project; `crew.lua` stays focused on workflow logic
-- **Conversation & Dialog modes** — stateful multi-turn chat with one agent (`crew:conversation({})`) or perspective-flipped agent-to-agent dialogs (`crew:dialog({})`) for debates and adversarial analysis
+- **Conversation & Dialog modes** — stateful multi-turn chat with one agent (`crew:conversation({})`) or perspective-flipped multi-agent dialogs (`crew:dialog({})`) for two-agent debates or N-agent roundtables
 - **Parallel execution** — independent tasks run concurrently within topological phases
 - **Three provider types** — OpenAI Chat Completions, Anthropic native Messages API, OpenAI Responses API (also works with Gemini, Groq, Kimi, DeepSeek, xAI, Ollama via OpenAI compat)
 - **Reasoning/thinking support** — captures chain-of-thought from Anthropic, DeepSeek, Kimi, and OpenAI Responses API; streams dim to stderr and persists to run records
@@ -91,7 +91,7 @@ ironcrew run .
 
 See [`examples/`](examples/) for working demos:
 
-**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate`
+**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable`
 
 **Providers:** [`examples/providers/`](examples/providers/) contains 12 reference files covering every supported provider — OpenAI Chat, OpenAI Responses (basic, reasoning, web_search), Anthropic (basic, web_search, extended thinking), Gemini, Groq, Kimi K2.5, Kimi K2-thinking, and DeepSeek Reasoner.
 
