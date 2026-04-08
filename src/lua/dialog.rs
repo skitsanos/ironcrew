@@ -22,6 +22,7 @@ use mlua::{Table, UserData, UserDataMethods, Value};
 use tokio::sync::Mutex;
 
 use crate::engine::agent::Agent;
+use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
@@ -63,8 +64,7 @@ pub struct DialogTurn {
 
 /// State of an agent-to-agent dialog.
 pub struct AgentDialog {
-    /// Stable identifier (reserved for future SSE wiring).
-    #[allow(dead_code)]
+    /// Stable identifier — included in every SSE event for this dialog.
     pub id: String,
 
     pub agent_a: Agent,
@@ -87,9 +87,17 @@ pub struct AgentDialog {
     pub transcript: Mutex<Vec<DialogTurn>>,
     /// Index of the next turn to run (0-based).
     pub next_index: Mutex<usize>,
+
+    /// EventBus for emitting dialog_* SSE events.
+    pub eventbus: EventBus,
+
+    /// Tracks whether dialog_completed has been emitted (set to true after run_all
+    /// reaches max_turns) so it isn't emitted twice for the same dialog.
+    pub completed_emitted: Mutex<bool>,
 }
 
 impl AgentDialog {
+    /// Build a fresh dialog. Emits a `dialog_started` event.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_a: Agent,
@@ -103,9 +111,19 @@ impl AgentDialog {
         stream: bool,
         max_tool_rounds: usize,
         starting_speaker: DialogSpeaker,
+        eventbus: EventBus,
     ) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        eventbus.emit(CrewEvent::DialogStarted {
+            dialog_id: id.clone(),
+            agent_a: agent_a.name.clone(),
+            agent_b: agent_b.name.clone(),
+            max_turns,
+        });
+
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             agent_a,
             agent_b,
             provider,
@@ -119,6 +137,8 @@ impl AgentDialog {
             starting_speaker,
             transcript: Mutex::new(Vec::new()),
             next_index: Mutex::new(0),
+            eventbus,
+            completed_emitted: Mutex::new(false),
         }
     }
 
@@ -287,9 +307,40 @@ impl AgentDialog {
 
         self.transcript.lock().await.push(turn.clone());
 
+        // Emit SSE events for this turn
+        self.eventbus.emit(CrewEvent::DialogTurn {
+            dialog_id: self.id.clone(),
+            turn_index: turn.index,
+            speaker: turn.speaker.label().to_string(),
+            agent: turn.agent_name.clone(),
+            content: turn.content.clone(),
+        });
+
+        if let Some(ref r) = turn.reasoning {
+            self.eventbus.emit(CrewEvent::DialogThinking {
+                dialog_id: self.id.clone(),
+                turn_index: turn.index,
+                speaker: turn.speaker.label().to_string(),
+                agent: turn.agent_name.clone(),
+                content: r.clone(),
+            });
+        }
+
         if self.stream {
             eprintln!();
             eprintln!();
+        }
+
+        // If this turn was the last one, emit dialog_completed
+        if next_index + 1 >= self.max_turns {
+            let mut emitted = self.completed_emitted.lock().await;
+            if !*emitted {
+                *emitted = true;
+                self.eventbus.emit(CrewEvent::DialogCompleted {
+                    dialog_id: self.id.clone(),
+                    total_turns: next_index + 1,
+                });
+            }
         }
 
         Ok(Some(turn))
@@ -440,6 +491,7 @@ pub fn build_dialog(
     tool_registry: ToolRegistry,
     crew_default_model: &str,
     crew_max_tool_rounds: usize,
+    eventbus: EventBus,
 ) -> mlua::Result<AgentDialog> {
     let agent_a = resolve_agent(table.get::<Value>("agent_a")?, agents, "agent_a")?;
     let agent_b = resolve_agent(table.get::<Value>("agent_b")?, agents, "agent_b")?;
@@ -482,6 +534,7 @@ pub fn build_dialog(
         stream,
         crew_max_tool_rounds,
         starting_speaker,
+        eventbus,
     ))
 }
 

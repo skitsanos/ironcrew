@@ -127,6 +127,13 @@ full untruncated output.
 | `tool_call`          | `task`, `tool`                                                | Agent invoked a tool                         |
 | `tool_result`        | `task`, `tool`, `success`, `duration_ms`                      | Tool returned a result                       |
 | `collaboration_turn` | `task`, `agent`, `turn`, `content`                            | A turn in a collaborative task               |
+| `conversation_started` | `conversation_id`, `agent`                                  | A `crew:conversation()` was created          |
+| `conversation_turn`  | `conversation_id`, `agent`, `turn_index`, `user_message`, `assistant_message` | Single completed turn (`send`/`ask`) |
+| `conversation_thinking` | `conversation_id`, `agent`, `turn_index`, `content`         | Reasoning captured during a conversation turn |
+| `dialog_started`     | `dialog_id`, `agent_a`, `agent_b`, `max_turns`                | A `crew:dialog()` was created                |
+| `dialog_turn`        | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | One turn in an agent-to-agent dialog (`speaker` = "a" or "b") |
+| `dialog_thinking`    | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | Reasoning captured during a dialog turn      |
+| `dialog_completed`   | `dialog_id`, `total_turns`                                    | Dialog reached `max_turns`                   |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
@@ -146,21 +153,28 @@ The `token_usage` field in `task_completed` contains:
 A `warning` event may be sent if the subscriber falls behind and events are
 dropped from the broadcast channel.
 
-### Modes Without SSE Events
+### Conversation and Dialog Events
 
-The following Lua primitives execute inside `crew:run()` but **do not emit
-SSE events** in this release:
+`crew:conversation({})` and `crew:dialog({})` emit dedicated SSE events with
+stable identifiers (`conversation_id` / `dialog_id`) so clients can group
+events per primitive when multiple are running in the same `crew:run()`.
 
-- **`crew:conversation({})`** — single-agent multi-turn chat. Output goes to
-  stderr only (with dim styling for reasoning).
-- **`crew:dialog({})`** — agent-to-agent dialog. Output goes to stderr with
-  `[agent_name]` prefixes per turn.
+**Conversation lifecycle:**
+- `conversation_started` — at construction
+- `conversation_turn` — once per `send()` / `ask()` call (with both the user
+  and assistant messages)
+- `conversation_thinking` — once per turn when the provider returns reasoning
+  content (Anthropic, OpenAI Responses, DeepSeek, Kimi)
 
-If a `crew.lua` script uses these primitives instead of (or in addition to)
-tasks, REST API subscribers will only see the surrounding task events. Full
-SSE wiring for conversations and dialogs (`conversation_message`,
-`conversation_thinking`, `dialog_turn`, `dialog_thinking` events) is planned
-for a future release.
+**Dialog lifecycle:**
+- `dialog_started` — at construction
+- `dialog_turn` — once per turn (one event per `next_turn()` or per turn
+  inside `run()`)
+- `dialog_thinking` — once per turn when reasoning is captured
+- `dialog_completed` — emitted exactly once when the dialog reaches `max_turns`
+
+Conversation and dialog output also still streams to stderr in the Lua process
+(with dim styling for reasoning) — the SSE events are an additional channel.
 
 ## Run History
 

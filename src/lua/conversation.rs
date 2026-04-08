@@ -21,6 +21,7 @@ use mlua::{Table, UserData, UserDataMethods, Value};
 use tokio::sync::Mutex;
 
 use crate::engine::agent::Agent;
+use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
@@ -29,8 +30,7 @@ use crate::utils::error::IronCrewError;
 
 /// A stateful, multi-turn conversation with a single agent.
 pub struct LuaConversation {
-    /// Stable identifier for this conversation (unused in v1, reserved for SSE wiring).
-    #[allow(dead_code)]
+    /// Stable identifier — included in every SSE event for this conversation.
     pub id: String,
 
     /// The agent driving the conversation.
@@ -59,10 +59,14 @@ pub struct LuaConversation {
 
     /// Maximum tool-call rounds per send().
     pub max_tool_rounds: usize,
+
+    /// EventBus for emitting conversation_* SSE events.
+    pub eventbus: EventBus,
 }
 
 impl LuaConversation {
     /// Build a fresh conversation with the system prompt seeded.
+    /// Emits a `conversation_started` event into the EventBus.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: Agent,
@@ -73,10 +77,18 @@ impl LuaConversation {
         max_history: Option<usize>,
         stream: bool,
         max_tool_rounds: usize,
+        eventbus: EventBus,
     ) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
         let messages = vec![ChatMessage::system(&system_prompt)];
+
+        eventbus.emit(CrewEvent::ConversationStarted {
+            conversation_id: id.clone(),
+            agent: agent.name.clone(),
+        });
+
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             agent,
             provider,
             tool_registry,
@@ -86,6 +98,7 @@ impl LuaConversation {
             max_history,
             stream,
             max_tool_rounds,
+            eventbus,
         }
     }
 
@@ -148,17 +161,43 @@ impl LuaConversation {
                     .content
                     .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
 
-                {
+                let turn_index = {
                     let mut history = self.messages.lock().await;
                     history.push(ChatMessage::assistant(Some(content.clone()), None));
                     self.enforce_history_cap(&mut history);
-                }
+                    // Each completed turn adds 2 messages (user + assistant) on top of system.
+                    // turn_index is 0-based: count of user messages already in history minus 1.
+                    history
+                        .iter()
+                        .filter(|m| m.role == "user")
+                        .count()
+                        .saturating_sub(1)
+                };
 
                 let reasoning = if accumulated_reasoning.is_empty() {
                     None
                 } else {
                     Some(accumulated_reasoning)
                 };
+
+                // Emit SSE events for this completed turn
+                self.eventbus.emit(CrewEvent::ConversationTurn {
+                    conversation_id: self.id.clone(),
+                    agent: self.agent.name.clone(),
+                    turn_index,
+                    user_message: user_message.to_string(),
+                    assistant_message: content.clone(),
+                });
+
+                if let Some(ref r) = reasoning {
+                    self.eventbus.emit(CrewEvent::ConversationThinking {
+                        conversation_id: self.id.clone(),
+                        agent: self.agent.name.clone(),
+                        turn_index,
+                        content: r.clone(),
+                    });
+                }
+
                 return Ok((content, reasoning));
             }
 
@@ -345,6 +384,7 @@ pub fn build_conversation(
     tool_registry: ToolRegistry,
     crew_default_model: &str,
     crew_max_tool_rounds: usize,
+    eventbus: EventBus,
 ) -> mlua::Result<LuaConversation> {
     // Resolve agent: either by name or inline (Agent table)
     let agent_value: Value = table.get("agent")?;
@@ -394,5 +434,6 @@ pub fn build_conversation(
         max_history,
         stream,
         crew_max_tool_rounds,
+        eventbus,
     ))
 }

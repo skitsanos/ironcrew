@@ -162,7 +162,13 @@ conv:reset()
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
 - No cross-run persistence — conversations live for the duration of one `crew:run()` script
-- **No SSE events emitted** — output goes to stderr only. REST API subscribers will not see conversation messages or reasoning. Full SSE wiring (`conversation_message`, `conversation_thinking` events) is planned for a future release.
+
+**SSE events:** Conversations emit `conversation_started`, `conversation_turn`,
+and `conversation_thinking` events through the EventBus. REST API subscribers
+on `/flows/{flow}/events/{run_id}` see them in real time alongside task events.
+Each event includes a stable `conversation_id` so clients can group multiple
+conversations within a single run. See [REST API](rest-api.md#sse-events) for
+the full event schema.
 
 See [`examples/conversation/`](../examples/conversation/) for a working example.
 
@@ -259,7 +265,12 @@ moderator that produces structured JSON synthesis.
 
 - Two agents only (multi-party round-robin or moderator-driven dialog is future work)
 - No early termination via Lua callback (only `max_turns` is supported)
-- **No SSE events emitted** — output goes to stderr only. Full SSE event flow (`dialog_turn`, `dialog_thinking`) is planned for a future release.
+
+**SSE events:** Dialogs emit `dialog_started`, `dialog_turn`,
+`dialog_thinking`, and `dialog_completed` events through the EventBus. REST API
+subscribers on `/flows/{flow}/events/{run_id}` see them in real time. Each
+event includes a stable `dialog_id` and `turn_index`. See
+[REST API](rest-api.md#sse-events) for the full event schema.
 
 ---
 

@@ -364,7 +364,7 @@ impl UserData for LuaCrew {
 
         // crew:conversation({agent = ..., model = ..., stream = ..., ...})
         // Creates a stateful multi-turn conversation bound to this crew.
-        methods.add_async_method("conversation", |_, this, table: Table| async move {
+        methods.add_async_method("conversation", |lua, this, table: Table| async move {
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -373,6 +373,12 @@ impl UserData for LuaCrew {
             let agents: Vec<crate::engine::agent::Agent> = crew.agents.clone();
             let default_model = crew.provider_config.model.clone();
             let max_tool_rounds = crew.max_tool_rounds;
+            // Prefer API-injected EventBus (from app_data) so events flow through
+            // the same SSE channel as task events; fall back to the crew's bus.
+            let eventbus = lua
+                .app_data_ref::<EventBus>()
+                .map(|e| e.clone())
+                .unwrap_or_else(|| crew.eventbus.clone());
             drop(crew);
 
             let conv = build_conversation(
@@ -382,13 +388,14 @@ impl UserData for LuaCrew {
                 this.runtime.tool_registry.clone(),
                 &default_model,
                 max_tool_rounds,
+                eventbus,
             )?;
             Ok(conv)
         });
 
         // crew:dialog({agent_a = ..., agent_b = ..., starter = ..., ...})
         // Creates an agent-to-agent dialog with perspective-flipped histories.
-        methods.add_async_method("dialog", |_, this, table: Table| async move {
+        methods.add_async_method("dialog", |lua, this, table: Table| async move {
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -397,6 +404,10 @@ impl UserData for LuaCrew {
             let agents: Vec<crate::engine::agent::Agent> = crew.agents.clone();
             let default_model = crew.provider_config.model.clone();
             let max_tool_rounds = crew.max_tool_rounds;
+            let eventbus = lua
+                .app_data_ref::<EventBus>()
+                .map(|e| e.clone())
+                .unwrap_or_else(|| crew.eventbus.clone());
             drop(crew);
 
             let dialog = build_dialog(
@@ -406,6 +417,7 @@ impl UserData for LuaCrew {
                 this.runtime.tool_registry.clone(),
                 &default_model,
                 max_tool_rounds,
+                eventbus,
             )?;
             Ok(dialog)
         });

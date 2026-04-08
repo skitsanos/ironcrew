@@ -107,8 +107,11 @@ implementation.
 
 **Limitations** (current):
 - Conversations and dialogs run intra-script — they do not persist across `crew:run()` calls
-- They stream to stderr only — no SSE events emitted yet
 - Dialogs are two-agent only (multi-party round-robin is future work)
+
+Both primitives emit dedicated SSE events (`conversation_*`, `dialog_*`)
+through the EventBus, so REST API subscribers can stream conversation messages
+and dialog turns in real time alongside task events.
 
 ## Error Handling
 
