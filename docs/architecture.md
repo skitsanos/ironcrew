@@ -32,6 +32,7 @@ IronCrew supports two modes: **directory mode** and **single-file mode**.
 ```
 my-project/
   crew.lua          # Entrypoint (required)
+  config.lua        # Project-wide defaults (optional)
   agents/           # Declarative agent definitions (optional)
     researcher.lua
     writer.lua
@@ -41,9 +42,29 @@ my-project/
 
 When you run `ironcrew my-project/`, the loader:
 
-1. Discovers and loads all `agents/*.lua` files (auto-injected into every `Crew.new()`)
-2. Discovers and loads all `tools/*.lua` files (registered in the tool registry)
-3. Executes `crew.lua` as the entrypoint
+1. Loads `config.lua` if present (its return table becomes the default for `Crew.new()`)
+2. Discovers and loads all `agents/*.lua` files (auto-injected into every `Crew.new()`)
+3. Discovers and loads all `tools/*.lua` files (registered in the tool registry)
+4. Executes `crew.lua` as the entrypoint
+
+### Project Defaults: `config.lua`
+
+If a `config.lua` file exists at the project root, it is auto-loaded before
+`crew.lua` runs. It must return a Lua table whose keys are shallow-merged into
+`Crew.new()` — fields explicitly set in `crew.lua` always win.
+
+```lua
+-- config.lua
+return {
+    provider = "anthropic",
+    model = "claude-haiku-4-5-20251001",
+    max_concurrent = 4,
+}
+```
+
+This keeps `crew.lua` focused on workflow logic (agents, tasks) while
+provider/model/limits live in a single project-wide file. All `Crew.new()`
+options are supported. See [Crews](crews.md) for details.
 
 ### Single-File Mode
 
@@ -51,8 +72,8 @@ When you run `ironcrew my-project/`, the loader:
 ironcrew my-script.lua
 ```
 
-When given a single `.lua` file, agents and tools are discovered from sibling
-directories (`agents/` and `tools/` relative to the script's parent directory).
+When given a single `.lua` file, agents, tools, and `config.lua` are discovered
+from sibling directories/files relative to the script's parent directory.
 
 ## Execution Model
 
@@ -110,6 +131,33 @@ dispatch within each phase:
 - Collaborative tasks orchestrate a multi-turn discussion between agents, then synthesize
 
 See [Tasks](tasks.md) for full details on these task types.
+
+### Conversation and Dialog Modes
+
+Beyond task-based execution, IronCrew exposes two stateful interaction
+primitives that live alongside tasks within a single `crew:run()`:
+
+**`LuaConversation`** (`crew:conversation({})`) — single-agent multi-turn chat.
+Maintains its own message history across `send()` / `ask()` calls. Supports
+tool calling via the crew's tool registry, streaming to stderr (with dim
+reasoning), and reasoning capture from compatible providers.
+
+**`AgentDialog`** (`crew:dialog({})`) — two-agent **perspective-flipped**
+conversation. The engine builds a fresh message list per turn from the active
+speaker's viewpoint: that agent's previous turns become `assistant` messages,
+the opponent's turns become `user` messages prefixed with `[opponent_name]:`.
+This gives each agent a coherent first-person view of the dialog without
+maintaining separate histories.
+
+Both primitives:
+- Share the crew's provider, model, and tool registry
+- Generate an internal UUID (currently unused, reserved for future SSE wiring)
+- Stream output to stderr only — they do **not** emit `task_*` events into the
+  EventBus / SSE stream that the REST API exposes
+
+See [Crews](crews.md) for the Lua API and the **debate + moderator pattern**
+(two adversarial agents + a structured moderator synthesis) which is the
+most useful application of these primitives.
 
 ## Agent Selection
 

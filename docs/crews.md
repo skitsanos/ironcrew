@@ -162,7 +162,7 @@ conv:reset()
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
 - No cross-run persistence — conversations live for the duration of one `crew:run()` script
-- Stderr-only event tracing — full SSE wiring (`conversation_message`, `conversation_thinking` events) is planned to mirror the task event flow
+- **No SSE events emitted** — output goes to stderr only. REST API subscribers will not see conversation messages or reasoning. Full SSE wiring (`conversation_message`, `conversation_thinking` events) is planned for a future release.
 
 See [`examples/conversation/`](../examples/conversation/) for a working example.
 
@@ -259,7 +259,7 @@ moderator that produces structured JSON synthesis.
 
 - Two agents only (multi-party round-robin or moderator-driven dialog is future work)
 - No early termination via Lua callback (only `max_turns` is supported)
-- Stderr-only event tracing (full SSE event flow planned)
+- **No SSE events emitted** — output goes to stderr only. Full SSE event flow (`dialog_turn`, `dialog_thinking`) is planned for a future release.
 
 ---
 

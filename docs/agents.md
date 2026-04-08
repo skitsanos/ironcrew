@@ -128,6 +128,30 @@ crew:add_task({
 })
 ```
 
+### Agents in Conversations and Dialogs
+
+Beyond tasks, agents can also drive **stateful conversations** and
+**agent-to-agent dialogs**. They are referenced by name from the same crew:
+
+```lua
+-- Single-agent multi-turn chat
+local conv = crew:conversation({ agent = "tutor" })
+local reply = conv:send("Explain ownership in Rust")
+
+-- Two-agent debate (perspective-flipped)
+local debate = crew:dialog({
+    agent_a = "bull",
+    agent_b = "bear",
+    starter = "Should we buy NVDA?",
+    max_turns = 6,
+})
+```
+
+Agents can also be passed inline as `Agent.new({...})` tables in both modes.
+The agent's `system_prompt`, `temperature`, `model`, `tools`, and
+`response_format` all carry over. See [Crews](crews.md#conversation-mode) for
+the full Conversation and Dialog API.
+
 ## Per-Agent Model Override
 
 Each agent can specify a `model` that overrides the crew default. This is the
