@@ -423,8 +423,7 @@ impl OpenAiResponsesProvider {
 
                         if item_type == "function_call" {
                             let name = item["name"].as_str().unwrap_or("").to_string();
-                            let call_id =
-                                item["call_id"].as_str().unwrap_or("").to_string();
+                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                             let _ = tx
                                 .send(StreamChunk::ToolCallStart {
                                     id: call_id.clone(),
@@ -458,8 +457,7 @@ impl OpenAiResponsesProvider {
                             let _ = tx.send(StreamChunk::Text(delta.to_string())).await;
                         }
                     }
-                    "response.reasoning_summary_text.delta"
-                    | "response.reasoning_text.delta" => {
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                         if let Some(delta) = parsed["delta"].as_str() {
                             full_reasoning.push_str(delta);
                             let _ = tx.send(StreamChunk::Thinking(delta.to_string())).await;
