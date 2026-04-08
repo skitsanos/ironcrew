@@ -86,6 +86,7 @@ pub async fn execute_foreach_task(
                 success: false,
                 duration_ms: 0,
                 token_usage: None,
+                reasoning: None,
             });
         }
     };
@@ -98,6 +99,7 @@ pub async fn execute_foreach_task(
             success: true,
             duration_ms: 0,
             token_usage: None,
+            reasoning: None,
         });
     }
 
@@ -173,7 +175,7 @@ pub async fn execute_foreach_task(
 
         for (idx, result) in parallel_results.into_iter().enumerate() {
             match result {
-                Ok((output, item_usage)) => {
+                Ok((output, _reasoning, item_usage)) => {
                     if let Some(u) = &item_usage {
                         accumulated_usage.prompt_tokens += u.prompt_tokens;
                         accumulated_usage.completion_tokens += u.completion_tokens;
@@ -229,7 +231,7 @@ pub async fn execute_foreach_task(
             )
             .await
             {
-                Ok((output, item_usage)) => {
+                Ok((output, _reasoning, item_usage)) => {
                     if let Some(u) = &item_usage {
                         accumulated_usage.prompt_tokens += u.prompt_tokens;
                         accumulated_usage.completion_tokens += u.completion_tokens;
@@ -280,5 +282,6 @@ pub async fn execute_foreach_task(
         } else {
             None
         },
+        reasoning: None,
     })
 }

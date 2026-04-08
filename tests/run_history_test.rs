@@ -21,6 +21,7 @@ async fn test_save_and_load_run() {
             success: true,
             duration_ms: 3000,
             token_usage: None,
+            reasoning: None,
         }],
         agent_count: 1,
         task_count: 1,

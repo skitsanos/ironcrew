@@ -10,6 +10,7 @@ local crew = Crew.new({
     model = "claude-sonnet-4-20250514",
     api_key = env("ANTHROPIC_API_KEY"),
     thinking_budget = 5000,
+    stream = true,  -- watch the reasoning unfold in real-time on stderr
 })
 
 crew:add_agent(Agent.new({

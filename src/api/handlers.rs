@@ -370,6 +370,7 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
         CrewEvent::TaskCompleted { .. } => "task_completed",
         CrewEvent::TaskFailed { .. } => "task_failed",
         CrewEvent::TaskSkipped { .. } => "task_skipped",
+        CrewEvent::TaskThinking { .. } => "task_thinking",
         CrewEvent::TaskRetry { .. } => "task_retry",
         CrewEvent::ToolCall { .. } => "tool_call",
         CrewEvent::ToolResult { .. } => "tool_result",

@@ -49,6 +49,13 @@ pub enum CrewEvent {
     #[serde(rename = "task_skipped")]
     TaskSkipped { task: String, reason: String },
 
+    #[serde(rename = "task_thinking")]
+    TaskThinking {
+        task: String,
+        agent: String,
+        content: String,
+    },
+
     #[serde(rename = "task_retry")]
     TaskRetry {
         task: String,

@@ -222,6 +222,13 @@ impl OpenAiProvider {
 
         let content = choice["content"].as_str().map(|s| s.to_string());
 
+        // Reasoning content (DeepSeek, Kimi, Moonshot): `reasoning_content`
+        // Some OpenAI-compat forks use `reasoning` instead.
+        let reasoning = choice["reasoning_content"]
+            .as_str()
+            .or_else(|| choice["reasoning"].as_str())
+            .map(|s| s.to_string());
+
         // Parse tool calls leniently — providers return different formats:
         // - OpenAI: arguments as JSON string, type="function", id present
         // - Gemini: arguments as object (not string), may omit type/id
@@ -238,6 +245,7 @@ impl OpenAiProvider {
 
         Ok(ChatResponse {
             content,
+            reasoning,
             tool_calls,
             usage,
         })
@@ -281,6 +289,7 @@ impl OpenAiProvider {
         }
 
         let mut full_content = String::new();
+        let mut full_reasoning = String::new();
         // Track tool call assembly (streaming sends deltas)
         let mut tool_call_buffers: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new(); // index -> (id, name, arguments)
@@ -318,6 +327,15 @@ impl OpenAiProvider {
                     if let Some(content) = delta["content"].as_str() {
                         full_content.push_str(content);
                         let _ = tx.send(StreamChunk::Text(content.to_string())).await;
+                    }
+
+                    // Reasoning delta (DeepSeek, Kimi, Moonshot use reasoning_content)
+                    if let Some(reasoning) = delta["reasoning_content"]
+                        .as_str()
+                        .or_else(|| delta["reasoning"].as_str())
+                    {
+                        full_reasoning.push_str(reasoning);
+                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string())).await;
                     }
 
                     // Tool calls delta
@@ -369,8 +387,15 @@ impl OpenAiProvider {
             Some(full_content)
         };
 
+        let reasoning = if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        };
+
         Ok(ChatResponse {
             content,
+            reasoning,
             tool_calls,
             usage: None,
         })

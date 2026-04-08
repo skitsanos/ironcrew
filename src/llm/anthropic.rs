@@ -319,6 +319,7 @@ impl AnthropicProvider {
         }
 
         let mut full_content = String::new();
+        let mut full_reasoning = String::new();
         let mut block_states: HashMap<usize, BlockState> = HashMap::new();
         let mut input_tokens: u32 = 0;
         let mut output_tokens: u32 = 0;
@@ -429,7 +430,10 @@ impl AnthropicProvider {
                                 }
                             }
                             "thinking_delta" => {
-                                // Skip thinking deltas — internal reasoning
+                                if let Some(text) = delta["thinking"].as_str() {
+                                    full_reasoning.push_str(text);
+                                    let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
+                                }
                             }
                             _ => {}
                         }
@@ -470,8 +474,15 @@ impl AnthropicProvider {
             Some(full_content)
         };
 
+        let reasoning = if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        };
+
         Ok(ChatResponse {
             content,
+            reasoning,
             tool_calls,
             usage: Some(TokenUsage {
                 prompt_tokens: input_tokens,
@@ -498,6 +509,7 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
         .ok_or_else(|| IronCrewError::Provider("Missing 'content' array in response".into()))?;
 
     let mut text_parts: Vec<String> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
 
     for block in content_blocks {
@@ -521,7 +533,10 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
                 });
             }
             "thinking" => {
-                // Skip thinking blocks — internal reasoning
+                // Capture thinking blocks as reasoning
+                if let Some(text) = block["thinking"].as_str() {
+                    reasoning_parts.push(text.to_string());
+                }
             }
             "web_search_tool_result" => {
                 // Append search results as text for the agent to see
@@ -573,8 +588,15 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
         Some(text_parts.join("\n"))
     };
 
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
+
     Ok(ChatResponse {
         content,
+        reasoning,
         tool_calls,
         usage,
     })

@@ -95,7 +95,7 @@ pub struct TaskExecutionContext<'a> {
 }
 
 impl<'a> TaskExecutionContext<'a> {
-    pub async fn execute(&self) -> Result<(String, Option<TaskTokenUsage>)> {
+    pub async fn execute(&self) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
         // Run before_task hook if present
         let raw_description = interpolate(&self.task.description, self.completed_results);
         let description = if let Some(bytecode) = self.before_task_hook {
@@ -106,6 +106,7 @@ impl<'a> TaskExecutionContext<'a> {
 
         let mut messages = Vec::new();
         let mut total_usage = TaskTokenUsage::default();
+        let mut accumulated_reasoning = String::new();
 
         // System prompt
         let system_content = self.agent.system_prompt.clone().unwrap_or_else(|| {
@@ -205,6 +206,11 @@ impl<'a> TaskExecutionContext<'a> {
                                 eprint!("{}", text);
                                 std::io::stderr().flush().ok();
                             }
+                            StreamChunk::Thinking(text) => {
+                                // Dim color for reasoning — visually distinct from output
+                                eprint!("\x1b[90m{}\x1b[0m", text);
+                                std::io::stderr().flush().ok();
+                            }
                             StreamChunk::Done => {
                                 eprintln!(); // newline at end
                             }
@@ -235,6 +241,14 @@ impl<'a> TaskExecutionContext<'a> {
                 total_usage.cached_tokens += usage.cached_tokens;
             }
 
+            // Accumulate reasoning content across tool-call rounds
+            if let Some(ref reasoning) = response.reasoning {
+                if !accumulated_reasoning.is_empty() {
+                    accumulated_reasoning.push('\n');
+                }
+                accumulated_reasoning.push_str(reasoning);
+            }
+
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
                 let has_usage = total_usage.total_tokens > 0;
@@ -249,8 +263,15 @@ impl<'a> TaskExecutionContext<'a> {
                     content
                 };
 
+                let reasoning = if accumulated_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(accumulated_reasoning)
+                };
+
                 return Ok((
                     final_output,
+                    reasoning,
                     if has_usage { Some(total_usage) } else { None },
                 ));
             }
@@ -324,7 +345,7 @@ pub async fn execute_task_standalone(
     memory_context: &str,
     messages_context: &str,
     should_stream: bool,
-) -> Result<(String, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
     execute_task_standalone_with_hooks(
         task,
         agent,
@@ -361,7 +382,7 @@ pub async fn execute_task_standalone_with_hooks(
     prompt_cache_retention: Option<String>,
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
-) -> Result<(String, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
     let ctx = TaskExecutionContext {
         task,
         agent,
