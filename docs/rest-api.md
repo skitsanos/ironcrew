@@ -146,6 +146,22 @@ The `token_usage` field in `task_completed` contains:
 A `warning` event may be sent if the subscriber falls behind and events are
 dropped from the broadcast channel.
 
+### Modes Without SSE Events
+
+The following Lua primitives execute inside `crew:run()` but **do not emit
+SSE events** in this release:
+
+- **`crew:conversation({})`** — single-agent multi-turn chat. Output goes to
+  stderr only (with dim styling for reasoning).
+- **`crew:dialog({})`** — agent-to-agent dialog. Output goes to stderr with
+  `[agent_name]` prefixes per turn.
+
+If a `crew.lua` script uses these primitives instead of (or in addition to)
+tasks, REST API subscribers will only see the surrounding task events. Full
+SSE wiring for conversations and dialogs (`conversation_message`,
+`conversation_thinking`, `dialog_turn`, `dialog_thinking` events) is planned
+for a future release.
+
 ## Run History
 
 ### List Runs

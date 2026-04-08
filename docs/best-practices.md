@@ -13,9 +13,31 @@ my-flow/
     writer.lua
   tools/
     summarize.lua
+  config.lua          # project-wide defaults (optional)
   crew.lua            # entrypoint
   .env                # API keys (never commit this)
 ```
+
+**Use `config.lua` for project defaults.** Put provider, model, concurrency,
+and routing settings in a `config.lua` file at the project root so `crew.lua`
+stays focused on workflow logic:
+
+```lua
+-- config.lua
+return {
+    provider = "anthropic",
+    model = "claude-haiku-4-5-20251001",
+    max_concurrent = 4,
+    models = {
+        task_execution = "claude-haiku-4-5-20251001",
+        collaboration_synthesis = "claude-sonnet-4-5-20250929",
+    },
+}
+```
+
+Fields explicitly set in `Crew.new()` always win, so per-crew overrides still
+work. This is the cleanest way to switch providers between dev and prod —
+swap `config.lua` only.
 
 For simple single-file flows, a standalone `crew.lua` works fine with inline
 agent definitions. Use the directory structure when you have multiple agents,
@@ -57,6 +79,36 @@ about format: "in 2-3 sentences" or "as a JSON array."
 
 **Expected output and context.** Set `expected_output` on agents for format hints.
 Use `context` on tasks to inject additional information into the prompt.
+
+## Stateful Conversations and Dialogs
+
+Beyond single-shot tasks, IronCrew offers two stateful interaction primitives.
+Choose the right shape for the work:
+
+| Use case | Primitive | Why |
+|----------|-----------|-----|
+| Workflow with clear DAG | **Tasks** | Parallel execution, dependency phases, persisted to run records |
+| Multi-turn chat with one agent | **`crew:conversation({})`** | Maintains message history, supports tool calls, captures reasoning |
+| Two committed perspectives debating | **`crew:dialog({})`** | Perspective-flipped histories, each agent sees the other as "user" |
+| Adversarial decision-making | **`crew:dialog()` + moderator** | Two debaters + a third agent that synthesizes structured output |
+
+**The debate + moderator pattern** is the most productive use of dialogs:
+
+1. Two agents with **opposing committed views** debate via `crew:dialog()`
+2. Force each side to provide a **falsification criterion** per turn (use system prompts that mandate an `INVALIDATION:` line)
+3. A third **moderator** agent reads the transcript via `crew:conversation()` and produces structured output
+4. Use `response_format = "json_schema"` on the moderator so the synthesis is machine-readable
+
+This pattern works for any binary decision under uncertainty: investment
+analysis, code review (ship-it vs critic), architectural choices (microservices
+vs monolith), hiring (hire vs pass), product decisions (build now vs wait).
+See [`examples/stock-debate/`](../examples/stock-debate/) for a complete
+implementation.
+
+**Limitations** (current):
+- Conversations and dialogs run intra-script — they do not persist across `crew:run()` calls
+- They stream to stderr only — no SSE events emitted yet
+- Dialogs are two-agent only (multi-party round-robin is future work)
 
 ## Error Handling
 

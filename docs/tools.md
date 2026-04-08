@@ -156,12 +156,27 @@ Custom tools run in a restricted sandbox (no `os`, `io`, `require`, `loadfile`,
 `dofile`). A `fs` namespace scoped to the project directory is available
 (`fs.read(path)`, `fs.write(path, content)`).
 
+**Tools cannot make HTTP calls.** The `http` global is not registered in the
+tool sandbox. If your tool needs remote data, fetch it in `crew.lua` (where
+`http` is available) and pass it via context, memory, or task results.
+Alternatively, the agent can call the built-in `http_request` tool directly
+without writing a custom Lua tool wrapper.
+
 ---
 
 ## Lua Globals
 
-The following functions and namespaces are available in all Lua contexts
-(crew.lua, tool scripts, agent definitions):
+IronCrew exposes Lua globals in two distinct sandboxes:
+
+| Sandbox | Where it runs | What's available |
+|---------|---------------|------------------|
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace** |
+| **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access — but **no `http`** |
+
+> **Important constraint:** Custom Lua tools cannot make HTTP calls. The `http`
+> global is only available in the crew sandbox. If a tool needs to fetch remote
+> data, either fetch it in `crew.lua` and pass it via memory/context, or use the
+> built-in `http_request` tool (which is invoked by the LLM, not by Lua code).
 
 ### Utility Functions
 
@@ -223,11 +238,11 @@ avoid recompilation.
 | `regex.replace_all(pattern, text, replacement)` | string | Replace all matches |
 | `regex.split(pattern, text)` | table | Split text by pattern |
 
-### HTTP Namespace
+### HTTP Namespace (crew sandbox only)
 
-Async HTTP client available in crew.lua scripts. All methods return a response
-table. Uses a shared connection pool (singleton `reqwest::Client`) across all
-Lua sandboxes.
+Async HTTP client available in `crew.lua`, `config.lua`, and agent definitions.
+**Not available in custom tool execute functions.** All methods return a
+response table. Uses a shared connection pool (singleton `reqwest::Client`).
 
 **Security:** All `http.*` calls enforce SSRF protection — requests to
 private/loopback IPs are blocked by default (override: `IRONCREW_ALLOW_PRIVATE_IPS=1`).
