@@ -41,7 +41,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [x] **Pluggable storage backends** — `StateStore` async trait with JSON files (default), SQLite, and PostgreSQL (feature-gated). Done in 2.0.1.
 
-- [ ] **Flow variables / config** — a `config.lua` or `flow.toml` file per project for default settings (model, timeouts, memory limits) so `crew.lua` stays focused on logic.
+- [x] **Flow variables / config** — `config.lua` at the project root provides default settings (provider, model, limits, router, reasoning, server tools) shallow-merged into `Crew.new()` so `crew.lua` stays focused on workflow. Done in 2.4.0.
 
 - [ ] **Image input support** — pass images to vision-capable models (GPT-4o, Gemini). Would need a `content` array in ChatMessage instead of a plain string.
 

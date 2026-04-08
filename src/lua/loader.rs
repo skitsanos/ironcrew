@@ -88,4 +88,12 @@ impl ProjectLoader {
     pub fn entrypoint(&self) -> Option<&Path> {
         self.entrypoint.as_deref()
     }
+
+    /// Path to `<project_dir>/config.lua` if it exists, otherwise `None`.
+    /// config.lua is an optional file that returns a table of default settings
+    /// merged into Crew.new() at runtime.
+    pub fn config_lua_path(&self) -> Option<PathBuf> {
+        let p = self.project_dir.join("config.lua");
+        if p.is_file() { Some(p) } else { None }
+    }
 }
