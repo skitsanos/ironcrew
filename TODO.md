@@ -80,9 +80,9 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [x] **Conversation mode** — single-agent multi-turn chat via `crew:conversation({...})` with tool support, streaming to stderr, reasoning capture, and `max_history` cap. Done in 2.4.0.
 - [x] **Agent-to-agent conversations** — `crew:dialog({})` runs perspective-flipped two-agent dialogs (each agent sees its own turns as assistant, opponent's as user with `[name]:` prefix). Includes `run`, `next_turn`, `reset`, transcript inspection. Done in 2.4.0.
+- [x] **Conversation/Dialog SSE wiring** — both primitives emit dedicated events (`conversation_started`/`turn`/`thinking` and `dialog_started`/`turn`/`thinking`/`completed`) through the EventBus. REST API subscribers see them in real time alongside task events. Each event includes a stable `conversation_id` / `dialog_id`. Done in 2.4.0.
   - [ ] **Multi-party dialogs** — round-robin or moderator-driven conversations with 3+ agents
   - [ ] **Custom termination** — Lua callback to end a dialog early (e.g., on agreement detection)
-  - [ ] **Conversation/Dialog SSE wiring** — emit events through the EventBus (currently stderr only)
   - [ ] **Cross-run persistence** — save/load conversation state by ID
 
 - [ ] **Cost estimation** — pre-run estimate of token usage and cost based on prompt sizes and model pricing.

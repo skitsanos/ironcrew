@@ -94,6 +94,63 @@ pub enum CrewEvent {
         content: String,
     },
 
+    // ─── Conversation (single-agent multi-turn chat) ────────────────────────
+    #[serde(rename = "conversation_started")]
+    ConversationStarted {
+        conversation_id: String,
+        agent: String,
+    },
+
+    #[serde(rename = "conversation_turn")]
+    ConversationTurn {
+        conversation_id: String,
+        agent: String,
+        turn_index: usize,
+        user_message: String,
+        assistant_message: String,
+    },
+
+    #[serde(rename = "conversation_thinking")]
+    ConversationThinking {
+        conversation_id: String,
+        agent: String,
+        turn_index: usize,
+        content: String,
+    },
+
+    // ─── Dialog (agent-to-agent) ────────────────────────────────────────────
+    #[serde(rename = "dialog_started")]
+    DialogStarted {
+        dialog_id: String,
+        agent_a: String,
+        agent_b: String,
+        max_turns: usize,
+    },
+
+    #[serde(rename = "dialog_turn")]
+    DialogTurn {
+        dialog_id: String,
+        turn_index: usize,
+        speaker: String,
+        agent: String,
+        content: String,
+    },
+
+    #[serde(rename = "dialog_thinking")]
+    DialogThinking {
+        dialog_id: String,
+        turn_index: usize,
+        speaker: String,
+        agent: String,
+        content: String,
+    },
+
+    #[serde(rename = "dialog_completed")]
+    DialogCompleted {
+        dialog_id: String,
+        total_turns: usize,
+    },
+
     // ─── Memory ─────────────────────────────────────────────────────────────
     #[serde(rename = "memory_set")]
     MemorySet { key: String },

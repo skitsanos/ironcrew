@@ -151,9 +151,12 @@ maintaining separate histories.
 
 Both primitives:
 - Share the crew's provider, model, and tool registry
-- Generate an internal UUID (currently unused, reserved for future SSE wiring)
-- Stream output to stderr only — they do **not** emit `task_*` events into the
-  EventBus / SSE stream that the REST API exposes
+- Generate a stable `conversation_id` / `dialog_id` UUID included in every event
+- Emit dedicated SSE events through the EventBus
+  (`conversation_started`/`conversation_turn`/`conversation_thinking` and
+  `dialog_started`/`dialog_turn`/`dialog_thinking`/`dialog_completed`) so REST
+  API subscribers can stream them in real time alongside task events
+- Also stream to stderr in the Lua process for CLI visibility
 
 See [Crews](crews.md) for the Lua API and the **debate + moderator pattern**
 (two adversarial agents + a structured moderator synthesis) which is the
@@ -241,7 +244,15 @@ local crew = Crew.new({
 
 ## Event System and Run History
 
-The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `TaskThinking`, `CollaborationTurn`). These power the REST API's Server-Sent Events stream and structured logging. `TaskThinking` events carry model reasoning/thinking content for reasoning-capable providers (Anthropic, OpenAI Responses, DeepSeek, Kimi).
+The orchestrator and Lua primitives emit events throughout execution
+(`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`,
+`TaskSkipped`, `TaskThinking`, `CollaborationTurn`, plus
+`ConversationStarted`/`ConversationTurn`/`ConversationThinking` and
+`DialogStarted`/`DialogTurn`/`DialogThinking`/`DialogCompleted` from
+`crew:conversation()` / `crew:dialog()`). These power the REST API's
+Server-Sent Events stream and structured logging. `TaskThinking`,
+`ConversationThinking`, and `DialogThinking` carry model reasoning content for
+reasoning-capable providers (Anthropic, OpenAI Responses, DeepSeek, Kimi).
 
 Each `crew:run()` saves a `RunRecord` with task results, token usage, timing,
 tags, reasoning (when captured), and status (success, partial failure, or failed).
