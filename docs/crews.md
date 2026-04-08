@@ -8,7 +8,7 @@ memory, and messaging into a single runnable workflow defined in Lua.
 ```lua
 local crew = Crew.new({
     goal            = "Analyze customer feedback and produce a report",
-    provider        = "openai",               -- only "openai" supported (works with any OpenAI-compatible API)
+    provider        = "openai",               -- "openai" | "anthropic" | "openai-responses"
     model           = "gpt-4.1-mini",          -- default model for all tasks
     base_url        = "https://api.openai.com/v1",  -- optional, overrides OPENAI_BASE_URL
     api_key         = env("OPENAI_API_KEY"),  -- optional, overrides OPENAI_API_KEY
@@ -36,7 +36,15 @@ local crew = Crew.new({
 | Key                      | Type     | Default            | Description |
 |--------------------------|----------|--------------------|-------------|
 | `goal`                   | string   | *required*         | High-level objective shown in the system prompt |
-| `provider`               | string   | `"openai"`         | LLM provider (must be `"openai"`) |
+| `provider`               | string   | `"openai"`         | LLM provider: `"openai"`, `"anthropic"`, or `"openai-responses"` |
+| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking |
+| `server_tools`           | table    | `{}`               | (Anthropic/Responses) server-side tools: `{"web_search"}`, `{"code_execution"}`, `{"file_search"}`, `{"code_interpreter"}` |
+| `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task |
+| `reasoning_effort`       | string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
+| `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` |
+| `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
+| `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
+| `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results |
 | `model`                  | string   | `"gpt-4.1-mini"`    | Default model for task execution |
 | `base_url`               | string   | env `OPENAI_BASE_URL` | API endpoint (supports Gemini, Groq, etc.) |
 | `api_key`                | string   | env `OPENAI_API_KEY`  | API key; auto-resolved from provider-specific env vars |

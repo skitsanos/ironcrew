@@ -122,6 +122,7 @@ full untruncated output.
 | `task_completed`     | `task`, `agent`, `duration_ms`, `success`, `output`, `token_usage` | Task finished successfully              |
 | `task_failed`        | `task`, `agent`, `error`, `duration_ms`                       | Task execution failed                        |
 | `task_skipped`       | `task`, `reason`                                              | Task skipped (condition evaluated false)     |
+| `task_thinking`      | `task`, `agent`, `content`                                    | Model reasoning/thinking (Anthropic, OpenAI Responses, DeepSeek, Kimi) |
 | `task_retry`         | `task`, `attempt`, `max_retries`, `backoff_secs`, `error`     | Task being retried after failure             |
 | `tool_call`          | `task`, `tool`                                                | Agent invoked a tool                         |
 | `tool_result`        | `task`, `tool`, `success`, `duration_ms`                      | Tool returned a result                       |
