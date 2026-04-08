@@ -208,9 +208,49 @@ agent's viewpoint:
 This way, each agent has a coherent first-person view of the dialog without
 maintaining separate histories.
 
-**Use cases:**
+**The debate + moderator pattern:**
 
-- Bull-vs-bear analysis debates (see [`examples/stock-debate/`](../examples/stock-debate/))
+The most useful application is a **debate followed by a moderator synthesis**.
+Two adversarial agents argue from committed positions, then a third agent
+reads the transcript and produces a structured decision with explicit
+falsification criteria. This turns "two LLMs talking" into "actionable output".
+
+```lua
+-- 1. Bull and Bear debate
+local debate = crew:dialog({
+    agent_a = "bull",
+    agent_b = "bear",
+    starter = data_summary .. "\nDebate the buy decision.",
+    max_turns = 6,
+})
+local transcript = debate:run()
+
+-- 2. Moderator synthesizes via a Conversation
+local moderator = crew:conversation({ agent = "moderator" })
+local synthesis = moderator:send(format_transcript(transcript))
+-- The moderator agent has response_format = json_schema for structured output
+```
+
+The moderator agent uses `response_format = { type = "json_schema", ... }` to
+return structured output (recommendation, confidence, agreed facts, key
+disagreements, invalidation criteria).
+
+This pattern generalizes well beyond stock analysis:
+
+| Domain | Agent A | Agent B | Moderator output |
+|--------|---------|---------|------------------|
+| Investment | Bull | Bear | Buy / hold / sell + invalidation |
+| Code review | "Ship it" advocate | Technical critic | Approve / changes / reject |
+| Architecture | Microservices | Monolith | Decision + tradeoffs |
+| Hiring | Hire advocate | Pass advocate | Hire / pass + signals |
+| Product | Build now | Wait/pivot | Ship / hold + risks |
+
+See [`examples/stock-debate/`](../examples/stock-debate/) for a complete
+implementation: live data fetching from Yahoo Finance, two committed analyst
+personas (each required to provide an INVALIDATION level per turn), and a
+moderator that produces structured JSON synthesis.
+
+**Other use cases:**
 - Devil's advocate review of a proposal
 - Two specialists discussing a problem from different angles
 - Agent personality testing across many turns
