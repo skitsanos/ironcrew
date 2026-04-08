@@ -75,6 +75,7 @@ fn filter_eligible_tasks<'a>(
                 success: false,
                 duration_ms: 0,
                 token_usage: None,
+                reasoning: None,
             };
             failed_tasks.insert(task.name.clone());
             results.insert(task.name.clone(), result);
@@ -102,6 +103,7 @@ fn filter_eligible_tasks<'a>(
                     success: true,
                     duration_ms: 0,
                     token_usage: None,
+                    reasoning: None,
                 };
                 results.insert(task.name.clone(), result);
                 tracing::info!(
@@ -120,7 +122,15 @@ fn filter_eligible_tasks<'a>(
 }
 
 /// The result type from each concurrent task future.
-type TaskFutureResult = (String, String, Result<String>, u64, Option<TaskTokenUsage>);
+/// Fields: task_name, agent_name, output_result, duration_ms, token_usage, reasoning
+type TaskFutureResult = (
+    String,
+    String,
+    Result<String>,
+    u64,
+    Option<TaskTokenUsage>,
+    Option<String>,
+);
 
 /// Process the results from concurrent task futures, handling success, failure, and error recovery.
 async fn process_phase_results(
@@ -131,9 +141,17 @@ async fn process_phase_results(
     results: &mut HashMap<String, TaskResult>,
     failed_tasks: &mut HashSet<String>,
 ) -> Result<()> {
-    for (task_name, agent_name, output, duration_ms, token_usage) in phase_results {
+    for (task_name, agent_name, output, duration_ms, token_usage, reasoning) in phase_results {
         match output {
             Ok(out) => {
+                // Emit TaskThinking event if reasoning was captured
+                if let Some(ref r) = reasoning {
+                    crew.eventbus.emit(CrewEvent::TaskThinking {
+                        task: task_name.clone(),
+                        agent: agent_name.clone(),
+                        content: r.clone(),
+                    });
+                }
                 crew.eventbus.emit(CrewEvent::TaskCompleted {
                     task: task_name.clone(),
                     agent: agent_name.clone(),
@@ -154,6 +172,7 @@ async fn process_phase_results(
                     success: true,
                     duration_ms,
                     token_usage,
+                    reasoning,
                 };
                 tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
                 results.insert(task_name, result);
@@ -202,6 +221,7 @@ async fn process_phase_results(
                     success: false,
                     duration_ms,
                     token_usage: None,
+                    reasoning: None,
                 };
                 tracing::error!("Task '{}' failed: {}", task_name, e);
                 failed_tasks.insert(task_name.clone());
@@ -470,6 +490,7 @@ pub async fn run_crew(
                                 success: true,
                                 duration_ms,
                                 token_usage: collab_usage,
+                                reasoning: None,
                             },
                         );
                     }
@@ -527,7 +548,7 @@ pub async fn run_crew(
                                 )
                                 .await
                                 {
-                                    Ok((output, handler_usage)) => {
+                                    Ok((output, handler_reasoning, handler_usage)) => {
                                         results.insert(
                                             task.name.clone(),
                                             TaskResult {
@@ -540,6 +561,7 @@ pub async fn run_crew(
                                                 success: true,
                                                 duration_ms,
                                                 token_usage: None,
+                                                reasoning: None,
                                             },
                                         );
                                         results.insert(
@@ -552,6 +574,7 @@ pub async fn run_crew(
                                                 duration_ms: error_start.elapsed().as_millis()
                                                     as u64,
                                                 token_usage: handler_usage,
+                                                reasoning: handler_reasoning,
                                             },
                                         );
                                         continue;
@@ -584,6 +607,7 @@ pub async fn run_crew(
                                 success: false,
                                 duration_ms,
                                 token_usage: None,
+                                reasoning: None,
                             },
                         );
                     }
@@ -712,6 +736,7 @@ pub async fn run_crew(
                     success: true,
                     duration_ms: 0,
                     token_usage: None,
+                    reasoning: None,
                 },
             );
         }

@@ -25,7 +25,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 ## High Value, Medium Effort
 
-- [ ] **Anthropic Claude provider** — native Claude API support. Claude uses a different message format (`human`/`assistant` roles, system as top-level param). Would need a second provider implementation.
+- [x] **Anthropic Claude provider** — native Messages API with server-side tools (web_search, code_execution), extended thinking, and block-based streaming. Done in 2.2.0.
 
 - [x] **Agent hooks** — `before_task` and `after_task` Lua callbacks stored as bytecode. Done in 2.0.1.
 

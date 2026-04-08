@@ -14,7 +14,7 @@ use crate::engine::messagebus::MessageBus;
 
 /// Execute a single task with retry/timeout logic inside a spawned context.
 ///
-/// Returns `(task_name, agent_name, result, duration_ms, token_usage)`.
+/// Returns `(task_name, agent_name, result, duration_ms, token_usage, reasoning)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_single_task(
     task: &Task,
@@ -35,6 +35,7 @@ pub async fn run_single_task(
     std::result::Result<String, IronCrewError>,
     u64,
     Option<TaskTokenUsage>,
+    Option<String>,
 ) {
     // Build memory context for this task
     let memory_context = memory.build_context(&task.description, 5).await;
@@ -69,7 +70,7 @@ pub async fn run_single_task(
         .unwrap_or(std::time::Duration::from_secs(300));
 
     let mut attempt = 0u32;
-    let (output, token_usage) = loop {
+    let (output, reasoning, token_usage) = loop {
         let result = execute_task_standalone_with_hooks(
             &task_owned,
             &agent_owned,
@@ -87,10 +88,10 @@ pub async fn run_single_task(
             after_task_hook.as_deref(),
         );
         match tokio::time::timeout(timeout_dur, result).await {
-            Ok(Ok((out, usage))) => break (Ok(out), usage),
+            Ok(Ok((out, reas, usage))) => break (Ok(out), reas, usage),
             Ok(Err(e)) => {
                 if attempt >= max_retries {
-                    break (Err(e), None);
+                    break (Err(e), None, None);
                 }
                 let backoff = base_backoff * 2f64.powi(attempt as i32);
                 tracing::warn!(
@@ -111,6 +112,7 @@ pub async fn run_single_task(
                             task: task_owned.name.clone(),
                             message: format!("Timed out after {}s", timeout_dur.as_secs()),
                         }),
+                        None,
                         None,
                     );
                 }
@@ -135,6 +137,7 @@ pub async fn run_single_task(
         output,
         duration,
         token_usage,
+        reasoning,
     )
 }
 
@@ -225,7 +228,7 @@ pub async fn handle_task_error(
     )
     .await
     {
-        Ok((output, token_usage)) => {
+        Ok((output, reasoning, token_usage)) => {
             tracing::info!(
                 "Error handler '{}' succeeded, task '{}' recovered",
                 error_handler_name,
@@ -238,6 +241,7 @@ pub async fn handle_task_error(
                 success: true,
                 duration_ms: 0, // caller sets actual duration
                 token_usage: None,
+                reasoning: None,
             };
             let handler_result = TaskResult {
                 task: error_handler_name.clone(),
@@ -246,6 +250,7 @@ pub async fn handle_task_error(
                 success: true,
                 duration_ms: error_start.elapsed().as_millis() as u64,
                 token_usage,
+                reasoning,
             };
             Some((recovered_result, Some(handler_result)))
         }

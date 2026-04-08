@@ -60,6 +60,10 @@ pub struct TaskResult {
     pub duration_ms: u64,
     #[serde(default)]
     pub token_usage: Option<TaskTokenUsage>,
+    /// Reasoning/thinking captured from the model (Anthropic thinking blocks,
+    /// OpenAI-compat reasoning_content). Persisted to run records when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Validate dependency references and detect cycles.

@@ -15,6 +15,7 @@ fn test_interpolate_output() {
             success: true,
             duration_ms: 1500,
             token_usage: None,
+            reasoning: None,
         },
     );
 
@@ -35,6 +36,7 @@ fn test_interpolate_multiple() {
             success: true,
             duration_ms: 100,
             token_usage: None,
+            reasoning: None,
         },
     );
     results.insert(
@@ -46,6 +48,7 @@ fn test_interpolate_multiple() {
             success: true,
             duration_ms: 200,
             token_usage: None,
+            reasoning: None,
         },
     );
 
@@ -66,6 +69,7 @@ fn test_interpolate_success_field() {
             success: true,
             duration_ms: 50,
             token_usage: None,
+            reasoning: None,
         },
     );
 
@@ -116,6 +120,7 @@ fn test_interpolate_agent_and_duration() {
             success: true,
             duration_ms: 2500,
             token_usage: None,
+            reasoning: None,
         },
     );
 

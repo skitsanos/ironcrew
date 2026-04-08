@@ -87,6 +87,9 @@ pub struct ToolCallFunction {
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub content: Option<String>,
+    /// Accumulated reasoning/thinking text from the model (if any).
+    /// Providers: Anthropic (thinking blocks), OpenAI-compat (reasoning_content).
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
     pub usage: Option<TokenUsage>,
 }
@@ -104,6 +107,8 @@ pub struct ToolSchema {
 pub enum StreamChunk {
     /// A text delta (partial content)
     Text(String),
+    /// A reasoning/thinking delta (shown separately from regular output)
+    Thinking(String),
     /// A tool call starting
     ToolCallStart { id: String, name: String },
     /// Tool call arguments delta
