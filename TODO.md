@@ -78,7 +78,10 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 ## Medium Value, Medium Effort
 
-- [ ] **Conversation mode** — multi-turn chat with an agent (not just single-shot tasks). Agent maintains conversation history across turns.
+- [x] **Conversation mode** — single-agent multi-turn chat via `crew:conversation({...})` with tool support, streaming to stderr, reasoning capture, and `max_history` cap. Done in 2.4.0.
+  - [ ] **Agent-to-agent conversations** — two agents conversing via turn-taking with separate perspectives
+  - [ ] **Conversation SSE wiring** — emit `conversation_message` / `conversation_thinking` events through the EventBus (currently stderr only)
+  - [ ] **Cross-run persistence** — save/load conversation state by ID
 
 - [ ] **Cost estimation** — pre-run estimate of token usage and cost based on prompt sizes and model pricing.
 

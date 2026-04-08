@@ -110,6 +110,64 @@ See [`examples/config-lua/`](../examples/config-lua/) for a working example.
 
 ---
 
+## Conversation Mode
+
+A `Conversation` is a stateful, multi-turn chat with an agent that maintains
+its own message history across calls — different from a `Task`, which is
+single-shot. Useful for stateful dialogues, agent testing, or interactive
+workflows inside a Lua script.
+
+Create a conversation bound to a crew (it inherits the crew's provider, model,
+and tool registry):
+
+```lua
+local conv = crew:conversation({
+    agent = "tutor",                          -- agent name (must be added to crew)
+    -- OR: agent = Agent.new({...})           -- inline agent
+
+    model = "claude-haiku-4-5-20251001",      -- optional override
+    system_prompt = "You are a Rust tutor.",  -- optional override (else from agent)
+    max_history = 20,                         -- optional cap on stored messages
+    stream = true,                            -- optional, stream replies to stderr
+})
+
+-- Simple turn — returns just the reply text
+local reply = conv:send("What is ownership in Rust?")
+
+-- Full response with metadata (content + reasoning + length)
+local response = conv:ask("Show me an example")
+print(response.content)
+print(response.reasoning)  -- present when using reasoning-capable providers
+print(response.length)     -- total messages in history
+
+-- History inspection
+local history = conv:history()  -- table of {role, content, tool_call_id?}
+local count = conv:length()
+local agent_name = conv:agent_name()
+
+-- Reset (clears all messages, keeps system prompt)
+conv:reset()
+```
+
+**What's supported:**
+
+- Multi-turn message history with shallow per-conversation isolation
+- Tool calling — uses the crew's tool registry, full tool-call loop with timeout
+- Streaming to stderr with dim reasoning (same model as task streaming)
+- Reasoning capture from Anthropic, OpenAI Responses, DeepSeek, Kimi
+- History cap (`max_history`) — oldest messages are trimmed first; system prompt is always preserved
+- Provider/model/system_prompt overrides per conversation
+
+**Limitations (current):**
+
+- Single-agent only — agent-to-agent conversations are planned for a future release
+- No cross-run persistence — conversations live for the duration of one `crew:run()` script
+- Stderr-only event tracing — full SSE wiring (`conversation_message`, `conversation_thinking` events) is planned to mirror the task event flow
+
+See [`examples/conversation/`](../examples/conversation/) for a working example.
+
+---
+
 ## Memory System
 
 Every crew has a key-value memory store. Agents can read and write shared state
