@@ -174,11 +174,13 @@ See [`examples/conversation/`](../examples/conversation/) for a working example.
 
 ---
 
-## Agent Dialog (Agent-to-Agent)
+## Agent Dialog (Multi-Agent)
 
-Two agents take turns responding to each other with **perspective-flipped**
+Two or more agents take turns in **round-robin** order with **perspective-flipped**
 message histories — each agent sees its own past turns as `assistant` messages
-and the opponent's turns as `user` messages prefixed with the opponent's name.
+and other participants' turns as `user` messages prefixed with the speaker's name.
+
+### Two-agent dialog
 
 ```lua
 local debate = crew:dialog({
@@ -186,21 +188,47 @@ local debate = crew:dialog({
     agent_b = "bear",
     starter = "Should we buy NVDA?",
     max_turns = 4,                     -- total turns combined (2 each here)
-    starting_speaker = "a",            -- "a" (default) or "b"
+    starting_speaker = "a",            -- "a" (default), "b", or an agent name
     stream = true,                     -- prefix output with [agent_name] on stderr
     max_history = 30,                  -- optional cap on retained turns
 })
+```
 
+### Multi-party dialog (3+ agents)
+
+```lua
+local roundtable = crew:dialog({
+    agents = { "optimist", "pessimist", "realist" },  -- 2 or more agents
+    starter = "Should we ship feature X this quarter?",
+    max_turns = 6,                                     -- 2 rounds of 3 agents
+    starting_speaker = "realist",                      -- by name
+})
+```
+
+The `agents` array form supports any number of agents (≥ 2). Turns are taken
+in round-robin order starting from `starting_speaker` (which accepts an agent
+name or a positional letter `"a"`, `"b"`, `"c"`, ...). When `max_turns` is
+omitted, it defaults to `2 * agents.len()` (two rounds each).
+
+### Methods (same for both forms)
+
+```lua
 -- Run the entire dialog and return the transcript
 local transcript = debate:run()
 -- transcript = { {index=0, speaker="a", agent="bull", content="...", reasoning="..."}, ... }
 
 -- Or step through interactively
-local turn = debate:next_turn()        -- runs one turn, returns {index, speaker, agent, content, reasoning}
-local count = debate:turn_count()      -- completed turns
-local active = debate:current_speaker() -- "a", "b", or nil if finished
-debate:reset()                          -- clear transcript and rewind
+local turn = debate:next_turn()           -- runs one turn, returns {index, speaker, agent, content, reasoning}
+local count = debate:turn_count()         -- completed turns
+local active = debate:current_speaker()   -- "a", "b", "c", ... or nil if finished
+local active_name = debate:current_agent() -- agent name (or nil if finished)
+local participants = debate:agents()       -- list of agent names
+debate:reset()                             -- clear transcript and rewind
 ```
+
+In SSE events and turn objects, `speaker` is always a positional letter
+(`"a"`, `"b"`, `"c"`, ..., up to `"z"`) and `agent` is always the agent name.
+Both fields are present so SSE consumers can use whichever is more useful.
 
 **How perspective-flipping works:**
 
