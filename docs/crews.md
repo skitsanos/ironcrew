@@ -59,6 +59,57 @@ local crew = Crew.new({
 
 ---
 
+## Project Defaults: `config.lua`
+
+If a `config.lua` file exists at the project root (alongside `crew.lua`), it is
+loaded automatically before `crew.lua` runs. It must return a table of default
+settings — any field set there becomes a default for `Crew.new()`.
+
+```lua
+-- config.lua
+return {
+    provider = "anthropic",
+    model = "claude-haiku-4-5-20251001",
+    max_concurrent = 4,
+    memory = "ephemeral",
+    models = {
+        task_execution = "claude-haiku-4-5-20251001",
+        collaboration_synthesis = "claude-sonnet-4-5-20250929",
+    },
+}
+```
+
+```lua
+-- crew.lua — only the workflow logic
+local crew = Crew.new({
+    goal = "Analyze a topic",
+    -- provider, model, max_concurrent, memory, models inherited from config.lua
+})
+```
+
+**Merge semantics:**
+
+- **Shallow merge** — fields explicitly set in `Crew.new()` always win
+- **No deep merge** — if both files define `models`, the user's `models` table
+  fully replaces the config.lua one
+- **All Crew.new() options supported** — `provider`, `model`, `base_url`,
+  `max_concurrent`, `memory`, `max_memory_items`, `max_memory_tokens`, `stream`,
+  `models`, `prompt_cache_key`, `prompt_cache_retention`, `thinking_budget`,
+  `server_tools`, `web_search_max_uses`, `reasoning_effort`, `reasoning_summary`,
+  `web_search_context_size`, `file_search_vector_store_ids`,
+  `file_search_max_results`
+- **Lua-powered** — config.lua runs in the same sandbox as crew.lua, so it can
+  call `env()`, `now_rfc3339()`, etc. (sensitive env vars are blocked, same as
+  crew.lua)
+
+This keeps `crew.lua` focused on the workflow (goal, agents, tasks) while
+provider/model/limits move to a single project-wide file. Useful for switching
+providers between dev and prod by swapping `config.lua` only.
+
+See [`examples/config-lua/`](../examples/config-lua/) for a working example.
+
+---
+
 ## Memory System
 
 Every crew has a key-value memory store. Agents can read and write shared state

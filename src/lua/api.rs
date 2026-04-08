@@ -71,8 +71,22 @@ pub fn register_crew_constructor(
     let agents = Arc::new(preloaded_agents);
     let project_dir = Arc::new(project_dir);
 
-    let new_fn = lua.create_function(move |_, table: Table| {
+    let new_fn = lua.create_function(move |lua, table: Table| {
         let project_dir = (*project_dir).clone();
+
+        // Shallow-merge defaults from config.lua (if present) into the user's
+        // table. Only keys not already present are added — user values win.
+        if let Ok(defaults) = lua.globals().get::<Table>("__ironcrew_config_defaults") {
+            for pair in defaults.pairs::<mlua::Value, mlua::Value>() {
+                let (key, value) = pair?;
+                if let mlua::Value::String(ref s) = key
+                    && !table.contains_key(s.clone())?
+                {
+                    table.set(key, value)?;
+                }
+            }
+        }
+
         let goal: String = table.get("goal")?;
         let provider: String = table
             .get::<String>("provider")

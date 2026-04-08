@@ -49,6 +49,27 @@ pub fn load_project(path: &Path) -> Result<ProjectLoader> {
 pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runtime>)> {
     let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
 
+    // Optionally load config.lua and store the resulting table as a Lua global.
+    // Crew.new() will shallow-merge missing keys from this table at call time.
+    if let Some(cfg_path) = loader.config_lua_path() {
+        let content = std::fs::read_to_string(&cfg_path).map_err(IronCrewError::Io)?;
+        let table: mlua::Table = lua
+            .load(&content)
+            .set_name(format!("config:{}", cfg_path.display()))
+            .eval()
+            .map_err(|e| {
+                IronCrewError::Validation(format!(
+                    "config.lua at {} must return a table: {}",
+                    cfg_path.display(),
+                    e
+                ))
+            })?;
+        lua.globals()
+            .set("__ironcrew_config_defaults", table)
+            .map_err(IronCrewError::Lua)?;
+        tracing::info!("Loaded config.lua from {}", cfg_path.display());
+    }
+
     // Register globals
     register_agent_constructor(&lua).map_err(IronCrewError::Lua)?;
 
