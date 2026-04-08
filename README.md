@@ -2,7 +2,7 @@
 
 **Build AI agent teams that work together.** IronCrew is a lightweight, high-performance framework for orchestrating multi-agent AI workflows. Write your agents, tasks, and logic in Lua — IronCrew handles parallel execution, tool calling, memory, and inter-agent communication in a single self-contained binary.
 
-Works with OpenAI, Google Gemini, Groq, Ollama, and any OpenAI-compatible API. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
+Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native), Google Gemini, Groq, Kimi K2.5, DeepSeek, xAI/Grok, Ollama, and any OpenAI-compatible API. Supports reasoning/thinking capture across providers. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
 ```lua
 local crew = Crew.new({
@@ -42,12 +42,15 @@ local results = crew:run()
 
 - **Lua scripting** — agents, tasks, tools, and orchestration defined in Lua
 - **Parallel execution** — independent tasks run concurrently within topological phases
-- **Provider-agnostic** — OpenAI, Gemini, Groq, Ollama, or any OpenAI-compatible API
+- **Three provider types** — OpenAI Chat Completions, Anthropic native Messages API, OpenAI Responses API (also works with Gemini, Groq, Kimi, DeepSeek, xAI, Ollama via OpenAI compat)
+- **Reasoning/thinking support** — captures chain-of-thought from Anthropic, DeepSeek, Kimi, and OpenAI Responses API; streams dim to stderr and persists to run records
+- **Server-side tools** — built-in `web_search`, `code_execution`, `file_search`, `code_interpreter` via Anthropic and OpenAI Responses
 - **Structured output** — JSON Schema `response_format` for validated LLM responses
 - **9 built-in tools** — file I/O, HTTP, hashing, templates, schema validation
 - **Memory & MessageBus** — shared state and agent-to-agent communication
 - **Collaborative tasks** — multi-agent discussions with automatic synthesis
 - **REST API + SSE** — run crews via HTTP with real-time event streaming
+- **Production-hardened** — CORS, SSRF protection, graceful shutdown, rate limiting, request/response size limits
 - **Single binary** — no runtime dependencies, Lua vendored and compiled in
 
 ## Quick Start
@@ -79,14 +82,20 @@ ironcrew run .
 | [CLI Reference](docs/cli.md) | All commands — run, validate, list, init, serve, inspect, clean |
 | [REST API](docs/rest-api.md) | Endpoints, SSE events, input parameters, Docker deployment |
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
-| [Providers](docs/providers.md) | OpenAI, Gemini, Groq, Ollama — configuration and tips |
+| [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
 
 ## Examples
 
 See [`examples/`](examples/) for working demos:
 
-`simple` · `research-crew` · `json-output` · `gemini` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `groq-json` · `http-api` · `batch-processing`
+**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `http-api` · `batch-processing`
+
+**Providers:** [`examples/providers/`](examples/providers/) contains 12 reference files covering every supported provider — OpenAI Chat, OpenAI Responses (basic, reasoning, web_search), Anthropic (basic, web_search, extended thinking), Gemini, Groq, Kimi K2.5, Kimi K2-thinking, and DeepSeek Reasoner.
+
+**Anthropic:** [`examples/anthropic/`](examples/anthropic/) — native provider with extended thinking and server-side web_search.
+
+**OpenAI Responses:** [`examples/responses/`](examples/responses/) — reasoning effort, streaming, built-in web search.
 
 ## License
 

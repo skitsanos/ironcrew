@@ -27,6 +27,12 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 - [x] **Anthropic Claude provider** — native Messages API with server-side tools (web_search, code_execution), extended thinking, and block-based streaming. Done in 2.2.0.
 
+- [x] **OpenAI Responses API provider** — native `/v1/responses` endpoint with reasoning items, built-in server-side tools (web_search, file_search, code_interpreter), and block-based streaming. Works with OpenAI, Azure, xAI/Grok, OpenRouter. Done in 2.3.0.
+
+- [x] **Cross-provider reasoning/thinking capture** — unified support for Anthropic thinking blocks, OpenAI Responses reasoning items, DeepSeek `reasoning_content`, Kimi/Moonshot `reasoning_content`. Streams dim to stderr, persists to run records, emits `task_thinking` SSE events. Done in 2.3.0.
+
+- [x] **Extended provider support** — URL-based auto-detection for Kimi/Moonshot, DeepSeek, xAI/Grok, and OpenRouter. Done in 2.3.0.
+
 - [x] **Agent hooks** — `before_task` and `after_task` Lua callbacks stored as bytecode. Done in 2.0.1.
 
 - [x] **Parallel foreach** — `foreach_parallel = true`. Done in 1.9.7.

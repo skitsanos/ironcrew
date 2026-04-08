@@ -193,10 +193,26 @@ local crew = Crew.new({
 
 ## Event System and Run History
 
-The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `CollaborationTurn`). These power the REST API's Server-Sent Events stream and structured logging.
+The orchestrator emits events throughout execution (`CrewStarted`, `PhaseStart`, `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `TaskSkipped`, `TaskThinking`, `CollaborationTurn`). These power the REST API's Server-Sent Events stream and structured logging. `TaskThinking` events carry model reasoning/thinking content for reasoning-capable providers (Anthropic, OpenAI Responses, DeepSeek, Kimi).
 
 Each `crew:run()` saves a `RunRecord` with task results, token usage, timing,
-tags, and status (success, partial failure, or failed).
+tags, reasoning (when captured), and status (success, partial failure, or failed).
+
+## Provider Architecture
+
+IronCrew supports three provider types via the `LlmProvider` trait:
+
+- **`OpenAiProvider`** (`provider = "openai"`) — Chat Completions API, works with
+  OpenAI, Gemini, Groq, Kimi, DeepSeek, Ollama, Azure, OpenRouter
+- **`AnthropicProvider`** (`provider = "anthropic"`) — native Messages API with
+  extended thinking, server-side web_search, prompt caching
+- **`OpenAiResponsesProvider`** (`provider = "openai-responses"`) — OpenAI
+  Responses API with first-class reasoning, built-in tools (web_search,
+  file_search, code_interpreter); also supports Azure, xAI/Grok, OpenRouter
+
+All three providers return a unified `ChatResponse` with optional `reasoning`
+content that flows through the executor into run records and `task_thinking`
+events. See [Providers](providers.md) for configuration details.
 
 Run records are persisted via a pluggable `StateStore` trait:
 

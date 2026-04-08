@@ -79,8 +79,15 @@ Use `${results.task_name.field}` to reference completed task data:
 | `${results.task_name.success}`        | `"true"` or `"false"`                    |
 | `${results.task_name.agent}`          | Name of the agent that handled the task  |
 | `${results.task_name.duration_ms}`    | Execution time in milliseconds           |
+| `${results.task_name.reasoning}`      | Reasoning/thinking captured from the model (if available) |
 
 Use `${env.VAR_NAME}` to reference environment variables.
+
+**Reasoning field:** When using reasoning-capable providers (Anthropic with
+`thinking_budget`, OpenAI Responses with `reasoning_effort`, DeepSeek Reasoner,
+Kimi K2-thinking), the model's chain-of-thought is captured in the `reasoning`
+field and persisted to the run record. This can be inspected via `ironcrew inspect`
+or rendered in a custom UI via the `task_thinking` SSE event.
 
 **Automatic dependency injection:** In addition to explicit interpolation, the engine
 automatically appends dependency outputs to the prompt (`Result from 'task_name': <output>`).

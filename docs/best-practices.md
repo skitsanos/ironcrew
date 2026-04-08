@@ -87,7 +87,21 @@ tasks and reserve capable models for reasoning. Set `models` on the crew or
 `model` on individual agents and tasks.
 
 **Streaming.** Enable `stream = true` on the crew or individual tasks to get
-LLM output as it arrives.
+LLM output as it arrives. When reasoning-capable providers are used
+(Anthropic thinking, OpenAI Responses reasoning, DeepSeek/Kimi reasoning), the
+reasoning deltas stream dim to stderr so you can watch the model's thought
+process unfold.
+
+**Reasoning/thinking.** For complex reasoning tasks, use
+`provider = "anthropic"` with `thinking_budget` or
+`provider = "openai-responses"` with `reasoning_effort = "medium"`. Both capture
+the reasoning in the run record for later inspection. Reasoning tokens count as
+output tokens and add cost, so reserve these for tasks that actually benefit
+from deeper thinking.
+
+**Server-side tools.** For research tasks, prefer built-in `web_search` via
+Anthropic or OpenAI Responses over custom HTTP tools — no SSRF concerns, proper
+citations, and one configuration flag instead of a whole tool implementation.
 
 ## Security
 

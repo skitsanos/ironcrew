@@ -251,9 +251,13 @@ be set in the shell or in `.env` files.
 | `OPENAI_API_KEY`  | Default API key for the OpenAI-compatible provider |
 | `OPENAI_BASE_URL` | Default base URL (e.g., `https://api.openai.com/v1`) |
 | `OPENAI_MODEL`    | Default model name (used in `.env` templates) |
+| `ANTHROPIC_API_KEY` | Required for `provider = "anthropic"`; auto-resolved when `base_url` contains `anthropic.com` |
 | `GEMINI_API_KEY`  | Auto-resolved when `base_url` contains `googleapis.com` or `gemini` |
 | `GROQ_API_KEY`    | Auto-resolved when `base_url` contains `groq.com` |
-| `ANTHROPIC_API_KEY` | Auto-resolved when `base_url` contains `anthropic.com` |
+| `MOONSHOT_API_KEY` | Auto-resolved when `base_url` contains `moonshot.ai` or `moonshot.cn` (Kimi K2.5) |
+| `DEEPSEEK_API_KEY` | Auto-resolved when `base_url` contains `deepseek.com` |
+| `XAI_API_KEY`     | Auto-resolved when `base_url` contains `x.ai` (Grok) |
+| `OPENROUTER_API_KEY` | Auto-resolved when `base_url` contains `openrouter.ai` |
 | `IRONCREW_LOG`    | Log level filter (e.g., `info`, `debug`, `trace`, `warn`, `error`) |
 | `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
 | `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls (e.g., `200` for 5 req/sec) |
