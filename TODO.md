@@ -25,7 +25,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 
 ## High Value, Medium Effort
 
-- [x] **Anthropic Claude provider** — native Messages API with server-side tools (web_search, code_execution), extended thinking, and block-based streaming. Done in 2.2.0.
+- [x] **Anthropic Claude provider** — native Messages API with server-side tools (web_search, code_execution), extended thinking, and block-based streaming. Done in 2.3.0.
 
 - [x] **OpenAI Responses API provider** — native `/v1/responses` endpoint with reasoning items, built-in server-side tools (web_search, file_search, code_interpreter), and block-based streaming. Works with OpenAI, Azure, xAI/Grok, OpenRouter. Done in 2.3.0.
 

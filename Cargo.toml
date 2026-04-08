@@ -1,6 +1,6 @@
 [package]
 name = "ironcrew"
-version = "2.1.0"
+version = "2.3.0"
 edition = "2024"
 description = "A runtime for Lua-defined AI agent crews"
 license = "MIT"
