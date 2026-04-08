@@ -11,6 +11,9 @@ use crate::engine::model_router::ModelRouter;
 use crate::engine::runtime::Runtime;
 use crate::llm::anthropic::{AnthropicConfig, AnthropicProvider, ServerTool};
 use crate::llm::openai::OpenAiProvider;
+use crate::llm::openai_responses::{
+    OpenAiResponsesProvider, ResponsesConfig, ServerTool as ResponsesServerTool,
+};
 use crate::llm::provider::LlmProvider;
 use crate::utils::error::IronCrewError;
 
@@ -83,9 +86,12 @@ pub fn register_crew_constructor(
             table.get::<Option<usize>>("max_concurrent").ok().flatten();
         let normalized_provider = provider.to_lowercase();
 
-        if !matches!(normalized_provider.as_str(), "openai" | "anthropic") {
+        if !matches!(
+            normalized_provider.as_str(),
+            "openai" | "anthropic" | "openai-responses"
+        ) {
             return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                "Unsupported provider '{}'. Supported: 'openai', 'anthropic'.",
+                "Unsupported provider '{}'. Supported: 'openai', 'anthropic', 'openai-responses'.",
                 provider
             ))));
         }
@@ -142,6 +148,84 @@ pub fn register_crew_constructor(
                     key,
                     base_url.clone(),
                     anthropic_config,
+                )))
+            } else if normalized_provider == "openai-responses" {
+                // OpenAI Responses API (also supports Azure, xAI/Grok, OpenRouter)
+                let key = api_key
+                    .clone()
+                    .or_else(|| {
+                        if let Some(ref url) = base_url
+                            && url.contains("x.ai")
+                        {
+                            return std::env::var("XAI_API_KEY").ok();
+                        }
+                        None
+                    })
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    .filter(|k| !k.trim().is_empty())
+                    .ok_or_else(|| {
+                        mlua::Error::external(IronCrewError::Validation(
+                            "openai-responses provider requires an api_key or OPENAI_API_KEY env var"
+                                .to_string(),
+                        ))
+                    })?;
+
+                // Parse Responses-specific config
+                let reasoning_effort: Option<String> = table.get("reasoning_effort").ok();
+                let reasoning_summary: Option<String> = table.get("reasoning_summary").ok();
+
+                let server_tools_list: Vec<String> = table
+                    .get::<mlua::Table>("server_tools")
+                    .map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let file_search_vector_store_ids: Vec<String> = table
+                    .get::<mlua::Table>("file_search_vector_store_ids")
+                    .map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let file_search_max_results: Option<u32> =
+                    table.get("file_search_max_results").ok();
+
+                let web_search_context_size: Option<String> =
+                    table.get("web_search_context_size").ok();
+
+                let server_tools: Vec<ResponsesServerTool> = server_tools_list
+                    .iter()
+                    .filter_map(|name| match name.as_str() {
+                        "web_search" => Some(ResponsesServerTool::WebSearch {
+                            context_size: web_search_context_size.clone(),
+                        }),
+                        "file_search" => Some(ResponsesServerTool::FileSearch {
+                            vector_store_ids: file_search_vector_store_ids.clone(),
+                            max_num_results: file_search_max_results,
+                        }),
+                        "code_interpreter" => Some(ResponsesServerTool::CodeInterpreter),
+                        other => {
+                            tracing::warn!("Unknown Responses server tool: '{}'", other);
+                            None
+                        }
+                    })
+                    .collect();
+
+                let responses_config = ResponsesConfig {
+                    reasoning_effort,
+                    reasoning_summary,
+                    server_tools,
+                };
+
+                Some(Arc::new(OpenAiResponsesProvider::new(
+                    key,
+                    base_url.clone(),
+                    responses_config,
                 )))
             } else if api_key.is_some() || base_url.is_some() {
                 // OpenAI with custom settings
