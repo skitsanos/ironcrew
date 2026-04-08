@@ -245,6 +245,18 @@ pub fn register_crew_constructor(
                             if url.contains("anthropic.com") {
                                 return std::env::var("ANTHROPIC_API_KEY").ok();
                             }
+                            if url.contains("moonshot.ai") || url.contains("moonshot.cn") {
+                                return std::env::var("MOONSHOT_API_KEY").ok();
+                            }
+                            if url.contains("deepseek.com") {
+                                return std::env::var("DEEPSEEK_API_KEY").ok();
+                            }
+                            if url.contains("x.ai") {
+                                return std::env::var("XAI_API_KEY").ok();
+                            }
+                            if url.contains("openrouter.ai") {
+                                return std::env::var("OPENROUTER_API_KEY").ok();
+                            }
                         }
                         None
                     })
