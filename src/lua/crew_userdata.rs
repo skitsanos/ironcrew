@@ -12,6 +12,7 @@ use crate::llm::provider::LlmProvider;
 use crate::utils::error::IronCrewError;
 
 use super::conversation::build_conversation;
+use super::dialog::build_dialog;
 use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
 use super::parsers::{agent_from_lua_table, load_agents_from_files, task_from_lua_table};
 
@@ -383,6 +384,30 @@ impl UserData for LuaCrew {
                 max_tool_rounds,
             )?;
             Ok(conv)
+        });
+
+        // crew:dialog({agent_a = ..., agent_b = ..., starter = ..., ...})
+        // Creates an agent-to-agent dialog with perspective-flipped histories.
+        methods.add_async_method("dialog", |_, this, table: Table| async move {
+            let crew = this.crew.lock().await;
+            let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
+                Some(p) => p.clone(),
+                None => this.runtime.provider.clone(),
+            };
+            let agents: Vec<crate::engine::agent::Agent> = crew.agents.clone();
+            let default_model = crew.provider_config.model.clone();
+            let max_tool_rounds = crew.max_tool_rounds;
+            drop(crew);
+
+            let dialog = build_dialog(
+                table,
+                &agents,
+                provider,
+                this.runtime.tool_registry.clone(),
+                &default_model,
+                max_tool_rounds,
+            )?;
+            Ok(dialog)
         });
 
         methods.add_async_method("run", |lua, this, ()| async move {

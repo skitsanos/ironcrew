@@ -160,11 +160,66 @@ conv:reset()
 
 **Limitations (current):**
 
-- Single-agent only — agent-to-agent conversations are planned for a future release
+- Single-agent only (use `crew:dialog({})` below for two-agent conversations)
 - No cross-run persistence — conversations live for the duration of one `crew:run()` script
 - Stderr-only event tracing — full SSE wiring (`conversation_message`, `conversation_thinking` events) is planned to mirror the task event flow
 
 See [`examples/conversation/`](../examples/conversation/) for a working example.
+
+---
+
+## Agent Dialog (Agent-to-Agent)
+
+Two agents take turns responding to each other with **perspective-flipped**
+message histories — each agent sees its own past turns as `assistant` messages
+and the opponent's turns as `user` messages prefixed with the opponent's name.
+
+```lua
+local debate = crew:dialog({
+    agent_a = "bull",                  -- agent name (or inline Agent.new())
+    agent_b = "bear",
+    starter = "Should we buy NVDA?",
+    max_turns = 4,                     -- total turns combined (2 each here)
+    starting_speaker = "a",            -- "a" (default) or "b"
+    stream = true,                     -- prefix output with [agent_name] on stderr
+    max_history = 30,                  -- optional cap on retained turns
+})
+
+-- Run the entire dialog and return the transcript
+local transcript = debate:run()
+-- transcript = { {index=0, speaker="a", agent="bull", content="...", reasoning="..."}, ... }
+
+-- Or step through interactively
+local turn = debate:next_turn()        -- runs one turn, returns {index, speaker, agent, content, reasoning}
+local count = debate:turn_count()      -- completed turns
+local active = debate:current_speaker() -- "a", "b", or nil if finished
+debate:reset()                          -- clear transcript and rewind
+```
+
+**How perspective-flipping works:**
+
+For each agent's turn, the engine builds a fresh message list from that
+agent's viewpoint:
+- **System** = that agent's `system_prompt`
+- **Starter** → `role: "user"` (the kickoff prompt)
+- **Their own previous turns** → `role: "assistant"`
+- **Opponent's previous turns** → `role: "user"`, prefixed with `[opponent_name]:`
+
+This way, each agent has a coherent first-person view of the dialog without
+maintaining separate histories.
+
+**Use cases:**
+
+- Bull-vs-bear analysis debates (see [`examples/stock-debate/`](../examples/stock-debate/))
+- Devil's advocate review of a proposal
+- Two specialists discussing a problem from different angles
+- Agent personality testing across many turns
+
+**Limitations:**
+
+- Two agents only (multi-party round-robin or moderator-driven dialog is future work)
+- No early termination via Lua callback (only `max_turns` is supported)
+- Stderr-only event tracing (full SSE event flow planned)
 
 ---
 

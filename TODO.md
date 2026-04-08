@@ -79,8 +79,10 @@ Sorted by value/effort ratio: high-value low-effort items first.
 ## Medium Value, Medium Effort
 
 - [x] **Conversation mode** — single-agent multi-turn chat via `crew:conversation({...})` with tool support, streaming to stderr, reasoning capture, and `max_history` cap. Done in 2.4.0.
-  - [ ] **Agent-to-agent conversations** — two agents conversing via turn-taking with separate perspectives
-  - [ ] **Conversation SSE wiring** — emit `conversation_message` / `conversation_thinking` events through the EventBus (currently stderr only)
+- [x] **Agent-to-agent conversations** — `crew:dialog({})` runs perspective-flipped two-agent dialogs (each agent sees its own turns as assistant, opponent's as user with `[name]:` prefix). Includes `run`, `next_turn`, `reset`, transcript inspection. Done in 2.4.0.
+  - [ ] **Multi-party dialogs** — round-robin or moderator-driven conversations with 3+ agents
+  - [ ] **Custom termination** — Lua callback to end a dialog early (e.g., on agreement detection)
+  - [ ] **Conversation/Dialog SSE wiring** — emit events through the EventBus (currently stderr only)
   - [ ] **Cross-run persistence** — save/load conversation state by ID
 
 - [ ] **Cost estimation** — pre-run estimate of token usage and cost based on prompt sizes and model pricing.
