@@ -264,6 +264,9 @@ pub async fn run_crew(
 
     let mut results: HashMap<String, TaskResult> = HashMap::new();
     let mut failed_tasks: HashSet<String> = HashSet::new();
+    // Track task names already persisted to memory, so we only write each once
+    // across phases (previously the loop re-wrote every successful result every phase).
+    let mut persisted_to_memory: HashSet<String> = HashSet::new();
 
     // Collect error handler task names so we can skip them in normal execution
     let error_handler_names: HashSet<&str> = crew
@@ -706,9 +709,11 @@ pub async fn run_crew(
         )
         .await?;
 
-        // Store successful task results in memory
+        // Store successful task results in memory. Only persist each task
+        // once across all phases — previously this loop iterated the whole
+        // results map every phase and re-wrote already-stored entries.
         for (task_name, result) in &results {
-            if result.success {
+            if result.success && persisted_to_memory.insert(task_name.clone()) {
                 let value = serde_json::json!({
                     "output": result.output,
                     "agent": result.agent,
@@ -742,8 +747,15 @@ pub async fn run_crew(
         }
     }
 
-    // Persist memory if using persistent backend
-    crew.memory.save().await.ok();
+    // Persist memory if using persistent backend. Log and emit a warning
+    // event on failure — operators should know if durable state is lost.
+    if let Err(e) = crew.memory.save().await {
+        tracing::error!("Failed to persist memory at end of run: {}", e);
+        crew.eventbus.emit(CrewEvent::Log {
+            level: "error".into(),
+            message: format!("Memory persistence failed: {}", e),
+        });
+    }
 
     // Note: RunComplete is NOT emitted here — the API handler is responsible
     // for emitting it with the correct run_id after the Lua script fully completes.
