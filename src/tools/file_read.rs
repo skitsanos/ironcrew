@@ -77,6 +77,33 @@ impl Tool for FileReadTool {
             })?;
 
         let validated = self.validate_path(path)?;
+
+        // Check file size BEFORE reading the whole file into memory.
+        let max_bytes: u64 = std::env::var("IRONCREW_FILE_READ_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10 * 1024 * 1024); // 10 MB default
+
+        let metadata =
+            tokio::fs::metadata(&validated)
+                .await
+                .map_err(|e| IronCrewError::ToolExecution {
+                    tool: "file_read".into(),
+                    message: format!("Failed to stat '{}': {}", path, e),
+                })?;
+
+        if metadata.len() > max_bytes {
+            return Err(IronCrewError::ToolExecution {
+                tool: "file_read".into(),
+                message: format!(
+                    "File '{}' is {} bytes, exceeds limit of {} bytes (set IRONCREW_FILE_READ_MAX_BYTES to override)",
+                    path,
+                    metadata.len(),
+                    max_bytes
+                ),
+            });
+        }
+
         tokio::fs::read_to_string(&validated)
             .await
             .map_err(|e| IronCrewError::ToolExecution {

@@ -102,13 +102,47 @@ impl Tool for WebScrapeTool {
                 message: format!("Failed to fetch '{}': {}", url, e),
             })?;
 
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| IronCrewError::ToolExecution {
+        // Cap HTML bytes BEFORE parsing into the DOM. Very large HTML
+        // documents can cause quadratic parser behavior and consume
+        // disproportionate RAM during DOM construction.
+        let max_html_bytes: usize = std::env::var("IRONCREW_WEB_SCRAPE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2 * 1024 * 1024); // 2 MB default
+
+        if let Some(len) = resp.content_length()
+            && len as usize > max_html_bytes
+        {
+            return Err(IronCrewError::ToolExecution {
+                tool: "web_scrape".into(),
+                message: format!(
+                    "HTML response too large: {} bytes (limit: {} bytes)",
+                    len, max_html_bytes
+                ),
+            });
+        }
+
+        // Stream with byte cap (handles chunked responses with no header).
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut html_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| IronCrewError::ToolExecution {
                 tool: "web_scrape".into(),
                 message: format!("Failed to read response: {}", e),
             })?;
+            if html_bytes.len() + chunk.len() > max_html_bytes {
+                return Err(IronCrewError::ToolExecution {
+                    tool: "web_scrape".into(),
+                    message: format!(
+                        "HTML response exceeded max size of {} bytes while streaming",
+                        max_html_bytes
+                    ),
+                });
+            }
+            html_bytes.extend_from_slice(&chunk);
+        }
+        let html = String::from_utf8_lossy(&html_bytes).into_owned();
 
         let document = Html::parse_document(&html);
         let body_selector = Selector::parse("body").unwrap();
