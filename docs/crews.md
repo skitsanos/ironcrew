@@ -289,9 +289,45 @@ moderator that produces structured JSON synthesis.
 - Two specialists discussing a problem from different angles
 - Agent personality testing across many turns
 
+### Moderator-driven speaker selection
+
+Instead of round-robin, pass a `turn_selector` Lua function that decides
+who speaks next. The callback receives the transcript so far and the list of
+agent names, and returns the name of the next speaker.
+
+```lua
+local moderator = crew:conversation({ agent = "facilitator" })
+
+local dialog = crew:dialog({
+    agents = { "product", "engineering", "customer_success" },
+    starter = "Should we launch next Tuesday?",
+    max_turns = 6,
+    turn_selector = function(transcript, agents)
+        if #transcript == 0 then return "product" end
+        -- Ask the facilitator agent who should speak next
+        return moderator:send("Who should speak next? " .. format(transcript))
+    end,
+})
+local transcript = dialog:run()
+```
+
+The callback is called via `call_async`, so it can call async methods like
+`moderator:send()`. You can also use the simpler `dialog:next_turn_from(name)`
+method for fully manual control in a loop:
+
+```lua
+for i = 1, 6 do
+    local next = moderator:send("Who next?")
+    local turn = dialog:next_turn_from(next)
+    if not turn then break end
+end
+```
+
+See [`examples/moderator-dialog/`](../examples/moderator-dialog/) for a
+complete implementation with an LLM-driven facilitator.
+
 **Limitations:**
 
-- Two agents only (multi-party round-robin or moderator-driven dialog is future work)
 - No early termination via Lua callback (only `max_turns` is supported)
 
 **SSE events:** Dialogs emit `dialog_started`, `dialog_turn`,

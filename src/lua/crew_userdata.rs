@@ -411,6 +411,7 @@ impl UserData for LuaCrew {
             drop(crew);
 
             let dialog = build_dialog(
+                &lua,
                 table,
                 &agents,
                 provider,

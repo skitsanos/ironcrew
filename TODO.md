@@ -82,7 +82,7 @@ Sorted by value/effort ratio: high-value low-effort items first.
 - [x] **Agent-to-agent conversations** — `crew:dialog({})` runs perspective-flipped two-agent dialogs (each agent sees its own turns as assistant, opponent's as user with `[name]:` prefix). Includes `run`, `next_turn`, `reset`, transcript inspection. Done in 2.4.0.
 - [x] **Conversation/Dialog SSE wiring** — both primitives emit dedicated events (`conversation_started`/`turn`/`thinking` and `dialog_started`/`turn`/`thinking`/`completed`) through the EventBus. REST API subscribers see them in real time alongside task events. Each event includes a stable `conversation_id` / `dialog_id`. Done in 2.4.0.
 - [x] **Multi-party dialogs** — `crew:dialog({agents = {...}})` supports 2+ agents in round-robin order. Speaker tracked by index, SSE events use positional letter labels (`"a"`, `"b"`, `"c"`, ...). Backward compatible with the legacy `agent_a`/`agent_b` form. Done in 2.4.0.
-  - [ ] **Moderator-driven dialogs** — let a separate agent (or Lua callback) decide who speaks next instead of round-robin
+- [x] **Moderator-driven dialogs** — `turn_selector` Lua callback invoked via `call_async` (supports async methods like `moderator:send()`). Also `dialog:next_turn_from(agent_name)` for manual control. Done in 2.4.0.
   - [ ] **Custom termination** — Lua callback to end a dialog early (e.g., on agreement detection)
   - [ ] **Cross-run persistence** — save/load conversation state by ID
 
