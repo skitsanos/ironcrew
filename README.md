@@ -91,7 +91,7 @@ ironcrew run .
 
 See [`examples/`](examples/) for working demos:
 
-**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable`
+**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable` · `moderator-dialog`
 
 **Providers:** [`examples/providers/`](examples/providers/) contains 12 reference files covering every supported provider — OpenAI Chat, OpenAI Responses (basic, reasoning, web_search), Anthropic (basic, web_search, extended thinking), Gemini, Groq, Kimi K2.5, Kimi K2-thinking, and DeepSeek Reasoner.
 

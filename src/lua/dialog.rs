@@ -85,6 +85,11 @@ pub struct AgentDialog {
     /// Tracks whether dialog_completed has been emitted (set to true after run_all
     /// reaches max_turns) so it isn't emitted twice for the same dialog.
     pub completed_emitted: Mutex<bool>,
+
+    /// Optional Lua callback for selecting the next speaker.
+    /// Signature: `function(transcript_table, agents_table) -> agent_name`
+    /// Stored as a registry key for thread safety. When `None`, round-robin.
+    pub turn_selector_key: Option<mlua::RegistryKey>,
 }
 
 impl AgentDialog {
@@ -103,6 +108,7 @@ impl AgentDialog {
         max_tool_rounds: usize,
         starting_speaker: usize,
         eventbus: EventBus,
+        turn_selector_key: Option<mlua::RegistryKey>,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
@@ -134,17 +140,111 @@ impl AgentDialog {
             next_index: Mutex::new(0),
             eventbus,
             completed_emitted: Mutex::new(false),
+            turn_selector_key,
         }
     }
 
-    /// Returns the index of the agent that should speak next, or None if the
-    /// dialog is over. Round-robin starting from `starting_speaker`.
-    async fn next_speaker(&self) -> Option<usize> {
+    /// Returns `true` if the dialog has not reached `max_turns` yet.
+    async fn has_turns_remaining(&self) -> bool {
+        *self.next_index.lock().await < self.max_turns
+    }
+
+    /// Default round-robin speaker selection.
+    async fn round_robin_speaker(&self) -> usize {
         let next_idx = *self.next_index.lock().await;
-        if next_idx >= self.max_turns {
-            return None;
+        (self.starting_speaker + next_idx) % self.agents.len()
+    }
+
+    /// Resolve the next speaker — uses turn_selector callback if present,
+    /// otherwise falls back to round-robin.
+    async fn select_speaker(&self, lua: &mlua::Lua) -> Result<usize, IronCrewError> {
+        if let Some(ref key) = self.turn_selector_key {
+            let func: mlua::Function = lua
+                .registry_value(key)
+                .map_err(|e| IronCrewError::Validation(format!("turn_selector callback: {}", e)))?;
+
+            // Build transcript table for the callback
+            let transcript = self.transcript.lock().await;
+            let transcript_table = lua
+                .create_table()
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+            for (i, turn) in transcript.iter().enumerate() {
+                let entry = lua
+                    .create_table()
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+                entry
+                    .set("index", turn.index)
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+                entry
+                    .set("speaker", speaker_label(turn.speaker_index))
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+                entry
+                    .set("agent", turn.agent_name.clone())
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+                entry
+                    .set("content", turn.content.clone())
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+                transcript_table
+                    .set(i + 1, entry)
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+            }
+            drop(transcript);
+
+            // Build agents name table
+            let agents_table = lua
+                .create_table()
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+            for (i, a) in self.agents.iter().enumerate() {
+                agents_table
+                    .set(i + 1, a.name.clone())
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+            }
+
+            // Call the callback (supports async methods like moderator:send())
+            let result: String = func
+                .call_async((transcript_table, agents_table))
+                .await
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("turn_selector returned error: {}", e))
+                })?;
+
+            // Resolve agent name to index
+            let name = result.trim();
+            self.agents
+                .iter()
+                .position(|a| a.name == name)
+                .ok_or_else(|| {
+                    IronCrewError::Validation(format!(
+                        "turn_selector returned unknown agent '{}'. Valid: [{}]",
+                        name,
+                        self.agents
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })
+        } else {
+            Ok(self.round_robin_speaker().await)
         }
-        Some((self.starting_speaker + next_idx) % self.agents.len())
+    }
+
+    /// Resolve an agent name to its index in this dialog.
+    fn agent_index(&self, name: &str) -> Result<usize, IronCrewError> {
+        self.agents
+            .iter()
+            .position(|a| a.name == name)
+            .ok_or_else(|| {
+                IronCrewError::Validation(format!(
+                    "Agent '{}' not in this dialog. Participants: [{}]",
+                    name,
+                    self.agents
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
     }
 
     /// Build the message list from the perspective of the agent at `speaker_index`.
@@ -188,13 +288,33 @@ impl AgentDialog {
         messages
     }
 
-    /// Run a single turn (the next speaker's reply) and append it to the transcript.
+    /// Run a single turn with automatic speaker selection (round-robin or callback).
     /// Returns `None` if the dialog has already reached max_turns.
-    pub async fn run_one_turn(&self) -> Result<Option<DialogTurn>, IronCrewError> {
-        let Some(speaker_index) = self.next_speaker().await else {
+    pub async fn run_one_turn(&self, lua: &mlua::Lua) -> Result<Option<DialogTurn>, IronCrewError> {
+        if !self.has_turns_remaining().await {
             return Ok(None);
-        };
+        }
+        let speaker_index = self.select_speaker(lua).await?;
+        self.execute_turn(speaker_index).await.map(Some)
+    }
 
+    /// Run a turn for a specific agent by name. Useful for moderator-driven
+    /// loops where the caller picks who speaks next.
+    /// Returns `None` if max_turns is reached.
+    pub async fn run_turn_for(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<DialogTurn>, IronCrewError> {
+        if !self.has_turns_remaining().await {
+            return Ok(None);
+        }
+        let speaker_index = self.agent_index(agent_name)?;
+        self.execute_turn(speaker_index).await.map(Some)
+    }
+
+    /// Execute a turn for the agent at `speaker_index`. Increments the turn
+    /// counter and emits SSE events.
+    async fn execute_turn(&self, speaker_index: usize) -> Result<DialogTurn, IronCrewError> {
         let agent = self.agents[speaker_index].clone();
         let messages = self.build_messages(speaker_index).await;
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
@@ -326,7 +446,7 @@ impl AgentDialog {
             }
         }
 
-        Ok(Some(turn))
+        Ok(turn)
     }
 
     async fn call_streaming(&self, request: ChatRequest) -> Result<ChatResponse, IronCrewError> {
@@ -389,9 +509,9 @@ impl AgentDialog {
     }
 
     /// Run all remaining turns sequentially.
-    pub async fn run_all(&self) -> Result<Vec<DialogTurn>, IronCrewError> {
+    pub async fn run_all(&self, lua: &mlua::Lua) -> Result<Vec<DialogTurn>, IronCrewError> {
         loop {
-            let turn = self.run_one_turn().await?;
+            let turn = self.run_one_turn(lua).await?;
             if turn.is_none() {
                 break;
             }
@@ -404,18 +524,36 @@ impl UserData for AgentDialog {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // dialog:run() — run all turns and return the full transcript
         methods.add_async_method("run", |lua, this, ()| async move {
-            let transcript = this.run_all().await.map_err(mlua::Error::external)?;
+            let transcript = this.run_all(&lua).await.map_err(mlua::Error::external)?;
             transcript_to_lua(&lua, &transcript)
         });
 
-        // dialog:next_turn() — run a single turn, returns the turn or nil
+        // dialog:next_turn() — run a single turn (round-robin or callback), returns the turn or nil
         methods.add_async_method("next_turn", |lua, this, ()| async move {
-            let turn = this.run_one_turn().await.map_err(mlua::Error::external)?;
+            let turn = this
+                .run_one_turn(&lua)
+                .await
+                .map_err(mlua::Error::external)?;
             match turn {
                 Some(t) => Ok(Value::Table(turn_to_lua(&lua, &t)?)),
                 None => Ok(Value::Nil),
             }
         });
+
+        // dialog:next_turn_from(agent_name) — force a specific agent to speak next
+        methods.add_async_method(
+            "next_turn_from",
+            |lua, this, agent_name: String| async move {
+                let turn = this
+                    .run_turn_for(&agent_name)
+                    .await
+                    .map_err(mlua::Error::external)?;
+                match turn {
+                    Some(t) => Ok(Value::Table(turn_to_lua(&lua, &t)?)),
+                    None => Ok(Value::Nil),
+                }
+            },
+        );
 
         // dialog:transcript() — get the current transcript
         methods.add_async_method("transcript", |lua, this, ()| async move {
@@ -428,17 +566,24 @@ impl UserData for AgentDialog {
             Ok(*this.next_index.lock().await)
         });
 
-        // dialog:current_speaker() — "a", "b", "c", ... or nil if finished
+        // dialog:current_speaker() — positional letter ("a", "b", ...) or nil if finished
         methods.add_async_method("current_speaker", |_, this, ()| async move {
-            Ok(this.next_speaker().await.map(speaker_label))
+            if this.has_turns_remaining().await {
+                let idx = this.round_robin_speaker().await;
+                Ok(Some(speaker_label(idx)))
+            } else {
+                Ok(None)
+            }
         });
 
-        // dialog:current_agent() — name of the next agent to speak, or nil if finished
+        // dialog:current_agent() — name of the next agent to speak (round-robin), or nil
         methods.add_async_method("current_agent", |_, this, ()| async move {
-            Ok(this
-                .next_speaker()
-                .await
-                .map(|idx| this.agents[idx].name.clone()))
+            if this.has_turns_remaining().await {
+                let idx = this.round_robin_speaker().await;
+                Ok(Some(this.agents[idx].name.clone()))
+            } else {
+                Ok(None)
+            }
         });
 
         // dialog:agents() — list of agent names participating in this dialog
@@ -486,6 +631,7 @@ fn transcript_to_lua(lua: &mlua::Lua, transcript: &[DialogTurn]) -> mlua::Result
 /// `agents = {"name", ...}` array OR the legacy `agent_a` / `agent_b` form.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dialog(
+    lua: &mlua::Lua,
     table: Table,
     crew_agents: &[Agent],
     provider: Arc<dyn LlmProvider>,
@@ -580,6 +726,14 @@ pub fn build_dialog(
         .ok()
         .unwrap_or_else(|| crew_default_model.to_string());
 
+    // Optional turn_selector callback — stored in the Lua registry for thread safety
+    let turn_selector_key: Option<mlua::RegistryKey> =
+        if let Ok(func) = table.get::<mlua::Function>("turn_selector") {
+            Some(lua.create_registry_value(func)?)
+        } else {
+            None
+        };
+
     Ok(AgentDialog::new(
         dialog_agents,
         provider,
@@ -592,6 +746,7 @@ pub fn build_dialog(
         crew_max_tool_rounds,
         starting_speaker,
         eventbus,
+        turn_selector_key,
     ))
 }
 
