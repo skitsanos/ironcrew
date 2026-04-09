@@ -193,17 +193,29 @@ API keys are masked in output (only the first 8 characters are shown).
 
 ### runs
 
-List past run history for a project.
+List past run history for a project. Output is paginated so very large run
+histories don't blow up memory or the terminal.
 
 ```
 ironcrew runs -p .
 ironcrew runs -p . --status success
+ironcrew runs -p . --tag prod --limit 50
+ironcrew runs -p . --since 2026-03-01T00:00:00Z
+ironcrew runs -p . --limit 20 --offset 40   # page 3
 ```
 
 | Flag           | Default | Description |
 |----------------|---------|-------------|
 | `-p, --project`| `.`     | Project path (locates `.ironcrew/runs/`) |
 | `-s, --status` | (all)   | Filter by status: `success`, `partial_failure`, `failed` |
+| `-t, --tag`    | (all)   | Filter by tag (exact match against the run's tag list) |
+| `--since`      | (all)   | Only include runs started at or after this RFC3339 timestamp |
+| `-l, --limit`  | `20`    | Maximum number of runs to return |
+| `-o, --offset` | `0`     | Skip the first N runs (use to page through older results) |
+
+The listing uses a metadata-only summary view, so listing runs never pays to
+load per-task outputs from disk/DB. Fetch the full record with
+`ironcrew inspect <run_id>` when you need the task results.
 
 ### inspect
 
@@ -308,6 +320,8 @@ be set in the shell or in `.env` files.
 | `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) |
 | `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`). Only alphanumeric and underscore allowed |
 | `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (default: `10`) |
+| `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` when `limit` is not provided. Default: `20` |
+| `IRONCREW_RUNS_MAX_LIMIT` | Hard cap on `limit` for `GET /flows/{flow}/runs`. A client asking for more is silently clamped. Default: `100` |
 
 ### .env File Loading
 

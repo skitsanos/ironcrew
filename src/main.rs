@@ -120,6 +120,18 @@ enum Commands {
         /// Filter by status: success, partial_failure, failed
         #[arg(short, long)]
         status: Option<String>,
+        /// Filter by tag
+        #[arg(short, long)]
+        tag: Option<String>,
+        /// Only show runs started at or after this RFC3339 timestamp
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of runs to return (default 20)
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        /// Skip the first N runs (for pagination)
+        #[arg(short, long, default_value_t = 0)]
+        offset: usize,
         /// Project path (to find .ironcrew/runs/)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
@@ -154,8 +166,23 @@ async fn main() {
         Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
         Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
         Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
-        Commands::Runs { status, project } => {
-            cli::history::cmd_runs(&project, status.as_deref()).await
+        Commands::Runs {
+            status,
+            tag,
+            since,
+            limit,
+            offset,
+            project,
+        } => {
+            cli::history::cmd_runs(
+                &project,
+                status.as_deref(),
+                tag.as_deref(),
+                since.as_deref(),
+                limit,
+                offset,
+            )
+            .await
         }
     };
 

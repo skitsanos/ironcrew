@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use super::run_history::{RunRecord, RunStatus};
+use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
 use super::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -187,6 +187,136 @@ impl StateStore for SqliteStore {
             records.push(record);
         }
         Ok(records)
+    }
+
+    async fn list_runs_summary(
+        &self,
+        filter: &ListRunsFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunSummary>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        // Build WHERE clause dynamically. NOTE: we never select task_results.
+        let mut sql = String::from(
+            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, \
+             agent_count, task_count, total_tokens, cached_tokens, tags \
+             FROM runs",
+        );
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut next_idx = 1usize;
+
+        if let Some(ref status) = filter.status {
+            where_clauses.push(format!("status = ?{}", next_idx));
+            params.push(Box::new(status.clone()));
+            next_idx += 1;
+        }
+        if let Some(ref since) = filter.since {
+            where_clauses.push(format!("started_at >= ?{}", next_idx));
+            params.push(Box::new(since.clone()));
+            next_idx += 1;
+        }
+        // Tag filter uses LIKE on the JSON text — good enough for small tag
+        // sets. Quotes are added so "foo" doesn't accidentally match "foobar".
+        if let Some(ref tag) = filter.tag {
+            where_clauses.push(format!("tags LIKE ?{}", next_idx));
+            params.push(Box::new(format!("%\"{}\"%", tag)));
+            next_idx += 1;
+        }
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY started_at DESC");
+
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT ?{}", next_idx));
+            params.push(Box::new(limit as i64));
+            next_idx += 1;
+            if offset > 0 {
+                sql.push_str(&format!(" OFFSET ?{}", next_idx));
+                params.push(Box::new(offset as i64));
+            }
+        }
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let status_str: String = row.get(2)?;
+                let tags_json: String = row.get(10)?;
+                Ok(RunSummary {
+                    run_id: row.get(0)?,
+                    flow_name: row.get(1)?,
+                    status: match status_str.as_str() {
+                        "success" => RunStatus::Success,
+                        "partial_failure" => RunStatus::PartialFailure,
+                        _ => RunStatus::Failed,
+                    },
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    duration_ms: row.get::<_, i64>(5)? as u64,
+                    agent_count: row.get::<_, i64>(6)? as usize,
+                    task_count: row.get::<_, i64>(7)? as usize,
+                    total_tokens: row.get::<_, i64>(8)? as u32,
+                    cached_tokens: row.get::<_, i64>(9)? as u32,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
+
+        let mut summaries = Vec::new();
+        for summary in rows.flatten() {
+            summaries.push(summary);
+        }
+        Ok(summaries)
+    }
+
+    async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut sql = String::from("SELECT COUNT(*) FROM runs");
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut next_idx = 1usize;
+
+        if let Some(ref status) = filter.status {
+            where_clauses.push(format!("status = ?{}", next_idx));
+            params.push(Box::new(status.clone()));
+            next_idx += 1;
+        }
+        if let Some(ref since) = filter.since {
+            where_clauses.push(format!("started_at >= ?{}", next_idx));
+            params.push(Box::new(since.clone()));
+            next_idx += 1;
+        }
+        if let Some(ref tag) = filter.tag {
+            where_clauses.push(format!("tags LIKE ?{}", next_idx));
+            params.push(Box::new(format!("%\"{}\"%", tag)));
+        }
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+            .map_err(|e| IronCrewError::Validation(format!("SQLite count error: {}", e)))?;
+        Ok(count as u64)
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {

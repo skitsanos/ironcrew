@@ -272,27 +272,51 @@ All IronCrew features use the same store:
 | Feature | Store operation |
 |---------|----------------|
 | `crew:run()` | `save_run` — saves the run record after execution |
-| `ironcrew runs` | `list_runs` — lists records, optional status filter |
+| `ironcrew runs` | `list_runs_summary` + `count_runs` — paginated metadata listing |
 | `ironcrew inspect` | `get_run` — retrieves a specific run by ID |
-| `ironcrew clean` | `list_runs` + `delete_run` — removes old records |
-| `GET /flows/{flow}/runs` | `list_runs` — API endpoint |
+| `ironcrew clean` | `list_runs` + `delete_run` — removes old records (legacy path) |
+| `GET /flows/{flow}/runs` | `list_runs_summary` + `count_runs` — paginated API endpoint |
 | `GET /flows/{flow}/runs/{id}` | `get_run` — API endpoint |
 | `DELETE /flows/{flow}/runs/{id}` | `delete_run` — API endpoint |
 | `ironcrew run --json` | `get_run` — reads back the saved record for output |
 
 ## The StateStore Trait
 
-The storage system is built on an async trait:
+The storage system is built on an async trait. Listing uses a paginated,
+metadata-only path (`list_runs_summary` + `count_runs`) so a caller never
+pays to transfer `task_results` when they only need a summary view. The
+legacy `list_runs` method is retained for backward-compatibility with the
+CLI `clean` command and will be removed in v3.0.0.
 
 ```rust
 #[async_trait]
 pub trait StateStore: Send + Sync {
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
+
+    /// **Deprecated** — use `list_runs_summary` instead.
     async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
+
+    /// Paginated, metadata-only list. `limit=0` means unlimited.
+    async fn list_runs_summary(
+        &self,
+        filter: &ListRunsFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunSummary>>;
+
+    /// Count matching runs — paired with `list_runs_summary` to populate
+    /// `total` in paginated responses.
+    async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
+
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 }
 ```
+
+`ListRunsFilter` has three optional fields: `status`, `tag`, and `since`
+(RFC3339 timestamp). All three are composed with `AND` when multiple are
+set. `RunSummary` is `RunRecord` minus `task_results` — the field that
+typically dominates a record's on-disk size.
 
 This design allows future backends (PostgreSQL, Redis, cloud storage) to use
 async I/O natively without blocking the Tokio runtime.

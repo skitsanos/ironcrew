@@ -48,10 +48,27 @@ pub struct TaskResultResponse {
     pub duration_ms: u64,
 }
 
-/// Query params for listing runs
+/// Query params for listing runs.
+///
+/// Pagination defaults come from `IRONCREW_RUNS_DEFAULT_LIMIT` (default 20);
+/// `limit` is hard-capped at `IRONCREW_RUNS_MAX_LIMIT` (default 100) so a
+/// single client can't request an unbounded page.
 #[derive(Deserialize)]
 pub struct ListRunsQuery {
     pub status: Option<String>,
+    pub tag: Option<String>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Paginated response for `GET /flows/{flow}/runs`.
+#[derive(Serialize)]
+pub struct ListRunsResponse {
+    pub runs: Vec<crate::engine::run_history::RunSummary>,
+    pub total: u64,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 /// Error response
