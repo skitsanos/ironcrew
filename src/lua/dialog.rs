@@ -17,10 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::sessions::{DialogStateRecord, validate_session_id};
+use crate::engine::store::StateStore;
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
@@ -40,12 +43,13 @@ fn speaker_label(index: usize) -> String {
 /// One turn in the dialog transcript.
 /// `speaker_index` is the position in the agents vec. The corresponding
 /// agent name is `agent_name`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogTurn {
     pub index: usize,
     pub speaker_index: usize,
     pub agent_name: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 
@@ -111,13 +115,38 @@ pub struct AgentDialog {
     /// The reason the dialog stopped early, if any. `None` while running
     /// and after a natural `max_turns` completion.
     pub stop_reason: Mutex<Option<String>>,
+
+    /// `true` when the caller supplied a stable `id` and the session is
+    /// eligible for cross-run persistence.
+    pub persistent: bool,
+
+    /// Optional state store for cross-run persistence.
+    pub store: Option<Arc<dyn StateStore>>,
+
+    /// Flow label persisted alongside the session (taken from `crew.goal`).
+    pub flow_name: String,
+
+    /// When `true` (default for persistent sessions), the dialog auto-saves
+    /// after each completed turn. Opt out with `autosave = false` and call
+    /// `dialog:save()` manually.
+    pub autosave: bool,
+
+    /// RFC3339 timestamp of the original creation, preserved across resumes.
+    pub created_at: String,
 }
 
 impl AgentDialog {
     /// Build a fresh dialog. Emits a `dialog_started` event.
     /// Caller must ensure `agents.len() >= 2` and `starting_speaker < agents.len()`.
+    /// Build a fresh (or resumed) dialog.
+    ///
+    /// When `store` and `id` are both provided, the store is consulted for
+    /// a prior `DialogStateRecord` with that id. On hit, the persisted
+    /// transcript, `next_index`, and stop state are reinstated so the
+    /// dialog picks up where it left off. On miss (or when no `id` was
+    /// supplied) the dialog starts fresh.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new_or_resume(
         agents: Vec<Agent>,
         provider: Arc<dyn LlmProvider>,
         tool_registry: ToolRegistry,
@@ -131,8 +160,54 @@ impl AgentDialog {
         eventbus: EventBus,
         turn_selector_key: Option<mlua::RegistryKey>,
         should_stop_key: Option<mlua::RegistryKey>,
-    ) -> Self {
-        let id = uuid::Uuid::new_v4().to_string();
+        id: Option<String>,
+        store: Option<Arc<dyn StateStore>>,
+        flow_name: String,
+        autosave: bool,
+    ) -> Result<Self, IronCrewError> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (id, persistent) = match id {
+            Some(s) => {
+                validate_session_id(&s)?;
+                (s, true)
+            }
+            None => (uuid::Uuid::new_v4().to_string(), false),
+        };
+
+        // Fresh defaults; overridden by a successful resume.
+        let mut transcript = VecDeque::new();
+        let mut next_index = 0usize;
+        let mut stopped = false;
+        let mut stop_reason: Option<String> = None;
+        let mut created_at = now.clone();
+
+        if persistent
+            && let Some(ref store) = store
+            && let Some(record) = store.get_dialog_state(&id).await?
+        {
+            // Sanity-check the resumed record — the agent list should
+            // match what the caller is setting up now. If it doesn't, we
+            // fail loud rather than silently resume with mismatched state.
+            let current_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+            if record.agent_names != current_names {
+                return Err(IronCrewError::Validation(format!(
+                    "Dialog '{}' was saved with agents {:?} but is being resumed with {:?}",
+                    id, record.agent_names, current_names
+                )));
+            }
+            transcript = record.transcript.into();
+            next_index = record.next_index;
+            stopped = record.stopped;
+            stop_reason = record.stop_reason;
+            created_at = record.created_at;
+            tracing::info!(
+                "Resumed dialog '{}' at turn {} ({} prior turns)",
+                id,
+                next_index,
+                transcript.len()
+            );
+        }
 
         eventbus.emit(CrewEvent::DialogStarted {
             dialog_id: id.clone(),
@@ -140,7 +215,7 @@ impl AgentDialog {
             max_turns,
         });
 
-        Self {
+        Ok(Self {
             id,
             agents,
             provider,
@@ -152,15 +227,48 @@ impl AgentDialog {
             stream,
             max_tool_rounds,
             starting_speaker,
-            transcript: Mutex::new(VecDeque::new()),
-            next_index: Mutex::new(0),
+            transcript: Mutex::new(transcript),
+            next_index: Mutex::new(next_index),
             eventbus,
             completed_emitted: Mutex::new(false),
             turn_selector_key,
             should_stop_key,
-            stopped: Mutex::new(false),
-            stop_reason: Mutex::new(None),
+            stopped: Mutex::new(stopped),
+            stop_reason: Mutex::new(stop_reason),
+            persistent,
+            store: if persistent { store } else { None },
+            flow_name,
+            autosave,
+            created_at,
+        })
+    }
+
+    /// Persist the current dialog state to the configured store.
+    /// No-ops for non-persistent sessions.
+    pub async fn persist(&self) -> Result<(), IronCrewError> {
+        let Some(ref store) = self.store else {
+            return Ok(());
+        };
+        if !self.persistent {
+            return Ok(());
         }
+        let transcript: Vec<DialogTurn> = self.transcript.lock().await.iter().cloned().collect();
+        let next_index = *self.next_index.lock().await;
+        let stopped = *self.stopped.lock().await;
+        let stop_reason = self.stop_reason.lock().await.clone();
+        let record = DialogStateRecord {
+            id: self.id.clone(),
+            flow_name: self.flow_name.clone(),
+            agent_names: self.agents.iter().map(|a| a.name.clone()).collect(),
+            starter: self.starter.clone(),
+            transcript,
+            next_index,
+            stopped,
+            stop_reason,
+            created_at: self.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_dialog_state(&record).await
     }
 
     /// Returns `true` if the dialog has not reached `max_turns` yet AND no
@@ -409,6 +517,7 @@ impl AgentDialog {
         let speaker_index = self.select_speaker(lua).await?;
         let turn = self.execute_turn(speaker_index).await?;
         self.maybe_stop_after_turn(lua, &turn).await?;
+        self.autosave_if_enabled().await;
         Ok(Some(turn))
     }
 
@@ -426,7 +535,20 @@ impl AgentDialog {
         let speaker_index = self.agent_index(agent_name)?;
         let turn = self.execute_turn(speaker_index).await?;
         self.maybe_stop_after_turn(lua, &turn).await?;
+        self.autosave_if_enabled().await;
         Ok(Some(turn))
+    }
+
+    /// Persist the dialog state after a turn, if autosave is enabled and
+    /// the session is persistent. Errors are logged but not propagated so
+    /// a transient store failure doesn't kill an in-progress dialog.
+    async fn autosave_if_enabled(&self) {
+        if !self.autosave || !self.persistent {
+            return;
+        }
+        if let Err(e) = self.persist().await {
+            tracing::warn!("Autosave failed for dialog '{}': {}", self.id, e);
+        }
     }
 
     /// Execute a turn for the agent at `speaker_index`. Increments the turn
@@ -749,6 +871,28 @@ impl UserData for AgentDialog {
         methods.add_async_method("stop_reason", |_, this, ()| async move {
             Ok(this.stop_reason.lock().await.clone())
         });
+
+        // dialog:id() — the stable session id (user-provided or auto-UUID)
+        methods.add_method("id", |_, this, ()| Ok(this.id.clone()));
+
+        // dialog:is_persistent() — true if tied to a store for cross-run resume
+        methods.add_method("is_persistent", |_, this, ()| Ok(this.persistent));
+
+        // dialog:save() — explicit save (useful when autosave = false)
+        methods.add_async_method("save", |_, this, ()| async move {
+            this.persist().await.map_err(mlua::Error::external)
+        });
+
+        // dialog:delete() — remove the persisted record
+        methods.add_async_method("delete", |_, this, ()| async move {
+            if let Some(ref store) = this.store {
+                store
+                    .delete_dialog_state(&this.id)
+                    .await
+                    .map_err(mlua::Error::external)?;
+            }
+            Ok(())
+        });
     }
 }
 
@@ -774,8 +918,12 @@ fn transcript_to_lua(lua: &mlua::Lua, transcript: &[DialogTurn]) -> mlua::Result
 
 /// Build an AgentDialog from a Lua options table. Participants are given via
 /// the `agents = {"name", ...}` array (two or more).
+///
+/// When `store` and the caller-provided `id` are both present, the dialog is
+/// resumed from the store if a prior record exists (transcript, `next_index`,
+/// and stop state). Autosave defaults to `true` for persistent sessions.
 #[allow(clippy::too_many_arguments)]
-pub fn build_dialog(
+pub async fn build_dialog(
     lua: &mlua::Lua,
     table: Table,
     crew_agents: &[Agent],
@@ -784,6 +932,8 @@ pub fn build_dialog(
     crew_default_model: &str,
     crew_max_tool_rounds: usize,
     eventbus: EventBus,
+    store: Option<Arc<dyn StateStore>>,
+    flow_name: String,
 ) -> mlua::Result<AgentDialog> {
     let agents_table = table.get::<Table>("agents").map_err(|_| {
         mlua::Error::external(IronCrewError::Validation(
@@ -902,7 +1052,12 @@ pub fn build_dialog(
             None
         };
 
-    Ok(AgentDialog::new(
+    // Cross-run persistence: `id` is the persistence key. When omitted the
+    // dialog is ephemeral (pre-2.8 behavior — a fresh UUID is generated).
+    let id: Option<String> = table.get::<String>("id").ok();
+    let autosave: bool = table.get::<bool>("autosave").unwrap_or(true);
+
+    AgentDialog::new_or_resume(
         dialog_agents,
         provider,
         tool_registry,
@@ -916,7 +1071,13 @@ pub fn build_dialog(
         eventbus,
         turn_selector_key,
         should_stop_key,
-    ))
+        id,
+        store,
+        flow_name,
+        autosave,
+    )
+    .await
+    .map_err(mlua::Error::external)
 }
 
 fn resolve_agent(value: Value, agents: &[Agent], field: &str) -> mlua::Result<Agent> {

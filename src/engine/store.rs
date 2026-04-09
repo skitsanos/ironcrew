@@ -1,11 +1,15 @@
 use async_trait::async_trait;
 
 use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
+use crate::engine::sessions::{ConversationRecord, DialogStateRecord};
 use crate::utils::error::Result;
 
-/// Pluggable storage backend for run records.
+/// Pluggable storage backend for run records and persistent sessions
+/// (conversations and dialogs).
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    // ─── Run history ────────────────────────────────────────────────────────
+
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
 
@@ -28,6 +32,23 @@ pub trait StateStore: Send + Sync {
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
 
     async fn delete_run(&self, run_id: &str) -> Result<()>;
+
+    // ─── Persistent sessions ────────────────────────────────────────────────
+
+    /// Upsert a conversation record, keyed by `record.id`.
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
+    /// Look up a conversation by id. Returns `Ok(None)` when the id does
+    /// not exist — this is how `crew:conversation({id = ...})` distinguishes
+    /// a fresh session from a resumed one.
+    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>>;
+    async fn delete_conversation(&self, id: &str) -> Result<()>;
+
+    /// Upsert a dialog state record, keyed by `record.id`.
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
+    /// Look up a dialog state by id. Returns `Ok(None)` when the id does
+    /// not exist.
+    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>>;
+    async fn delete_dialog_state(&self, id: &str) -> Result<()>;
 }
 
 /// Create a StateStore based on environment configuration.
@@ -38,7 +59,13 @@ pub trait StateStore: Send + Sync {
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
 /// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases
-pub async fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn StateStore>> {
+///
+/// Returns an `Arc` so the same instance can be shared across the crew's
+/// `run()`, `conversation()`, and `dialog()` call paths without re-opening
+/// the underlying connection/pool.
+pub async fn create_store(
+    default_dir: std::path::PathBuf,
+) -> Result<std::sync::Arc<dyn StateStore>> {
     let store_type = std::env::var("IRONCREW_STORE").unwrap_or_else(|_| "json".into());
 
     match store_type.to_lowercase().as_str() {
@@ -55,7 +82,9 @@ pub async fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn Sta
                         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
                 }
             }
-            Ok(Box::new(super::sqlite_store::SqliteStore::new(db_path)?))
+            Ok(std::sync::Arc::new(super::sqlite_store::SqliteStore::new(
+                db_path,
+            )?))
         }
         #[cfg(feature = "postgres")]
         "postgres" | "postgresql" => {
@@ -67,15 +96,18 @@ pub async fn create_store(default_dir: std::path::PathBuf) -> Result<Box<dyn Sta
             let table_prefix = std::env::var("IRONCREW_PG_TABLE_PREFIX").unwrap_or_default();
             let store =
                 super::postgres_store::PostgresStore::new(&database_url, &table_prefix).await?;
-            Ok(Box::new(store))
+            Ok(std::sync::Arc::new(store))
         }
         #[cfg(not(feature = "postgres"))]
         "postgres" | "postgresql" => Err(crate::utils::error::IronCrewError::Validation(
             "PostgreSQL backend requires building with --features postgres".into(),
         )),
         _ => {
-            let runs_dir = default_dir.join("runs");
-            Ok(Box::new(super::run_history::JsonFileStore::new(runs_dir)?))
+            // JsonFileStore creates `runs/`, `conversations/`, and `dialogs/`
+            // subdirectories inside the given `.ironcrew/` root.
+            Ok(std::sync::Arc::new(super::run_history::JsonFileStore::new(
+                default_dir,
+            )?))
         }
     }
 }

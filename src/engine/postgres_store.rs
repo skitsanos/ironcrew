@@ -5,12 +5,15 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+use super::sessions::{ConversationRecord, DialogStateRecord};
 use super::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct PostgresStore {
     pool: PgPool,
     table_name: String,
+    conversations_table: String,
+    dialogs_table: String,
 }
 
 impl PostgresStore {
@@ -44,10 +47,14 @@ impl PostgresStore {
             })?;
 
         let table_name = format!("{}runs", table_prefix);
+        let conversations_table = format!("{}conversations", table_prefix);
+        let dialogs_table = format!("{}dialogs", table_prefix);
 
         let store = Self {
             pool,
             table_name: table_name.clone(),
+            conversations_table,
+            dialogs_table,
         };
         store.bootstrap().await?;
 
@@ -161,9 +168,60 @@ impl PostgresStore {
             }
         }
 
+        // 5. Session tables — conversations and dialogs for resumable sessions
+        let ct = &self.conversations_table;
+        let dt = &self.dialogs_table;
+
+        let session_tables = [
+            format!(
+                "CREATE TABLE IF NOT EXISTS {ct} (
+                    id          TEXT PRIMARY KEY,
+                    flow_name   TEXT NOT NULL,
+                    agent_name  TEXT NOT NULL,
+                    messages    JSONB NOT NULL DEFAULT '[]',
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                )"
+            ),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {dt} (
+                    id          TEXT PRIMARY KEY,
+                    flow_name   TEXT NOT NULL,
+                    agent_names JSONB NOT NULL DEFAULT '[]',
+                    starter     TEXT NOT NULL,
+                    transcript  JSONB NOT NULL DEFAULT '[]',
+                    next_index  INTEGER NOT NULL,
+                    stopped     BOOLEAN NOT NULL DEFAULT FALSE,
+                    stop_reason TEXT,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                )"
+            ),
+        ];
+        for sql in &session_tables {
+            sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
+                IronCrewError::Validation(format!("Failed to create session table: {}", e))
+            })?;
+        }
+
+        // Session indexes — updated_at helps "list recent sessions" queries
+        let session_indexes = [
+            format!("CREATE INDEX IF NOT EXISTS idx_{ct}_updated_at ON {ct} (updated_at DESC)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{ct}_flow_name ON {ct} (flow_name)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{dt}_updated_at ON {dt} (updated_at DESC)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{dt}_flow_name ON {dt} (flow_name)"),
+        ];
+        for sql in &session_indexes {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Session index creation: {}", e);
+            }
+        }
+
         tracing::debug!(
-            "PostgreSQL bootstrap complete for table '{}'",
-            self.table_name
+            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}'",
+            self.table_name,
+            self.conversations_table,
+            self.dialogs_table
         );
         Ok(())
     }
@@ -364,6 +422,195 @@ impl StateStore for PostgresStore {
                 run_id
             )));
         }
+        Ok(())
+    }
+
+    // ─── Persistent sessions ────────────────────────────────────────────────
+
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
+        let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
+        })?;
+        let sql = format!(
+            "INSERT INTO {t} (id, flow_name, agent_name, messages, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6) \
+             ON CONFLICT (id) DO UPDATE SET \
+               flow_name = EXCLUDED.flow_name, \
+               agent_name = EXCLUDED.agent_name, \
+               messages = EXCLUDED.messages, \
+               updated_at = EXCLUDED.updated_at",
+            t = self.conversations_table
+        );
+        sqlx::query(&sql)
+            .bind(&record.id)
+            .bind(&record.flow_name)
+            .bind(&record.agent_name)
+            .bind(&messages_json)
+            .bind(&record.created_at)
+            .bind(&record.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL save_conversation error: {}", e))
+            })?;
+        Ok(())
+    }
+
+    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>> {
+        let sql = format!(
+            "SELECT id, flow_name, agent_name, messages::text, created_at, updated_at \
+             FROM {} WHERE id = $1",
+            self.conversations_table
+        );
+        let row_opt = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL get_conversation error: {}", e))
+            })?;
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+        let messages_str: String = row
+            .try_get("messages")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+        Ok(Some(ConversationRecord {
+            id: row
+                .try_get("id")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            flow_name: row
+                .try_get("flow_name")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            agent_name: row
+                .try_get("agent_name")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            messages: serde_json::from_str(&messages_str).unwrap_or_default(),
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            updated_at: row
+                .try_get("updated_at")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+        }))
+    }
+
+    async fn delete_conversation(&self, id: &str) -> Result<()> {
+        let sql = format!("DELETE FROM {} WHERE id = $1", self.conversations_table);
+        sqlx::query(&sql)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL delete_conversation error: {}", e))
+            })?;
+        Ok(())
+    }
+
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
+        let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
+        })?;
+        let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
+        })?;
+        let sql = format!(
+            "INSERT INTO {t} \
+             (id, flow_name, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
+             VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7, $8, $9, $10) \
+             ON CONFLICT (id) DO UPDATE SET \
+               flow_name = EXCLUDED.flow_name, \
+               agent_names = EXCLUDED.agent_names, \
+               starter = EXCLUDED.starter, \
+               transcript = EXCLUDED.transcript, \
+               next_index = EXCLUDED.next_index, \
+               stopped = EXCLUDED.stopped, \
+               stop_reason = EXCLUDED.stop_reason, \
+               updated_at = EXCLUDED.updated_at",
+            t = self.dialogs_table
+        );
+        sqlx::query(&sql)
+            .bind(&record.id)
+            .bind(&record.flow_name)
+            .bind(&agents_json)
+            .bind(&record.starter)
+            .bind(&transcript_json)
+            .bind(record.next_index as i32)
+            .bind(record.stopped)
+            .bind(&record.stop_reason)
+            .bind(&record.created_at)
+            .bind(&record.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL save_dialog_state error: {}", e))
+            })?;
+        Ok(())
+    }
+
+    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>> {
+        let sql = format!(
+            "SELECT id, flow_name, agent_names::text, starter, transcript::text, \
+             next_index, stopped, stop_reason, created_at, updated_at \
+             FROM {} WHERE id = $1",
+            self.dialogs_table
+        );
+        let row_opt = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL get_dialog_state error: {}", e))
+            })?;
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+        let agents_str: String = row
+            .try_get("agent_names")
+            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+        let transcript_str: String = row
+            .try_get("transcript")
+            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+        let next_index_i32: i32 = row
+            .try_get("next_index")
+            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
+        Ok(Some(DialogStateRecord {
+            id: row
+                .try_get("id")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            flow_name: row
+                .try_get("flow_name")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            agent_names: serde_json::from_str(&agents_str).unwrap_or_default(),
+            starter: row
+                .try_get("starter")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            transcript: serde_json::from_str(&transcript_str).unwrap_or_default(),
+            next_index: next_index_i32.max(0) as usize,
+            stopped: row
+                .try_get("stopped")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            stop_reason: row
+                .try_get("stop_reason")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            updated_at: row
+                .try_get("updated_at")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+        }))
+    }
+
+    async fn delete_dialog_state(&self, id: &str) -> Result<()> {
+        let sql = format!("DELETE FROM {} WHERE id = $1", self.dialogs_table);
+        sqlx::query(&sql)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL delete_dialog_state error: {}", e))
+            })?;
         Ok(())
     }
 }
