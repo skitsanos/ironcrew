@@ -128,67 +128,6 @@ impl StateStore for SqliteStore {
         Ok(record)
     }
 
-    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(filter) =
-            status_filter
-        {
-            (
-                    "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE status = ?1 ORDER BY started_at DESC".into(),
-                    vec![Box::new(filter.to_string())],
-                )
-        } else {
-            (
-                    "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs ORDER BY started_at DESC".into(),
-                    vec![],
-                )
-        };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let status_str: String = row.get(2)?;
-                let task_results_json: String = row.get(6)?;
-                let tags_json: String = row.get(11)?;
-
-                Ok(RunRecord {
-                    run_id: row.get(0)?,
-                    flow_name: row.get(1)?,
-                    status: match status_str.as_str() {
-                        "success" => RunStatus::Success,
-                        "partial_failure" => RunStatus::PartialFailure,
-                        _ => RunStatus::Failed,
-                    },
-                    started_at: row.get(3)?,
-                    finished_at: row.get(4)?,
-                    duration_ms: row.get::<_, i64>(5)? as u64,
-                    task_results: serde_json::from_str(&task_results_json).unwrap_or_default(),
-                    agent_count: row.get::<_, i64>(7)? as usize,
-                    task_count: row.get::<_, i64>(8)? as usize,
-                    total_tokens: row.get::<_, i64>(9)? as u32,
-                    cached_tokens: row.get::<_, i64>(10)? as u32,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                })
-            })
-            .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
-
-        let mut records = Vec::new();
-        for record in rows.flatten() {
-            records.push(record);
-        }
-        Ok(records)
-    }
-
     async fn list_runs_summary(
         &self,
         filter: &ListRunsFilter,

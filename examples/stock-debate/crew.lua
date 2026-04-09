@@ -317,9 +317,8 @@ for cases where one side is clearly on stronger ground.
 -- ---------------------------------------------------------------------------
 
 local debate = crew:dialog({
-    agent_a = "bull",
-    agent_b = "bear",
-    starting_speaker = "a",
+    agents = { "bull", "bear" },
+    starting_speaker = "bull",
     max_turns = DEBATE_TURNS,
     starter = "Here is the recent market data for " .. TICKER .. ":\n\n" ..
         stock_summary .. "\n\n" ..

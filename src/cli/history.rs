@@ -141,7 +141,11 @@ pub async fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
     }
 
     let store = create_store(ironcrew_dir).await?;
-    let runs = store.list_runs(None).await?;
+    // limit=0 means unlimited across all backends. We only need run_ids and
+    // started_at (to keep the newest N), both of which RunSummary carries.
+    let runs = store
+        .list_runs_summary(&ListRunsFilter::default(), 0, 0)
+        .await?;
 
     if runs.is_empty() {
         println!("No runs to clean.");
@@ -163,8 +167,8 @@ pub async fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
             println!("Deleted memory store.");
         }
     } else {
-        // Keep the last N, delete the rest
-        // runs are already sorted newest-first from store.list_runs()
+        // Keep the last N, delete the rest.
+        // Summaries are already sorted newest-first by every backend.
         if runs.len() <= keep {
             println!(
                 "Only {} run(s) found, nothing to clean (keeping {}).",

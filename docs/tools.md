@@ -57,12 +57,6 @@ Individual files that fail to read yield `{path, error}` entries in the
 When either limit is hit, the glob iteration stops and the result is returned
 with `truncated: true`. Set either env var to `0` to disable the cap.
 
-> **Breaking change in v2.6.0:** this tool previously returned a bare JSON
-> array of `{path, content}` objects. It now returns an object with
-> `{files, file_count, total_bytes, truncated}` so agents can observe
-> truncation. If you have code that parses the output, access the `files`
-> key.
-
 ### file_write
 
 Write content to a file. Creates parent directories automatically. Only

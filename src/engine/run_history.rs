@@ -162,28 +162,6 @@ impl StateStore for JsonFileStore {
         Ok(record)
     }
 
-    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
-        let mut runs = Vec::new();
-        for entry in std::fs::read_dir(&self.store_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                let data = std::fs::read_to_string(&path)?;
-                if let Ok(record) = serde_json::from_str::<RunRecord>(&data) {
-                    if let Some(filter) = status_filter
-                        && record.status.to_string() != filter
-                    {
-                        continue;
-                    }
-                    runs.push(record);
-                }
-            }
-        }
-        // Sort by started_at descending (newest first)
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        Ok(runs)
-    }
-
     async fn list_runs_summary(
         &self,
         filter: &ListRunsFilter,
@@ -255,7 +233,3 @@ impl StateStore for JsonFileStore {
         Ok(())
     }
 }
-
-/// Backward-compatible alias for `JsonFileStore`.
-#[allow(dead_code)]
-pub type RunHistory = JsonFileStore;

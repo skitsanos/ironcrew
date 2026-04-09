@@ -122,8 +122,8 @@ pub enum CrewEvent {
     #[serde(rename = "dialog_started")]
     DialogStarted {
         dialog_id: String,
-        agent_a: String,
-        agent_b: String,
+        /// All participating agents in turn order.
+        agents: Vec<String>,
         max_turns: usize,
     },
 
@@ -149,6 +149,12 @@ pub enum CrewEvent {
     DialogCompleted {
         dialog_id: String,
         total_turns: usize,
+        /// Why the dialog ended. `None` means it ran to `max_turns` normally.
+        /// When the dialog was stopped early by a `should_stop` callback, this
+        /// carries the reason string that the callback returned (or a generic
+        /// marker if the callback returned `true` without a reason).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
     },
 
     // ─── Memory ─────────────────────────────────────────────────────────────

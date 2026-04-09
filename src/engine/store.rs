@@ -9,11 +9,6 @@ pub trait StateStore: Send + Sync {
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
 
-    /// Legacy full-record list. **Deprecated** — use `list_runs_summary` instead.
-    /// Kept for backward compatibility with the CLI `clean` command and existing
-    /// tests. Will be removed in v3.0.0.
-    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
-
     /// Paginated, metadata-only list view. Returns summaries without
     /// `task_results`, so clients can list hundreds of runs cheaply and fetch
     /// full records on demand via `get_run`.

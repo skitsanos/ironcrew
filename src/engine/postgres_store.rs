@@ -234,30 +234,6 @@ impl StateStore for PostgresStore {
         row_to_record(&row)
     }
 
-    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>> {
-        let rows = if let Some(filter) = status_filter {
-            let sql = format!(
-                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
-                 FROM {} WHERE status = $1 ORDER BY started_at DESC",
-                self.table_name
-            );
-            sqlx::query(&sql)
-                .bind(filter)
-                .fetch_all(&self.pool)
-                .await
-        } else {
-            let sql = format!(
-                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
-                 FROM {} ORDER BY started_at DESC",
-                self.table_name
-            );
-            sqlx::query(&sql).fetch_all(&self.pool).await
-        }
-        .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?;
-
-        rows.iter().map(row_to_record).collect()
-    }
-
     async fn list_runs_summary(
         &self,
         filter: &ListRunsFilter,

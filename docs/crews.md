@@ -180,15 +180,14 @@ Two or more agents take turns in **round-robin** order with **perspective-flippe
 message histories — each agent sees its own past turns as `assistant` messages
 and other participants' turns as `user` messages prefixed with the speaker's name.
 
-### Two-agent dialog
+### Basic dialog
 
 ```lua
 local debate = crew:dialog({
-    agent_a = "bull",                  -- agent name (or inline Agent.new())
-    agent_b = "bear",
+    agents = { "bull", "bear" },       -- two or more agents, in turn order
     starter = "Should we buy NVDA?",
     max_turns = 4,                     -- total turns combined (2 each here)
-    starting_speaker = "a",            -- "a" (default), "b", or an agent name
+    starting_speaker = "bull",         -- agent name or positional letter
     stream = true,                     -- prefix output with [agent_name] on stderr
     max_history = 30,                  -- optional cap on retained turns
 })
@@ -198,16 +197,16 @@ local debate = crew:dialog({
 
 ```lua
 local roundtable = crew:dialog({
-    agents = { "optimist", "pessimist", "realist" },  -- 2 or more agents
+    agents = { "optimist", "pessimist", "realist" },
     starter = "Should we ship feature X this quarter?",
-    max_turns = 6,                                     -- 2 rounds of 3 agents
-    starting_speaker = "realist",                      -- by name
+    max_turns = 6,                                    -- 2 rounds of 3 agents
+    starting_speaker = "realist",                     -- by name
 })
 ```
 
-The `agents` array form supports any number of agents (≥ 2). Turns are taken
-in round-robin order starting from `starting_speaker` (which accepts an agent
-name or a positional letter `"a"`, `"b"`, `"c"`, ...). When `max_turns` is
+The `agents` array supports any number of participants (≥ 2). Turns are taken
+in round-robin order starting from `starting_speaker`, which accepts either an
+agent name or a positional letter `"a"`, `"b"`, `"c"`, ... When `max_turns` is
 omitted, it defaults to `2 * agents.len()` (two rounds each).
 
 ### Methods (same for both forms)
@@ -252,8 +251,7 @@ falsification criteria. This turns "two LLMs talking" into "actionable output".
 ```lua
 -- 1. Bull and Bear debate
 local debate = crew:dialog({
-    agent_a = "bull",
-    agent_b = "bear",
+    agents = { "bull", "bear" },
     starter = data_summary .. "\nDebate the buy decision.",
     max_turns = 6,
 })
@@ -326,9 +324,64 @@ end
 See [`examples/moderator-dialog/`](../examples/moderator-dialog/) for a
 complete implementation with an LLM-driven facilitator.
 
-**Limitations:**
+### Custom early termination
 
-- No early termination via Lua callback (only `max_turns` is supported)
+Dialogs keep running until they reach `max_turns`, but you often want to
+stop earlier when some condition is met (consensus detected, a threshold
+crossed, a stop keyword found). Pass a `should_stop` callback:
+
+```lua
+local dialog = crew:dialog({
+    agents = { "alice", "bob" },
+    starter = "Negotiate a fair price for the clock",
+    max_turns = 20,  -- generous safety cap
+    should_stop = function(last_turn, transcript)
+        -- last_turn: {index, speaker, agent, content, reasoning?}
+        -- transcript: full array of completed turns
+        if last_turn.content:find("AGREED") and #transcript >= 2 then
+            return "consensus reached"  -- stop, reason stored + emitted
+        end
+        return false  -- continue
+    end,
+})
+
+local transcript = dialog:run()
+local reason = dialog:stop_reason()  -- "consensus reached" or nil
+```
+
+The callback fires after every turn (automatic or manual) and can return:
+
+| Return value    | Effect |
+|-----------------|--------|
+| `nil` / `false` | Continue the dialog |
+| `true`          | Stop; reason = `"custom_stop"` |
+| `"reason"`      | Stop with that reason string |
+| Anything else   | Usage error — surfaces as a validation failure |
+
+Like `turn_selector`, the callback is invoked via `call_async`, so you can
+use async methods inside it (e.g. ask another agent to judge whether the
+debate has converged). The `max_turns` value still acts as a hard safety
+ceiling — it bounds the worst case if the callback never returns a stop
+signal.
+
+**Querying state from Lua:**
+
+| Method                   | Returns |
+|--------------------------|---------|
+| `dialog:stopped()`       | `true` if `should_stop` requested termination |
+| `dialog:stop_reason()`   | The reason string, or `nil` for normal completion |
+
+When the dialog stops early, the `dialog_completed` SSE event carries the
+reason:
+
+```json
+{"type": "dialog_completed", "dialog_id": "...", "total_turns": 5, "stop_reason": "consensus reached"}
+```
+
+The `stop_reason` field is omitted for runs that terminate via `max_turns`
+(backward-compatible with older clients). See
+[`examples/dialog-early-stop/`](../examples/dialog-early-stop/) for a
+full negotiation example.
 
 **SSE events:** Dialogs emit `dialog_started`, `dialog_turn`,
 `dialog_thinking`, and `dialog_completed` events through the EventBus. REST API
