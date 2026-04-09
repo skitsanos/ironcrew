@@ -63,6 +63,8 @@ Sorted by value/effort ratio: high-value low-effort items first.
 - [x] **API error sanitization** — no filesystem paths in responses. Done in 2.1.0.
 - [x] **Directory permissions** — `.ironcrew/` set to 0o700 on Unix. Done in 2.1.0.
 - [x] **PG hardening** — table prefix validation, configurable pool size. Done in 2.1.0.
+- [x] **Tier 1 correctness fixes** — `RunComplete.total_tokens` sum bug, UTF-8 panic in SSE truncation, silent memory save errors, O(phases×tasks) memory re-writes. Done in 2.4.0.
+- [x] **Tier 2 default retention budgets** — `LuaConversation` default `max_history` (50), `AgentDialog` transcript cap (100), `MessageBus` per-agent queue cap (1000), pending broadcasts cap (500), `EventBus` replay buffer byte budget (4 MB). Live SSE broadcasts remain lossless. Done in 2.5.0.
 
 ---
 

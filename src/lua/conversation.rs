@@ -422,7 +422,28 @@ pub fn build_conversation(
         .or_else(|| agent.system_prompt.clone())
         .unwrap_or_else(|| format!("You are {}. Your goal: {}", agent.name, agent.goal));
 
-    let max_history: Option<usize> = table.get("max_history").ok();
+    // max_history resolution order:
+    //   1. Explicit value in the Lua table (including 0 → unbounded)
+    //   2. IRONCREW_CONVERSATION_MAX_HISTORY env var
+    //   3. Safe default of 50 messages
+    //
+    // A value of 0 is treated as an explicit opt-in to unbounded history,
+    // for backward compatibility with v2.3.x users who relied on unbounded.
+    let max_history: Option<usize> = match table.get::<usize>("max_history") {
+        Ok(0) => None, // explicit unbounded opt-in
+        Ok(n) => Some(n),
+        Err(_) => {
+            let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+            match env_default {
+                Some(0) => None, // env var explicitly disables the cap
+                Some(n) => Some(n),
+                None => Some(50), // safe default
+            }
+        }
+    };
+
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
     Ok(LuaConversation::new(
