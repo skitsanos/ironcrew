@@ -287,7 +287,17 @@ be set in the shell or in `.env` files.
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` to allow HTTP requests to private/loopback IPs (SSRF protection disabled) |
 | `IRONCREW_ENV_BLOCKLIST` | Comma-separated additional env var names to block from Lua `env()` |
-| `IRONCREW_MAX_RESPONSE_SIZE` | Max HTTP response body size in bytes (default: `52428800` = 50MB) |
+
+**Tool Resource Budgets:**
+
+| Variable          | Description |
+|-------------------|-------------|
+| `IRONCREW_MAX_RESPONSE_SIZE` | Max HTTP response body size for the `http_request` tool, in bytes. Enforced both via `Content-Length` header and during streaming read. Default: `52428800` (50 MB) |
+| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parse. Default: `2097152` (2 MB) |
+| `IRONCREW_FILE_READ_MAX_BYTES` | Max file size for the `file_read` tool, in bytes. Checked via metadata before reading. Default: `10485760` (10 MB) |
+| `IRONCREW_GLOB_MAX_FILES` | Max number of files returned by `file_read_glob`. `0` disables the cap. Default: `500` |
+| `IRONCREW_GLOB_MAX_BYTES` | Max total bytes aggregated by `file_read_glob` across all matched files. `0` disables the cap. Default: `52428800` (50 MB) |
+| `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | Max bytes captured per stream (stdout and stderr independently) by the `shell` tool. Overflow is discarded and a truncation marker is appended. Default: `1048576` (1 MB) |
 
 **Storage:**
 

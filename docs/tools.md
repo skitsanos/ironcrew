@@ -17,16 +17,51 @@ absolute paths and directory traversal (`..`) are rejected.
 { "path": "input/report.md" }
 ```
 
+**Limit:** files larger than `IRONCREW_FILE_READ_MAX_BYTES` (default 10 MB)
+are rejected with a clear error. Checked via filesystem metadata before
+any content is read into memory.
+
 ### file_read_glob
 
-Read multiple files matching a glob pattern. Returns a JSON array of
-`{path, content}` objects (or `{path, error}` on failure), sorted by path.
+Read multiple files matching a glob pattern. Returns a JSON **object** with
+the files array plus observability metadata.
 
 - **Parameters:** `pattern` (string, required)
 
 ```lua
 { "pattern": "data/**/*.json" }
 ```
+
+**Output shape** (v2.6.0+):
+
+```json
+{
+  "files": [
+    { "path": "data/a.json", "content": "..." },
+    { "path": "data/b.json", "content": "..." }
+  ],
+  "file_count": 2,
+  "total_bytes": 4096,
+  "truncated": false
+}
+```
+
+Individual files that fail to read yield `{path, error}` entries in the
+`files` array instead of `{path, content}`.
+
+**Limits:**
+- `IRONCREW_GLOB_MAX_FILES` (default 500) — max number of files to return.
+- `IRONCREW_GLOB_MAX_BYTES` (default 50 MB) — max aggregated byte total across
+  all returned files.
+
+When either limit is hit, the glob iteration stops and the result is returned
+with `truncated: true`. Set either env var to `0` to disable the cap.
+
+> **Breaking change in v2.6.0:** this tool previously returned a bare JSON
+> array of `{path, content}` objects. It now returns an object with
+> `{files, file_count, total_bytes, truncated}` so agents can observe
+> truncation. If you have code that parses the output, access the `files`
+> key.
 
 ### file_write
 
@@ -52,6 +87,11 @@ text is returned. Output is truncated to 10 000 characters.
 { "url": "https://example.com/article" }
 ```
 
+**Limit:** raw HTML is streamed with a byte cap of
+`IRONCREW_WEB_SCRAPE_MAX_BYTES` (default 2 MB) **before** DOM parsing, to
+avoid the quadratic worst case of feeding very large HTML to the parser.
+Responses exceeding the cap are rejected with an error.
+
 ### shell
 
 Execute a shell command via `sh -c` and return stdout/stderr. **Disabled by
@@ -63,6 +103,13 @@ See [Shell Tool Safety](#shell-tool-safety) below.
 ```lua
 { "command": "wc -l data/*.csv" }
 ```
+
+**Output limits:** stdout and stderr are each capped at
+`IRONCREW_SHELL_MAX_OUTPUT_BYTES` bytes (default 1 MB per stream). The child
+process is spawned with piped stdio and each stream is read with a bounded
+reader. When the cap is hit, further output is drained and discarded (so the
+child can still exit cleanly) and a truncation marker is appended to the
+captured output.
 
 ### http_request
 
@@ -86,8 +133,13 @@ authentication. Supports bearer, basic, and API-key auth.
 
 **Security:** Requests to private/internal IP addresses (loopback, RFC1918,
 link-local, CGNAT) are blocked by default to prevent SSRF attacks. Override with
-`IRONCREW_ALLOW_PRIVATE_IPS=1`. Response bodies larger than 50MB (configurable
-via `IRONCREW_MAX_RESPONSE_SIZE`) are rejected before reading.
+`IRONCREW_ALLOW_PRIVATE_IPS=1`.
+
+**Response size limit:** `IRONCREW_MAX_RESPONSE_SIZE` (default 50 MB). Enforced
+both via the `Content-Length` header (cheap pre-check) and during streaming
+read (handles chunked responses with no header) — the request aborts as soon
+as the byte budget is exceeded, so oversized responses never fully materialize
+in memory.
 
 ### hash
 

@@ -76,10 +76,40 @@ async fn test_file_read_glob_basic() {
 
     let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
     let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
-    assert_eq!(parsed.len(), 2);
-    assert_eq!(parsed[0]["content"], "content a");
-    assert_eq!(parsed[1]["content"], "content b");
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    // v2.6.0: output is an object, not a bare array
+    let files = parsed["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["content"], "content a");
+    assert_eq!(files[1]["content"], "content b");
+    assert_eq!(parsed["file_count"], 2);
+    assert_eq!(parsed["truncated"], false);
+    // total_bytes = len("content a") + len("content b") = 9 + 9 = 18
+    assert_eq!(parsed["total_bytes"], 18);
+}
+
+#[tokio::test]
+async fn test_file_read_glob_file_count_cap() {
+    // Temporarily force a tight file-count cap via env var
+    unsafe {
+        std::env::set_var("IRONCREW_GLOB_MAX_FILES", "2");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("f{}.txt", i)), format!("file{}", i)).unwrap();
+    }
+
+    let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
+    let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["file_count"], 2);
+    assert_eq!(parsed["truncated"], true);
+
+    unsafe {
+        std::env::remove_var("IRONCREW_GLOB_MAX_FILES");
+    }
 }
 
 #[tokio::test]

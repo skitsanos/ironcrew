@@ -162,13 +162,15 @@ impl Tool for HttpRequestTool {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
-        // Check Content-Length before reading body to prevent OOM
-        let max_response_size: u64 = std::env::var("IRONCREW_MAX_RESPONSE_SIZE")
+        // Enforce max response size BOTH via Content-Length header (cheap check)
+        // AND via streaming read (covers chunked responses with no header).
+        let max_response_size: usize = std::env::var("IRONCREW_MAX_RESPONSE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50 * 1024 * 1024); // 50MB default
+
         if let Some(len) = resp.content_length()
-            && len > max_response_size
+            && len as usize > max_response_size
         {
             return Err(IronCrewError::ToolExecution {
                 tool: "http_request".into(),
@@ -179,13 +181,28 @@ impl Tool for HttpRequestTool {
             });
         }
 
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| IronCrewError::ToolExecution {
+        // Stream the body, aborting as soon as the byte budget is exceeded.
+        // This protects against responses that omit Content-Length.
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut body_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| IronCrewError::ToolExecution {
                 tool: "http_request".into(),
                 message: format!("Failed to read response: {e}"),
             })?;
+            if body_bytes.len() + chunk.len() > max_response_size {
+                return Err(IronCrewError::ToolExecution {
+                    tool: "http_request".into(),
+                    message: format!(
+                        "Response exceeded max size of {} bytes while streaming",
+                        max_response_size
+                    ),
+                });
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
 
         // Try to parse as JSON for pretty output
         let body_value: serde_json::Value =

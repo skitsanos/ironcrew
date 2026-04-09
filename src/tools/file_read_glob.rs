@@ -24,7 +24,7 @@ impl Tool for FileReadGlobTool {
     }
 
     fn description(&self) -> &str {
-        "Read multiple files matching a glob pattern and return them as a JSON array of {path, content} objects"
+        "Read multiple files matching a glob pattern. Returns a JSON object: {files: [{path, content}, ...], file_count, total_bytes, truncated}. Per-call limits: IRONCREW_GLOB_MAX_FILES (default 500), IRONCREW_GLOB_MAX_BYTES (default 50 MB)."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -60,13 +60,25 @@ impl Tool for FileReadGlobTool {
             });
         }
 
+        // Resource budgets (see docs/cli.md). Set either to 0 to disable.
+        let max_files: usize = std::env::var("IRONCREW_GLOB_MAX_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+        let max_total_bytes: u64 = std::env::var("IRONCREW_GLOB_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50 * 1024 * 1024); // 50 MB
+
         let full_pattern = if let Some(ref base) = self.base_dir {
             format!("{}/{}", base.display(), pattern)
         } else {
             pattern.to_string()
         };
 
-        let mut results = Vec::new();
+        let mut files = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut truncated = false;
 
         let entries = glob::glob(&full_pattern).map_err(|e| IronCrewError::ToolExecution {
             tool: "file_read_glob".into(),
@@ -74,6 +86,12 @@ impl Tool for FileReadGlobTool {
         })?;
 
         for entry in entries {
+            // Stop if we've hit the file-count cap.
+            if max_files > 0 && files.len() >= max_files {
+                truncated = true;
+                break;
+            }
+
             let path = entry.map_err(|e| IronCrewError::ToolExecution {
                 tool: "file_read_glob".into(),
                 message: format!("Glob error: {}", e),
@@ -88,13 +106,21 @@ impl Tool for FileReadGlobTool {
 
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => {
-                        results.push(json!({
+                        // Enforce total-byte budget BEFORE appending, so we never
+                        // materialize a read that would push us over the cap.
+                        let next_total = total_bytes + content.len() as u64;
+                        if max_total_bytes > 0 && next_total > max_total_bytes {
+                            truncated = true;
+                            break;
+                        }
+                        total_bytes = next_total;
+                        files.push(json!({
                             "path": relative.display().to_string(),
                             "content": content
                         }));
                     }
                     Err(e) => {
-                        results.push(json!({
+                        files.push(json!({
                             "path": relative.display().to_string(),
                             "error": format!("Failed to read: {}", e)
                         }));
@@ -104,14 +130,22 @@ impl Tool for FileReadGlobTool {
         }
 
         // Sort by path for deterministic output
-        results.sort_by(|a, b| {
+        files.sort_by(|a, b| {
             a["path"]
                 .as_str()
                 .unwrap_or("")
                 .cmp(b["path"].as_str().unwrap_or(""))
         });
 
-        serde_json::to_string_pretty(&results).map_err(|e| IronCrewError::ToolExecution {
+        let file_count = files.len();
+        let output = json!({
+            "files": files,
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "truncated": truncated,
+        });
+
+        serde_json::to_string_pretty(&output).map_err(|e| IronCrewError::ToolExecution {
             tool: "file_read_glob".into(),
             message: format!("Serialization error: {}", e),
         })
