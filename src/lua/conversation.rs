@@ -2,17 +2,8 @@
 //!
 //! Created via `crew:conversation({...})`. Maintains its own message history
 //! across `send()` / `ask()` calls. Supports tool calling via the crew's
-//! tool registry, streaming to stderr, and reasoning capture.
-//!
-//! ## Future work
-//! - **Agent-to-agent conversations** — currently single-agent only. A future
-//!   variant could let two agents converse via turn-taking with separate
-//!   message histories per perspective.
-//! - **SSE wiring** — emit `CrewEvent::ConversationMessage` /
-//!   `ConversationThinking` so REST API subscribers can stream the
-//!   conversation in real-time (currently stderr only).
-//! - **Persistence** — save/load conversation state across runs, accessible
-//!   by `conversation_id`.
+//! tool registry, streaming to stderr, reasoning capture, and optional
+//! cross-run persistence keyed by a stable `id`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +13,8 @@ use tokio::sync::Mutex;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::sessions::{ConversationRecord, validate_session_id};
+use crate::engine::store::StateStore;
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
@@ -31,7 +24,13 @@ use crate::utils::error::IronCrewError;
 /// A stateful, multi-turn conversation with a single agent.
 pub struct LuaConversation {
     /// Stable identifier — included in every SSE event for this conversation.
+    /// If the user provided one via `id = "..."`, it's the persistence key;
+    /// otherwise it's an auto-UUID and the session is not persisted.
     pub id: String,
+
+    /// `true` when the caller provided a stable `id` and the session is
+    /// eligible for cross-run persistence.
+    pub persistent: bool,
 
     /// The agent driving the conversation.
     pub agent: Agent,
@@ -62,13 +61,35 @@ pub struct LuaConversation {
 
     /// EventBus for emitting conversation_* SSE events.
     pub eventbus: EventBus,
+
+    /// Optional state store for cross-run persistence. `Some` when the
+    /// parent crew was able to instantiate its store *and* the caller
+    /// provided an `id`.
+    pub store: Option<Arc<dyn StateStore>>,
+
+    /// Flow label persisted alongside the session (taken from `crew.goal`).
+    pub flow_name: String,
+
+    /// When `true` (default for persistent sessions), the conversation is
+    /// auto-saved to the store after every completed turn. Opt out with
+    /// `autosave = false` and call `conversation:save()` manually.
+    pub autosave: bool,
+
+    /// RFC3339 timestamp of the original creation (loaded from the store on
+    /// resume, or set at construction for fresh sessions).
+    pub created_at: String,
 }
 
 impl LuaConversation {
-    /// Build a fresh conversation with the system prompt seeded.
-    /// Emits a `conversation_started` event into the EventBus.
+    /// Build a fresh (or resumed) conversation.
+    ///
+    /// When `store` is `Some` and `id` is `Some`, the store is consulted for
+    /// a prior record with that id. On hit, the persisted history replaces
+    /// the freshly-seeded `[system]` bootstrap so the conversation picks up
+    /// where it left off. On miss, a new record will be written on the
+    /// first autosave.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new_or_resume(
         agent: Agent,
         provider: Arc<dyn LlmProvider>,
         tool_registry: ToolRegistry,
@@ -78,17 +99,48 @@ impl LuaConversation {
         stream: bool,
         max_tool_rounds: usize,
         eventbus: EventBus,
-    ) -> Self {
-        let id = uuid::Uuid::new_v4().to_string();
-        let messages = vec![ChatMessage::system(&system_prompt)];
+        id: Option<String>,
+        store: Option<Arc<dyn StateStore>>,
+        flow_name: String,
+        autosave: bool,
+    ) -> Result<Self, IronCrewError> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Resolve the id and decide whether the session is persistent.
+        let (id, persistent) = match id {
+            Some(s) => {
+                validate_session_id(&s)?;
+                (s, true)
+            }
+            None => (uuid::Uuid::new_v4().to_string(), false),
+        };
+
+        // Seed the message list. If we can hit the store for a resume, use
+        // the persisted messages instead of the bootstrap seed.
+        let mut messages = vec![ChatMessage::system(&system_prompt)];
+        let mut created_at = now.clone();
+
+        if persistent
+            && let Some(ref store) = store
+            && let Some(record) = store.get_conversation(&id).await?
+        {
+            messages = record.messages;
+            created_at = record.created_at;
+            tracing::info!(
+                "Resumed conversation '{}' with {} messages",
+                id,
+                messages.len()
+            );
+        }
 
         eventbus.emit(CrewEvent::ConversationStarted {
             conversation_id: id.clone(),
             agent: agent.name.clone(),
         });
 
-        Self {
+        Ok(Self {
             id,
+            persistent,
             agent,
             provider,
             tool_registry,
@@ -99,7 +151,32 @@ impl LuaConversation {
             stream,
             max_tool_rounds,
             eventbus,
+            store: if persistent { store } else { None },
+            flow_name,
+            autosave,
+            created_at,
+        })
+    }
+
+    /// Persist the current state to the configured store. Safe to call even
+    /// for non-persistent sessions — it simply no-ops.
+    pub async fn persist(&self) -> Result<(), IronCrewError> {
+        let Some(ref store) = self.store else {
+            return Ok(());
+        };
+        if !self.persistent {
+            return Ok(());
         }
+        let messages = self.messages.lock().await.clone();
+        let record = ConversationRecord {
+            id: self.id.clone(),
+            flow_name: self.flow_name.clone(),
+            agent_name: self.agent.name.clone(),
+            messages,
+            created_at: self.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_conversation(&record).await
     }
 
     /// Run a single send/respond round (with tool-call loop) and return the
@@ -196,6 +273,15 @@ impl LuaConversation {
                         turn_index,
                         content: r.clone(),
                     });
+                }
+
+                // Autosave after each successful turn (no-op for sessions
+                // without a store or with autosave disabled).
+                if self.autosave
+                    && self.persistent
+                    && let Err(e) = self.persist().await
+                {
+                    tracing::warn!("Autosave failed for conversation '{}': {}", self.id, e);
                 }
 
                 return Ok((content, reasoning));
@@ -371,13 +457,39 @@ impl UserData for LuaConversation {
 
         // conv:agent_name() → the agent's name
         methods.add_method("agent_name", |_, this, ()| Ok(this.agent.name.clone()));
+
+        // conv:id() → the stable session id (user-provided or auto-UUID)
+        methods.add_method("id", |_, this, ()| Ok(this.id.clone()));
+
+        // conv:is_persistent() → true if the session is tied to the store
+        methods.add_method("is_persistent", |_, this, ()| Ok(this.persistent));
+
+        // conv:save() → explicit save (useful when autosave = false)
+        methods.add_async_method("save", |_, this, ()| async move {
+            this.persist().await.map_err(mlua::Error::external)
+        });
+
+        // conv:delete() → remove the persisted record (and mark as non-persistent)
+        methods.add_async_method("delete", |_, this, ()| async move {
+            if let Some(ref store) = this.store {
+                store
+                    .delete_conversation(&this.id)
+                    .await
+                    .map_err(mlua::Error::external)?;
+            }
+            Ok(())
+        });
     }
 }
 
 /// Build a LuaConversation from a Lua options table, agent lookup, provider,
 /// tool registry, and crew defaults.
+///
+/// When `store` and the caller-provided `id` are both present, the conversation
+/// is resumed from the store if a prior record exists. Autosave defaults to
+/// `true` for persistent sessions and is a no-op for ephemeral ones.
 #[allow(clippy::too_many_arguments)]
-pub fn build_conversation(
+pub async fn build_conversation(
     table: Table,
     agents: &[Agent],
     provider: Arc<dyn LlmProvider>,
@@ -385,6 +497,8 @@ pub fn build_conversation(
     crew_default_model: &str,
     crew_max_tool_rounds: usize,
     eventbus: EventBus,
+    store: Option<Arc<dyn StateStore>>,
+    flow_name: String,
 ) -> mlua::Result<LuaConversation> {
     // Resolve agent: either by name or inline (Agent table)
     let agent_value: Value = table.get("agent")?;
@@ -446,7 +560,14 @@ pub fn build_conversation(
 
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
-    Ok(LuaConversation::new(
+    // Cross-run persistence: `id` is the persistence key. When omitted,
+    // the session is ephemeral (same behavior as pre-2.8 conversations).
+    let id: Option<String> = table.get::<String>("id").ok();
+    // Autosave defaults to true when persistence is active. For non-persistent
+    // sessions this value is effectively ignored.
+    let autosave: bool = table.get::<bool>("autosave").unwrap_or(true);
+
+    LuaConversation::new_or_resume(
         agent,
         provider,
         tool_registry,
@@ -456,5 +577,11 @@ pub fn build_conversation(
         stream,
         crew_max_tool_rounds,
         eventbus,
-    ))
+        id,
+        store,
+        flow_name,
+        autosave,
+    )
+    .await
+    .map_err(mlua::Error::external)
 }

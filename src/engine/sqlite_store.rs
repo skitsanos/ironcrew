@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+use super::sessions::{ConversationRecord, DialogStateRecord};
 use super::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -17,7 +18,10 @@ impl SqliteStore {
             IronCrewError::Validation(format!("Failed to open SQLite database: {}", e))
         })?;
 
-        // Create table if not exists
+        // Create tables if not exists. Three tables share the same SQLite file:
+        //   runs          — historical task outputs (see run_history.rs)
+        //   conversations — resumable single-agent chats (sessions.rs)
+        //   dialogs       — resumable multi-agent dialogs (sessions.rs)
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -33,9 +37,31 @@ impl SqliteStore {
                 cached_tokens INTEGER DEFAULT 0,
                 tags TEXT DEFAULT '[]',
                 created_at TEXT DEFAULT (datetime('now'))
-            )",
+            );
+
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                flow_name TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                messages TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dialogs (
+                id TEXT PRIMARY KEY,
+                flow_name TEXT NOT NULL,
+                agent_names TEXT NOT NULL,
+                starter TEXT NOT NULL,
+                transcript TEXT NOT NULL,
+                next_index INTEGER NOT NULL,
+                stopped INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
         )
-        .map_err(|e| IronCrewError::Validation(format!("Failed to create runs table: {}", e)))?;
+        .map_err(|e| IronCrewError::Validation(format!("Failed to create SQLite tables: {}", e)))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -277,6 +303,176 @@ impl StateStore for SqliteStore {
                 run_id
             )));
         }
+        Ok(())
+    }
+
+    // ─── Persistent sessions ────────────────────────────────────────────────
+
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
+        })?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO conversations \
+             (id, flow_name, agent_name, messages, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                record.id,
+                record.flow_name,
+                record.agent_name,
+                messages_json,
+                record.created_at,
+                record.updated_at,
+            ],
+        )
+        .map_err(|e| IronCrewError::Validation(format!("SQLite save_conversation error: {}", e)))?;
+        Ok(())
+    }
+
+    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, flow_name, agent_name, messages, created_at, updated_at \
+                 FROM conversations WHERE id = ?1",
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+        let row = stmt
+            .query_row(rusqlite::params![id], |row| {
+                let messages_json: String = row.get(3)?;
+                Ok(ConversationRecord {
+                    id: row.get(0)?,
+                    flow_name: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    messages: serde_json::from_str(&messages_json).unwrap_or_default(),
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(IronCrewError::Validation(format!(
+                    "SQLite get_conversation error: {}",
+                    other
+                ))),
+            })?;
+        Ok(row)
+    }
+
+    async fn delete_conversation(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        conn.execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| {
+            IronCrewError::Validation(format!("SQLite delete_conversation error: {}", e))
+        })?;
+        Ok(())
+    }
+
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
+        })?;
+        let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
+        })?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO dialogs \
+             (id, flow_name, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                record.id,
+                record.flow_name,
+                agents_json,
+                record.starter,
+                transcript_json,
+                record.next_index as i64,
+                record.stopped as i64,
+                record.stop_reason,
+                record.created_at,
+                record.updated_at,
+            ],
+        )
+        .map_err(|e| {
+            IronCrewError::Validation(format!("SQLite save_dialog_state error: {}", e))
+        })?;
+        Ok(())
+    }
+
+    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, flow_name, agent_names, starter, transcript, next_index, \
+                 stopped, stop_reason, created_at, updated_at \
+                 FROM dialogs WHERE id = ?1",
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+        let row = stmt
+            .query_row(rusqlite::params![id], |row| {
+                let agents_json: String = row.get(2)?;
+                let transcript_json: String = row.get(4)?;
+                Ok(DialogStateRecord {
+                    id: row.get(0)?,
+                    flow_name: row.get(1)?,
+                    agent_names: serde_json::from_str(&agents_json).unwrap_or_default(),
+                    starter: row.get(3)?,
+                    transcript: serde_json::from_str(&transcript_json).unwrap_or_default(),
+                    next_index: row.get::<_, i64>(5)? as usize,
+                    stopped: row.get::<_, i64>(6)? != 0,
+                    stop_reason: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(IronCrewError::Validation(format!(
+                    "SQLite get_dialog_state error: {}",
+                    other
+                ))),
+            })?;
+        Ok(row)
+    }
+
+    async fn delete_dialog_state(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        conn.execute("DELETE FROM dialogs WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| {
+                IronCrewError::Validation(format!("SQLite delete_dialog_state error: {}", e))
+            })?;
         Ok(())
     }
 }

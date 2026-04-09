@@ -2,14 +2,15 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::engine::crew::Crew;
 use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
+use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
-use crate::utils::error::IronCrewError;
+use crate::utils::error::{IronCrewError, Result};
 
 use super::conversation::build_conversation;
 use super::dialog::build_dialog;
@@ -28,6 +29,25 @@ pub struct LuaCrew {
     pub runtime: Arc<Runtime>,
     pub custom_provider: Option<Arc<dyn LlmProvider>>,
     pub project_dir: PathBuf,
+    /// Lazily-initialized shared store. The first call to
+    /// `get_or_init_store()` creates the backing `StateStore` for this
+    /// crew; subsequent `crew:run()`, `crew:conversation()`, and
+    /// `crew:dialog()` calls all reuse the same instance. This matters
+    /// most for PostgreSQL, where each `create_store()` call would
+    /// otherwise spin up a fresh connection pool.
+    pub store: OnceCell<Arc<dyn StateStore>>,
+}
+
+impl LuaCrew {
+    /// Lazily create (or return the cached) shared `StateStore` for this crew.
+    async fn get_or_init_store(&self) -> Result<Arc<dyn StateStore>> {
+        let ironcrew_dir = self.project_dir.join(".ironcrew");
+        let store = self
+            .store
+            .get_or_try_init(|| async { create_store(ironcrew_dir).await })
+            .await?;
+        Ok(store.clone())
+    }
 }
 
 impl UserData for LuaCrew {
@@ -373,6 +393,7 @@ impl UserData for LuaCrew {
             let agents: Vec<crate::engine::agent::Agent> = crew.agents.clone();
             let default_model = crew.provider_config.model.clone();
             let max_tool_rounds = crew.max_tool_rounds;
+            let flow_name = crew.goal.clone();
             // Prefer API-injected EventBus (from app_data) so events flow through
             // the same SSE channel as task events; fall back to the crew's bus.
             let eventbus = lua
@@ -380,6 +401,13 @@ impl UserData for LuaCrew {
                 .map(|e| e.clone())
                 .unwrap_or_else(|| crew.eventbus.clone());
             drop(crew);
+
+            // Resolve the shared store for cross-run persistence. If the
+            // store can't be created (e.g. misconfigured PG URL), fall back
+            // to an ephemeral in-memory session rather than failing the
+            // whole call — this mirrors how ephemeral conversations worked
+            // before the persistence layer was added.
+            let store = this.get_or_init_store().await.ok();
 
             let conv = build_conversation(
                 table,
@@ -389,7 +417,10 @@ impl UserData for LuaCrew {
                 &default_model,
                 max_tool_rounds,
                 eventbus,
-            )?;
+                store,
+                flow_name,
+            )
+            .await?;
             Ok(conv)
         });
 
@@ -404,11 +435,16 @@ impl UserData for LuaCrew {
             let agents: Vec<crate::engine::agent::Agent> = crew.agents.clone();
             let default_model = crew.provider_config.model.clone();
             let max_tool_rounds = crew.max_tool_rounds;
+            let flow_name = crew.goal.clone();
             let eventbus = lua
                 .app_data_ref::<EventBus>()
                 .map(|e| e.clone())
                 .unwrap_or_else(|| crew.eventbus.clone());
             drop(crew);
+
+            // Shared store (same pattern as conversation) — falls back to
+            // ephemeral mode if the store can't be created.
+            let store = this.get_or_init_store().await.ok();
 
             let dialog = build_dialog(
                 &lua,
@@ -419,7 +455,10 @@ impl UserData for LuaCrew {
                 &default_model,
                 max_tool_rounds,
                 eventbus,
-            )?;
+                store,
+                flow_name,
+            )
+            .await?;
             Ok(dialog)
         });
 
@@ -449,7 +488,6 @@ impl UserData for LuaCrew {
             // If the API handler injected a run_id via app_data, use it for consistency.
             let pre_assigned_run_id: Option<String> =
                 lua.app_data_ref::<String>().map(|r| r.clone());
-            let ironcrew_dir = this.project_dir.join(".ironcrew");
             let mut record = crew.create_run_record(
                 pre_assigned_run_id,
                 &results,
@@ -462,7 +500,8 @@ impl UserData for LuaCrew {
             if let Some(tags) = lua.app_data_ref::<Vec<String>>() {
                 record.tags = tags.clone();
             }
-            let store = crate::engine::store::create_store(ironcrew_dir)
+            let store = this
+                .get_or_init_store()
                 .await
                 .map_err(mlua::Error::external)?;
             let run_id = store

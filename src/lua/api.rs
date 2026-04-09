@@ -356,6 +356,7 @@ pub fn register_crew_constructor(
             runtime: runtime.clone(),
             custom_provider,
             project_dir,
+            store: tokio::sync::OnceCell::new(),
         })
     })?;
 

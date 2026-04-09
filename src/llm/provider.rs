@@ -12,7 +12,7 @@ pub struct TokenUsage {
     pub cached_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,

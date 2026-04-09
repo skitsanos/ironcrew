@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::engine::sessions::{ConversationRecord, DialogStateRecord};
 use crate::engine::task::TaskResult;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -117,21 +118,40 @@ fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
     true
 }
 
-/// JSON file-based store for persisting run records to disk.
+/// JSON file-based store rooted at an `.ironcrew/` directory.
+///
+/// Each record type gets its own subdirectory: `runs/`, `conversations/`,
+/// and `dialogs/`. All three are owner-only (0o700) on Unix since they
+/// may contain sensitive model output.
 pub struct JsonFileStore {
-    store_dir: PathBuf,
+    runs_dir: PathBuf,
+    conversations_dir: PathBuf,
+    dialogs_dir: PathBuf,
 }
 
 impl JsonFileStore {
-    pub fn new(store_dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&store_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Restrict .ironcrew/runs/ to owner-only (run history may contain sensitive output)
-            let _ = std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700));
+    /// Create (or open) a JSON-backed store inside the given `.ironcrew/`
+    /// directory. The directory — and the three subdirectories it contains
+    /// — are created with `create_dir_all` if they don't already exist.
+    pub fn new(ironcrew_dir: PathBuf) -> Result<Self> {
+        let runs_dir = ironcrew_dir.join("runs");
+        let conversations_dir = ironcrew_dir.join("conversations");
+        let dialogs_dir = ironcrew_dir.join("dialogs");
+
+        for dir in [&runs_dir, &conversations_dir, &dialogs_dir] {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
         }
-        Ok(Self { store_dir })
+
+        Ok(Self {
+            runs_dir,
+            conversations_dir,
+            dialogs_dir,
+        })
     }
 }
 
@@ -139,7 +159,7 @@ impl JsonFileStore {
 impl StateStore for JsonFileStore {
     async fn save_run(&self, record: &RunRecord) -> Result<String> {
         let filename = format!("{}.json", record.run_id);
-        let path = self.store_dir.join(&filename);
+        let path = self.runs_dir.join(&filename);
         let json = serde_json::to_string_pretty(record)
             .map_err(|e| IronCrewError::Validation(format!("Failed to serialize run: {}", e)))?;
         std::fs::write(&path, json)?;
@@ -149,7 +169,7 @@ impl StateStore for JsonFileStore {
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let filename = format!("{}.json", run_id);
-        let path = self.store_dir.join(&filename);
+        let path = self.runs_dir.join(&filename);
         if !path.exists() {
             return Err(IronCrewError::Validation(format!(
                 "Run '{}' not found",
@@ -173,7 +193,7 @@ impl StateStore for JsonFileStore {
         // memory as soon as possible. The winning optimization here would be
         // a sidecar index file — out of scope for this tier.
         let mut summaries = Vec::new();
-        for entry in std::fs::read_dir(&self.store_dir)? {
+        for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -204,7 +224,7 @@ impl StateStore for JsonFileStore {
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
         let mut count: u64 = 0;
-        for entry in std::fs::read_dir(&self.store_dir)? {
+        for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -222,7 +242,7 @@ impl StateStore for JsonFileStore {
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
         let filename = format!("{}.json", run_id);
-        let path = self.store_dir.join(&filename);
+        let path = self.runs_dir.join(&filename);
         if !path.exists() {
             return Err(IronCrewError::Validation(format!(
                 "Run '{}' not found",
@@ -230,6 +250,71 @@ impl StateStore for JsonFileStore {
             )));
         }
         std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    // ─── Persistent sessions ────────────────────────────────────────────────
+    //
+    // `get_*` returns Ok(None) when the file is missing so the caller can
+    // tell "first time this id is used" apart from real I/O errors.
+
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
+        let path = self.conversations_dir.join(format!("{}.json", record.id));
+        let json = serde_json::to_string_pretty(record).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize conversation: {}", e))
+        })?;
+        std::fs::write(&path, json)?;
+        tracing::debug!("Conversation saved: {} -> {}", record.id, path.display());
+        Ok(())
+    }
+
+    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>> {
+        let path = self.conversations_dir.join(format!("{}.json", id));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let record: ConversationRecord = serde_json::from_str(&data).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to parse conversation '{}': {}", id, e))
+        })?;
+        Ok(Some(record))
+    }
+
+    async fn delete_conversation(&self, id: &str) -> Result<()> {
+        let path = self.conversations_dir.join(format!("{}.json", id));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
+        let path = self.dialogs_dir.join(format!("{}.json", record.id));
+        let json = serde_json::to_string_pretty(record).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize dialog state: {}", e))
+        })?;
+        std::fs::write(&path, json)?;
+        tracing::debug!("Dialog state saved: {} -> {}", record.id, path.display());
+        Ok(())
+    }
+
+    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>> {
+        let path = self.dialogs_dir.join(format!("{}.json", id));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let record: DialogStateRecord = serde_json::from_str(&data).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to parse dialog state '{}': {}", id, e))
+        })?;
+        Ok(Some(record))
+    }
+
+    async fn delete_dialog_state(&self, id: &str) -> Result<()> {
+        let path = self.dialogs_dir.join(format!("{}.json", id));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
         Ok(())
     }
 }

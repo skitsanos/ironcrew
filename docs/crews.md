@@ -161,7 +161,48 @@ conv:reset()
 **Limitations (current):**
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
-- No cross-run persistence — conversations live for the duration of one `crew:run()` script
+
+### Cross-run persistence
+
+By default a conversation is ephemeral — it exists for the lifetime of one
+`crew:run()` and disappears when the process exits. Pass a stable `id` to
+persist it and resume across separate `ironcrew run` invocations (or API
+requests):
+
+```lua
+local chat = crew:conversation({
+    id       = "support-ticket-4821",   -- any ASCII [a-zA-Z0-9._-]{1,128}
+    agent    = "support_bot",
+    -- autosave = false,                -- opt out of auto-save (default: true)
+})
+
+chat:send("I'm seeing 504s from the billing API")
+-- State is saved after every completed turn.
+```
+
+When the same code runs again with the same `id`, IronCrew loads the prior
+message history from the store and the conversation picks up mid-thread.
+Omit `id` to get the pre-2.8 ephemeral behavior.
+
+**Session methods:**
+
+| Method                | Description |
+|-----------------------|-------------|
+| `conv:id()`           | The stable session id (user-supplied or auto-UUID) |
+| `conv:is_persistent()`| `true` if `id` was supplied and the session is tied to the store |
+| `conv:save()`         | Explicit save — useful when `autosave = false` |
+| `conv:delete()`       | Remove the persisted record from the store |
+
+Sessions are stored via the same `StateStore` backend as run history
+(JSON, SQLite, or PostgreSQL), under `.ironcrew/conversations/` for JSON
+or in a `conversations` table otherwise. See
+[`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
+for a full walkthrough.
+
+**Gotchas:** IDs are restricted to alphanumerics plus `-`, `_`, `.` (1-128
+chars) to prevent path traversal and SQL oddness; violations fail loud at
+the Lua layer. Concurrency is last-write-wins — don't use the same id for
+simultaneous sessions without your own locking.
 
 **SSE events:** Conversations emit `conversation_started`, `conversation_turn`,
 and `conversation_thinking` events through the EventBus. REST API subscribers
@@ -170,7 +211,9 @@ Each event includes a stable `conversation_id` so clients can group multiple
 conversations within a single run. See [REST API](rest-api.md#sse-events) for
 the full event schema.
 
-See [`examples/conversation/`](../examples/conversation/) for a working example.
+See [`examples/conversation/`](../examples/conversation/) for a basic example
+and [`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
+for the persistence demo.
 
 ---
 
@@ -382,6 +425,46 @@ The `stop_reason` field is omitted for runs that terminate via `max_turns`
 (backward-compatible with older clients). See
 [`examples/dialog-early-stop/`](../examples/dialog-early-stop/) for a
 full negotiation example.
+
+### Cross-run persistence
+
+Dialogs support the same `id`-keyed persistence as conversations. Supply
+a stable `id` and IronCrew saves the transcript, `next_index`, and stop
+state after every turn; re-opening the dialog with the same `id` on a
+subsequent run resumes from exactly where it left off.
+
+```lua
+local debate = crew:dialog({
+    id      = "ship-decision-q2",
+    agents  = { "optimist", "pessimist" },
+    starter = "Should we ship the billing rewrite this sprint?",
+    max_turns = 6,
+    -- autosave = false,   -- opt out of auto-save (default: true)
+})
+
+debate:run()   -- picks up from next_index if a prior record exists
+```
+
+On resume, the **agent list is validated against the stored record** —
+if you save a dialog with `{ "alice", "bob" }` and then try to resume it
+with `{ "alice", "carol" }`, the resume fails with a clear validation
+error rather than silently mixing state.
+
+**Session methods (same shape as conversation):**
+
+| Method                  | Description |
+|-------------------------|-------------|
+| `dialog:id()`           | The stable dialog id (user-supplied or auto-UUID) |
+| `dialog:is_persistent()`| `true` if the dialog is tied to the store |
+| `dialog:save()`         | Explicit save (for `autosave = false`) |
+| `dialog:delete()`       | Remove the persisted record |
+| `dialog:turn_count()`   | Returns `next_index` — reflects prior runs too |
+
+Dialogs are stored in `.ironcrew/dialogs/` (JSON) or a `dialogs` table
+(SQLite/PostgreSQL). The
+[`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
+project demonstrates both a resumable conversation and a resumable dialog
+in the same script.
 
 **SSE events:** Dialogs emit `dialog_started`, `dialog_turn`,
 `dialog_thinking`, and `dialog_completed` events through the EventBus. REST API

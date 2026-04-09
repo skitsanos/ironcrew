@@ -14,6 +14,7 @@ pub mod orchestrator;
 pub mod postgres_store;
 pub mod run_history;
 pub mod runtime;
+pub mod sessions;
 pub mod sqlite_store;
 pub mod store;
 pub mod task;

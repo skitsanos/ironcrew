@@ -279,16 +279,21 @@ All IronCrew features use the same store:
 | `GET /flows/{flow}/runs/{id}` | `get_run` — API endpoint |
 | `DELETE /flows/{flow}/runs/{id}` | `delete_run` — API endpoint |
 | `ironcrew run --json` | `get_run` — reads back the saved record for output |
+| `crew:conversation({id=...})` | `save_conversation` / `get_conversation` — resume-by-id chat sessions |
+| `crew:dialog({id=...})` | `save_dialog_state` / `get_dialog_state` — resume-by-id multi-agent dialogs |
 
 ## The StateStore Trait
 
-The storage system is built on an async trait. Listing uses a paginated,
-metadata-only path (`list_runs_summary` + `count_runs`) so a caller never
-pays to transfer `task_results` when they only need a summary view.
+The storage system is built on a single async trait covering both run
+history (paginated, metadata-first) and persistent sessions (stable-id,
+upsert-style). Listing uses `list_runs_summary` + `count_runs` so a
+caller never pays to transfer `task_results` when they only need a
+summary view.
 
 ```rust
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    // ─── Run history ────────────────────────────────────────────────
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
 
@@ -300,11 +305,17 @@ pub trait StateStore: Send + Sync {
         offset: usize,
     ) -> Result<Vec<RunSummary>>;
 
-    /// Count matching runs — paired with `list_runs_summary` to populate
-    /// `total` in paginated responses.
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
-
     async fn delete_run(&self, run_id: &str) -> Result<()>;
+
+    // ─── Persistent sessions ────────────────────────────────────────
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
+    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>>;
+    async fn delete_conversation(&self, id: &str) -> Result<()>;
+
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
+    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>>;
+    async fn delete_dialog_state(&self, id: &str) -> Result<()>;
 }
 ```
 
@@ -313,8 +324,40 @@ pub trait StateStore: Send + Sync {
 set. `RunSummary` is `RunRecord` minus `task_results` — the field that
 typically dominates a record's on-disk size.
 
-This design allows future backends (PostgreSQL, Redis, cloud storage) to use
-async I/O natively without blocking the Tokio runtime.
+**Sessions vs runs:** `get_*` returns `Option` for sessions (so the caller
+can distinguish "first time this id is used" from a real error) but `Result`
+for runs (because `get_run` is always called with an id the caller believes
+exists). Session `save_*` is idempotent upsert — calling it with an
+existing id overwrites the prior record.
+
+### Session storage layout
+
+| Backend     | Conversations                                   | Dialogs                                    |
+|-------------|--------------------------------------------------|--------------------------------------------|
+| `json`      | `.ironcrew/conversations/<id>.json`             | `.ironcrew/dialogs/<id>.json`              |
+| `sqlite`    | `conversations` table in `.ironcrew/ironcrew.db` | `dialogs` table in the same file           |
+| `postgres`  | `{prefix}conversations` table                    | `{prefix}dialogs` table                    |
+
+All JSON subdirectories are created at `0o700` on Unix. SQLite and
+PostgreSQL tables are created on first connect via `CREATE TABLE IF NOT
+EXISTS`, with GIN indexes on the JSONB columns (PostgreSQL) for future
+filtering support.
+
+### Session ID validation
+
+User-supplied session IDs are restricted to ASCII alphanumerics plus `-`,
+`_`, and `.`, and must be 1-128 characters. The restriction runs at the
+Lua layer (`src/engine/sessions.rs::validate_session_id`) before the id
+ever reaches a backend, which prevents:
+
+- Path traversal against the JSON store (e.g. `../etc/passwd`).
+- SQL metacharacter oddness against SQLite/PostgreSQL.
+- Silent truncation on filesystems with short filename limits.
+
+Violations surface as a clear `Validation` error.
+
+This design allows future backends (Redis, cloud storage) to use async I/O
+natively without blocking the Tokio runtime.
 
 ## Switching Backends
 
