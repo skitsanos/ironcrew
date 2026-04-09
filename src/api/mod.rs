@@ -34,6 +34,8 @@ pub struct RunCrewResponse {
     pub flow_name: String,
     pub status: String,
     pub duration_ms: u64,
+    /// Aggregate token usage across all tasks in this run.
+    pub total_tokens: u32,
     pub results: Vec<TaskResultResponse>,
 }
 

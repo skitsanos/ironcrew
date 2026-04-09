@@ -125,7 +125,7 @@ pub async fn run_flow(
                             run_id: run_id_clone.clone(),
                             status: response.status.clone(),
                             duration_ms: response.duration_ms,
-                            total_tokens: response.results.iter().map(|_| 0u32).sum(),
+                            total_tokens: response.total_tokens,
                         });
                     }
                     Ok(Err(e)) => {
@@ -249,6 +249,7 @@ async fn execute_crew_from_path_with_events(
             flow_name: run.flow_name.clone(),
             status: run.status.to_string(),
             duration_ms: run.duration_ms,
+            total_tokens: run.total_tokens,
             results: run
                 .task_results
                 .iter()
@@ -273,6 +274,7 @@ async fn execute_crew_from_path_with_events(
         flow_name: "unknown".into(),
         status: "completed".into(),
         duration_ms: 0,
+        total_tokens: 0,
         results: vec![],
     })
 }
@@ -310,6 +312,7 @@ pub async fn execute_crew_from_path(
             flow_name: run.flow_name.clone(),
             status: run.status.to_string(),
             duration_ms: run.duration_ms,
+            total_tokens: run.total_tokens,
             results: run
                 .task_results
                 .iter()
@@ -329,6 +332,7 @@ pub async fn execute_crew_from_path(
         flow_name: "unknown".into(),
         status: "completed".into(),
         duration_ms: 0,
+        total_tokens: 0,
         results: vec![],
     })
 }
@@ -389,6 +393,19 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
     }
 }
 
+/// Truncate a string at the nearest UTF-8 char boundary at or below `max` bytes.
+/// Returns a slice that is never in the middle of a multi-byte codepoint.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut boundary = max;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
 /// Optionally truncate output fields in SSE events.
 /// Works with Arc<CrewEvent> — returns a new owned event only when truncation is needed.
 fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<CrewEvent> {
@@ -407,8 +424,8 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
             duration_ms: *duration_ms,
             success: *success,
             output: format!(
-                "{}... [truncated, {} total chars]",
-                &output[..max],
+                "{}... [truncated, {} total bytes]",
+                truncate_utf8(output, max),
                 output.len()
             ),
             token_usage: token_usage.clone(),
@@ -423,12 +440,59 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
             agent: agent.clone(),
             turn: *turn,
             content: format!(
-                "{}... [truncated, {} total chars]",
-                &content[..max],
+                "{}... [truncated, {} total bytes]",
+                truncate_utf8(content, max),
                 content.len()
             ),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn ascii_under_limit_returns_full() {
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[test]
+    fn ascii_over_limit_truncates() {
+        assert_eq!(truncate_utf8("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn emoji_truncate_does_not_panic() {
+        // "🎉" is 4 bytes in UTF-8
+        let s = "🎉🎉🎉🎉🎉"; // 20 bytes
+        // Try every possible max from 0 to len — no panics
+        for max in 0..=s.len() {
+            let _ = truncate_utf8(s, max);
+        }
+    }
+
+    #[test]
+    fn emoji_truncate_lands_on_boundary() {
+        let s = "🎉🎉🎉"; // 12 bytes, 3 chars
+        // max=5 should walk back to boundary 4 (after first emoji)
+        assert_eq!(truncate_utf8(s, 5), "🎉");
+        // max=4 already a boundary
+        assert_eq!(truncate_utf8(s, 4), "🎉");
+        // max=3 walks back to 0
+        assert_eq!(truncate_utf8(s, 3), "");
+    }
+
+    #[test]
+    fn cjk_truncate_does_not_panic() {
+        // CJK chars are 3 bytes each
+        let s = "你好世界"; // 12 bytes, 4 chars
+        for max in 0..=s.len() {
+            let _ = truncate_utf8(s, max);
+        }
+        assert_eq!(truncate_utf8(s, 3), "你");
+        assert_eq!(truncate_utf8(s, 6), "你好");
     }
 }
 
