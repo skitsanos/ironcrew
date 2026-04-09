@@ -10,9 +10,6 @@
 //! turn.
 //!
 //! ## Future work
-//! - SSE wiring (`dialog_turn`, `dialog_thinking` events)
-//! - Custom termination conditions via Lua callback
-//! - More than two agents (round-robin or moderator-driven)
 //! - Cross-run persistence
 
 use std::collections::VecDeque;
@@ -92,6 +89,28 @@ pub struct AgentDialog {
     /// Signature: `function(transcript_table, agents_table) -> agent_name`
     /// Stored as a registry key for thread safety. When `None`, round-robin.
     pub turn_selector_key: Option<mlua::RegistryKey>,
+
+    /// Optional Lua callback for custom early termination.
+    ///
+    /// Signature: `function(last_turn_table, transcript_table) -> bool | string | nil`
+    ///
+    /// Return values:
+    ///   - `false` / `nil`  → continue
+    ///   - `true`           → stop (reason = "custom_stop")
+    ///   - `"reason"`       → stop with that reason string
+    ///
+    /// Stored as a registry key for thread safety. When `None`, the dialog
+    /// runs until `max_turns` is reached.
+    pub should_stop_key: Option<mlua::RegistryKey>,
+
+    /// Set to true once a `should_stop` callback has requested termination.
+    /// `has_turns_remaining` consults this flag so manual `next_turn` loops
+    /// also respect the stop condition.
+    pub stopped: Mutex<bool>,
+
+    /// The reason the dialog stopped early, if any. `None` while running
+    /// and after a natural `max_turns` completion.
+    pub stop_reason: Mutex<Option<String>>,
 }
 
 impl AgentDialog {
@@ -111,18 +130,13 @@ impl AgentDialog {
         starting_speaker: usize,
         eventbus: EventBus,
         turn_selector_key: Option<mlua::RegistryKey>,
+        should_stop_key: Option<mlua::RegistryKey>,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
 
-        // For backward compat, the dialog_started event still has agent_a/agent_b
-        // fields when there are exactly 2 agents. For 3+ agents we use the
-        // first two as the canonical pair (older clients still get something
-        // useful) and the full list is reflected in dialog_turn events.
         eventbus.emit(CrewEvent::DialogStarted {
             dialog_id: id.clone(),
-            agent_a: agent_names[0].clone(),
-            agent_b: agent_names.get(1).cloned().unwrap_or_default(),
+            agents: agents.iter().map(|a| a.name.clone()).collect(),
             max_turns,
         });
 
@@ -143,12 +157,107 @@ impl AgentDialog {
             eventbus,
             completed_emitted: Mutex::new(false),
             turn_selector_key,
+            should_stop_key,
+            stopped: Mutex::new(false),
+            stop_reason: Mutex::new(None),
         }
     }
 
-    /// Returns `true` if the dialog has not reached `max_turns` yet.
+    /// Returns `true` if the dialog has not reached `max_turns` yet AND no
+    /// `should_stop` callback has requested termination.
     async fn has_turns_remaining(&self) -> bool {
+        if *self.stopped.lock().await {
+            return false;
+        }
         *self.next_index.lock().await < self.max_turns
+    }
+
+    /// Interpret a Lua return value from the `should_stop` callback.
+    ///
+    /// Accepted shapes:
+    ///   - `nil` / `false` → continue (returns `None`)
+    ///   - `true`          → stop with the default reason `"custom_stop"`
+    ///   - `"reason"`      → stop with the given reason
+    ///
+    /// Anything else (numbers, tables, etc.) is a usage error and surfaces as
+    /// a validation error so the user gets a clear message instead of a
+    /// silent no-op.
+    fn interpret_stop_value(value: mlua::Value) -> Result<Option<String>, IronCrewError> {
+        match value {
+            mlua::Value::Nil => Ok(None),
+            mlua::Value::Boolean(false) => Ok(None),
+            mlua::Value::Boolean(true) => Ok(Some("custom_stop".into())),
+            mlua::Value::String(s) => {
+                let owned = s
+                    .to_str()
+                    .map(|s| s.to_string())
+                    .map_err(|e| IronCrewError::Validation(format!("should_stop reason: {}", e)))?;
+                if owned.is_empty() {
+                    Ok(Some("custom_stop".into()))
+                } else {
+                    Ok(Some(owned))
+                }
+            }
+            other => Err(IronCrewError::Validation(format!(
+                "should_stop callback must return nil, bool, or string — got {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// After a turn has been executed, consult the `should_stop` callback (if
+    /// any). If it signals stop, record the reason, flip the `stopped` flag,
+    /// and emit `DialogCompleted` (guarded by `completed_emitted` so the
+    /// max-turns path can't double-emit).
+    async fn maybe_stop_after_turn(
+        &self,
+        lua: &mlua::Lua,
+        turn: &DialogTurn,
+    ) -> Result<(), IronCrewError> {
+        let Some(ref key) = self.should_stop_key else {
+            return Ok(());
+        };
+
+        let func: mlua::Function = lua
+            .registry_value(key)
+            .map_err(|e| IronCrewError::Validation(format!("should_stop callback: {}", e)))?;
+
+        // Build last-turn table for the callback
+        let last_turn_table = turn_to_lua(lua, turn)
+            .map_err(|e| IronCrewError::Validation(format!("should_stop: {}", e)))?;
+
+        // Build transcript snapshot for the callback
+        let transcript = self.transcript.lock().await;
+        let transcript_table: Vec<DialogTurn> = transcript.iter().cloned().collect();
+        drop(transcript);
+        let transcript_lua = transcript_to_lua(lua, &transcript_table)
+            .map_err(|e| IronCrewError::Validation(format!("should_stop: {}", e)))?;
+
+        // Call via call_async so users can use async methods (e.g. a
+        // moderator:send() check) inside the callback.
+        let result: mlua::Value = func
+            .call_async((last_turn_table, transcript_lua))
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("should_stop callback: {}", e)))?;
+
+        let Some(reason) = Self::interpret_stop_value(result)? else {
+            return Ok(());
+        };
+
+        *self.stopped.lock().await = true;
+        *self.stop_reason.lock().await = Some(reason.clone());
+
+        let mut emitted = self.completed_emitted.lock().await;
+        if !*emitted {
+            *emitted = true;
+            let total = *self.next_index.lock().await;
+            self.eventbus.emit(CrewEvent::DialogCompleted {
+                dialog_id: self.id.clone(),
+                total_turns: total,
+                stop_reason: Some(reason),
+            });
+        }
+        Ok(())
     }
 
     /// Default round-robin speaker selection.
@@ -291,27 +400,33 @@ impl AgentDialog {
     }
 
     /// Run a single turn with automatic speaker selection (round-robin or callback).
-    /// Returns `None` if the dialog has already reached max_turns.
+    /// Returns `None` if the dialog has already reached max_turns or was
+    /// stopped by a `should_stop` callback on a previous turn.
     pub async fn run_one_turn(&self, lua: &mlua::Lua) -> Result<Option<DialogTurn>, IronCrewError> {
         if !self.has_turns_remaining().await {
             return Ok(None);
         }
         let speaker_index = self.select_speaker(lua).await?;
-        self.execute_turn(speaker_index).await.map(Some)
+        let turn = self.execute_turn(speaker_index).await?;
+        self.maybe_stop_after_turn(lua, &turn).await?;
+        Ok(Some(turn))
     }
 
     /// Run a turn for a specific agent by name. Useful for moderator-driven
     /// loops where the caller picks who speaks next.
-    /// Returns `None` if max_turns is reached.
+    /// Returns `None` if max_turns is reached or a prior turn triggered stop.
     pub async fn run_turn_for(
         &self,
+        lua: &mlua::Lua,
         agent_name: &str,
     ) -> Result<Option<DialogTurn>, IronCrewError> {
         if !self.has_turns_remaining().await {
             return Ok(None);
         }
         let speaker_index = self.agent_index(agent_name)?;
-        self.execute_turn(speaker_index).await.map(Some)
+        let turn = self.execute_turn(speaker_index).await?;
+        self.maybe_stop_after_turn(lua, &turn).await?;
+        Ok(Some(turn))
     }
 
     /// Execute a turn for the agent at `speaker_index`. Increments the turn
@@ -449,7 +564,10 @@ impl AgentDialog {
             eprintln!();
         }
 
-        // If this turn was the last one, emit dialog_completed
+        // If this turn was the last one, emit dialog_completed for the
+        // natural max-turns path. Early `should_stop` termination is handled
+        // in `maybe_stop_after_turn`, and `completed_emitted` guarantees only
+        // one of the two paths actually fires the event.
         if next_index + 1 >= self.max_turns {
             let mut emitted = self.completed_emitted.lock().await;
             if !*emitted {
@@ -457,6 +575,7 @@ impl AgentDialog {
                 self.eventbus.emit(CrewEvent::DialogCompleted {
                     dialog_id: self.id.clone(),
                     total_turns: next_index + 1,
+                    stop_reason: None,
                 });
             }
         }
@@ -560,7 +679,7 @@ impl UserData for AgentDialog {
             "next_turn_from",
             |lua, this, agent_name: String| async move {
                 let turn = this
-                    .run_turn_for(&agent_name)
+                    .run_turn_for(&lua, &agent_name)
                     .await
                     .map_err(mlua::Error::external)?;
                 match turn {
@@ -620,6 +739,16 @@ impl UserData for AgentDialog {
 
         // dialog:max_turns() — configured turn limit
         methods.add_method("max_turns", |_, this, ()| Ok(this.max_turns));
+
+        // dialog:stopped() — true if a should_stop callback has requested termination
+        methods.add_async_method("stopped", |_, this, ()| async move {
+            Ok(*this.stopped.lock().await)
+        });
+
+        // dialog:stop_reason() — the reason string if stopped early, otherwise nil
+        methods.add_async_method("stop_reason", |_, this, ()| async move {
+            Ok(this.stop_reason.lock().await.clone())
+        });
     }
 }
 
@@ -643,8 +772,8 @@ fn transcript_to_lua(lua: &mlua::Lua, transcript: &[DialogTurn]) -> mlua::Result
     Ok(table)
 }
 
-/// Build an AgentDialog from a Lua options table. Accepts either a new
-/// `agents = {"name", ...}` array OR the legacy `agent_a` / `agent_b` form.
+/// Build an AgentDialog from a Lua options table. Participants are given via
+/// the `agents = {"name", ...}` array (two or more).
 #[allow(clippy::too_many_arguments)]
 pub fn build_dialog(
     lua: &mlua::Lua,
@@ -656,20 +785,18 @@ pub fn build_dialog(
     crew_max_tool_rounds: usize,
     eventbus: EventBus,
 ) -> mlua::Result<AgentDialog> {
-    // Resolve participants — prefer the new `agents` array if present.
-    let dialog_agents: Vec<Agent> = if let Ok(agents_table) = table.get::<Table>("agents") {
-        let mut out: Vec<Agent> = Vec::new();
-        for value in agents_table.sequence_values::<Value>() {
-            let value = value?;
-            out.push(resolve_agent(value, crew_agents, "agents")?);
-        }
-        out
-    } else {
-        // Legacy two-agent form
-        let agent_a = resolve_agent(table.get::<Value>("agent_a")?, crew_agents, "agent_a")?;
-        let agent_b = resolve_agent(table.get::<Value>("agent_b")?, crew_agents, "agent_b")?;
-        vec![agent_a, agent_b]
-    };
+    let agents_table = table.get::<Table>("agents").map_err(|_| {
+        mlua::Error::external(IronCrewError::Validation(
+            "Dialog requires an `agents = {\"name\", ...}` array of two or more \
+             participants"
+                .into(),
+        ))
+    })?;
+    let mut dialog_agents: Vec<Agent> = Vec::new();
+    for value in agents_table.sequence_values::<Value>() {
+        let value = value?;
+        dialog_agents.push(resolve_agent(value, crew_agents, "agents")?);
+    }
 
     if dialog_agents.len() < 2 {
         return Err(mlua::Error::external(IronCrewError::Validation(
@@ -767,6 +894,14 @@ pub fn build_dialog(
             None
         };
 
+    // Optional should_stop callback — same registry-key pattern as turn_selector
+    let should_stop_key: Option<mlua::RegistryKey> =
+        if let Ok(func) = table.get::<mlua::Function>("should_stop") {
+            Some(lua.create_registry_value(func)?)
+        } else {
+            None
+        };
+
     Ok(AgentDialog::new(
         dialog_agents,
         provider,
@@ -780,6 +915,7 @@ pub fn build_dialog(
         starting_speaker,
         eventbus,
         turn_selector_key,
+        should_stop_key,
     ))
 }
 
@@ -803,5 +939,68 @@ fn resolve_agent(value: Value, agents: &[Agent], field: &str) -> mlua::Result<Ag
             "Dialog: {} must be a string (agent name) or Agent table",
             field
         )))),
+    }
+}
+
+#[cfg(test)]
+mod interpret_stop_tests {
+    use super::*;
+
+    fn lua() -> mlua::Lua {
+        mlua::Lua::new()
+    }
+
+    #[test]
+    fn nil_means_continue() {
+        let result = AgentDialog::interpret_stop_value(mlua::Value::Nil).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn false_means_continue() {
+        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(false)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn true_means_stop_with_default_reason() {
+        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(true)).unwrap();
+        assert_eq!(result.as_deref(), Some("custom_stop"));
+    }
+
+    #[test]
+    fn string_means_stop_with_that_reason() {
+        let lua = lua();
+        let s = lua.create_string("consensus reached").unwrap();
+        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
+        assert_eq!(result.as_deref(), Some("consensus reached"));
+    }
+
+    #[test]
+    fn empty_string_falls_back_to_default_reason() {
+        let lua = lua();
+        let s = lua.create_string("").unwrap();
+        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
+        assert_eq!(result.as_deref(), Some("custom_stop"));
+    }
+
+    #[test]
+    fn number_is_rejected_as_usage_error() {
+        let result = AgentDialog::interpret_stop_value(mlua::Value::Integer(42));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must return nil, bool, or string"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn table_is_rejected_as_usage_error() {
+        let lua = lua();
+        let t = lua.create_table().unwrap();
+        let result = AgentDialog::interpret_stop_value(mlua::Value::Table(t));
+        assert!(result.is_err());
     }
 }

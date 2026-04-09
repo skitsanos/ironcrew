@@ -274,7 +274,7 @@ All IronCrew features use the same store:
 | `crew:run()` | `save_run` — saves the run record after execution |
 | `ironcrew runs` | `list_runs_summary` + `count_runs` — paginated metadata listing |
 | `ironcrew inspect` | `get_run` — retrieves a specific run by ID |
-| `ironcrew clean` | `list_runs` + `delete_run` — removes old records (legacy path) |
+| `ironcrew clean` | `list_runs_summary` + `delete_run` — removes old records |
 | `GET /flows/{flow}/runs` | `list_runs_summary` + `count_runs` — paginated API endpoint |
 | `GET /flows/{flow}/runs/{id}` | `get_run` — API endpoint |
 | `DELETE /flows/{flow}/runs/{id}` | `delete_run` — API endpoint |
@@ -284,18 +284,13 @@ All IronCrew features use the same store:
 
 The storage system is built on an async trait. Listing uses a paginated,
 metadata-only path (`list_runs_summary` + `count_runs`) so a caller never
-pays to transfer `task_results` when they only need a summary view. The
-legacy `list_runs` method is retained for backward-compatibility with the
-CLI `clean` command and will be removed in v3.0.0.
+pays to transfer `task_results` when they only need a summary view.
 
 ```rust
 #[async_trait]
 pub trait StateStore: Send + Sync {
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
-
-    /// **Deprecated** — use `list_runs_summary` instead.
-    async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
 
     /// Paginated, metadata-only list. `limit=0` means unlimited.
     async fn list_runs_summary(

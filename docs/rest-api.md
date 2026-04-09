@@ -130,10 +130,10 @@ full untruncated output.
 | `conversation_started` | `conversation_id`, `agent`                                  | A `crew:conversation()` was created          |
 | `conversation_turn`  | `conversation_id`, `agent`, `turn_index`, `user_message`, `assistant_message` | Single completed turn (`send`/`ask`) |
 | `conversation_thinking` | `conversation_id`, `agent`, `turn_index`, `content`         | Reasoning captured during a conversation turn |
-| `dialog_started`     | `dialog_id`, `agent_a`, `agent_b`, `max_turns`                | A `crew:dialog()` was created                |
+| `dialog_started`     | `dialog_id`, `agents`, `max_turns`                            | A `crew:dialog()` was created (`agents` is the array of participating agent names in turn order) |
 | `dialog_turn`        | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | One turn in an agent-to-agent dialog (`speaker` = "a" or "b") |
 | `dialog_thinking`    | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | Reasoning captured during a dialog turn      |
-| `dialog_completed`   | `dialog_id`, `total_turns`                                    | Dialog reached `max_turns`                   |
+| `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended (either reached `max_turns` or a `should_stop` callback stopped it; `stop_reason` is present only when the callback stopped it) |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
@@ -171,7 +171,10 @@ events per primitive when multiple are running in the same `crew:run()`.
 - `dialog_turn` — once per turn (one event per `next_turn()` or per turn
   inside `run()`)
 - `dialog_thinking` — once per turn when reasoning is captured
-- `dialog_completed` — emitted exactly once when the dialog reaches `max_turns`
+- `dialog_completed` — emitted exactly once, either when the dialog reaches
+  `max_turns` or when a `should_stop` Lua callback requests early termination.
+  The event carries an optional `stop_reason` string in the early-stop case
+  (omitted for max-turns completion, so older clients are unaffected)
 
 Conversation and dialog output also still streams to stderr in the Lua process
 (with dim styling for reasoning) — the SSE events are an additional channel.
@@ -237,10 +240,8 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
 }
 ```
 
-> **Breaking change in v2.7.0:** this endpoint previously returned a bare
-> JSON array of full `RunRecord` objects. It now returns a paginated object
-> with lightweight `RunSummary` entries. To fetch a full `RunRecord`
-> (including `task_results`), call `GET /flows/{flow}/runs/{id}`.
+To fetch a full `RunRecord` (including `task_results`), call
+`GET /flows/{flow}/runs/{id}`.
 
 ### Get Run Details
 

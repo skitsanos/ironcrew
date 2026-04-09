@@ -1,4 +1,4 @@
-use ironcrew::engine::run_history::{ListRunsFilter, RunHistory, RunRecord, RunStatus};
+use ironcrew::engine::run_history::{JsonFileStore, ListRunsFilter, RunRecord, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
 
@@ -22,7 +22,7 @@ fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) ->
 #[tokio::test]
 async fn test_save_and_load_run() {
     let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     let record = RunRecord {
         run_id: "test-run-123".into(),
@@ -56,46 +56,9 @@ async fn test_save_and_load_run() {
 }
 
 #[tokio::test]
-async fn test_list_runs() {
-    let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
-
-    for i in 0..3 {
-        let record = RunRecord {
-            run_id: format!("run-{}", i),
-            flow_name: "test".into(),
-            status: if i == 1 {
-                RunStatus::Failed
-            } else {
-                RunStatus::Success
-            },
-            started_at: format!("2026-03-18T12:00:0{}Z", i),
-            finished_at: format!("2026-03-18T12:00:0{}Z", i + 1),
-            duration_ms: 1000,
-            task_results: vec![],
-            agent_count: 1,
-            task_count: 1,
-            total_tokens: 0,
-            cached_tokens: 0,
-            tags: vec![],
-        };
-        history.save_run(&record).await.unwrap();
-    }
-
-    let all = history.list_runs(None).await.unwrap();
-    assert_eq!(all.len(), 3);
-
-    let success_only = history.list_runs(Some("success")).await.unwrap();
-    assert_eq!(success_only.len(), 2);
-
-    let failed_only = history.list_runs(Some("failed")).await.unwrap();
-    assert_eq!(failed_only.len(), 1);
-}
-
-#[tokio::test]
 async fn test_delete_run() {
     let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     let record = RunRecord {
         run_id: "to-delete".into(),
@@ -120,14 +83,14 @@ async fn test_delete_run() {
 #[tokio::test]
 async fn test_get_nonexistent_run() {
     let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
     assert!(history.get_run("nonexistent").await.is_err());
 }
 
 #[tokio::test]
 async fn test_list_runs_summary_pagination() {
     let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     for i in 0..5 {
         history
@@ -166,7 +129,7 @@ async fn test_list_runs_summary_pagination() {
 #[tokio::test]
 async fn test_list_runs_summary_filters() {
     let dir = tempfile::tempdir().unwrap();
-    let history = RunHistory::new(dir.path().to_path_buf()).unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     history
         .save_run(&make_record(

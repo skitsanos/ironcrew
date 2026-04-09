@@ -393,7 +393,7 @@ impl UserData for LuaCrew {
             Ok(conv)
         });
 
-        // crew:dialog({agent_a = ..., agent_b = ..., starter = ..., ...})
+        // crew:dialog({agents = {"name", ...}, starter = ..., ...})
         // Creates an agent-to-agent dialog with perspective-flipped histories.
         methods.add_async_method("dialog", |lua, this, table: Table| async move {
             let crew = this.crew.lock().await;

@@ -140,8 +140,7 @@ local reply = conv:send("Explain ownership in Rust")
 
 -- Two-agent debate (perspective-flipped)
 local debate = crew:dialog({
-    agent_a = "bull",
-    agent_b = "bear",
+    agents = { "bull", "bear" },
     starter = "Should we buy NVDA?",
     max_turns = 6,
 })
