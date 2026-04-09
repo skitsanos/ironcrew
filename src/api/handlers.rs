@@ -449,53 +449,6 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
     }
 }
 
-#[cfg(test)]
-mod truncate_tests {
-    use super::truncate_utf8;
-
-    #[test]
-    fn ascii_under_limit_returns_full() {
-        assert_eq!(truncate_utf8("hello", 10), "hello");
-    }
-
-    #[test]
-    fn ascii_over_limit_truncates() {
-        assert_eq!(truncate_utf8("hello world", 5), "hello");
-    }
-
-    #[test]
-    fn emoji_truncate_does_not_panic() {
-        // "🎉" is 4 bytes in UTF-8
-        let s = "🎉🎉🎉🎉🎉"; // 20 bytes
-        // Try every possible max from 0 to len — no panics
-        for max in 0..=s.len() {
-            let _ = truncate_utf8(s, max);
-        }
-    }
-
-    #[test]
-    fn emoji_truncate_lands_on_boundary() {
-        let s = "🎉🎉🎉"; // 12 bytes, 3 chars
-        // max=5 should walk back to boundary 4 (after first emoji)
-        assert_eq!(truncate_utf8(s, 5), "🎉");
-        // max=4 already a boundary
-        assert_eq!(truncate_utf8(s, 4), "🎉");
-        // max=3 walks back to 0
-        assert_eq!(truncate_utf8(s, 3), "");
-    }
-
-    #[test]
-    fn cjk_truncate_does_not_panic() {
-        // CJK chars are 3 bytes each
-        let s = "你好世界"; // 12 bytes, 4 chars
-        for max in 0..=s.len() {
-            let _ = truncate_utf8(s, max);
-        }
-        assert_eq!(truncate_utf8(s, 3), "你");
-        assert_eq!(truncate_utf8(s, 6), "你好");
-    }
-}
-
 pub async fn flow_events(
     State(state): State<Arc<AppState>>,
     Path((flow, run_id)): Path<(String, String)>,
@@ -760,4 +713,51 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
     }
 
     Json(tools)
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn ascii_under_limit_returns_full() {
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[test]
+    fn ascii_over_limit_truncates() {
+        assert_eq!(truncate_utf8("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn emoji_truncate_does_not_panic() {
+        // "🎉" is 4 bytes in UTF-8
+        let s = "🎉🎉🎉🎉🎉"; // 20 bytes
+        // Try every possible max from 0 to len — no panics
+        for max in 0..=s.len() {
+            let _ = truncate_utf8(s, max);
+        }
+    }
+
+    #[test]
+    fn emoji_truncate_lands_on_boundary() {
+        let s = "🎉🎉🎉"; // 12 bytes, 3 chars
+        // max=5 should walk back to boundary 4 (after first emoji)
+        assert_eq!(truncate_utf8(s, 5), "🎉");
+        // max=4 already a boundary
+        assert_eq!(truncate_utf8(s, 4), "🎉");
+        // max=3 walks back to 0
+        assert_eq!(truncate_utf8(s, 3), "");
+    }
+
+    #[test]
+    fn cjk_truncate_does_not_panic() {
+        // CJK chars are 3 bytes each
+        let s = "你好世界"; // 12 bytes, 4 chars
+        for max in 0..=s.len() {
+            let _ = truncate_utf8(s, max);
+        }
+        assert_eq!(truncate_utf8(s, 3), "你");
+        assert_eq!(truncate_utf8(s, 6), "你好");
+    }
 }
