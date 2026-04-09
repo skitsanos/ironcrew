@@ -15,6 +15,7 @@
 //! - More than two agents (round-robin or moderator-driven)
 //! - Cross-run persistence
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +76,8 @@ pub struct AgentDialog {
     pub starting_speaker: usize,
 
     /// The shared transcript — turns in chronological order.
-    pub transcript: Mutex<Vec<DialogTurn>>,
+    /// Stored as a VecDeque so `max_history` trimming can pop from the front in O(1).
+    pub transcript: Mutex<VecDeque<DialogTurn>>,
     /// Index of the next turn to run (0-based).
     pub next_index: Mutex<usize>,
 
@@ -136,7 +138,7 @@ impl AgentDialog {
             stream,
             max_tool_rounds,
             starting_speaker,
-            transcript: Mutex::new(Vec::new()),
+            transcript: Mutex::new(VecDeque::new()),
             next_index: Mutex::new(0),
             eventbus,
             completed_emitted: Mutex::new(false),
@@ -407,7 +409,20 @@ impl AgentDialog {
             },
         };
 
-        self.transcript.lock().await.push(turn.clone());
+        {
+            let mut transcript = self.transcript.lock().await;
+            transcript.push_back(turn.clone());
+            // Trim the stored transcript if a cap is configured. This keeps
+            // the stored transcript bounded in the same way `build_messages`
+            // already bounds the ephemeral prompt message list.
+            if let Some(cap) = self.max_history
+                && cap > 0
+            {
+                while transcript.len() > cap {
+                    transcript.pop_front();
+                }
+            }
+        }
 
         // Emit SSE events for this turn
         let speaker_str = speaker_label(speaker_index);
@@ -516,7 +531,7 @@ impl AgentDialog {
                 break;
             }
         }
-        Ok(self.transcript.lock().await.clone())
+        Ok(self.transcript.lock().await.iter().cloned().collect())
     }
 }
 
@@ -557,7 +572,8 @@ impl UserData for AgentDialog {
 
         // dialog:transcript() — get the current transcript
         methods.add_async_method("transcript", |lua, this, ()| async move {
-            let transcript = this.transcript.lock().await.clone();
+            let transcript: Vec<DialogTurn> =
+                this.transcript.lock().await.iter().cloned().collect();
             transcript_to_lua(&lua, &transcript)
         });
 
@@ -683,7 +699,24 @@ pub fn build_dialog(
     let max_turns: usize = table
         .get::<usize>("max_turns")
         .unwrap_or(dialog_agents.len() * 2);
-    let max_history: Option<usize> = table.get("max_history").ok();
+    // max_history resolution order (same pattern as LuaConversation):
+    //   1. Explicit value in the Lua table (0 → unbounded opt-in)
+    //   2. IRONCREW_DIALOG_MAX_HISTORY env var
+    //   3. Safe default of 100 turns
+    let max_history: Option<usize> = match table.get::<usize>("max_history") {
+        Ok(0) => None,
+        Ok(n) => Some(n),
+        Err(_) => {
+            let env_default = std::env::var("IRONCREW_DIALOG_MAX_HISTORY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+            match env_default {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(100),
+            }
+        }
+    };
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
     // starting_speaker accepts:

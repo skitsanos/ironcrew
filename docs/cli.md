@@ -264,7 +264,12 @@ be set in the shell or in `.env` files.
 | `IRONCREW_TOOL_TIMEOUT` | Max seconds a single tool execution may run (default: `60`) |
 | `IRONCREW_DEFAULT_MAX_CONCURRENT` | Default max parallel tasks per phase when not set in crew config (default: `10`) |
 | `IRONCREW_MAX_PROMPT_CHARS` | Max user prompt size in characters (default: `102400` = 100KB). Truncates with warning |
-| `IRONCREW_MAX_EVENTS` | Max events in the EventBus replay buffer (default: `1000`) |
+| `IRONCREW_MAX_EVENTS` | Max events (count) in the EventBus replay buffer (default: `1000`) |
+| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | Max total bytes in the replay buffer (default: `4194304` = 4 MB). Live SSE broadcasts are always lossless — this only affects the catch-up replay for late subscribers. `0` disables the cap. |
+| `IRONCREW_CONVERSATION_MAX_HISTORY` | Default `max_history` for `crew:conversation({})` when not set explicitly (default: `50`). `0` means unbounded |
+| `IRONCREW_DIALOG_MAX_HISTORY` | Default `max_history` for `crew:dialog({})` when not set explicitly (default: `100`). Applies to both the prompt window and the stored transcript. `0` means unbounded |
+| `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | Max messages per agent queue in the MessageBus (default: `1000`). Oldest dropped on overflow with a warning log. `0` disables the cap |
+| `IRONCREW_MESSAGEBUS_PENDING_CAP` | Max pending broadcasts (messages sent before any agent is registered) (default: `500`). `0` disables the cap |
 
 **API Server:**
 

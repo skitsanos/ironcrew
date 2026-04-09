@@ -58,6 +58,48 @@ pub struct MessageBus {
     pending_broadcasts: Arc<RwLock<Vec<Arc<Message>>>>,
 }
 
+/// Returns the max per-agent queue depth from the environment,
+/// defaulting to 1000 messages. A value of 0 disables the cap.
+fn queue_depth_limit() -> Option<usize> {
+    match std::env::var("IRONCREW_MESSAGEBUS_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(1000),
+    }
+}
+
+/// Returns the max pending-broadcasts cap from the environment,
+/// defaulting to 500. A value of 0 disables the cap.
+fn pending_cap_limit() -> Option<usize> {
+    match std::env::var("IRONCREW_MESSAGEBUS_PENDING_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(500),
+    }
+}
+
+/// Drop oldest messages from a single queue until it's under `cap`.
+/// Logs a warning on each eviction so operators can see the pressure.
+fn enforce_queue_cap(queue: &mut VecDeque<Arc<Message>>, agent_name: &str, cap: Option<usize>) {
+    let Some(cap) = cap else {
+        return;
+    };
+    while queue.len() > cap {
+        queue.pop_front();
+        tracing::warn!(
+            "MessageBus: queue for '{}' exceeded depth cap ({}), dropping oldest message",
+            agent_name,
+            cap
+        );
+    }
+}
+
 impl MessageBus {
     pub fn new() -> Self {
         Self {
@@ -75,6 +117,7 @@ impl MessageBus {
     /// Send a message to a specific agent or broadcast to all.
     pub async fn send(&self, message: Message) {
         let message = Arc::new(message);
+        let depth_cap = queue_depth_limit();
 
         let mut history = self.history.write().await;
         history.push_back(Arc::clone(&message));
@@ -90,24 +133,35 @@ impl MessageBus {
             // Broadcast: add to all existing queues except sender (zero-copy via Arc)
             let agent_names: Vec<String> = queues.keys().cloned().collect();
             if agent_names.is_empty() {
-                // No agents registered yet — store for later delivery
+                // No agents registered yet — store for later delivery,
+                // respecting the pending-cap.
                 drop(queues);
-                self.pending_broadcasts.write().await.push(message);
+                let pending_cap = pending_cap_limit();
+                let mut pending = self.pending_broadcasts.write().await;
+                pending.push(message);
+                if let Some(cap) = pending_cap {
+                    while pending.len() > cap {
+                        pending.remove(0); // drop oldest
+                        tracing::warn!(
+                            "MessageBus: pending_broadcasts cap ({}) exceeded, dropping oldest",
+                            cap
+                        );
+                    }
+                }
                 return;
             }
             for name in agent_names {
                 if name != message.from {
-                    queues
-                        .entry(name)
-                        .or_default()
-                        .push_back(Arc::clone(&message));
+                    let queue = queues.entry(name.clone()).or_default();
+                    queue.push_back(Arc::clone(&message));
+                    enforce_queue_cap(queue, &name, depth_cap);
                 }
             }
         } else {
-            queues
-                .entry(message.to.clone())
-                .or_default()
-                .push_back(message);
+            let target = message.to.clone();
+            let queue = queues.entry(target.clone()).or_default();
+            queue.push_back(message);
+            enforce_queue_cap(queue, &target, depth_cap);
         }
     }
 
@@ -118,12 +172,12 @@ impl MessageBus {
 
         // Deliver any pending broadcasts to this agent (zero-copy via Arc)
         let pending = self.pending_broadcasts.read().await;
+        let depth_cap = queue_depth_limit();
         for msg in pending.iter() {
             if msg.from != name {
-                queues
-                    .entry(name.to_string())
-                    .or_default()
-                    .push_back(Arc::clone(msg));
+                let queue = queues.entry(name.to_string()).or_default();
+                queue.push_back(Arc::clone(msg));
+                enforce_queue_cap(queue, name, depth_cap);
             }
         }
     }
