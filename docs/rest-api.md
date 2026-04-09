@@ -180,15 +180,67 @@ Conversation and dialog output also still streams to stderr in the Lua process
 
 ### List Runs
 
+Paginated, metadata-only listing of past runs. The response body is an
+object with `runs`, `total`, `limit`, and `offset` — **not** a bare array.
+Individual run summaries omit `task_results` so listings stay cheap even on
+stores with thousands of historical runs.
+
 ```bash
-# All runs
+# First page (defaults: 20 per page, newest first)
 curl http://localhost:3000/flows/research-crew/runs
 
 # Filter by status
-curl http://localhost:3000/flows/research-crew/runs?status=success
+curl "http://localhost:3000/flows/research-crew/runs?status=success"
+
+# Filter by tag and limit
+curl "http://localhost:3000/flows/research-crew/runs?tag=prod&limit=50"
+
+# Page 3 (skip first 40)
+curl "http://localhost:3000/flows/research-crew/runs?limit=20&offset=40"
+
+# Only runs since a given RFC3339 timestamp
+curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
 ```
 
-Valid status values: `success`, `partial_failure`, `failed`.
+**Query parameters**
+
+| Param    | Type    | Description |
+|----------|---------|-------------|
+| `status` | string  | `success`, `partial_failure`, `failed` |
+| `tag`    | string  | Exact-match against the run's tag list |
+| `since`  | string  | RFC3339 timestamp; only runs at or after this time |
+| `limit`  | integer | Page size (default `IRONCREW_RUNS_DEFAULT_LIMIT`, capped at `IRONCREW_RUNS_MAX_LIMIT`, default 100) |
+| `offset` | integer | Skip the first N results |
+
+**Response shape**
+
+```json
+{
+  "runs": [
+    {
+      "run_id": "a1b2c3d4-...",
+      "flow_name": "research-crew",
+      "status": "success",
+      "started_at": "2026-04-09T08:00:00Z",
+      "finished_at": "2026-04-09T08:01:20Z",
+      "duration_ms": 80000,
+      "agent_count": 2,
+      "task_count": 3,
+      "total_tokens": 1200,
+      "cached_tokens": 400,
+      "tags": ["prod"]
+    }
+  ],
+  "total": 137,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+> **Breaking change in v2.7.0:** this endpoint previously returned a bare
+> JSON array of full `RunRecord` objects. It now returns a paginated object
+> with lightweight `RunSummary` entries. To fetch a full `RunRecord`
+> (including `task_results`), call `GET /flows/{flow}/runs/{id}`.
 
 ### Get Run Details
 

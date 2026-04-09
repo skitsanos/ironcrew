@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::engine::run_history::RunRecord;
+use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
 use crate::utils::error::Result;
 
 /// Pluggable storage backend for run records.
@@ -8,7 +8,30 @@ use crate::utils::error::Result;
 pub trait StateStore: Send + Sync {
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
+
+    /// Legacy full-record list. **Deprecated** — use `list_runs_summary` instead.
+    /// Kept for backward compatibility with the CLI `clean` command and existing
+    /// tests. Will be removed in v3.0.0.
     async fn list_runs(&self, status_filter: Option<&str>) -> Result<Vec<RunRecord>>;
+
+    /// Paginated, metadata-only list view. Returns summaries without
+    /// `task_results`, so clients can list hundreds of runs cheaply and fetch
+    /// full records on demand via `get_run`.
+    ///
+    /// `limit` caps the number of rows returned (0 = unlimited).
+    /// `offset` skips the first N rows (0 = start from the newest).
+    /// `filter` selects runs matching status, tag, and/or since timestamp.
+    async fn list_runs_summary(
+        &self,
+        filter: &ListRunsFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunSummary>>;
+
+    /// Count of runs matching `filter`. Paired with `list_runs_summary` to
+    /// provide `total` in paginated API responses.
+    async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
+
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 }
 

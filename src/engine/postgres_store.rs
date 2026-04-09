@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::run_history::{RunRecord, RunStatus};
+use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
 use super::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -258,6 +258,121 @@ impl StateStore for PostgresStore {
         rows.iter().map(row_to_record).collect()
     }
 
+    async fn list_runs_summary(
+        &self,
+        filter: &ListRunsFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunSummary>> {
+        // Build WHERE clause dynamically with numbered placeholders.
+        // Note: we NEVER select task_results — that's the whole point of
+        // the summary view. Without the heavy JSONB column, this query is
+        // effectively just an index scan on started_at.
+        let mut sql = format!(
+            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, \
+             agent_count, task_count, total_tokens, cached_tokens, tags::text \
+             FROM {}",
+            self.table_name
+        );
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut next_idx = 1usize;
+
+        if filter.status.is_some() {
+            where_clauses.push(format!("status = ${}", next_idx));
+            next_idx += 1;
+        }
+        if filter.since.is_some() {
+            where_clauses.push(format!("started_at >= ${}", next_idx));
+            next_idx += 1;
+        }
+        if filter.tag.is_some() {
+            // JSONB @> for containment — uses the GIN index on tags
+            where_clauses.push(format!("tags @> ${}::jsonb", next_idx));
+            next_idx += 1;
+        }
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY started_at DESC");
+
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT ${}", next_idx));
+            next_idx += 1;
+            if offset > 0 {
+                sql.push_str(&format!(" OFFSET ${}", next_idx));
+            }
+        }
+
+        // Bind parameters in the same order they appear in the SQL
+        let mut query = sqlx::query(&sql);
+        if let Some(ref status) = filter.status {
+            query = query.bind(status);
+        }
+        if let Some(ref since) = filter.since {
+            query = query.bind(since);
+        }
+        if let Some(ref tag) = filter.tag {
+            // Wrap in a JSONB array: ["tag"]
+            query = query.bind(format!("[\"{}\"]", tag));
+        }
+        if limit > 0 {
+            query = query.bind(limit as i64);
+            if offset > 0 {
+                query = query.bind(offset as i64);
+            }
+        }
+
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?;
+
+        rows.iter().map(row_to_summary).collect()
+    }
+
+    async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
+        let mut sql = format!("SELECT COUNT(*) FROM {}", self.table_name);
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut next_idx = 1usize;
+
+        if filter.status.is_some() {
+            where_clauses.push(format!("status = ${}", next_idx));
+            next_idx += 1;
+        }
+        if filter.since.is_some() {
+            where_clauses.push(format!("started_at >= ${}", next_idx));
+            next_idx += 1;
+        }
+        if filter.tag.is_some() {
+            where_clauses.push(format!("tags @> ${}::jsonb", next_idx));
+        }
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        let mut query = sqlx::query(&sql);
+        if let Some(ref status) = filter.status {
+            query = query.bind(status);
+        }
+        if let Some(ref since) = filter.since {
+            query = query.bind(since);
+        }
+        if let Some(ref tag) = filter.tag {
+            query = query.bind(format!("[\"{}\"]", tag));
+        }
+
+        let row = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL count error: {}", e)))?;
+        let count: i64 = row
+            .try_get(0)
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+        Ok(count as u64)
+    }
+
     async fn delete_run(&self, run_id: &str) -> Result<()> {
         let sql = format!("DELETE FROM {} WHERE run_id = $1", self.table_name);
 
@@ -323,6 +438,57 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
             .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
         duration_ms: duration_ms as u64,
         task_results: serde_json::from_str(&task_results_str).unwrap_or_default(),
+        agent_count: agent_count as usize,
+        task_count: task_count as usize,
+        total_tokens: total_tokens as u32,
+        cached_tokens: cached_tokens as u32,
+        tags: serde_json::from_str(&tags_str).unwrap_or_default(),
+    })
+}
+
+/// Convert a row from the summary query into a RunSummary (no task_results).
+fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
+    let status_str: String = row
+        .try_get("status")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let tags_str: String = row
+        .try_get("tags")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let duration_ms: i64 = row
+        .try_get("duration_ms")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let agent_count: i32 = row
+        .try_get("agent_count")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let task_count: i32 = row
+        .try_get("task_count")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let total_tokens: i32 = row
+        .try_get("total_tokens")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+    let cached_tokens: i32 = row
+        .try_get("cached_tokens")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+
+    Ok(RunSummary {
+        run_id: row
+            .try_get("run_id")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        flow_name: row
+            .try_get("flow_name")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        status: match status_str.as_str() {
+            "success" => RunStatus::Success,
+            "partial_failure" => RunStatus::PartialFailure,
+            _ => RunStatus::Failed,
+        },
+        started_at: row
+            .try_get("started_at")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        finished_at: row
+            .try_get("finished_at")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        duration_ms: duration_ms as u64,
         agent_count: agent_count as usize,
         task_count: task_count as usize,
         total_tokens: total_tokens as u32,

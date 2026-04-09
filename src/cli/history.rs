@@ -1,10 +1,17 @@
 use std::path::Path;
 
-use crate::engine::run_history::RunStatus;
+use crate::engine::run_history::{ListRunsFilter, RunStatus};
 use crate::engine::store::create_store;
 use crate::utils::error::Result;
 
-pub async fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()> {
+pub async fn cmd_runs(
+    project: &Path,
+    status_filter: Option<&str>,
+    tag_filter: Option<&str>,
+    since_filter: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<()> {
     // Load .env so store config (IRONCREW_STORE, DATABASE_URL, etc.) is available
     dotenvy::dotenv().ok();
     let env_file = project.join(".env");
@@ -14,7 +21,15 @@ pub async fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()>
 
     let ironcrew_dir = project.join(".ironcrew");
     let store = create_store(ironcrew_dir).await?;
-    let runs = store.list_runs(status_filter).await?;
+
+    let filter = ListRunsFilter {
+        status: status_filter.map(|s| s.to_string()),
+        tag: tag_filter.map(|s| s.to_string()),
+        since: since_filter.map(|s| s.to_string()),
+    };
+
+    let runs = store.list_runs_summary(&filter, limit, offset).await?;
+    let total = store.count_runs(&filter).await?;
 
     if runs.is_empty() {
         println!("No runs found.");
@@ -34,15 +49,13 @@ pub async fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()>
             RunStatus::PartialFailure => "partial",
             RunStatus::Failed => "failed",
         };
+        // Summary rows don't carry per-task results, so we just show the task count.
+        // Use `ironcrew inspect <run_id>` for the full success/fail breakdown.
         println!(
             "{:<38} {:<16} {:<10} {:<10} {}",
             run.run_id,
             status_display,
-            format!(
-                "{}/{}",
-                run.task_results.iter().filter(|r| r.success).count(),
-                run.task_count
-            ),
+            run.task_count,
             format!("{}ms", run.duration_ms),
             if run.started_at.len() >= 19 {
                 &run.started_at[..19]
@@ -52,7 +65,11 @@ pub async fn cmd_runs(project: &Path, status_filter: Option<&str>) -> Result<()>
         );
     }
 
-    println!("\n{} run(s) total.", runs.len());
+    let end = offset + runs.len();
+    println!("\nShowing {}-{} of {} run(s).", offset + 1, end, total);
+    if end < total as usize {
+        println!("Use --offset {} to see the next page.", offset + runs.len());
+    }
     Ok(())
 }
 

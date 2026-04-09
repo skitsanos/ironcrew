@@ -13,8 +13,8 @@ use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
 
 use super::{
-    AppState, ErrorResponse, ListRunsQuery, RunCrewResponse, TaskResultResponse, error_response,
-    resolve_flow_path, resolve_ironcrew_dir,
+    AppState, ErrorResponse, ListRunsQuery, ListRunsResponse, RunCrewResponse, TaskResultResponse,
+    error_response, resolve_flow_path, resolve_ironcrew_dir,
 };
 
 fn flow_status(err: &IronCrewError) -> StatusCode {
@@ -527,23 +527,61 @@ pub async fn flow_events(
 // Run history (per-flow)
 // ---------------------------------------------------------------------------
 
+/// Default page size for `GET /flows/{flow}/runs` — override with `IRONCREW_RUNS_DEFAULT_LIMIT`.
+fn runs_default_limit() -> usize {
+    std::env::var("IRONCREW_RUNS_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+}
+
+/// Hard cap on page size — override with `IRONCREW_RUNS_MAX_LIMIT`.
+/// A client that asks for more than this gets silently clamped.
+fn runs_max_limit() -> usize {
+    std::env::var("IRONCREW_RUNS_MAX_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+}
+
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
-) -> Result<Json<Vec<crate::engine::run_history::RunRecord>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ListRunsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
     let store = create_store(ironcrew_dir)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let default_limit = runs_default_limit();
+    let max_limit = runs_max_limit();
+    let limit = params.limit.unwrap_or(default_limit).min(max_limit).max(1);
+    let offset = params.offset.unwrap_or(0);
+
+    let filter = crate::engine::run_history::ListRunsFilter {
+        status: params.status.clone(),
+        tag: params.tag.clone(),
+        since: params.since.clone(),
+    };
+
     let runs = store
-        .list_runs(params.status.as_deref())
+        .list_runs_summary(&filter, limit, offset)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(runs))
+    let total = store
+        .count_runs(&filter)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ListRunsResponse {
+        runs,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 pub async fn get_run(
