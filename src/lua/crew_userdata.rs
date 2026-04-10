@@ -419,6 +419,8 @@ impl UserData for LuaCrew {
                 eventbus,
                 store,
                 flow_name,
+                this.project_dir.clone(),
+                reqwest::Client::new(),
             )
             .await?;
             Ok(conv)
