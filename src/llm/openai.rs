@@ -75,7 +75,29 @@ impl OpenAiProvider {
             .iter()
             .map(|m| {
                 let mut msg = json!({"role": m.role});
-                if let Some(ref content) = m.content {
+                // When images are attached, serialize content as an array of
+                // content parts (text + image_url blocks). This is the OpenAI
+                // vision format, also used by Gemini and other OpenAI-compatible
+                // endpoints.
+                if let Some(ref images) = m.images {
+                    if !images.is_empty() {
+                        let mut parts: Vec<serde_json::Value> = Vec::new();
+                        if let Some(ref text) = m.content {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for img in images {
+                            let data_uri =
+                                format!("data:{};base64,{}", img.mime_type, img.data);
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": data_uri }
+                            }));
+                        }
+                        msg["content"] = json!(parts);
+                    } else if let Some(ref content) = m.content {
+                        msg["content"] = json!(content);
+                    }
+                } else if let Some(ref content) = m.content {
                     msg["content"] = json!(content);
                 }
                 if let Some(ref tool_call_id) = m.tool_call_id {
