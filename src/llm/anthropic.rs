@@ -98,10 +98,38 @@ impl AnthropicProvider {
             }
 
             let translated = match msg.role.as_str() {
-                "user" => json!({
-                    "role": "user",
-                    "content": msg.content.as_deref().unwrap_or(""),
-                }),
+                "user" => {
+                    if let Some(ref images) = msg.images {
+                        if !images.is_empty() {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            // Anthropic recommends images before text
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": img.mime_type,
+                                        "data": img.data,
+                                    }
+                                }));
+                            }
+                            if let Some(ref text) = msg.content {
+                                parts.push(json!({"type": "text", "text": text}));
+                            }
+                            json!({"role": "user", "content": parts})
+                        } else {
+                            json!({
+                                "role": "user",
+                                "content": msg.content.as_deref().unwrap_or(""),
+                            })
+                        }
+                    } else {
+                        json!({
+                            "role": "user",
+                            "content": msg.content.as_deref().unwrap_or(""),
+                        })
+                    }
+                }
                 "assistant" => {
                     let mut blocks: Vec<Value> = Vec::new();
                     if let Some(ref content) = msg.content
