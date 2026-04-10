@@ -82,10 +82,14 @@ fn build_js_bundle() -> String {
 // ── SVG → data URI ────────────────────────────────────────────────────────────
 
 fn svg_to_data_uri(svg: &str) -> String {
+    // Percent-encode ALL characters that could break a JS string literal.
+    // Both quote types must be encoded since the URI ends up inside either
+    // single- or double-quoted JS strings.
     let encoded = svg
         .replace('\n', " ")
         .replace('\r', "")
-        .replace('"', "'")
+        .replace('"', "%22")
+        .replace('\'', "%27")
         .replace('#', "%23")
         .replace('<', "%3C")
         .replace('>', "%3E");
