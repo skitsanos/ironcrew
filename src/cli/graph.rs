@@ -24,6 +24,21 @@ pub fn cmd_graph(path: &Path, output: Option<&Path>) -> Result<()> {
         data.tasks.len(),
         data.tools.len()
     );
+
+    if data.agents.is_empty() && data.tasks.is_empty() {
+        println!();
+        println!(
+            "  Warning: no agents or tasks were captured. This can happen when"
+        );
+        println!(
+            "  crew.lua depends on runtime data (HTTP fetches, API calls) that"
+        );
+        println!(
+            "  isn't available during static analysis. The graph will show only"
+        );
+        println!("  the crew and result nodes.");
+    }
+
     println!();
     println!("Graph saved to: {}", output_path.display());
     println!("Open in a browser to view the interactive DAG.");
