@@ -28,6 +28,12 @@ pub struct LuaConversation {
     /// otherwise it's an auto-UUID and the session is not persisted.
     pub id: String,
 
+    /// Project directory for resolving relative image paths.
+    pub project_dir: std::path::PathBuf,
+
+    /// Shared HTTP client for downloading image URLs.
+    pub http_client: reqwest::Client,
+
     /// `true` when the caller provided a stable `id` and the session is
     /// eligible for cross-run persistence.
     pub persistent: bool,
@@ -103,6 +109,8 @@ impl LuaConversation {
         store: Option<Arc<dyn StateStore>>,
         flow_name: String,
         autosave: bool,
+        project_dir: std::path::PathBuf,
+        http_client: reqwest::Client,
     ) -> Result<Self, IronCrewError> {
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -155,6 +163,8 @@ impl LuaConversation {
             flow_name,
             autosave,
             created_at,
+            project_dir,
+            http_client,
         })
     }
 
@@ -184,11 +194,16 @@ impl LuaConversation {
     async fn run_turn(
         &self,
         user_message: &str,
+        images: Option<Vec<crate::llm::provider::ImageInput>>,
     ) -> Result<(String, Option<String>), IronCrewError> {
         // Append the user message to history
         {
             let mut history = self.messages.lock().await;
-            history.push(ChatMessage::user(user_message));
+            if let Some(imgs) = images {
+                history.push(ChatMessage::user_with_images(user_message, imgs));
+            } else {
+                history.push(ChatMessage::user(user_message));
+            }
             self.enforce_history_cap(&mut history);
         }
 
@@ -399,19 +414,61 @@ impl LuaConversation {
 
 impl UserData for LuaConversation {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // conv:send(message) → returns plain text
-        methods.add_async_method("send", |_, this, message: String| async move {
+        // conv:send(message[, opts]) → returns plain text
+        // opts may include: { images = { "path/to/img.png", "https://..." } }
+        methods.add_async_method("send", |_, this, args: mlua::MultiValue| async move {
+            let mut args_iter = args.into_iter();
+
+            let message: String = match args_iter.next() {
+                Some(mlua::Value::String(s)) => s.to_str()?.to_string(),
+                _ => {
+                    return Err(mlua::Error::external(
+                        crate::utils::error::IronCrewError::Validation(
+                            "send() requires a string message as first argument".into(),
+                        ),
+                    ));
+                }
+            };
+
+            let images = parse_images_from_opts(
+                args_iter.next(),
+                &this.project_dir,
+                &this.http_client,
+            )
+            .await?;
+
             let (content, _reasoning) = this
-                .run_turn(&message)
+                .run_turn(&message, images)
                 .await
                 .map_err(mlua::Error::external)?;
             Ok(content)
         });
 
-        // conv:ask(message) → returns { content, reasoning, length }
-        methods.add_async_method("ask", |lua, this, message: String| async move {
+        // conv:ask(message[, opts]) → returns { content, reasoning, length }
+        // opts may include: { images = { "path/to/img.png", "https://..." } }
+        methods.add_async_method("ask", |lua, this, args: mlua::MultiValue| async move {
+            let mut args_iter = args.into_iter();
+
+            let message: String = match args_iter.next() {
+                Some(mlua::Value::String(s)) => s.to_str()?.to_string(),
+                _ => {
+                    return Err(mlua::Error::external(
+                        crate::utils::error::IronCrewError::Validation(
+                            "ask() requires a string message as first argument".into(),
+                        ),
+                    ));
+                }
+            };
+
+            let images = parse_images_from_opts(
+                args_iter.next(),
+                &this.project_dir,
+                &this.http_client,
+            )
+            .await?;
+
             let (content, reasoning) = this
-                .run_turn(&message)
+                .run_turn(&message, images)
                 .await
                 .map_err(mlua::Error::external)?;
 
@@ -482,6 +539,43 @@ impl UserData for LuaConversation {
     }
 }
 
+/// Parse an optional `{ images = { ... } }` table from Lua into a loaded
+/// `Vec<ImageInput>`. Returns `None` when no images are present or the
+/// argument is absent / not a table.
+async fn parse_images_from_opts(
+    opts_value: Option<mlua::Value>,
+    project_dir: &std::path::Path,
+    client: &reqwest::Client,
+) -> mlua::Result<Option<Vec<crate::llm::provider::ImageInput>>> {
+    match opts_value {
+        Some(mlua::Value::Table(opts)) => {
+            if let Ok(img_table) = opts.get::<mlua::Table>("images") {
+                // Collect paths before any await so the non-Send iterator
+                // is dropped before we cross async boundaries.
+                let paths: Vec<String> = img_table
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?;
+
+                let mut loaded = Vec::new();
+                for path in paths {
+                    let img = crate::llm::image::load_image(&path, project_dir, client)
+                        .await
+                        .map_err(mlua::Error::external)?;
+                    loaded.push(img);
+                }
+                if loaded.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(loaded))
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Build a LuaConversation from a Lua options table, agent lookup, provider,
 /// tool registry, and crew defaults.
 ///
@@ -499,6 +593,8 @@ pub async fn build_conversation(
     eventbus: EventBus,
     store: Option<Arc<dyn StateStore>>,
     flow_name: String,
+    project_dir: std::path::PathBuf,
+    http_client: reqwest::Client,
 ) -> mlua::Result<LuaConversation> {
     // Resolve agent: either by name or inline (Agent table)
     let agent_value: Value = table.get("agent")?;
@@ -581,6 +677,8 @@ pub async fn build_conversation(
         store,
         flow_name,
         autosave,
+        project_dir,
+        http_client,
     )
     .await
     .map_err(mlua::Error::external)
