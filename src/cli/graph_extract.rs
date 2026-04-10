@@ -64,6 +64,11 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         .set("env", env_fn)
         .map_err(IronCrewError::Lua)?;
 
+    // Register stub globals for APIs that crew.lua scripts may use before
+    // reaching Crew.new(). Without these, scripts like stock-debate crash
+    // on `http.get()` or `json_parse()` before any crew data is captured.
+    register_stub_globals(&lua).map_err(IronCrewError::Lua)?;
+
     // ------------------------------------------------------------------
     // 4. Shared capture state
     // ------------------------------------------------------------------
@@ -134,14 +139,49 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
             })?;
             crew_proxy.set("run", run_fn)?;
 
-            // conversation() / dialog() / memory() return stubs.
-            let stub_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
+            // conversation() returns a stub with send/ask/history/reset/length methods.
+            let conv_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
                 let t = lua.create_table()?;
+                t.set("send", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
+                t.set("ask", lua.create_function(|lua, _args: mlua::MultiValue| {
+                    let r = lua.create_table()?;
+                    r.set("content", "")?;
+                    Ok(r)
+                })?)?;
+                t.set("history", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
+                t.set("reset", lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?)?;
+                t.set("length", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
+                t.set("agent_name", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
+                t.set("id", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
                 Ok(mlua::Value::Table(t))
             })?;
-            crew_proxy.set("conversation", stub_fn.clone())?;
-            crew_proxy.set("dialog", stub_fn.clone())?;
-            crew_proxy.set("memory", stub_fn)?;
+            crew_proxy.set("conversation", conv_fn)?;
+
+            // dialog() returns a stub with run/next_turn/transcript/agents etc.
+            let dialog_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
+                let t = lua.create_table()?;
+                t.set("run", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
+                t.set("next_turn", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
+                t.set("next_turn_from", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
+                t.set("transcript", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
+                t.set("turn_count", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
+                t.set("current_speaker", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
+                t.set("current_agent", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
+                t.set("agents", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
+                t.set("reset", lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?)?;
+                t.set("max_turns", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
+                t.set("stopped", lua.create_function(|_, _args: mlua::MultiValue| Ok(false))?)?;
+                t.set("stop_reason", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
+                t.set("id", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
+                Ok(mlua::Value::Table(t))
+            })?;
+            crew_proxy.set("dialog", dialog_fn)?;
+
+            // memory() returns nil (key-value lookup returns nothing).
+            let mem_fn = lua.create_function(|_, _args: mlua::MultiValue| {
+                Ok(mlua::Value::Nil)
+            })?;
+            crew_proxy.set("memory", mem_fn)?;
 
             // Set __index so method calls work on the proxy table.
             let mt = lua.create_table()?;
@@ -165,7 +205,55 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
 
     let source = std::fs::read_to_string(entrypoint).map_err(IronCrewError::Io)?;
-    let _ = lua.load(&source).exec();
+
+    // First pass: try executing the full script. Errors are caught by
+    // wrapping in pcall so the Lua VM stays alive.
+    let wrapped = format!(
+        "local __ok, __err = pcall(function()\n{}\nend)\n",
+        source
+    );
+    match lua.load(&wrapped).exec() {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!("graph_extract: crew.lua execution stopped: {}", e);
+        }
+    }
+
+    // If the first pass captured nothing (common when the script depends
+    // on live data that stubs can't satisfy), try a fallback: extract just
+    // the crew-setup portion starting from `Crew.new(` and execute that.
+    // This skips the data-processing preamble that crashes on nil values.
+    {
+        let captured_so_far = capture.lock().unwrap();
+        if captured_so_far.goal.is_empty()
+            && captured_so_far.tasks.is_empty()
+            && captured_so_far.inline_agents.is_empty()
+        {
+            drop(captured_so_far);
+            if let Some(crew_start) = source.find("Crew.new(") {
+                tracing::debug!(
+                    "graph_extract: first pass captured nothing, trying crew-setup fallback"
+                );
+                // Extract local constant definitions from the preamble
+                // (before Crew.new) so variables like TICKER, RANGE are
+                // available when the crew-setup portion executes.
+                let preamble = &source[..crew_start];
+                let locals = extract_local_constants(preamble);
+
+                let crew_portion = &source[crew_start..];
+                let fallback = format!(
+                    "{}\nlocal __ok, __err = pcall(function()\nlocal crew = {}\nend)\n",
+                    locals, crew_portion
+                );
+                match lua.load(&fallback).exec() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("graph_extract: fallback also stopped: {}", e);
+                    }
+                }
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // 7. Assemble GraphData from captured + file-based data
@@ -350,4 +438,114 @@ fn pretty_name(name: &str) -> String {
         None => String::new(),
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
+}
+
+/// Register stub globals for common APIs that crew.lua scripts may call
+/// before (or instead of) `Crew.new()`. Without these, scripts that use
+/// `http.get()`, `json_parse()`, etc. crash before any crew data is
+/// captured — making the graph command useless for those projects.
+fn register_stub_globals(lua: &mlua::Lua) -> mlua::Result<()> {
+    // A "deep nil" proxy: any property chain like `t.a.b.c[1].d` returns
+    // another proxy instead of crashing. This lets scripts that process
+    // HTTP/JSON data before reaching Crew.new() get past the data section.
+    lua.load(
+        r#"
+        function __ironcrew_deep_nil()
+            local proxy = {}
+            setmetatable(proxy, {
+                __index    = function() return __ironcrew_deep_nil() end,
+                __call     = function() return __ironcrew_deep_nil() end,
+                __len      = function() return 0 end,
+                __tostring = function() return "" end,
+                __concat   = function(a, b) return tostring(a) .. tostring(b) end,
+                __add      = function() return 0 end,
+                __sub      = function() return 0 end,
+                __mul      = function() return 0 end,
+                __div      = function() return 0 end,
+                __mod      = function() return 0 end,
+                __unm      = function() return 0 end,
+                __lt       = function() return false end,
+                __le       = function() return false end,
+                __eq       = function() return false end,
+            })
+            return proxy
+        end
+    "#,
+    )
+    .exec()?;
+
+    // http.get / http.post / http.request — return a response whose `.json`
+    // is a deep-nil proxy so property chains don't crash.
+    let http = lua.create_table()?;
+    let http_stub = lua.create_function(|lua, _args: mlua::MultiValue| {
+        let resp = lua.create_table()?;
+        resp.set("ok", true)?;
+        resp.set("status", 200)?;
+        resp.set("body", "")?;
+        let deep_nil: mlua::Function = lua.globals().get("__ironcrew_deep_nil")?;
+        resp.set("json", deep_nil.call::<mlua::Value>(())?)?;
+        Ok(resp)
+    })?;
+    http.set("get", http_stub.clone())?;
+    http.set("post", http_stub.clone())?;
+    http.set("put", http_stub.clone())?;
+    http.set("delete", http_stub.clone())?;
+    http.set("request", http_stub)?;
+    lua.globals().set("http", http)?;
+
+    // json_parse — returns an empty table for any input
+    lua.globals().set(
+        "json_parse",
+        lua.create_function(|lua, _input: mlua::Value| lua.create_table())?,
+    )?;
+
+    // json_stringify — returns "{}" for any input
+    lua.globals().set(
+        "json_stringify",
+        lua.create_function(|_, _input: mlua::Value| Ok("{}".to_string()))?,
+    )?;
+
+    // print — no-op in capture mode (suppress all output)
+    lua.globals().set(
+        "print",
+        lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?,
+    )?;
+
+    // error — no-op in capture mode. Scripts that validate runtime data
+    // (e.g., "if #series < 50 then error(...)") would abort before
+    // reaching Crew.new(). Swallowing error() lets the script continue
+    // past validation checks into the crew setup code.
+    lua.globals().set(
+        "error",
+        lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?,
+    )?;
+
+    Ok(())
+}
+
+/// Extract simple `local X = "string"` and `local X = number` constant
+/// definitions from Lua source. These are safe to prepend to a partial
+/// script execution so that variables referenced after Crew.new() are
+/// available even when we skip the data-processing preamble.
+fn extract_local_constants(source: &str) -> String {
+    let mut constants = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        // Match: local IDENT = "string" | local IDENT = number | local IDENT = true/false
+        if trimmed.starts_with("local ") && trimmed.contains('=') {
+            let after_eq = trimmed.splitn(2, '=').nth(1).unwrap_or("").trim();
+            let is_simple = after_eq.starts_with('"')
+                || after_eq.starts_with('\'')
+                || after_eq.starts_with("[[")
+                || after_eq == "true"
+                || after_eq == "false"
+                || after_eq == "nil"
+                || after_eq.parse::<f64>().is_ok();
+            if is_simple {
+                constants.push_str(trimmed);
+                constants.push('\n');
+            }
+        }
+    }
+    constants
 }
