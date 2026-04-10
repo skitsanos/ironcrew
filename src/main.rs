@@ -115,6 +115,15 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Generate a DAG visualization HTML file
+    Graph {
+        /// Path to project directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output HTML file path (default: <project>/graph.html)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// List past runs
     Runs {
         /// Filter by status: success, partial_failure, failed
@@ -166,6 +175,7 @@ async fn main() {
         Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
         Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
         Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
+        Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
         Commands::Runs {
             status,
             tag,
