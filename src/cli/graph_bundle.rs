@@ -59,12 +59,38 @@ fn build_js_bundle() -> String {
 
     let mut out = String::new();
     for source in &sources {
+        // Track whether we're inside a multi-line import block:
+        //   import {
+        //     foo,
+        //     bar,
+        //   } from './module.js';
+        let mut in_import_block = false;
+
         for line in source.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("import ") && trimmed.contains(" from ") {
-                // drop ES module import entirely
+
+            // Handle multi-line import blocks
+            if in_import_block {
+                // Keep skipping until we find the closing `} from '...'`
+                if trimmed.contains("from ") && trimmed.contains(';') {
+                    in_import_block = false;
+                }
                 continue;
             }
+
+            // Single-line import: `import { x } from './y.js';`
+            if trimmed.starts_with("import ") && trimmed.contains(" from ") {
+                continue;
+            }
+
+            // Start of multi-line import: `import {` (no `from` on this line)
+            if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
+                if !trimmed.contains(" from ") {
+                    in_import_block = true;
+                    continue;
+                }
+            }
+
             if let Some(rest) = trimmed.strip_prefix("export ") {
                 // keep the declaration, drop the `export ` keyword
                 out.push_str(rest);
