@@ -86,8 +86,7 @@ impl OpenAiProvider {
                             parts.push(json!({"type": "text", "text": text}));
                         }
                         for img in images {
-                            let data_uri =
-                                format!("data:{};base64,{}", img.mime_type, img.data);
+                            let data_uri = format!("data:{};base64,{}", img.mime_type, img.data);
                             parts.push(json!({
                                 "type": "image_url",
                                 "image_url": { "url": data_uri }

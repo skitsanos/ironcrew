@@ -430,12 +430,9 @@ impl UserData for LuaConversation {
                 }
             };
 
-            let images = parse_images_from_opts(
-                args_iter.next(),
-                &this.project_dir,
-                &this.http_client,
-            )
-            .await?;
+            let images =
+                parse_images_from_opts(args_iter.next(), &this.project_dir, &this.http_client)
+                    .await?;
 
             let (content, _reasoning) = this
                 .run_turn(&message, images)
@@ -460,12 +457,9 @@ impl UserData for LuaConversation {
                 }
             };
 
-            let images = parse_images_from_opts(
-                args_iter.next(),
-                &this.project_dir,
-                &this.http_client,
-            )
-            .await?;
+            let images =
+                parse_images_from_opts(args_iter.next(), &this.project_dir, &this.http_client)
+                    .await?;
 
             let (content, reasoning) = this
                 .run_turn(&message, images)
