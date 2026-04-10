@@ -76,7 +76,11 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_call_id: None,
             tool_calls: None,
-            images: if images.is_empty() { None } else { Some(images) },
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
         }
     }
 }

@@ -162,6 +162,41 @@ conv:reset()
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
 
+### Image input
+
+Pass images to vision-capable models alongside text messages:
+
+```lua
+local reply = conv:send("Describe this image", {
+    images = { "path/to/photo.jpg" }
+})
+
+-- Multiple images
+local reply = conv:send("Compare these two logos", {
+    images = { "logo-a.png", "logo-b.png" }
+})
+
+-- URL
+local reply = conv:send("What's in this photo?", {
+    images = { "https://example.com/photo.jpg" }
+})
+```
+
+Both `send()` and `ask()` accept an optional second argument — a table
+with an `images` key containing an array of file paths or URLs.
+
+**Supported formats:** JPEG, PNG, GIF, WebP (up to 20 MB per image).
+
+**Provider compatibility:** works with any vision-capable model — GPT-4o,
+Gemini Flash, Claude (Anthropic), and OpenAI-compatible endpoints. Each
+provider's image format is handled automatically.
+
+Image paths are resolved relative to the project directory. URLs are
+downloaded at send time.
+
+See [`examples/vision/`](../examples/vision/) for a working example with
+Gemini Flash.
+
 ### Cross-run persistence
 
 By default a conversation is ephemeral — it exists for the lifetime of one
