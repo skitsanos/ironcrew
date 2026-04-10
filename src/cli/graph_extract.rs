@@ -60,7 +60,9 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
     let env_fn = lua
         .create_function(|_, key: String| Ok(std::env::var(&key).ok()))
         .map_err(IronCrewError::Lua)?;
-    lua.globals().set("env", env_fn).map_err(IronCrewError::Lua)?;
+    lua.globals()
+        .set("env", env_fn)
+        .map_err(IronCrewError::Lua)?;
 
     // ------------------------------------------------------------------
     // 4. Shared capture state
@@ -96,31 +98,33 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
             let crew_proxy = lua.create_table()?;
 
             let cap_add_agent = capture_for_crew.clone();
-            let add_agent_fn = lua.create_function(move |_, (_self, agent_table): (mlua::Value, Table)| {
-                match agent_from_lua_table(&agent_table) {
-                    Ok(agent) => {
-                        cap_add_agent.lock().unwrap().inline_agents.push(agent);
+            let add_agent_fn =
+                lua.create_function(move |_, (_self, agent_table): (mlua::Value, Table)| {
+                    match agent_from_lua_table(&agent_table) {
+                        Ok(agent) => {
+                            cap_add_agent.lock().unwrap().inline_agents.push(agent);
+                        }
+                        Err(e) => {
+                            tracing::warn!("graph_extract: failed to parse inline agent: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("graph_extract: failed to parse inline agent: {}", e);
-                    }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
             crew_proxy.set("add_agent", add_agent_fn)?;
 
             let cap_add_task = capture_for_crew.clone();
-            let add_task_fn = lua.create_function(move |_, (_self, task_table): (mlua::Value, Table)| {
-                match task_from_lua_table(&task_table) {
-                    Ok(task) => {
-                        cap_add_task.lock().unwrap().tasks.push(task);
+            let add_task_fn =
+                lua.create_function(move |_, (_self, task_table): (mlua::Value, Table)| {
+                    match task_from_lua_table(&task_table) {
+                        Ok(task) => {
+                            cap_add_task.lock().unwrap().tasks.push(task);
+                        }
+                        Err(e) => {
+                            tracing::warn!("graph_extract: failed to parse task: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("graph_extract: failed to parse task: {}", e);
-                    }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
             crew_proxy.set("add_task", add_task_fn)?;
 
             // run() returns an empty table — no LLM calls.
@@ -148,9 +152,7 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         })
         .map_err(IronCrewError::Lua)?;
 
-    crew_table
-        .set("new", new_fn)
-        .map_err(IronCrewError::Lua)?;
+    crew_table.set("new", new_fn).map_err(IronCrewError::Lua)?;
     lua.globals()
         .set("Crew", crew_table)
         .map_err(IronCrewError::Lua)?;
@@ -170,8 +172,10 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
     // ------------------------------------------------------------------
     let captured = capture.lock().unwrap();
 
-    // Merge agents: file-based agents first, then any inline-only agents that
-    // are not already present by name.
+    // Merge agents: file-based agents (auto_discovered) first, then any
+    // inline-only agents that are not already present by name.
+    let file_agent_names: std::collections::HashSet<String> =
+        file_agents.iter().map(|a| a.name.clone()).collect();
     let mut all_agents: Vec<Agent> = file_agents;
     for inline in &captured.inline_agents {
         if !all_agents.iter().any(|a| a.name == inline.name) {
@@ -193,13 +197,20 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
     // GraphAgents
     let graph_agents: Vec<GraphAgent> = all_agents
         .iter()
-        .map(|a| GraphAgent {
-            name: a.name.clone(),
-            goal: a.goal.clone(),
-            capabilities: a.capabilities.clone(),
-            tools: a.tools.clone(),
-            source: "file".into(),
-            temperature: a.temperature,
+        .map(|a| {
+            let source = if file_agent_names.contains(&a.name) {
+                "auto_discovered"
+            } else {
+                "inline"
+            };
+            GraphAgent {
+                name: a.name.clone(),
+                goal: a.goal.clone(),
+                capabilities: a.capabilities.clone(),
+                tools: a.tools.clone(),
+                source: source.into(),
+                temperature: a.temperature,
+            }
         })
         .collect();
 
