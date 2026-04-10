@@ -12,6 +12,13 @@ pub struct TokenUsage {
     pub cached_tokens: u32,
 }
 
+/// An image attachment for a chat message. Always carries base64 data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageInput {
+    pub mime_type: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -22,6 +29,8 @@ pub struct ChatMessage {
     /// For role="assistant" messages: tool calls requested by the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallRequest>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageInput>>,
 }
 
 impl ChatMessage {
@@ -31,6 +40,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_call_id: None,
             tool_calls: None,
+            images: None,
         }
     }
     pub fn user(content: &str) -> Self {
@@ -39,6 +49,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_call_id: None,
             tool_calls: None,
+            images: None,
         }
     }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCallRequest>>) -> Self {
@@ -47,6 +58,7 @@ impl ChatMessage {
             content,
             tool_call_id: None,
             tool_calls,
+            images: None,
         }
     }
     pub fn tool(tool_call_id: &str, content: &str) -> Self {
@@ -55,6 +67,16 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
+            images: None,
+        }
+    }
+    pub fn user_with_images(content: &str, images: Vec<ImageInput>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+            images: if images.is_empty() { None } else { Some(images) },
         }
     }
 }
