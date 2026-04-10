@@ -84,11 +84,11 @@ fn build_js_bundle() -> String {
             }
 
             // Start of multi-line import: `import {` (no `from` on this line)
-            if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
-                if !trimmed.contains(" from ") {
-                    in_import_block = true;
-                    continue;
-                }
+            if (trimmed.starts_with("import ") || trimmed.starts_with("import{"))
+                && !trimmed.contains(" from ")
+            {
+                in_import_block = true;
+                continue;
             }
 
             if let Some(rest) = trimmed.strip_prefix("export ") {

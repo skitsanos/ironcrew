@@ -142,17 +142,38 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
             // conversation() returns a stub with send/ask/history/reset/length methods.
             let conv_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
                 let t = lua.create_table()?;
-                t.set("send", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
-                t.set("ask", lua.create_function(|lua, _args: mlua::MultiValue| {
-                    let r = lua.create_table()?;
-                    r.set("content", "")?;
-                    Ok(r)
-                })?)?;
-                t.set("history", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
-                t.set("reset", lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?)?;
-                t.set("length", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
-                t.set("agent_name", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
-                t.set("id", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
+                t.set(
+                    "send",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?,
+                )?;
+                t.set(
+                    "ask",
+                    lua.create_function(|lua, _args: mlua::MultiValue| {
+                        let r = lua.create_table()?;
+                        r.set("content", "")?;
+                        Ok(r)
+                    })?,
+                )?;
+                t.set(
+                    "history",
+                    lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?,
+                )?;
+                t.set(
+                    "reset",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?,
+                )?;
+                t.set(
+                    "length",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?,
+                )?;
+                t.set(
+                    "agent_name",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?,
+                )?;
+                t.set(
+                    "id",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?,
+                )?;
                 Ok(mlua::Value::Table(t))
             })?;
             crew_proxy.set("conversation", conv_fn)?;
@@ -160,27 +181,64 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
             // dialog() returns a stub with run/next_turn/transcript/agents etc.
             let dialog_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
                 let t = lua.create_table()?;
-                t.set("run", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
-                t.set("next_turn", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
-                t.set("next_turn_from", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
-                t.set("transcript", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
-                t.set("turn_count", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
-                t.set("current_speaker", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
-                t.set("current_agent", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
-                t.set("agents", lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?)?;
-                t.set("reset", lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?)?;
-                t.set("max_turns", lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?)?;
-                t.set("stopped", lua.create_function(|_, _args: mlua::MultiValue| Ok(false))?)?;
-                t.set("stop_reason", lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?)?;
-                t.set("id", lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?)?;
+                t.set(
+                    "run",
+                    lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?,
+                )?;
+                t.set(
+                    "next_turn",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?,
+                )?;
+                t.set(
+                    "next_turn_from",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?,
+                )?;
+                t.set(
+                    "transcript",
+                    lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?,
+                )?;
+                t.set(
+                    "turn_count",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?,
+                )?;
+                t.set(
+                    "current_speaker",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?,
+                )?;
+                t.set(
+                    "current_agent",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?,
+                )?;
+                t.set(
+                    "agents",
+                    lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?,
+                )?;
+                t.set(
+                    "reset",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?,
+                )?;
+                t.set(
+                    "max_turns",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(0))?,
+                )?;
+                t.set(
+                    "stopped",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(false))?,
+                )?;
+                t.set(
+                    "stop_reason",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?,
+                )?;
+                t.set(
+                    "id",
+                    lua.create_function(|_, _args: mlua::MultiValue| Ok(""))?,
+                )?;
                 Ok(mlua::Value::Table(t))
             })?;
             crew_proxy.set("dialog", dialog_fn)?;
 
             // memory() returns nil (key-value lookup returns nothing).
-            let mem_fn = lua.create_function(|_, _args: mlua::MultiValue| {
-                Ok(mlua::Value::Nil)
-            })?;
+            let mem_fn = lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?;
             crew_proxy.set("memory", mem_fn)?;
 
             // Set __index so method calls work on the proxy table.
@@ -208,10 +266,7 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
 
     // First pass: try executing the full script. Errors are caught by
     // wrapping in pcall so the Lua VM stays alive.
-    let wrapped = format!(
-        "local __ok, __err = pcall(function()\n{}\nend)\n",
-        source
-    );
+    let wrapped = format!("local __ok, __err = pcall(function()\n{}\nend)\n", source);
     match lua.load(&wrapped).exec() {
         Ok(_) => {}
         Err(e) => {
@@ -533,7 +588,7 @@ fn extract_local_constants(source: &str) -> String {
         let trimmed = line.trim();
         // Match: local IDENT = "string" | local IDENT = number | local IDENT = true/false
         if trimmed.starts_with("local ") && trimmed.contains('=') {
-            let after_eq = trimmed.splitn(2, '=').nth(1).unwrap_or("").trim();
+            let after_eq = trimmed.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
             let is_simple = after_eq.starts_with('"')
                 || after_eq.starts_with('\'')
                 || after_eq.starts_with("[[")
