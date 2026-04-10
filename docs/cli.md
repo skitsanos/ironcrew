@@ -170,6 +170,32 @@ cp .env.template .env
 ironcrew run .
 ```
 
+### graph
+
+Generate an interactive DAG visualization of a crew project. Outputs a
+self-contained HTML file that renders the crew's agents, tasks, tools,
+and dependencies as a radial graph with simulation.
+
+```
+ironcrew graph .
+ironcrew graph examples/research-crew
+ironcrew graph . -o my-dag.html
+```
+
+| Flag           | Default                | Description |
+|----------------|------------------------|-------------|
+| `-o, --output` | `<project>/graph.html` | Output HTML file path |
+
+The generated HTML requires internet for the X6 library (CDN) and IBM
+Plex Sans font on first load. All crew data, JS logic, CSS, and SVG
+icons are embedded inline — no other external dependencies.
+
+Open the file in a browser to:
+- View the crew structure (agents, tasks, tools, dependencies)
+- Click nodes to inspect details in the right panel
+- Hover nodes to highlight connected edges and neighbors
+- Run a simulated execution with animated edges and status indicators
+
 ### doctor
 
 Diagnose project health: check environment variables, project structure,

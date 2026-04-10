@@ -1,0 +1,333 @@
+/*
+ * IronCrew DAG prototype — all styling.
+ *
+ * Theme tokens live in `:root` so a future tier can swap them by
+ * overriding a few CSS variables from env-driven config. Most of the
+ * X6 SVG node styling lives in JS (assets/js/theme.js + app.js) — this
+ * file handles the surrounding chrome (header, inspector, legend).
+ */
+
+:root {
+  --base-font-size: clamp(1rem, 0.2vw + 0.95rem, 1.125rem);
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-border: #334155;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --accent: #3b82f6;
+  --success: #10b981;
+  --error:   #ef4444;
+  --pending: #64748b;
+  --running: #3b82f6;
+  --icon: #ffffff;
+
+  --crew-accent: #64748b;
+
+  --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont,
+               "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  font-size: var(--base-font-size);
+}
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  height: 100%;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Header ─────────────────────────────────────────────────────── */
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.875rem 1.5rem;
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--panel);
+}
+
+header .brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.875rem;
+}
+header .brand h1 {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+header .brand .tag {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 0.625rem;
+}
+
+header .toolbar { display: flex; gap: 0.625rem; align-items: center; }
+
+header .toolbar button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.8125rem;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+header .toolbar button:hover { background: #2563eb; }
+header .toolbar button:disabled {
+  background: var(--panel-border);
+  cursor: not-allowed;
+}
+header .toolbar button.secondary {
+  background: transparent;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+}
+header .toolbar button.secondary:hover {
+  background: var(--panel-border);
+}
+header .toolbar button svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  stroke-width: 2;
+  stroke: var(--icon);
+  fill: none;
+}
+
+/* ─── Main layout (canvas + inspector) ───────────────────────────── */
+
+#main {
+  display: grid;
+  grid-template-columns: 1fr 18.75rem;
+  height: calc(100vh - 3.625rem);
+}
+
+#graph-container {
+  background: var(--bg);
+  background-image: radial-gradient(circle, #1e293b 1px, transparent 1px);
+  background-size: 1.5rem 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.x6-graph { background: transparent; }
+
+/* ─── Inspector panel (right sidebar) ────────────────────────────── */
+
+#inspector {
+  background: var(--panel);
+  border-left: 1px solid var(--panel-border);
+  padding: 1.25rem;
+  overflow-y: auto;
+}
+#inspector h2 {
+  margin: 0 0 0.75rem 0;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+#inspector .empty {
+  color: var(--text-dim);
+  font-size: 0.8125rem;
+  font-style: italic;
+  padding: 1.25rem 0;
+}
+#inspector .field {
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--panel-border);
+}
+#inspector .field:last-child { border-bottom: none; }
+#inspector .label {
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 0.25rem;
+  letter-spacing: 0.8px;
+  font-weight: 500;
+}
+#inspector .value {
+  font-size: 0.875rem;
+  color: var(--text);
+  word-break: break-word;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+#inspector .value.block { display: block; }
+#inspector .value.small {
+  font-size: 0.75rem;
+  letter-spacing: 0.2px;
+}
+#inspector .value pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "IBM Plex Mono", Consolas, "SFMono-Regular", Menlo, Monaco, monospace;
+}
+#inspector .value img.inline-icon,
+#inspector .value svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  color: var(--icon);
+  fill: none;
+  flex-shrink: 0;
+}
+#inspector .value img.inline-icon {
+  display: block;
+  filter: brightness(0) saturate(100%) invert(100%);
+}
+#inspector .value svg.inline-icon {
+  stroke: var(--icon);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+#inspector .status-pill {
+  display: inline-block;
+  padding: 0.1875rem 0.625rem;
+  border-radius: 0.625rem;
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+.status-pill.pending { background: #334155; color: #cbd5e1; }
+.status-pill.running { background: #1e40af; color: #dbeafe; }
+.status-pill.success { background: #14532d; color: #bbf7d0; }
+.status-pill.error   { background: #7f1d1d; color: #fecaca; }
+
+/* ─── Legend (bottom-left overlay) ───────────────────────────────── */
+
+.legend-shell {
+  position: absolute;
+  left: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 20;
+}
+
+.legend-toggle {
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.96);
+  backdrop-filter: blur(8px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--icon);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.legend-toggle:hover {
+  background: rgba(51, 65, 85, 0.98);
+  border-color: #475569;
+}
+
+.legend-toggle:active {
+  transform: translateY(1px);
+}
+
+.legend-toggle img {
+  width: 1.125rem;
+  height: 1.125rem;
+  display: block;
+  filter: brightness(0) saturate(100%) invert(100%);
+}
+
+#legend {
+  margin-top: 0.75rem;
+  background: rgba(30, 41, 59, 0.94);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--panel-border);
+  border-radius: 0.5rem;
+  padding: 0.875rem 1.125rem;
+  font-size: 0.8125rem;
+  color: var(--text-dim);
+  max-width: 18.75rem;
+  line-height: 1.8;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.125rem 0.875rem;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28);
+  transform-origin: left bottom;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.legend-shell.is-collapsed #legend {
+  opacity: 0;
+  transform: translateY(0.4rem) scale(0.96);
+  pointer-events: none;
+  visibility: hidden;
+  position: absolute;
+  left: 0;
+  bottom: 3.25rem;
+}
+#legend .section { grid-column: 1 / -1; }
+#legend h3 {
+  margin: 0.375rem 0 0.25rem 0;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text);
+  font-weight: 600;
+}
+#legend .row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0;
+}
+#legend .row svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  stroke: var(--icon);
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+#legend .row .legend-icon {
+  width: 1.125rem;
+  height: 1.125rem;
+  flex-shrink: 0;
+  color: var(--icon);
+  filter: brightness(0) saturate(100%) invert(100%);
+}
+#legend .swatch {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 0.125rem;
+  flex-shrink: 0;
+}
+
+/* ─── Edge animation ─────────────────────────────────────────────── */
+
+/* Edge animation is handled by X6's native `animation` property
+   (set via edge.prop('animation', [...])) — no CSS keyframes needed. */

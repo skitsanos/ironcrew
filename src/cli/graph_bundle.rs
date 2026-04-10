@@ -7,8 +7,7 @@ use crate::utils::error::Result;
 
 const CSS: &str = include_str!("../../examples/graph-prototype/assets/css/main.css");
 
-const JS_THEME: &str =
-    include_str!("../../examples/graph-prototype/assets/js/theme.js");
+const JS_THEME: &str = include_str!("../../examples/graph-prototype/assets/js/theme.js");
 const JS_ICON_REGISTRY: &str =
     include_str!("../../examples/graph-prototype/assets/js/icon-registry.js");
 const JS_GRAPH_SHAPES: &str =
@@ -17,46 +16,30 @@ const JS_GRAPH_BUILDER: &str =
     include_str!("../../examples/graph-prototype/assets/js/graph-builder.js");
 const JS_GRAPH_RUNTIME: &str =
     include_str!("../../examples/graph-prototype/assets/js/graph-runtime.js");
-const JS_APP: &str =
-    include_str!("../../examples/graph-prototype/assets/js/app.js");
+const JS_APP: &str = include_str!("../../examples/graph-prototype/assets/js/app.js");
 
-const SVG_SPRITE: &str =
-    include_str!("../../examples/graph-prototype/assets/images/icons.svg");
+const SVG_SPRITE: &str = include_str!("../../examples/graph-prototype/assets/images/icons.svg");
 
 // ── Individual SVG icons ──────────────────────────────────────────────────────
 
-const ICON_AGENT: &str =
-    include_str!("../../examples/graph-prototype/assets/images/agent.svg");
-const ICON_CHAT: &str =
-    include_str!("../../examples/graph-prototype/assets/images/chat.svg");
-const ICON_CODE: &str =
-    include_str!("../../examples/graph-prototype/assets/images/code.svg");
-const ICON_COLLAB: &str =
-    include_str!("../../examples/graph-prototype/assets/images/collab.svg");
+const ICON_AGENT: &str = include_str!("../../examples/graph-prototype/assets/images/agent.svg");
+const ICON_CHAT: &str = include_str!("../../examples/graph-prototype/assets/images/chat.svg");
+const ICON_CODE: &str = include_str!("../../examples/graph-prototype/assets/images/code.svg");
+const ICON_COLLAB: &str = include_str!("../../examples/graph-prototype/assets/images/collab.svg");
 const ICON_CONDITION: &str =
     include_str!("../../examples/graph-prototype/assets/images/condition.svg");
-const ICON_CREW: &str =
-    include_str!("../../examples/graph-prototype/assets/images/crew.svg");
-const ICON_DIALOG: &str =
-    include_str!("../../examples/graph-prototype/assets/images/dialog.svg");
-const ICON_INFO: &str =
-    include_str!("../../examples/graph-prototype/assets/images/info.svg");
-const ICON_LOOP: &str =
-    include_str!("../../examples/graph-prototype/assets/images/loop.svg");
-const ICON_MEMORY: &str =
-    include_str!("../../examples/graph-prototype/assets/images/memory.svg");
-const ICON_MESSAGE: &str =
-    include_str!("../../examples/graph-prototype/assets/images/message.svg");
+const ICON_CREW: &str = include_str!("../../examples/graph-prototype/assets/images/crew.svg");
+const ICON_DIALOG: &str = include_str!("../../examples/graph-prototype/assets/images/dialog.svg");
+const ICON_INFO: &str = include_str!("../../examples/graph-prototype/assets/images/info.svg");
+const ICON_LOOP: &str = include_str!("../../examples/graph-prototype/assets/images/loop.svg");
+const ICON_MEMORY: &str = include_str!("../../examples/graph-prototype/assets/images/memory.svg");
+const ICON_MESSAGE: &str = include_str!("../../examples/graph-prototype/assets/images/message.svg");
 const ICON_PARALLEL: &str =
     include_str!("../../examples/graph-prototype/assets/images/parallel.svg");
-const ICON_RESULT: &str =
-    include_str!("../../examples/graph-prototype/assets/images/result.svg");
-const ICON_RETRY: &str =
-    include_str!("../../examples/graph-prototype/assets/images/retry.svg");
-const ICON_SUBFLOW: &str =
-    include_str!("../../examples/graph-prototype/assets/images/subflow.svg");
-const ICON_TASK: &str =
-    include_str!("../../examples/graph-prototype/assets/images/task.svg");
+const ICON_RESULT: &str = include_str!("../../examples/graph-prototype/assets/images/result.svg");
+const ICON_RETRY: &str = include_str!("../../examples/graph-prototype/assets/images/retry.svg");
+const ICON_SUBFLOW: &str = include_str!("../../examples/graph-prototype/assets/images/subflow.svg");
+const ICON_TASK: &str = include_str!("../../examples/graph-prototype/assets/images/task.svg");
 const ICON_TOOL_CALL: &str =
     include_str!("../../examples/graph-prototype/assets/images/tool-call.svg");
 
@@ -150,8 +133,7 @@ pub fn generate_html(data: &GraphData, output_path: &Path) -> Result<()> {
     let svg_sprite = SVG_SPRITE;
     let icon_overrides = build_icon_data_uris();
     let js_bundle = build_js_bundle();
-    let data_json = serde_json::to_string_pretty(data)
-        .unwrap_or_else(|_| "{}".to_string());
+    let data_json = serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
 
     let html = format!(
         r##"<!DOCTYPE html>

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IronCrew — DAG Prototype</title>
+
+<!--
+    IronCrew DAG visualization prototype (AntV X6).
+
+    Assets are split out for easier iteration:
+        assets/css/main.css        — all styling
+        assets/js/theme.js         — theme tokens (colors/fonts)
+        assets/js/data.js          — crew fixture
+        assets/js/app.js           — prototype bootstrap
+        assets/js/graph-shapes.js  — node/edge symbols, registry, sizing and text wrapping
+        assets/js/graph-builder.js — graph model + layout + node/edge wiring
+        assets/js/graph-runtime.js — inspector + simulation loop + animation
+        assets/js/icon-registry.js  — central icon definitions + legend model
+        assets/images/icons.svg    — SVG symbol library (<use> targets)
+
+    Serve via:
+        python3 -m http.server --directory examples/graph-prototype 8080
+        open http://localhost:8080/
+
+    Plain `open index.html` won't work because ES modules and
+    cross-file <use href="..."> both require http:// (not file://).
+-->
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+  rel="stylesheet"
+/>
+
+<link rel="stylesheet" href="assets/css/main.css" />
+<script src="https://cdn.jsdelivr.net/npm/@antv/x6/dist/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>IronCrew</h1>
+    <span class="tag">DAG prototype</span>
+  </div>
+  <div class="toolbar">
+    <button id="btn-reset" class="secondary">
+      <svg><use href="assets/images/icons.svg#icon-rotate-ccw"/></svg>
+      Reset
+    </button>
+    <button id="btn-play">
+      <svg><use href="assets/images/icons.svg#icon-play"/></svg>
+      Simulate run
+    </button>
+  </div>
+</header>
+
+<div id="main">
+  <div id="graph-container">
+    <div id="legend-panel" class="legend-shell is-collapsed">
+      <button id="legend-toggle" class="legend-toggle" type="button" aria-expanded="false" aria-controls="legend">
+        <img src="assets/images/info.svg" alt="" />
+      </button>
+      <div id="legend"></div>
+    </div>
+  </div>
+
+  <aside id="inspector">
+    <h2>Inspector</h2>
+    <div class="empty">Click a node to see its details</div>
+  </aside>
+</div>
+
+<script type="module" src="assets/js/app.js"></script>
+</body>
+</html>
