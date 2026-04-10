@@ -6,6 +6,9 @@ use crate::utils::error::Result;
 
 /// Generate a DAG visualization HTML file for a crew project.
 pub fn cmd_graph(path: &Path, output: Option<&Path>) -> Result<()> {
+    println!("Note: `ironcrew graph` is an experimental feature. Its output format,");
+    println!("layout, and CLI interface may change in future releases.");
+    println!();
     println!("Extracting graph data from {}...", path.display());
 
     let data = extract_graph_data(path)?;
