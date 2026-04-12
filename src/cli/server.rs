@@ -99,5 +99,19 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         .await
         .map_err(|e| IronCrewError::Validation(format!("Server error: {}", e)))?;
 
+    // Post-serve drain window: background tasks spawned from `Drop` paths
+    // (notably `McpConnectionManager::shutdown_blocking` for reaping stdio
+    // MCP child processes) need a moment to complete before the tokio
+    // runtime tears them down. Configurable for cloud deployments with
+    // tight SIGTERM grace periods (Kubernetes `terminationGracePeriodSeconds`).
+    let drain_ms: u64 = std::env::var("IRONCREW_SHUTDOWN_DRAIN_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    if drain_ms > 0 {
+        tracing::info!(drain_ms, "Draining background shutdown tasks");
+        tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
+    }
+
     Ok(())
 }

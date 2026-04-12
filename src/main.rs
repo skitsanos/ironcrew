@@ -3,6 +3,8 @@ mod cli;
 mod engine;
 mod llm;
 mod lua;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod tools;
 mod utils;
 

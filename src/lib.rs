@@ -3,5 +3,7 @@ pub mod cli;
 pub mod engine;
 pub mod llm;
 pub mod lua;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod tools;
 pub mod utils;

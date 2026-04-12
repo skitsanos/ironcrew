@@ -17,6 +17,9 @@ use crate::llm::openai_responses::{
 use crate::llm::provider::LlmProvider;
 use crate::utils::error::IronCrewError;
 
+#[cfg(feature = "mcp")]
+use crate::mcp::parse_mcp_config;
+
 // Re-export everything that was previously defined here so that existing
 // import paths (`crate::lua::api::…`) continue to work unchanged.
 // Some re-exports are only consumed by integration tests or downstream crates.
@@ -351,12 +354,25 @@ pub fn register_crew_constructor(
             crew.add_agent(agent.clone());
         }
 
+        // ── MCP config (feature-gated) ──────────────────────────────────
+        #[cfg(feature = "mcp")]
+        let mcp_config = match table.get::<mlua::Table>("mcp_servers") {
+            Ok(mcp_table) => Some(parse_mcp_config(&mcp_table)?),
+            Err(_) => None,
+        };
+
         Ok(LuaCrew {
             crew: Arc::new(Mutex::new(crew)),
             runtime: runtime.clone(),
             custom_provider,
             project_dir,
             store: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "mcp")]
+            mcp_config,
+            #[cfg(feature = "mcp")]
+            mcp_manager: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(feature = "mcp")]
+            mcp_tool_registry: Arc::new(tokio::sync::Mutex::new(None)),
         })
     })?;
 

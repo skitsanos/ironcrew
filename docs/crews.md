@@ -706,3 +706,113 @@ local result = crew:subworkflow("sub/analysis.lua", {
   no absolute paths).
 - The subworkflow script's return value is serialized through JSON and
   transferred back to the parent VM.
+
+---
+
+## MCP (Model Context Protocol) Tool Servers
+
+IronCrew can connect to external [MCP](https://modelcontextprotocol.io/) servers and expose
+their tools to agents. Supported transports: **stdio** (child process) and **HTTP Streamable**.
+
+MCP is enabled by default (Cargo feature `mcp`). Build without it via `--no-default-features`.
+
+### Quick start
+
+```lua
+local crew = Crew.new({
+    goal = "Summarise recent Git activity",
+    provider = "openai",
+    model    = "gpt-4.1-mini",
+
+    mcp_servers = {
+        -- Label must match ^[a-z][a-z0-9_-]{0,15}$
+        git = {
+            transport = "stdio",
+            command   = "uvx",
+            args      = { "mcp-server-git" },
+        },
+    },
+})
+
+crew:add_agent({
+    name  = "analyst",
+    role  = "Git analyst",
+    goal  = "Summarise the repo",
+    -- Tools are exposed as  mcp__<server_label>__<tool_name>
+    tools = { "mcp__git__git_status", "mcp__git__git_log" },
+})
+```
+
+### Transport options
+
+#### Stdio
+
+```lua
+mcp_servers = {
+    mypkg = {
+        transport   = "stdio",
+        command     = "uvx",            -- binary to spawn
+        args        = { "mcp-server-git" },
+        env         = { MY_VAR = "val" },  -- extra env vars for child (optional)
+        inherit_env = false,            -- default: false (safer for cloud)
+    },
+}
+```
+
+**Security:** by default, child processes only inherit `PATH`, `HOME`, `USER`, `LANG`, and
+`LC_*` variables. Your `OPENAI_API_KEY` and other secrets are **not** forwarded.
+Set `inherit_env = true` to opt in to full inheritance (not recommended in production).
+
+#### HTTP
+
+```lua
+mcp_servers = {
+    myapi = {
+        transport = "http",
+        url       = "https://mcp.example.com/mcp",
+        headers   = {
+            authorization = "Bearer " .. env("MCP_API_TOKEN"),
+        },
+    },
+}
+```
+
+HTTP URLs are validated against the SSRF filter (private IPs blocked by default).
+Localhost is blocked unless `IRONCREW_MCP_ALLOW_LOCALHOST=1` is set.
+
+### Tool naming
+
+Tools discovered from MCP servers are registered in the IronCrew tool registry as:
+
+```
+mcp__<server_label>__<tool_name>
+```
+
+Constraints:
+- Server label: `^[a-z][a-z0-9_-]{0,15}$` (lowercase, max 16 chars)
+- Composed name: ≤ 64 characters total
+
+### Connection lifecycle
+
+- MCP servers are **connected in parallel** on the first `crew:run()` call.
+- Any handshake failure aborts the run with a clear error.
+- The connection is **cached** for the crew's lifetime — subsequent `crew:run()` calls
+  reuse the same connections without reconnecting.
+- On crew drop / server shutdown, connections are torn down gracefully: stdio children
+  are reaped via pipe closure, HTTP streams close cleanly. See
+  [cloud-deployment.md](cloud-deployment.md#graceful-shutdown) for tuning the drain
+  window (`IRONCREW_SHUTDOWN_DRAIN_MS`) on Kubernetes / Railway.
+
+### Security environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `IRONCREW_MCP_ALLOWED_COMMANDS` | (unset = allow all) | Comma-separated binary names allowed for stdio. E.g. `"uvx,npx"`. |
+| `IRONCREW_MCP_ALLOW_LOCALHOST` | `0` | Set to `1` to allow localhost/loopback HTTP URLs. |
+| `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` | `10` | Seconds to wait for the MCP handshake to complete. |
+| `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` (256 KB) | Maximum bytes returned per tool call. Oversized results are truncated with a `[truncated: N bytes omitted]` marker. |
+
+### Examples
+
+- `examples/mcp/git-tools/` — stdio example with `mcp-server-git`
+- `examples/mcp/http-tools/` — HTTP Streamable example
