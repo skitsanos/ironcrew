@@ -12,6 +12,9 @@ use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
 use crate::utils::error::{IronCrewError, Result};
 
+#[cfg(feature = "mcp")]
+use crate::mcp::{McpConfig, McpConnectionManager};
+
 use super::conversation::build_conversation;
 use super::dialog::build_dialog;
 use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
@@ -36,6 +39,17 @@ pub struct LuaCrew {
     /// most for PostgreSQL, where each `create_store()` call would
     /// otherwise spin up a fresh connection pool.
     pub store: OnceCell<Arc<dyn StateStore>>,
+    /// Parsed MCP server configuration (set at Crew.new() time).
+    #[cfg(feature = "mcp")]
+    pub mcp_config: Option<McpConfig>,
+    /// Cached MCP connection manager. Created once on the first `crew:run()` call
+    /// and reused for all subsequent runs (no reconnect overhead).
+    #[cfg(feature = "mcp")]
+    pub mcp_manager: Arc<Mutex<Option<McpConnectionManager>>>,
+    /// Augmented tool registry that includes MCP tools. Set after first connect_all.
+    /// Stored here so subsequent runs don't re-register MCP tools on each call.
+    #[cfg(feature = "mcp")]
+    pub mcp_tool_registry: Arc<Mutex<Option<crate::tools::registry::ToolRegistry>>>,
 }
 
 impl LuaCrew {
@@ -467,6 +481,46 @@ impl UserData for LuaCrew {
         methods.add_async_method("run", |lua, this, ()| async move {
             let run_start = chrono::Utc::now();
 
+            // ── MCP: connect once and register tools, then reuse the cached registry ──
+            #[cfg(feature = "mcp")]
+            let tool_registry = {
+                // Check if the augmented registry is already cached
+                let cached = {
+                    let guard = this.mcp_tool_registry.lock().await;
+                    guard.clone()
+                };
+
+                if let Some(registry) = cached {
+                    // Fast path: reuse cached augmented registry
+                    registry
+                } else if let Some(ref mcp_cfg) = this.mcp_config {
+                    if mcp_cfg.is_empty() {
+                        this.runtime.tool_registry.clone()
+                    } else {
+                        // First run: connect all MCP servers and register their tools
+                        let mut registry = this.runtime.tool_registry.clone();
+                        let manager = McpConnectionManager::connect_all(mcp_cfg, &mut registry)
+                            .await
+                            .map_err(mlua::Error::external)?;
+                        // Cache both the manager and the augmented registry
+                        {
+                            let mut guard = this.mcp_manager.lock().await;
+                            *guard = Some(manager);
+                        }
+                        {
+                            let mut guard = this.mcp_tool_registry.lock().await;
+                            *guard = Some(registry.clone());
+                        }
+                        registry
+                    }
+                } else {
+                    this.runtime.tool_registry.clone()
+                }
+            };
+
+            #[cfg(not(feature = "mcp"))]
+            let tool_registry = this.runtime.tool_registry.clone();
+
             let mut crew = this.crew.lock().await;
 
             // If an EventBus was injected via Lua app_data (from API handler), use it.
@@ -479,7 +533,7 @@ impl UserData for LuaCrew {
                 None => this.runtime.provider.clone(),
             };
             let results = crew
-                .run(provider, &this.runtime.tool_registry)
+                .run(provider, &tool_registry)
                 .await
                 .map_err(mlua::Error::external)?;
 

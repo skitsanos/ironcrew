@@ -85,6 +85,7 @@ ironcrew run .
 | [REST API](docs/rest-api.md) | Endpoints, SSE events, input parameters, Docker deployment |
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
+| [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
 
 ## Examples

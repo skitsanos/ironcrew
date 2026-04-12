@@ -22,6 +22,9 @@ pub enum IronCrewError {
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("MCP error [{server}]: {message}")]
+    Mcp { server: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, IronCrewError>;
