@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -68,7 +68,7 @@ impl Tool for HttpRequestTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| IronCrewError::ToolExecution {

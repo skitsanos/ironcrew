@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod conversations;
 pub mod handlers;
 
 use axum::{
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::engine::eventbus::EventBus;
+use crate::engine::store::StateStore;
 
 /// A running crew: its event bus and an abort handle to cancel it.
 pub struct ActiveRun {
@@ -21,10 +23,27 @@ pub struct ActiveRun {
     pub abort_handle: tokio::task::AbortHandle,
 }
 
+/// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
+/// Flow slug is the last path segment of the resolved flow dir — the same
+/// value stored in `ConversationRecord.flow_path`, so the map is implicitly
+/// namespaced by flow.
+pub type ActiveConversationsMap =
+    Arc<RwLock<HashMap<(String, String), Arc<conversations::ConversationHandle>>>>;
+
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
     pub active_runs: Arc<RwLock<HashMap<String, ActiveRun>>>,
+    pub active_conversations: ActiveConversationsMap,
+    /// Hard cap on `active_conversations.len()` — reads
+    /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
+    pub max_active_conversations: usize,
+    /// Server-wide persistence singleton. Bootstrapped once at
+    /// `cmd_serve` startup and reused across every handler so Postgres
+    /// migrations / table checks don't re-run per request, and so every
+    /// caller shares the same connection pool instead of spinning a new
+    /// one per conversation start.
+    pub store: Arc<dyn StateStore>,
 }
 
 /// Response from running a crew
@@ -150,6 +169,31 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/validate", get(validate_flow))
         .route("/flows/{flow}/agents", get(list_agents))
         .route("/flows/{flow}/events/{run_id}", get(flow_events))
+        // Phase-1 Human-in-the-Loop conversation endpoints
+        .route(
+            "/flows/{flow}/conversations",
+            get(conversations::list_conversations),
+        )
+        .route(
+            "/flows/{flow}/conversations/{id}/start",
+            post(conversations::start_conversation),
+        )
+        .route(
+            "/flows/{flow}/conversations/{id}/messages",
+            post(conversations::post_message),
+        )
+        .route(
+            "/flows/{flow}/conversations/{id}/history",
+            get(conversations::get_history),
+        )
+        .route(
+            "/flows/{flow}/conversations/{id}/events",
+            get(conversations::conversation_events),
+        )
+        .route(
+            "/flows/{flow}/conversations/{id}",
+            delete(conversations::delete_conversation),
+        )
         .route("/nodes", get(list_nodes))
         .layer(axum::middleware::from_fn(auth::bearer_auth));
 

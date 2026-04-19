@@ -4,6 +4,9 @@ How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**
 
 IronCrew is a single statically-linked Rust binary. It runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a one-shot job.
 
+For HTTP-specific capacity planning, active conversation sizing, SSE tuning, and
+horizontal scaling advice, see [HTTP Scaling](http-scaling.md).
+
 ---
 
 ## Binary profile
@@ -19,15 +22,19 @@ IronCrew is a single statically-linked Rust binary. It runs in `serve` mode as a
 
 IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cleanly:
 
-1. Signal received → stops accepting new HTTP requests.
-2. In-flight requests run to completion (via Axum's `with_graceful_shutdown`).
-3. Per-request `LuaCrew` instances drop → MCP managers call `shutdown_blocking()` which spawns async cleanup tasks for each stdio child / HTTP connection.
-4. A drain window lets those background tasks finish reaping stdio child processes before the Tokio runtime tears down.
+1. Signal received → server stops accepting new HTTP requests and starts the hard-deadline clock (`IRONCREW_SHUTDOWN_TIMEOUT_SECS`).
+2. All entries in `active_conversations` are actively dropped. Dropping a chat session closes its per-session `EventBus`, so SSE subscribers on `/conversations/{id}/events` unblock and their streams terminate.
+3. All entries in `active_runs` are aborted via their `abort_handle` and then dropped, which closes the run's `EventBus` and unblocks any SSE subscriber on `/events/{run_id}`.
+4. Axum's `with_graceful_shutdown` lets remaining in-flight non-SSE requests finish.
+5. Per-request `LuaCrew` instances drop → MCP managers call `shutdown_blocking()` which spawns async cleanup tasks for each stdio child / HTTP connection.
+6. If Axum graceful shutdown takes longer than `IRONCREW_SHUTDOWN_TIMEOUT_SECS`, the server exits anyway (logs a warning).
+7. A post-serve drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) gives the Drop-spawned MCP cleanup tasks a moment before the Tokio runtime tears down.
 
-### The drain window
+### Shutdown tunables
 
 | Variable | Default | Description |
 |---|---|---|
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard deadline, in seconds, counted from the moment SIGTERM/SIGINT arrives. If Axum graceful shutdown exceeds it, the process exits anyway. Drop this to `~7` on platforms with 10-second grace windows (e.g. Railway). |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | `1000` | Milliseconds to wait after Axum returns, so Drop-spawned shutdown tasks can complete. Set to `0` to skip (children will be killed when the runtime drops). |
 
 **Tune this value** to fit your platform's grace period:
@@ -43,17 +50,27 @@ IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cl
        │                      │
        │─── SIGTERM ─────────►│
        │                      │── stop accepting new requests
-       │                      │── drain in-flight (up to max_run_lifetime)
+       │                      │── start hard-deadline clock
+       │                      │       (IRONCREW_SHUTDOWN_TIMEOUT_SECS)
+       │                      │── drop active_conversations
+       │                      │       → closes chat EventBuses
+       │                      │       → SSE subscribers unblock
+       │                      │── abort active_runs, drop their EventBuses
+       │                      │       → SSE subscribers on /events/{id} unblock
+       │                      │── axum graceful-shutdown: finish
+       │                      │       remaining non-SSE in-flight requests
        │                      │── drop LuaCrews, shutdown MCP clients
+       │                      │       (spawns stdio child reapers)
        │                      │── IRONCREW_SHUTDOWN_DRAIN_MS wait
-       │                      │── exit 0
+       │                      │── exit 0  (or exit anyway on hard-deadline
+       │                      │            if graceful shutdown overran)
        │◄── container exit ───│
        │
        │ (if still running after terminationGracePeriodSeconds)
        │─── SIGKILL ─────────►│
 ```
 
-Ensure `terminationGracePeriodSeconds ≥ IRONCREW_MAX_RUN_LIFETIME + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s margin`.
+Ensure `terminationGracePeriodSeconds ≥ IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s margin`. Because long-running runs are aborted on SIGTERM, you do **not** need to add `IRONCREW_MAX_RUN_LIFETIME` into this budget.
 
 ---
 
@@ -104,6 +121,19 @@ Production deployments should set these at minimum:
 | `IRONCREW_MAX_RUN_LIFETIME` | `1800` (30 min) | Hard per-run timeout. Lower for short flows. |
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many turns. |
 | `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns. |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Max simultaneous live chat sessions (HTTP + CLI). Exceeding returns 503. |
+| `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` (30 min) | Idle window after which a chat handle is evicted from memory. |
+| `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/conversations`. |
+| `IRONCREW_CONVERSATIONS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the conversation list endpoint. |
+| `IRONCREW_RUNS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/runs`. |
+| `IRONCREW_RUNS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the run list endpoint. |
+| `IRONCREW_MAX_FLOW_DEPTH` | `5` | Maximum recursion depth for `run_flow` sub-flow invocation. Raise only if you have intentional deep nesting. |
+| `IRONCREW_TOOL_TIMEOUT` | `60` | Seconds to wait before a single tool call is cancelled. |
+| `IRONCREW_SSE_OUTPUT_MAX_CHARS` | _off_ | If set, truncates per-event SSE output text at N characters. Unset leaves events unlimited. |
+
+The conversation-related defaults above are only generic fallbacks. For Cloud
+deployments, especially when using HTTP chat and SSE, size them intentionally
+using the guidance in [HTTP Scaling](http-scaling.md).
 
 ### Recommended baselines
 
@@ -145,13 +175,19 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 
 **Railway:** the built-in PostgreSQL add-on is the simplest path. Add it and Railway sets `DATABASE_URL` automatically.
 
+**Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once at `cmd_serve` startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run exactly once at boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
+
 ### Postgres-specific
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | — | Standard Postgres DSN. Required. |
+| `DATABASE_URL` | — | PostgreSQL 15+ DSN. Required. |
 | `IRONCREW_PG_TABLE_PREFIX` | empty | Prefix for shared databases (e.g. `tenant1_`). Alphanumeric + underscore only. |
 | `IRONCREW_DB_POOL_SIZE` | `10` | Connection pool size. Raise for concurrent load. |
+
+IronCrew supports PostgreSQL 15+ only. This matches the session-storage
+features used by the runtime and the intended deployment target of
+extension-capable Postgres installs such as `pgvector`.
 
 ---
 
@@ -201,7 +237,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
       - name: ironcrew
-        image: your-registry/ironcrew:2.12.0
+        image: your-registry/ironcrew:2.13.0
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080
@@ -358,6 +394,7 @@ Railway sends `SIGTERM` on deploys and scales. Its grace period is **10 seconds*
 
 ```
 IRONCREW_MAX_RUN_LIFETIME=60        # fast runs
+IRONCREW_SHUTDOWN_TIMEOUT_SECS=7    # fits inside Railway's 10s grace
 IRONCREW_SHUTDOWN_DRAIN_MS=500
 ```
 

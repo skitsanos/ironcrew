@@ -4,7 +4,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -78,7 +78,7 @@ impl Tool for ShellTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let command = args["command"]
             .as_str()
             .ok_or_else(|| IronCrewError::ToolExecution {

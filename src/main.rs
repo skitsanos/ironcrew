@@ -126,6 +126,18 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Start an interactive chat REPL against a conversational agent
+    Chat {
+        /// Path to project directory or crew.lua file
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Agent name to converse with (must be declared in crew.lua)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Stable session id (enables cross-run persistence)
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// List past runs
     Runs {
         /// Filter by status: success, partial_failure, failed
@@ -178,6 +190,7 @@ async fn main() {
         Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
         Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
         Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
+        Commands::Chat { path, agent, id } => cli::chat::cmd_chat(&path, agent, id).await,
         Commands::Runs {
             status,
             tag,

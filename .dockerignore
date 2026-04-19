@@ -2,6 +2,7 @@ target/
 .git/
 .github/
 .idea/
+node_modules
 .env
 .env.build
 .DS_Store

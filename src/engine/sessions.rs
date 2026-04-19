@@ -17,10 +17,44 @@ use crate::utils::error::{IronCrewError, Result};
 pub struct ConversationRecord {
     pub id: String,
     pub flow_name: String,
+    /// User-facing flow identifier (e.g. "chat-cli" — the last path segment
+    /// of the resolved flow directory). Used by the HTTP and CLI layers to
+    /// filter conversations per-flow. Legacy records without this field stay
+    /// addressable by id, but will not appear in per-flow listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_path: Option<String>,
     pub agent_name: String,
     pub messages: Vec<ChatMessage>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Lightweight conversation metadata — same as `ConversationRecord` without
+/// the full message list. Used for paginated list views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_path: Option<String>,
+    pub agent_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Number of user turns completed.
+    pub turn_count: usize,
+}
+
+impl From<&ConversationRecord> for ConversationSummary {
+    fn from(r: &ConversationRecord) -> Self {
+        let turn_count = r.messages.iter().filter(|m| m.role == "user").count();
+        Self {
+            id: r.id.clone(),
+            flow_path: r.flow_path.clone(),
+            agent_name: r.agent_name.clone(),
+            created_at: r.created_at.clone(),
+            updated_at: r.updated_at.clone(),
+            turn_count,
+        }
+    }
 }
 
 /// Persistent snapshot of a `crew:dialog({id = "..."})` session.
@@ -30,6 +64,9 @@ pub struct ConversationRecord {
 pub struct DialogStateRecord {
     pub id: String,
     pub flow_name: String,
+    /// User-facing flow identifier. See `ConversationRecord::flow_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_path: Option<String>,
     /// Agents participating in the dialog, in turn order.
     pub agent_names: Vec<String>,
     /// Kickoff message for the first turn.

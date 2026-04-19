@@ -5,6 +5,7 @@ use crate::engine::agent::Agent;
 use crate::engine::interpolate::interpolate;
 use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
+use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -308,9 +309,11 @@ impl<'a> TaskExecutionContext<'a> {
                         .unwrap_or(60),
                 );
 
+                let tool_ctx = ToolCallContext::default();
                 let tool_result = match tokio::time::timeout(
                     tool_timeout,
-                    self.tool_registry.execute(&tool_call.function.name, args),
+                    self.tool_registry
+                        .execute(&tool_call.function.name, args, &tool_ctx),
                 )
                 .await
                 {

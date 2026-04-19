@@ -2,6 +2,8 @@
 
 Agents are your AI specialists - each with a focused role, capabilities, and personality. You tell them *what* they're good at; IronCrew figures out *when* to use them.
 
+> **Note:** Agent auto-selection is a simple word-overlap heuristic (capability, tool-keyword, and goal matching — see `AgentSelector` in `src/engine/agent.rs`), **not** an LLM-driven decision. See [Agent Selection Heuristics](#agent-selection-heuristics) below.
+
 ## Defining Agents
 
 There are two ways to define agents: inline in `crew.lua` or as declarative files.
@@ -150,6 +152,17 @@ Agents can also be passed inline as `Agent.new({...})` tables in both modes.
 The agent's `system_prompt`, `temperature`, `model`, `tools`, and
 `response_format` all carry over. See [Crews](crews.md#conversation-mode) for
 the full Conversation and Dialog API.
+
+**Tool-calling in conversations.** Tool-calling works inside `crew:conversation()`
+tool-call loops — agents that declare `tools = { ... }` can invoke those tools
+during any turn. This includes the built-in tools (see [Tools](tools.md) for the
+built-in tool names), custom Lua tools under `tools/*.lua`, and MCP client tools
+exposed as `mcp__<server>__<tool>` when the crew has `mcp_servers` configured.
+
+**Image input.** `conv:send(msg, { images = {...} })` accepts an `images` list
+where each entry is a file path (relative to the project directory), a URL
+(`http(s)://...`), or a data URI. Added in 2.11.0. See
+[Crews](crews.md#conversation-mode) for the full spec.
 
 ## Per-Agent Model Override
 

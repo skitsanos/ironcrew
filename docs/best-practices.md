@@ -26,11 +26,11 @@ stays focused on workflow logic:
 -- config.lua
 return {
     provider = "anthropic",
-    model = "claude-haiku-4-5-20251001",
+    model = "claude-haiku-4-5",
     max_concurrent = 4,
     models = {
-        task_execution = "claude-haiku-4-5-20251001",
-        collaboration_synthesis = "claude-sonnet-4-5-20250929",
+        task_execution = "claude-haiku-4-5",
+        collaboration_synthesis = "claude-sonnet-4-5",
     },
 }
 ```
@@ -105,9 +105,30 @@ vs monolith), hiring (hire vs pass), product decisions (build now vs wait).
 See [`examples/stock-debate/`](../examples/stock-debate/) for a complete
 implementation.
 
+### Persistent conversations
+
+`crew:conversation({id = ...})` and `crew:dialog({id = ...})` persist
+across runs via the configured `StateStore`. Passing a stable `id` is
+what turns an ephemeral session into a resumable one:
+
+- `crew:conversation({ id = "alice-support" })` resumes from the prior
+  message history if a record with that id already exists; otherwise it
+  starts fresh and writes on each turn.
+- Cross-run persistence is scoped by `(flow_path, id)` — two different
+  flows can reuse the same id without collision. See
+  [`docs/storage.md`](storage.md#conversation-scoping-flow_path) for the
+  full scoping rules.
+- HTTP flows can list the sessions visible to a flow via
+  `GET /flows/{flow}/conversations` (paginated; tuned by
+  `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` / `IRONCREW_CONVERSATIONS_MAX_LIMIT`).
+
+What does **not** carry across calls is the live, in-memory conversation
+handle returned from `crew:conversation({})` (no id) within a single Lua
+script execution — that handle is scratch state and disappears when the
+script returns.
+
 **Limitations** (current):
-- Conversations and dialogs run intra-script — they do not persist across `crew:run()` calls
-- Dialogs are two-agent only (multi-party round-robin is future work)
+- Dialogs are two-agent only (multi-party round-robin is future work).
 
 Both primitives emit dedicated SSE events (`conversation_*`, `dialog_*`)
 through the EventBus, so REST API subscribers can stream conversation messages
@@ -125,7 +146,13 @@ due to transient issues (rate limits, network errors). The engine emits
 **Timeouts.** Set `timeout_secs` on long-running tasks to prevent them from
 blocking the entire crew. The server enforces a 30-minute maximum run lifetime
 (`IRONCREW_MAX_RUN_LIFETIME`). The server handles `SIGTERM` and `Ctrl+C`
-gracefully, allowing in-flight requests to complete before shutdown.
+by actively dropping active chat sessions and aborting active runs so SSE
+streams terminate immediately; remaining non-SSE in-flight requests finish
+via Axum's graceful shutdown. A hard deadline
+(`IRONCREW_SHUTDOWN_TIMEOUT_SECS`, default 10 s) forces the process to
+exit if graceful shutdown overruns. See
+[Cloud Deployment – Graceful shutdown](cloud-deployment.md#graceful-shutdown)
+for the full sequence.
 
 **Conditions.** Use `condition` to skip tasks based on previous results. A task
 with a false condition emits a `task_skipped` event and does not count as failed.
@@ -158,6 +185,19 @@ from deeper thinking.
 Anthropic or OpenAI Responses over custom HTTP tools — no SSRF concerns, proper
 citations, and one configuration flag instead of a whole tool implementation.
 
+**Server-wide operational caps.** Size these to your pod and traffic:
+
+- `IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default `100`) — hard cap on
+  concurrent in-memory chat sessions. Exceeding returns `503`.
+- `IRONCREW_CHAT_SESSION_IDLE_SECS` (default `1800`) — idle window after
+  which a chat session handle is evicted from memory. The underlying
+  `ConversationRecord` in the store is untouched, so clients can resume
+  the session by hitting `/start` again with the same id.
+- `IRONCREW_CONVERSATION_MAX_HISTORY` (default `50`) — per-session message
+  cap. Older messages are trimmed from the in-memory history on each turn.
+- `IRONCREW_MAX_FLOW_DEPTH` (default `5`) — recursion cap for `run_flow`
+  sub-flow invocation. Raise only when you intentionally chain deeply.
+
 ## Security
 
 **CORS.** The API server denies cross-origin requests by default. Set
@@ -172,10 +212,25 @@ with `IRONCREW_ALLOW_PRIVATE_IPS=1` if your agents legitimately need to reach
 internal services.
 
 **Environment variable security.** Lua `env()` blocks sensitive variables by
-default: `DATABASE_URL`, `IRONCREW_API_TOKEN`, and any variable ending with
-`_API_KEY`, `_SECRET`, `_TOKEN`, or `_PASSWORD`. Add custom names to
-`IRONCREW_ENV_BLOCKLIST` (comma-separated). This prevents Lua scripts from
-exfiltrating secrets into task output.
+default: `DATABASE_URL`, `IRONCREW_API_TOKEN`, `IRONCREW_PG_TABLE_PREFIX`,
+and any variable ending with `_API_KEY`, `_SECRET`, `_TOKEN`, or
+`_PASSWORD`. Add custom names to `IRONCREW_ENV_BLOCKLIST` (comma-separated).
+This prevents Lua scripts from exfiltrating secrets into task output. See
+`src/lua/sandbox.rs` for the authoritative list.
+
+**MCP hardening.** When MCP servers are in the mix, tighten the defaults:
+
+- `IRONCREW_MCP_ALLOWED_COMMANDS` — comma-separated allowlist of binary
+  names for stdio MCP servers (e.g. `uvx,npx`). Leaving this unset allows
+  any command. **Recommended in production.**
+- `IRONCREW_MCP_ALLOW_LOCALHOST` — by default IronCrew refuses `http://`
+  MCP URLs pointing at loopback. Set to `1` only when the MCP server runs
+  as a trusted sidecar in the same pod.
+- `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` — default `10`. Raise only when
+  slow cold-starts (`uvx` / `npx` downloading on first run) are expected.
+- `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` — default `262144` (256 KB). Caps
+  the result size returned from any MCP tool call; oversized results are
+  truncated with a marker.
 
 **Request/response size limits.** The server enforces a max request body size
 (`IRONCREW_MAX_BODY_SIZE`, default 10MB). HTTP tools and Lua `http.*` enforce
@@ -224,9 +279,18 @@ multi-instance cloud deployments. Pool size is configurable via
 allows sharing a database across projects — only alphanumeric and underscore are
 allowed.
 
-**Per-flow stores.** Each flow gets its own store instance based on its
-`.ironcrew` directory. This keeps data isolated between flows regardless of the
-backend.
+**Store lifecycle.** The lifetime of the store depends on how IronCrew is
+launched:
+
+- **`ironcrew run` (CLI one-shot).** Each invocation creates its own store
+  instance rooted at the flow's `.ironcrew/` directory and tears it down
+  when the process exits. Flows are naturally isolated.
+- **`ironcrew serve`.** A **single store instance is bootstrapped once at
+  server startup** and shared across every request handler and every
+  flow under `--flows-dir`. Postgres migrations run exactly once at boot;
+  the connection pool is shared. Conversation and dialog records keep
+  per-flow isolation through the `(flow_path, id)` composite key — see
+  [`docs/storage.md`](storage.md#conversation-scoping-flow_path).
 
 **Switching backends.** Changing `IRONCREW_STORE` does not migrate existing data.
 If you switch from `json` to `sqlite`, previously stored JSON runs remain in the

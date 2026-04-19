@@ -56,6 +56,7 @@ local crew = Crew.new({
 | `prompt_cache_key`       | string   | `nil`              | Provider-side prompt cache identifier |
 | `prompt_cache_retention` | string   | `nil`              | Cache retention hint (e.g. `"1h"`) |
 | `models`                 | table    | `{}`               | Model router mapping (purpose -> model) |
+| `mcp_servers`            | table    | `{}`               | External [MCP](#mcp-model-context-protocol-tool-servers) tool servers (stdio / HTTP) to connect on first `crew:run()` |
 
 ---
 
@@ -69,12 +70,12 @@ settings — any field set there becomes a default for `Crew.new()`.
 -- config.lua
 return {
     provider = "anthropic",
-    model = "claude-haiku-4-5-20251001",
+    model = "claude-haiku-4-5",
     max_concurrent = 4,
     memory = "ephemeral",
     models = {
-        task_execution = "claude-haiku-4-5-20251001",
-        collaboration_synthesis = "claude-sonnet-4-5-20250929",
+        task_execution = "claude-haiku-4-5",
+        collaboration_synthesis = "claude-sonnet-4-5",
     },
 }
 ```
@@ -117,6 +118,21 @@ its own message history across calls — different from a `Task`, which is
 single-shot. Useful for stateful dialogues, agent testing, or interactive
 workflows inside a Lua script.
 
+> **Guard top-level `crew:run()` when mixing chat and task execution.**
+> IronCrew sets `IRONCREW_MODE` as a Lua global before `crew.lua` runs:
+> `"run"` under `ironcrew run` and `"chat"` under `ironcrew chat` (and the
+> HTTP conversation endpoints). If your script defines tasks and also
+> exposes a conversational agent, wrap the bootstrapping call:
+>
+> ```lua
+> if IRONCREW_MODE ~= "chat" then
+>     crew:run()
+> end
+> ```
+>
+> This prevents chat-mode boot-up (REPL or HTTP `/start`) from triggering a
+> full task execution just to instantiate the crew.
+
 Create a conversation bound to a crew (it inherits the crew's provider, model,
 and tool registry):
 
@@ -125,7 +141,7 @@ local conv = crew:conversation({
     agent = "tutor",                          -- agent name (must be added to crew)
     -- OR: agent = Agent.new({...})           -- inline agent
 
-    model = "claude-haiku-4-5-20251001",      -- optional override
+    model = "claude-haiku-4-5",      -- optional override
     system_prompt = "You are a Rust tutor.",  -- optional override (else from agent)
     max_history = 20,                         -- optional cap on stored messages
     stream = true,                            -- optional, stream replies to stderr
@@ -229,8 +245,13 @@ Omit `id` to get the pre-2.8 ephemeral behavior.
 | `conv:delete()`       | Remove the persisted record from the store |
 
 Sessions are stored via the same `StateStore` backend as run history
-(JSON, SQLite, or PostgreSQL), under `.ironcrew/conversations/` for JSON
-or in a `conversations` table otherwise. See
+(JSON, SQLite, or PostgreSQL). Records are keyed by `(flow_path, id)` so
+different flows can reuse the same id. The JSON backend lays them out at
+`<conversations_dir>/<flow>/<id>.json` (typically
+`.ironcrew/conversations/<flow>/<id>.json`); SQL backends store the same
+composite key in the `conversations` table. Legacy flat records from
+before multi-flow isolation remain in `<conversations_dir>/<id>.json`
+and are reachable only via global/admin lookups. See
 [`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
 for a full walkthrough.
 
@@ -249,6 +270,35 @@ the full event schema.
 See [`examples/conversation/`](../examples/conversation/) for a basic example
 and [`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
 for the persistence demo.
+
+### HTTP Conversation Endpoints
+
+The same `crew:conversation({})` primitive is exposed over HTTP by
+`ironcrew serve` as six endpoints. Sessions are created explicitly with
+`POST /start`, turns are serialized per-id, and state persists through the
+same `StateStore` used by `ironcrew chat`.
+
+| Method | Path                                                | Purpose                           |
+| ------ | --------------------------------------------------- | --------------------------------- |
+| POST   | `/flows/{flow}/conversations/{id}/start`            | Create or re-open a chat session  |
+| POST   | `/flows/{flow}/conversations/{id}/messages`         | Send a user turn, wait for reply  |
+| GET    | `/flows/{flow}/conversations/{id}/history`          | Read the stored transcript        |
+| GET    | `/flows/{flow}/conversations/{id}/events`           | SSE stream for the session        |
+| DELETE | `/flows/{flow}/conversations/{id}`                  | Drop handle + delete record       |
+| GET    | `/flows/{flow}/conversations`                       | Paginated list (filtered by flow) |
+
+See [REST API: Conversations](rest-api.md#conversations-phase-1-human-in-the-loop)
+for request/response shapes and a worked curl session.
+
+### Chat & Conversation Env Vars
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Hard cap on simultaneously-active in-memory chat handles across the server. Breaches return `503` |
+| `IRONCREW_CHAT_SESSION_IDLE_SECS`   | `1800` | Idle timeout before an in-memory chat handle is evicted (its record stays on disk) |
+| `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20`  | Default page size for `GET /flows/{flow}/conversations` |
+| `IRONCREW_CONVERSATIONS_MAX_LIMIT`  | `100` | Hard cap on the `limit` query parameter for the same endpoint |
+| `IRONCREW_CONVERSATION_MAX_HISTORY` | `50`  | Default `max_history` for `crew:conversation({})` when not set explicitly. `0` = unbounded |
 
 ---
 
@@ -495,8 +545,12 @@ error rather than silently mixing state.
 | `dialog:delete()`       | Remove the persisted record |
 | `dialog:turn_count()`   | Returns `next_index` — reflects prior runs too |
 
-Dialogs are stored in `.ironcrew/dialogs/` (JSON) or a `dialogs` table
-(SQLite/PostgreSQL). The
+Dialogs share the same `(flow_path, id)` keying as conversations. The
+JSON backend lays them out at `<dialogs_dir>/<flow>/<id>.json` (typically
+`.ironcrew/dialogs/<flow>/<id>.json`); SQL backends store the composite
+key in the `dialogs` table. Legacy flat records remain in
+`<dialogs_dir>/<id>.json` and are visible only to global/admin lookups.
+The
 [`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
 project demonstrates both a resumable conversation and a resumable dialog
 in the same script.
@@ -706,6 +760,54 @@ local result = crew:subworkflow("sub/analysis.lua", {
   no absolute paths).
 - The subworkflow script's return value is serialized through JSON and
   transferred back to the parent VM.
+
+### `run_flow(path, input)` — sandbox-level sub-flow
+
+`run_flow` is a sandbox-level Lua global available in **every** VM
+IronCrew creates — the top-level `crew.lua`, any `tools/*.lua` custom
+tool, and the tool-call handlers invoked during a conversational turn. It
+does not require a `Crew` instance.
+
+```lua
+local result = run_flow("subs/analyze.lua", { input = value })
+```
+
+**Signature**
+
+| Arg     | Type   | Description |
+|---------|--------|-------------|
+| `path`  | string | Path to a Lua flow, resolved relative to the calling VM's project directory. Absolute paths, `..`, and anything that escapes the project root are rejected |
+| `input` | table? | Optional table passed to the sub-flow as the `input` Lua global |
+
+Returns whatever the sub-flow's final Lua expression yields. Tables
+round-trip as tables, primitives as primitives, everything else collapses
+to `nil`.
+
+**Behavior**
+
+- Runs in-process in a fresh `Crew.new` sandbox; JSON is the only
+  transport between the caller and the sub-flow's VM
+- Shares the parent's `Runtime` (tool registry, provider, MCP
+  connections) but gets its own crew, memory, and message bus
+- Nesting is capped by `IRONCREW_MAX_FLOW_DEPTH` (default `5`); exceeding
+  the cap fails with a validation error
+- Emits `log` events through the caller's EventBus:
+  `run_flow: <path>` at start and `run_flow done: <path> (<ms>ms)` at
+  completion
+
+**When to use it over `crew:subworkflow()`**
+
+`crew:subworkflow()` is still supported and keeps its `output_key` sugar
+for wrapping the result into a single-field table. Prefer `run_flow`
+when:
+
+- You need sub-flow dispatch from a place that does not have a `crew`
+  handle (custom tool Lua, a conversational agent's tool-call path)
+- You want the raw return value without `output_key` wrapping
+- You want the call to work identically inside nested flows
+
+See [`examples/chat-http`](../examples/chat-http/) for a chat flow that
+delegates to a sub-crew via a custom tool that calls `run_flow()`.
 
 ---
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -38,7 +38,7 @@ impl Tool for HashTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let text = args["text"]
             .as_str()
             .ok_or_else(|| IronCrewError::ToolExecution {

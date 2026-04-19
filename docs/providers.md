@@ -32,7 +32,7 @@ No extra configuration needed beyond setting `OPENAI_API_KEY`.
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-4.1-mini",
 })
 ```
 
@@ -51,10 +51,18 @@ local crew = Crew.new({
 })
 ```
 
-Available models include `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview`.
+Available models include `gemini-2.5-flash` and `gemini-2.5-pro`.
 Gemini supports JSON Schema structured output via `response_format` on agents.
 IronCrew handles Gemini-specific quirks automatically (array-wrapped error
 responses, tool call arguments returned as objects instead of strings).
+
+> **Gemini 3 preview caveat:** the `gemini-3-flash-preview` and `gemini-3-pro`
+> endpoints emit `thought_signature` tokens that Gemini requires the client to
+> echo back on tool-call follow-up turns. The OpenAI-compat bridge does not
+> currently thread those signatures through, so Gemini 3 preview rejects any
+> follow-up turn after a tool call. Stick to `gemini-2.5-flash` /
+> `gemini-2.5-pro` for flows that use tools until the provider bridge learns
+> to preserve thought signatures.
 
 ### Groq
 
@@ -69,7 +77,7 @@ local crew = Crew.new({
 })
 ```
 
-### Kimi K2.5 (Moonshot AI)
+### Kimi / Moonshot AI
 
 Set `MOONSHOT_API_KEY`. Auto-detected when base URL contains `moonshot.ai` or
 `moonshot.cn`. Kimi returns `reasoning_content` in responses which IronCrew
@@ -79,13 +87,14 @@ captures automatically into the `reasoning` field.
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "kimi-k2.5",
+    model = "kimi-k2",
     base_url = "https://api.moonshot.ai/v1",
 })
 ```
 
-Available models: `kimi-k2.5`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo`,
-`moonshot-v1-8k`, `moonshot-v1-32k`, `moonshot-v1-128k`.
+Available models: `kimi-k2`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo`,
+`moonshot-v1-8k`, `moonshot-v1-32k`, `moonshot-v1-128k`. Check the Moonshot
+docs for the currently supported IDs.
 
 ### DeepSeek
 
@@ -118,17 +127,26 @@ local crew = Crew.new({
 
 ### Azure OpenAI
 
-Use your Azure deployment endpoint as the base URL.
+Use your Azure deployment endpoint as the base URL. Omit `api_key` — the Lua
+sandbox's default `*_API_KEY` blocklist prevents `env("AZURE_OPENAI_API_KEY")`
+from resolving, so the key must come from the Rust side.
 
 ```lua
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-4.1-mini",
     base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/v1",
-    api_key = env("AZURE_OPENAI_API_KEY"),
 })
 ```
+
+Azure is not covered by the URL-based key auto-detection table below, so the
+key falls back to `OPENAI_API_KEY`. In practice you have two options:
+
+1. Export your Azure key as `OPENAI_API_KEY` before running `ironcrew`.
+2. Relax the sandbox blocklist (see [docs/sandbox.md](sandbox.md)) so the Lua
+   `env("AZURE_OPENAI_API_KEY")` call is permitted, then pass `api_key`
+   explicitly.
 
 ## Anthropic Native (`provider = "anthropic"`)
 
@@ -143,7 +161,7 @@ streaming. Set `ANTHROPIC_API_KEY` in your environment.
 local crew = Crew.new({
     goal = "My crew",
     provider = "anthropic",
-    model = "claude-haiku-4-5-20251001",
+    model = "claude-haiku-4-5",
 })
 ```
 
@@ -156,7 +174,7 @@ custom tool or HTTP calls needed.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "anthropic",
-    model = "claude-haiku-4-5-20251001",
+    model = "claude-haiku-4-5",
     server_tools = { "web_search" },
     web_search_max_uses = 3,
 })
@@ -175,7 +193,7 @@ Supported server tools:
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "anthropic",
-    model = "claude-sonnet-4-5-20250929",
+    model = "claude-sonnet-4-5",
     thinking_budget = 5000,     -- tokens allocated for internal reasoning
     stream = true,              -- watch reasoning unfold dim on stderr
 })
@@ -186,8 +204,7 @@ Thinking blocks are:
 - **Persisted to the run record** under `task_results[].reasoning`
 - **Emitted as `task_thinking` SSE events** for API subscribers
 
-Available models: `claude-haiku-4-5-20251001`, `claude-sonnet-4-5-20250929`,
-`claude-opus-4-6`, `claude-sonnet-4-6`.
+Available models: `claude-haiku-4-5`, `claude-sonnet-4-5`.
 
 ## OpenAI Responses API (`provider = "openai-responses"`)
 
@@ -201,7 +218,7 @@ built-in server-side tools, and cleaner streaming semantics. Also supported by
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-4.1-mini",
 })
 ```
 
@@ -211,16 +228,14 @@ local crew = Crew.new({
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
-    model = "gpt-5.4-nano",
+    model = "gpt-4.1-mini",
     reasoning_effort = "medium",      -- "low" | "medium" | "high"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
 })
 ```
 
-Both `gpt-5.4-nano` and `gpt-5.4-mini` support reasoning and are cheaper than
-`gpt-5.4`. Reasoning summaries are streamed dim to stderr and persisted to the
-run record.
+Reasoning summaries are streamed dim to stderr and persisted to the run record.
 
 ### Built-in server-side tools
 
@@ -228,7 +243,7 @@ run record.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-4.1-mini",
     server_tools = { "web_search", "file_search", "code_interpreter" },
     web_search_context_size = "medium",           -- "low" | "medium" | "high"
     file_search_vector_store_ids = { "vs_abc" },  -- required for file_search
@@ -250,7 +265,7 @@ Supported server tools:
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "grok-4.20-reasoning",
+    model = "grok-4",
     base_url = "https://api.x.ai/v1",
 })
 ```
@@ -261,28 +276,43 @@ not support the `instructions` parameter.
 
 ## API Key Auto-Resolution
 
-When `Crew.new()` includes a `base_url`, IronCrew resolves the API key in this
-order:
+Key resolution depends on the `provider` value.
+
+### `provider = "openai"`
 
 1. Explicit `api_key` in the Crew config (note: Lua `env()` blocks `*_API_KEY`
-   by default, so this is usually not set — env var auto-detection handles it)
-2. Provider-specific env var based on the base URL:
+   by default, so this is usually not set — env var auto-detection handles it).
+2. Provider-specific env var based on the `base_url`:
 
-| URL contains | Env var |
-|--------------|---------|
-| `generativelanguage.googleapis.com` or `gemini` | `GEMINI_API_KEY` |
-| `groq.com` | `GROQ_API_KEY` |
-| `anthropic.com` | `ANTHROPIC_API_KEY` |
-| `moonshot.ai` or `moonshot.cn` | `MOONSHOT_API_KEY` |
-| `deepseek.com` | `DEEPSEEK_API_KEY` |
-| `x.ai` | `XAI_API_KEY` |
-| `openrouter.ai` | `OPENROUTER_API_KEY` |
+| URL contains                                     | Env var              |
+|--------------------------------------------------|----------------------|
+| `generativelanguage.googleapis.com` or `gemini`  | `GEMINI_API_KEY`     |
+| `groq.com`                                       | `GROQ_API_KEY`       |
+| `anthropic.com`                                  | `ANTHROPIC_API_KEY`  |
+| `moonshot.ai` or `moonshot.cn`                   | `MOONSHOT_API_KEY`   |
+| `deepseek.com`                                   | `DEEPSEEK_API_KEY`   |
+| `x.ai`                                           | `XAI_API_KEY`        |
+| `openrouter.ai`                                  | `OPENROUTER_API_KEY` |
 
-3. Fallback to `OPENAI_API_KEY`
+3. Fallback to `OPENAI_API_KEY`.
 
-For `provider = "anthropic"`, the key is resolved from `ANTHROPIC_API_KEY` (no
-URL matching needed). For `provider = "openai-responses"`, the key is resolved
-from `OPENAI_API_KEY` (or `XAI_API_KEY` if the base URL contains `x.ai`).
+### `provider = "openai-responses"`
+
+The Responses provider currently only special-cases xAI:
+
+| URL contains | Env var       |
+|--------------|---------------|
+| `x.ai`       | `XAI_API_KEY` |
+
+Everything else falls back to `OPENAI_API_KEY`. OpenRouter requests may still
+be sent through the Responses path if OpenRouter itself accepts them, but
+**URL-based key auto-detection is not wired** for OpenRouter on this provider
+— export the key as `OPENAI_API_KEY` or set `api_key` explicitly.
+
+### `provider = "anthropic"`
+
+The key is always resolved from `ANTHROPIC_API_KEY`. No URL matching is
+performed.
 
 ## Reasoning & Thinking Support
 
@@ -294,7 +324,7 @@ a unified interface:
 | Anthropic | `thinking` content blocks | `thinking_budget = N` |
 | OpenAI Responses | `reasoning` output items | `reasoning_effort = "medium"` |
 | DeepSeek Reasoner | `reasoning_content` field | (automatic) |
-| Kimi K2.5 / K2-thinking | `reasoning_content` field | (automatic) |
+| Kimi / K2-thinking | `reasoning_content` field | (automatic) |
 | Moonshot | `reasoning_content` field | (automatic) |
 
 **Where reasoning appears:**
@@ -316,11 +346,11 @@ the same crew, optimizing cost and performance.
 local crew = Crew.new({
     goal = "Cost-optimized crew",
     provider = "openai",
-    model = "gpt-5.4-mini",           -- default fallback
+    model = "gpt-4.1-mini",           -- default fallback
     models = {
-        task_execution = "gpt-5.4-mini",
-        collaboration = "gpt-5.4-mini",
-        collaboration_synthesis = "gpt-5.4",
+        task_execution = "gpt-4.1-mini",
+        collaboration = "gpt-4.1-mini",
+        collaboration_synthesis = "gpt-4.1",
     },
 })
 ```
@@ -359,8 +389,8 @@ when `prompt_cache_key` is set on the crew.
 
 ## Tips
 
-- Use `gpt-5.4-mini`, `gpt-5.4-nano`, `gemini-2.5-flash`, or `claude-haiku-4-5`
-  for simple tasks. Reserve stronger models for tasks requiring deep reasoning.
+- Use `gpt-4.1-mini`, `gemini-2.5-flash`, or `claude-haiku-4-5` for simple
+  tasks. Reserve stronger models for tasks requiring deep reasoning.
 - Set model overrides at the task level when a single task needs more capability
   than the rest of the crew.
 - For reasoning-heavy tasks, use `provider = "openai-responses"` with
@@ -373,3 +403,12 @@ when `prompt_cache_key` is set on the crew.
 - All providers communicate over HTTPS. The HTTP client has a 120-second timeout
   per request. SSRF protection blocks private IPs (override with
   `IRONCREW_ALLOW_PRIVATE_IPS=1`).
+
+## See also: MCP servers
+
+Model capability is only half the picture — crews can also attach
+**Model Context Protocol (MCP) servers** to expose external tools to every
+agent. Pass `mcp_servers = {...}` to `Crew.new({...})` with either a stdio
+spawn spec or an HTTP Streamable URL, and the registered tools show up
+alongside built-ins. See the MCP section of [docs/crews.md](crews.md) for
+the full config schema, transport details, and examples.

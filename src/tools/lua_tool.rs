@@ -1,10 +1,13 @@
 use async_trait::async_trait;
 use mlua::{Function, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
+use crate::engine::runtime::Runtime;
 use crate::llm::provider::ToolSchema;
 use crate::lua::sandbox::create_tool_lua_with_base_dir;
+use crate::lua::subflow::SubflowDepth;
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct LuaScriptTool {
@@ -13,6 +16,13 @@ pub struct LuaScriptTool {
     pub parameters: serde_json::Value,
     pub source: String,
     pub base_dir: Option<PathBuf>,
+    /// Weak ref to the owning `Runtime`. Populated by `Runtime::set_self_ref`
+    /// after the `Arc<Runtime>` is constructed so sub-flows can re-enter the
+    /// same tool registry without a reference cycle.
+    runtime: Mutex<Option<Weak<Runtime>>>,
+    /// Project directory wrapped in `Arc` so sub-flow Lua VMs can pull it
+    /// out of app-data without cloning a `PathBuf` per call.
+    project_dir_arc: Mutex<Option<Arc<PathBuf>>>,
 }
 
 impl LuaScriptTool {
@@ -29,6 +39,24 @@ impl LuaScriptTool {
             parameters,
             source,
             base_dir,
+            runtime: Mutex::new(None),
+            project_dir_arc: Mutex::new(None),
+        }
+    }
+
+    /// Populate the weak `Runtime` reference. Called from
+    /// `Runtime::set_self_ref` once the owning `Arc<Runtime>` exists.
+    pub fn set_runtime(&self, runtime: Weak<Runtime>) {
+        if let Ok(mut guard) = self.runtime.lock() {
+            *guard = Some(runtime);
+        }
+    }
+
+    /// Populate the shared project-directory `Arc`. Called alongside
+    /// `set_runtime` so both pieces of state arrive together.
+    pub fn set_project_dir(&self, project_dir: Arc<PathBuf>) {
+        if let Ok(mut guard) = self.project_dir_arc.lock() {
+            *guard = Some(project_dir);
         }
     }
 }
@@ -51,9 +79,32 @@ impl Tool for LuaScriptTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolCallContext) -> Result<String> {
         let lua =
             create_tool_lua_with_base_dir(self.base_dir.clone()).map_err(IronCrewError::Lua)?;
+
+        // Seed app-data on the sandbox VM so sandbox-level primitives (like
+        // `run_flow`) can reach the runtime + project dir + current subflow
+        // depth. Missing values silently turn the primitive into a clean
+        // error at fire-time — registration still succeeds.
+        if let Ok(guard) = self.runtime.lock()
+            && let Some(ref weak) = *guard
+            && let Some(runtime) = weak.upgrade()
+        {
+            lua.set_app_data(runtime);
+        }
+        if let Ok(guard) = self.project_dir_arc.lock()
+            && let Some(ref project_dir) = *guard
+        {
+            lua.set_app_data(project_dir.clone());
+        }
+        lua.set_app_data(SubflowDepth(ctx.depth));
+        if let Some(ref eventbus) = ctx.eventbus {
+            lua.set_app_data(eventbus.clone());
+        }
+        if let Some(ref store) = ctx.store {
+            lua.set_app_data(store.clone());
+        }
 
         // Load the tool definition
         let table: mlua::Table = lua.load(&self.source).eval().map_err(IronCrewError::Lua)?;
@@ -78,10 +129,13 @@ impl Tool for LuaScriptTool {
             }
         };
 
-        // Call the function
+        // Call the function. Use `call_async` so any `run_flow` (or other
+        // async primitives) nested inside the Lua execute block can await
+        // cleanly instead of blocking the Tokio worker.
         let result: Value =
             execute_fn
-                .call(args_table)
+                .call_async(args_table)
+                .await
                 .map_err(|e| IronCrewError::ToolExecution {
                     tool: self.tool_name.clone(),
                     message: format!("Lua execute error: {}", e),

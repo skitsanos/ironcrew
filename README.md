@@ -82,7 +82,9 @@ ironcrew run .
 | [Crews](docs/crews.md) | Crew configuration, memory, messaging, model router, prompt caching |
 | [Tools](docs/tools.md) | Built-in tools, custom Lua tools, Lua globals and HTTP namespace |
 | [CLI Reference](docs/cli.md) | All commands — run, validate, list, init, serve, inspect, clean |
+| [Chat & Conversations](docs/chat.md) | Phase 1 HITL — `ironcrew chat` REPL and HTTP conversation endpoints |
 | [REST API](docs/rest-api.md) | Endpoints, SSE events, input parameters, Docker deployment |
+| [HTTP Scaling](docs/http-scaling.md) | Capacity planning, session limits, SSE/proxy tuning, horizontal scaling |
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
 | [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |

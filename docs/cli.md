@@ -53,6 +53,32 @@ ironcrew run . --input '{"topic": "Rust"}' --json 2>/dev/null | jq '.status'
 - In `--json` mode, Lua `print()` calls are suppressed and the full run record
 (status, tasks, token usage) is written to stdout as JSON. Tracing logs go to
 stderr, so piping works cleanly.
+- The Lua VM has `IRONCREW_MODE = "run"` set before `crew.lua` executes
+  (mirroring the `"chat"` value used by `ironcrew chat`), so scripts can
+  branch on mode if they need to.
+
+### chat
+
+Start an interactive REPL against a conversational agent.
+
+```
+ironcrew chat .
+ironcrew chat examples/chat-cli --agent tutor
+ironcrew chat examples/chat-cli --agent tutor --id onboarding-2026-04
+```
+
+| Flag | Description |
+|------|-------------|
+| `--agent <name>` | Agent to converse with (must be declared in `crew.lua`) |
+| `--id <id>` | Stable session id — enables cross-run persistence |
+
+- The Lua VM has `IRONCREW_MODE = "chat"` set before `crew.lua` executes,
+  so guard any top-level one-shot `crew:run()` with
+  `if IRONCREW_MODE ~= "chat" then ... end`.
+- Slash commands: `/help`, `/exit`, `/quit`, `/reset`, `/id`, `/save`,
+  `/history`.
+- See [docs/chat.md](chat.md) for the full reference and
+  [examples/chat-cli/](../examples/chat-cli/) for a runnable example.
 
 ### validate
 
@@ -109,6 +135,12 @@ ironcrew serve --host 0.0.0.0 --port 8080 --flows-dir ./flows
 | DELETE | `/flows/{flow}/runs/{id}`        | Delete a run record |
 | GET    | `/flows/{flow}/validate`         | Validate a flow |
 | GET    | `/flows/{flow}/agents`           | List agents in a flow |
+| POST   | `/flows/{flow}/conversations/{id}/start`    | Create or re-open a chat session |
+| POST   | `/flows/{flow}/conversations/{id}/messages` | Send a user turn, wait for reply |
+| GET    | `/flows/{flow}/conversations/{id}/history`  | Read the stored transcript |
+| GET    | `/flows/{flow}/conversations/{id}/events`   | SSE stream for the session |
+| DELETE | `/flows/{flow}/conversations/{id}`          | Drop handle + delete record |
+| GET    | `/flows/{flow}/conversations`               | Paginated list (filtered by flow) |
 | GET    | `/nodes`                         | List built-in tools |
 
 ### fmt
@@ -210,7 +242,7 @@ Checks performed:
 
 | Category | Details |
 |----------|---------|
-| Environment | `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_MODEL`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY` |
+| Environment | `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_MODEL`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY` |
 | IronCrew config | `IRONCREW_LOG`, `IRONCREW_ALLOW_SHELL`, `IRONCREW_RATE_LIMIT_MS`, `IRONCREW_MAX_RUN_LIFETIME`, `IRONCREW_STORE`, `IRONCREW_STORE_PATH` |
 | Project | `.env` presence, `crew.lua` existence and syntax, `agents/` count, `tools/` count |
 | Run history | Number of past runs in `.ironcrew/runs/` |
@@ -304,10 +336,20 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_PROMPT_CHARS` | Max user prompt size in characters (default: `102400` = 100KB). Truncates with warning |
 | `IRONCREW_MAX_EVENTS` | Max events (count) in the EventBus replay buffer (default: `1000`) |
 | `IRONCREW_EVENT_REPLAY_MAX_BYTES` | Max total bytes in the replay buffer (default: `4194304` = 4 MB). Live SSE broadcasts are always lossless — this only affects the catch-up replay for late subscribers. `0` disables the cap. |
-| `IRONCREW_CONVERSATION_MAX_HISTORY` | Default `max_history` for `crew:conversation({})` when not set explicitly (default: `50`). `0` means unbounded |
-| `IRONCREW_DIALOG_MAX_HISTORY` | Default `max_history` for `crew:dialog({})` when not set explicitly (default: `100`). Applies to both the prompt window and the stored transcript. `0` means unbounded |
 | `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | Max messages per agent queue in the MessageBus (default: `1000`). Oldest dropped on overflow with a warning log. `0` disables the cap |
 | `IRONCREW_MESSAGEBUS_PENDING_CAP` | Max pending broadcasts (messages sent before any agent is registered) (default: `500`). `0` disables the cap |
+
+**Conversations / Chat:**
+
+| Variable          | Description |
+|-------------------|-------------|
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `100`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
+| `IRONCREW_CHAT_SESSION_IDLE_SECS` | Idle timeout in seconds before an in-memory chat handle is evicted from RAM (default: `1800` = 30 min). The on-disk record stays untouched |
+| `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/conversations` (default: `20`) |
+| `IRONCREW_CONVERSATIONS_MAX_LIMIT` | Hard cap on the `limit` query parameter for `GET /flows/{flow}/conversations` (default: `100`) |
+| `IRONCREW_CONVERSATION_MAX_HISTORY` | Default `max_history` for `crew:conversation({})` when not set explicitly (default: `50`). `0` means unbounded |
+| `IRONCREW_DIALOG_MAX_HISTORY` | Default `max_history` for `crew:dialog({})` when not set explicitly (default: `100`). Applies to both the prompt window and the stored transcript. `0` means unbounded |
+| `IRONCREW_MAX_FLOW_DEPTH` | Max recursive nesting for `run_flow()` / `crew:subworkflow()` (default: `5`). Exceeding it fails with a validation error |
 
 **API Server:**
 
@@ -318,6 +360,8 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10MB) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | Hard deadline in seconds applied after SIGTERM/Ctrl+C. If graceful teardown hasn't completed by then, the process exits anyway (default: `10`) |
+| `IRONCREW_SHUTDOWN_DRAIN_MS` | Post-serve drain window in milliseconds for background tasks spawned from `Drop` paths (notably reaping stdio MCP children) (default: `1000`). Set to `0` to skip |
 
 **Security:**
 
@@ -337,13 +381,22 @@ be set in the shell or in `.env` files.
 | `IRONCREW_GLOB_MAX_BYTES` | Max total bytes aggregated by `file_read_glob` across all matched files. `0` disables the cap. Default: `52428800` (50 MB) |
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | Max bytes captured per stream (stdout and stderr independently) by the `shell` tool. Overflow is discarded and a truncation marker is appended. Default: `1048576` (1 MB) |
 
+**MCP (Model Context Protocol):**
+
+| Variable          | Description |
+|-------------------|-------------|
+| `IRONCREW_MCP_ALLOWED_COMMANDS` | Comma-separated binary names allowed for stdio MCP servers (e.g. `"uvx,npx"`). Unset = allow all. Set this in production to keep child-process execution tight |
+| `IRONCREW_MCP_ALLOW_LOCALHOST` | Set to `1` to allow HTTP MCP URLs pointing at localhost/loopback. Default: `0` (blocked by SSRF filter) |
+| `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` | Seconds to wait for the MCP handshake to complete before aborting the run (default: `10`) |
+| `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | Maximum bytes returned per MCP tool call (default: `262144` = 256 KB). Oversized results are truncated with a `[truncated: N bytes omitted]` marker |
+
 **Storage:**
 
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_STORE`    | Storage backend: `json` (default), `sqlite`, or `postgres` |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
-| `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) |
+| `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) |
 | `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`). Only alphanumeric and underscore allowed |
 | `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (default: `10`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` when `limit` is not provided. Default: `20` |

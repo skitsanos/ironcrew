@@ -18,20 +18,29 @@ ironcrew serve --flows-dir ./flows --port 3000
 The server loads `.env` from the current working directory on startup, so API keys
 set there are available to all flows.
 
+For production sizing, session-cap tuning, SSE proxy guidance, and horizontal
+scaling considerations, see [HTTP Scaling](http-scaling.md).
+
 ## Endpoints
 
-| Method   | Path                              | Description                        |
-|----------|-----------------------------------|------------------------------------|
-| GET      | `/health`                         | Health check (returns version)     |
-| POST     | `/flows/{flow}/run`               | Start a crew run (async)           |
-| POST     | `/flows/{flow}/abort/{run_id}`    | Abort a running crew               |
-| GET      | `/flows/{flow}/events/{run_id}`   | SSE event stream for a run         |
-| GET      | `/flows/{flow}/runs`              | List past runs for a flow          |
-| GET      | `/flows/{flow}/runs/{id}`         | Get a specific run record          |
-| DELETE   | `/flows/{flow}/runs/{id}`         | Delete a run record                |
-| GET      | `/flows/{flow}/validate`          | Validate a flow (syntax + agents)  |
-| GET      | `/flows/{flow}/agents`            | List agents defined in a flow      |
-| GET      | `/nodes`                          | List all built-in tools            |
+| Method   | Path                                               | Description                                         |
+|----------|----------------------------------------------------|-----------------------------------------------------|
+| GET      | `/health`                                          | Health check (returns version)                      |
+| POST     | `/flows/{flow}/run`                                | Start a crew run (async)                            |
+| POST     | `/flows/{flow}/abort/{run_id}`                     | Abort a running crew                                |
+| GET      | `/flows/{flow}/events/{run_id}`                    | SSE event stream for a run                          |
+| GET      | `/flows/{flow}/runs`                               | List past runs for a flow                           |
+| GET      | `/flows/{flow}/runs/{id}`                          | Get a specific run record                           |
+| DELETE   | `/flows/{flow}/runs/{id}`                          | Delete a run record                                 |
+| GET      | `/flows/{flow}/validate`                           | Validate a flow (syntax + agents)                   |
+| GET      | `/flows/{flow}/agents`                             | List agents defined in a flow                       |
+| GET      | `/nodes`                                           | List all built-in tools                             |
+| POST     | `/flows/{flow}/conversations/{id}/start`           | Create or re-open a chat session — see [chat.md](chat.md) |
+| POST     | `/flows/{flow}/conversations/{id}/messages`        | Send a user turn, wait for a reply — see [chat.md](chat.md) |
+| GET      | `/flows/{flow}/conversations/{id}/history`         | Read the stored transcript — see [chat.md](chat.md) |
+| GET      | `/flows/{flow}/conversations/{id}/events`          | SSE stream for a chat session — see [chat.md](chat.md) |
+| DELETE   | `/flows/{flow}/conversations/{id}`                 | Drop handle + delete record — see [chat.md](chat.md) |
+| GET      | `/flows/{flow}/conversations`                      | Paginated list of chat sessions — see [chat.md](chat.md) |
 
 The `{flow}` parameter is the directory name inside `--flows-dir`. Path traversal
 is rejected -- only single-component names are accepted.
@@ -179,6 +188,19 @@ events per primitive when multiple are running in the same `crew:run()`.
 Conversation and dialog output also still streams to stderr in the Lua process
 (with dim styling for reasoning) — the SSE events are an additional channel.
 
+## Operational Notes
+
+For HTTP chat deployments, keep in mind:
+
+- `IRONCREW_MAX_ACTIVE_CONVERSATIONS` caps live in-memory chat handles, not
+  total persisted sessions and not overall throughput
+- `IRONCREW_CHAT_SESSION_IDLE_SECS` controls when inactive chat handles are
+  evicted from RAM
+- SSE replay buffering is bounded separately by `IRONCREW_MAX_EVENTS` and
+  `IRONCREW_EVENT_REPLAY_MAX_BYTES` (default 4 MB; see `src/engine/eventbus.rs`)
+
+For tuning guidance and deployment patterns, see [HTTP Scaling](http-scaling.md).
+
 ## Run History
 
 ### List Runs
@@ -267,7 +289,12 @@ IRONCREW_STORE=sqlite ironcrew serve --flows-dir ./flows
 ```
 
 All run history endpoints (`list_runs`, `get_run`, `delete_run`) work
-identically regardless of backend. Each flow gets its own store instance.
+identically regardless of backend. Under `ironcrew serve`, the store is a
+**server-wide singleton** bootstrapped once at startup in `cmd_serve`
+(`src/cli/server.rs`) and shared across every flow and every request. This
+means Postgres bootstrap runs exactly once, the connection pool is shared,
+and per-request `/start` latency stays around ~10 ms instead of the
+~300 ms a per-request bootstrap would cost.
 
 ## Flow Inspection
 
@@ -309,6 +336,29 @@ curl http://localhost:3000/nodes
 Returns all registered built-in tools with their names, descriptions, and
 JSON Schema parameter definitions.
 
+## Conversations (Phase 1 Human-in-the-Loop)
+
+Phase 1 exposes the existing `crew:conversation({...})` primitive as six
+HTTP endpoints. Sessions are created explicitly with `POST /start`, turns
+are serialized per-id, and records persist through the same `StateStore`
+used by `ironcrew chat`.
+
+| Method | Path                                                | Purpose                             |
+| ------ | --------------------------------------------------- | ----------------------------------- |
+| POST   | `/flows/{flow}/conversations/{id}/start`            | Create or re-open a chat session    |
+| POST   | `/flows/{flow}/conversations/{id}/messages`         | Send a user turn, wait for a reply  |
+| GET    | `/flows/{flow}/conversations/{id}/history`          | Read the stored transcript          |
+| GET    | `/flows/{flow}/conversations/{id}/events`           | SSE stream for the session          |
+| DELETE | `/flows/{flow}/conversations/{id}`                  | Drop handle + delete record         |
+| GET    | `/flows/{flow}/conversations`                       | Paginated list (filtered by flow)   |
+
+`POST /messages` against an unknown id returns `404` — sessions never
+auto-create. The hard cap on simultaneously-active sessions is
+`IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default 100); breaches return `503`.
+
+See [docs/chat.md](chat.md) for the full reference, request/response
+shapes, and a worked curl session.
+
 ## Health Check
 
 ```bash
@@ -318,9 +368,12 @@ curl http://localhost:3000/health
 ```json
 {
   "status": "ok",
-  "version": "1.3.0"
+  "version": "2.13.0"
 }
 ```
+
+The `version` field is populated from the crate's `CARGO_PKG_VERSION`, so it
+always reflects the binary you are actually running.
 
 ## Authentication
 
@@ -386,9 +439,25 @@ or server structure. Full error details are logged server-side.
 
 ## Graceful Shutdown
 
-The server handles `SIGTERM` and `Ctrl+C` for graceful shutdown. In-flight
-requests are allowed to complete before the process exits. This is essential for
-Kubernetes rolling updates and Railway deployments.
+The server handles `SIGTERM` and `Ctrl+C` for graceful shutdown. On receipt of
+the signal, IronCrew:
+
+1. Stops accepting new connections via Axum's graceful-shutdown hook.
+2. **Actively drops** every entry in `active_conversations` and **aborts**
+   every task in `active_runs` so that open SSE streams close cleanly
+   instead of hanging until the client times out.
+3. Waits out a short post-serve drain window to let background cleanup tasks
+   (e.g. MCP child-process reapers) finish.
+
+Two environment variables tune the behavior:
+
+| Variable                         | Default | Purpose                                                                                   |
+|----------------------------------|---------|-------------------------------------------------------------------------------------------|
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10`    | Hard deadline after the signal is received; the server exits even if Axum graceful shutdown has not finished yet. |
+| `IRONCREW_SHUTDOWN_DRAIN_MS`     | `1000`  | Post-serve drain window for background cleanup tasks (MCP child-process reaping, etc.).   |
+
+This is essential for Kubernetes rolling updates and Railway deployments —
+SSE consumers see a clean disconnect and can reconnect to a fresh pod.
 
 ## Docker Deployment
 

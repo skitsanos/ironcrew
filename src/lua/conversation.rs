@@ -4,6 +4,12 @@
 //! across `send()` / `ask()` calls. Supports tool calling via the crew's
 //! tool registry, streaming to stderr, reasoning capture, and optional
 //! cross-run persistence keyed by a stable `id`.
+//!
+//! The userdata is a thin handle around an `Arc<LuaConversationInner>`. All
+//! state and behavior lives on the inner type; the outer struct only exists
+//! so callers outside the Lua boundary (HTTP handlers, CLI `chat` REPL) can
+//! grab a clone of the `Arc` and call `run_turn().await` directly without
+//! bouncing back through the Lua VM.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,11 +24,14 @@ use crate::engine::store::StateStore;
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
+use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
-/// A stateful, multi-turn conversation with a single agent.
-pub struct LuaConversation {
+/// Shared inner state of a conversation. All methods live here so that
+/// non-Lua consumers (HTTP API, CLI REPL) can call them via
+/// `Arc<LuaConversationInner>` without a Lua round-trip.
+pub struct LuaConversationInner {
     /// Stable identifier — included in every SSE event for this conversation.
     /// If the user provided one via `id = "..."`, it's the persistence key;
     /// otherwise it's an auto-UUID and the session is not persisted.
@@ -76,6 +85,12 @@ pub struct LuaConversation {
     /// Flow label persisted alongside the session (taken from `crew.goal`).
     pub flow_name: String,
 
+    /// User-facing flow path (e.g. "chat-cli") used by the HTTP/CLI layer
+    /// to group sessions. Falls back to `None` for Lua-only callers that
+    /// didn't thread a flow path through — those records stay addressable
+    /// by id but won't appear in per-flow listings.
+    pub flow_path: Option<String>,
+
     /// When `true` (default for persistent sessions), the conversation is
     /// auto-saved to the store after every completed turn. Opt out with
     /// `autosave = false` and call `conversation:save()` manually.
@@ -86,8 +101,8 @@ pub struct LuaConversation {
     pub created_at: String,
 }
 
-impl LuaConversation {
-    /// Build a fresh (or resumed) conversation.
+impl LuaConversationInner {
+    /// Build a fresh (or resumed) conversation inner.
     ///
     /// When `store` is `Some` and `id` is `Some`, the store is consulted for
     /// a prior record with that id. On hit, the persisted history replaces
@@ -108,6 +123,7 @@ impl LuaConversation {
         id: Option<String>,
         store: Option<Arc<dyn StateStore>>,
         flow_name: String,
+        flow_path: Option<String>,
         autosave: bool,
         project_dir: std::path::PathBuf,
         http_client: reqwest::Client,
@@ -130,7 +146,7 @@ impl LuaConversation {
 
         if persistent
             && let Some(ref store) = store
-            && let Some(record) = store.get_conversation(&id).await?
+            && let Some(record) = store.get_conversation(flow_path.as_deref(), &id).await?
         {
             messages = record.messages;
             created_at = record.created_at;
@@ -161,6 +177,7 @@ impl LuaConversation {
             eventbus,
             store: if persistent { store } else { None },
             flow_name,
+            flow_path,
             autosave,
             created_at,
             project_dir,
@@ -181,6 +198,7 @@ impl LuaConversation {
         let record = ConversationRecord {
             id: self.id.clone(),
             flow_name: self.flow_name.clone(),
+            flow_path: self.flow_path.clone(),
             agent_name: self.agent.name.clone(),
             messages,
             created_at: self.created_at.clone(),
@@ -189,9 +207,36 @@ impl LuaConversation {
         store.save_conversation(&record).await
     }
 
+    /// Reset history — clear all messages, keep the system prompt.
+    pub async fn reset_history(&self) {
+        let mut history = self.messages.lock().await;
+        history.clear();
+        history.push(ChatMessage::system(&self.system_prompt));
+    }
+
+    /// Current number of messages (including system prompt).
+    pub async fn message_count(&self) -> usize {
+        self.messages.lock().await.len()
+    }
+
+    /// Snapshot of the full message list.
+    pub async fn messages_snapshot(&self) -> Vec<ChatMessage> {
+        self.messages.lock().await.clone()
+    }
+
+    /// Number of user turns completed so far.
+    pub async fn turn_count(&self) -> usize {
+        self.messages
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.role == "user")
+            .count()
+    }
+
     /// Run a single send/respond round (with tool-call loop) and return the
     /// full ChatResponse plus any reasoning captured across tool rounds.
-    async fn run_turn(
+    pub async fn run_turn(
         &self,
         user_message: &str,
         images: Option<Vec<crate::llm::provider::ImageInput>>,
@@ -376,9 +421,20 @@ impl LuaConversation {
                 .unwrap_or(60),
         );
 
+        // Seed the tool-call context with the store + eventbus this
+        // conversation is already using. `LuaScriptTool` pulls these back out
+        // on its sandbox Lua VM so custom tools can call `run_flow` and have
+        // it inherit the same store/SSE channel as the parent conversation.
+        let tool_ctx = ToolCallContext {
+            store: self.store.clone(),
+            eventbus: Some(self.eventbus.clone()),
+            depth: 0,
+        };
+
         let tool_result = match tokio::time::timeout(
             tool_timeout,
-            self.tool_registry.execute(&tool_call.function.name, args),
+            self.tool_registry
+                .execute(&tool_call.function.name, args, &tool_ctx),
         )
         .await
         {
@@ -410,6 +466,30 @@ impl LuaConversation {
         let excess = history.len() - limit;
         history.drain(1..1 + excess);
     }
+
+    /// Delete the persisted record (if any) for this session. Flow-scoped
+    /// so a conversation can only delete its own flow's record.
+    pub async fn delete(&self) -> Result<(), IronCrewError> {
+        if let Some(ref store) = self.store {
+            store
+                .delete_conversation(self.flow_path.as_deref(), &self.id)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Lua userdata wrapper. Holds an `Arc<LuaConversationInner>` so callers
+/// outside Lua can share ownership without duplicating state.
+#[derive(Clone)]
+pub struct LuaConversation(pub Arc<LuaConversationInner>);
+
+impl LuaConversation {
+    /// Clone the underlying `Arc` so other components (HTTP handlers, CLI
+    /// REPL) can call `run_turn()` directly without going through Lua.
+    pub fn inner(&self) -> Arc<LuaConversationInner> {
+        Arc::clone(&self.0)
+    }
 }
 
 impl UserData for LuaConversation {
@@ -431,10 +511,11 @@ impl UserData for LuaConversation {
             };
 
             let images =
-                parse_images_from_opts(args_iter.next(), &this.project_dir, &this.http_client)
+                parse_images_from_opts(args_iter.next(), &this.0.project_dir, &this.0.http_client)
                     .await?;
 
             let (content, _reasoning) = this
+                .0
                 .run_turn(&message, images)
                 .await
                 .map_err(mlua::Error::external)?;
@@ -458,10 +539,11 @@ impl UserData for LuaConversation {
             };
 
             let images =
-                parse_images_from_opts(args_iter.next(), &this.project_dir, &this.http_client)
+                parse_images_from_opts(args_iter.next(), &this.0.project_dir, &this.0.http_client)
                     .await?;
 
             let (content, reasoning) = this
+                .0
                 .run_turn(&message, images)
                 .await
                 .map_err(mlua::Error::external)?;
@@ -471,13 +553,13 @@ impl UserData for LuaConversation {
             if let Some(r) = reasoning {
                 table.set("reasoning", r)?;
             }
-            table.set("length", this.messages.lock().await.len())?;
+            table.set("length", this.0.message_count().await)?;
             Ok(table)
         });
 
         // conv:history() → list of {role, content}
         methods.add_async_method("history", |lua, this, ()| async move {
-            let history = this.messages.lock().await;
+            let history = this.0.messages.lock().await;
             let table = lua.create_table()?;
             for (i, msg) in history.iter().enumerate() {
                 let entry = lua.create_table()?;
@@ -495,40 +577,32 @@ impl UserData for LuaConversation {
 
         // conv:length() → number of stored messages
         methods.add_async_method("length", |_, this, ()| async move {
-            Ok(this.messages.lock().await.len())
+            Ok(this.0.message_count().await)
         });
 
         // conv:reset() → clear all messages, keep the system prompt
         methods.add_async_method("reset", |_, this, ()| async move {
-            let mut history = this.messages.lock().await;
-            history.clear();
-            history.push(ChatMessage::system(&this.system_prompt));
+            this.0.reset_history().await;
             Ok(())
         });
 
         // conv:agent_name() → the agent's name
-        methods.add_method("agent_name", |_, this, ()| Ok(this.agent.name.clone()));
+        methods.add_method("agent_name", |_, this, ()| Ok(this.0.agent.name.clone()));
 
         // conv:id() → the stable session id (user-provided or auto-UUID)
-        methods.add_method("id", |_, this, ()| Ok(this.id.clone()));
+        methods.add_method("id", |_, this, ()| Ok(this.0.id.clone()));
 
         // conv:is_persistent() → true if the session is tied to the store
-        methods.add_method("is_persistent", |_, this, ()| Ok(this.persistent));
+        methods.add_method("is_persistent", |_, this, ()| Ok(this.0.persistent));
 
         // conv:save() → explicit save (useful when autosave = false)
         methods.add_async_method("save", |_, this, ()| async move {
-            this.persist().await.map_err(mlua::Error::external)
+            this.0.persist().await.map_err(mlua::Error::external)
         });
 
         // conv:delete() → remove the persisted record (and mark as non-persistent)
         methods.add_async_method("delete", |_, this, ()| async move {
-            if let Some(ref store) = this.store {
-                store
-                    .delete_conversation(&this.id)
-                    .await
-                    .map_err(mlua::Error::external)?;
-            }
-            Ok(())
+            this.0.delete().await.map_err(mlua::Error::external)
         });
     }
 }
@@ -587,6 +661,7 @@ pub async fn build_conversation(
     eventbus: EventBus,
     store: Option<Arc<dyn StateStore>>,
     flow_name: String,
+    flow_path: Option<String>,
     project_dir: std::path::PathBuf,
     http_client: reqwest::Client,
 ) -> mlua::Result<LuaConversation> {
@@ -655,9 +730,17 @@ pub async fn build_conversation(
     let id: Option<String> = table.get::<String>("id").ok();
     // Autosave defaults to true when persistence is active. For non-persistent
     // sessions this value is effectively ignored.
-    let autosave: bool = table.get::<bool>("autosave").unwrap_or(true);
+    //
+    // NOTE: use `Option<bool>` rather than `bool` here — `table.get::<bool>`
+    // on a missing key coerces nil to `false` (mlua's FromLua impl), which
+    // would silently disable autosave whenever the caller omits the field.
+    let autosave: bool = table
+        .get::<Option<bool>>("autosave")
+        .ok()
+        .flatten()
+        .unwrap_or(true);
 
-    LuaConversation::new_or_resume(
+    let inner = LuaConversationInner::new_or_resume(
         agent,
         provider,
         tool_registry,
@@ -670,10 +753,13 @@ pub async fn build_conversation(
         id,
         store,
         flow_name,
+        flow_path,
         autosave,
         project_dir,
         http_client,
     )
     .await
-    .map_err(mlua::Error::external)
+    .map_err(mlua::Error::external)?;
+
+    Ok(LuaConversation(Arc::new(inner)))
 }

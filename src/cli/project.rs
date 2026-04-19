@@ -5,7 +5,7 @@ use crate::engine::runtime::Runtime;
 use crate::llm::openai::OpenAiProvider;
 use crate::lua::api::{
     load_agents_from_files, load_tool_defs_from_files, register_agent_constructor,
-    register_crew_constructor,
+    register_crew_constructor, set_ironcrew_mode,
 };
 use crate::lua::loader::ProjectLoader;
 use crate::lua::sandbox::create_crew_lua;
@@ -89,6 +89,19 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
     let mut runtime = Runtime::new(provider, Some(loader.project_dir()));
     runtime.register_lua_tools(tool_defs)?;
     let runtime = Arc::new(runtime);
+    // Propagate the weak self-ref into every registered LuaScriptTool so
+    // sandbox-level `run_flow` can reach the tool registry without a
+    // reference cycle.
+    runtime.set_self_ref(Arc::downgrade(&runtime));
+
+    // Seed sub-flow app-data on the top-level Lua VM. Sub-VMs created by
+    // `invoke_subflow` inherit these via explicit set_app_data calls; the
+    // top-level seeding here is what lets `run_flow` work from crew.lua
+    // and from LuaScriptTool-hosted scripts.
+    let project_dir_arc = Arc::new(loader.project_dir().to_path_buf());
+    lua.set_app_data(runtime.clone());
+    lua.set_app_data(project_dir_arc.clone());
+    lua.set_app_data(crate::lua::subflow::SubflowDepth(0));
 
     // Register Crew.new() with preloaded agents auto-injected
     register_crew_constructor(
@@ -98,6 +111,11 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
         loader.project_dir().to_path_buf(),
     )
     .map_err(IronCrewError::Lua)?;
+
+    // Default mode is "run" — callers driving the VM in chat mode (the
+    // `ironcrew chat` CLI command and the HTTP `start` handler) overwrite
+    // this before executing the entrypoint.
+    set_ironcrew_mode(&lua, "run").map_err(IronCrewError::Lua)?;
 
     Ok((lua, runtime))
 }

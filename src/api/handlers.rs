@@ -80,12 +80,14 @@ pub async fn run_flow(
     // Spawn the actual work as a child task — store its AbortHandle for cancellation
     let eventbus_inner = eventbus.clone();
     let run_id_for_work = run_id.clone();
+    let store_for_work = state.store.clone();
     let work_handle = tokio::spawn(async move {
         execute_crew_from_path_with_events(
             &flow_path,
             &eventbus_inner,
             &run_id_for_work,
             input.as_ref(),
+            Some(store_for_work),
         )
         .await
     });
@@ -195,6 +197,7 @@ async fn execute_crew_from_path_with_events(
     eventbus: &EventBus,
     run_id: &str,
     input: Option<&serde_json::Value>,
+    shared_store: Option<Arc<dyn crate::engine::store::StateStore>>,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
@@ -207,6 +210,12 @@ async fn execute_crew_from_path_with_events(
 
     // Store the run_id so LuaCrew::run() uses it for the RunRecord
     lua.set_app_data(run_id.to_string());
+
+    // Inject the server-wide store singleton so `LuaCrew` prefills its
+    // OnceCell instead of bootstrapping a new Postgres pool per run.
+    if let Some(store) = shared_store.clone() {
+        lua.set_app_data(store);
+    }
 
     // Inject input as a global `input` table (from the HTTP request body)
     if let Some(input_value) = input {
@@ -240,9 +249,11 @@ async fn execute_crew_from_path_with_events(
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
     // Read the recorded run directly so concurrent executions cannot swap results.
-    let ironcrew_dir = loader.project_dir().join(".ironcrew");
     if let Some(run_id) = run_id {
-        let store = create_store(ironcrew_dir).await?;
+        let store = match shared_store.clone() {
+            Some(s) => s,
+            None => create_store(loader.project_dir().join(".ironcrew")).await?,
+        };
         let run = store.get_run(&run_id).await?;
         return Ok(RunCrewResponse {
             run_id: run.run_id.clone(),
@@ -549,11 +560,11 @@ pub async fn list_runs(
     Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<ListRunsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
+    // Flow path is still validated for traversal safety, but the store
+    // itself is the server-wide singleton from `AppState`.
+    let _ = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-    let store = create_store(ironcrew_dir)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let store = &state.store;
 
     let default_limit = runs_default_limit();
     let max_limit = runs_max_limit();
@@ -588,13 +599,11 @@ pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
+    let _ = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-    let store = create_store(ironcrew_dir)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let record = store
+    let record = state
+        .store
         .get_run(&id)
         .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
@@ -606,13 +615,11 @@ pub async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let ironcrew_dir = resolve_ironcrew_dir(&state, &flow)
+    let _ = resolve_ironcrew_dir(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-    let store = create_store(ironcrew_dir)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    store
+    state
+        .store
         .delete_run(&id)
         .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;

@@ -27,6 +27,7 @@ use crate::engine::store::StateStore;
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
 };
+use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
@@ -126,6 +127,12 @@ pub struct AgentDialog {
     /// Flow label persisted alongside the session (taken from `crew.goal`).
     pub flow_name: String,
 
+    /// User-facing flow path slug — same scoping IronCrew uses for
+    /// conversations. Persisted record's `(flow_path, id)` forms the
+    /// effective unique key so two flows can reuse the same dialog id
+    /// without colliding.
+    pub flow_path: Option<String>,
+
     /// When `true` (default for persistent sessions), the dialog auto-saves
     /// after each completed turn. Opt out with `autosave = false` and call
     /// `dialog:save()` manually.
@@ -163,6 +170,7 @@ impl AgentDialog {
         id: Option<String>,
         store: Option<Arc<dyn StateStore>>,
         flow_name: String,
+        flow_path: Option<String>,
         autosave: bool,
     ) -> Result<Self, IronCrewError> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -184,7 +192,7 @@ impl AgentDialog {
 
         if persistent
             && let Some(ref store) = store
-            && let Some(record) = store.get_dialog_state(&id).await?
+            && let Some(record) = store.get_dialog_state(flow_path.as_deref(), &id).await?
         {
             // Sanity-check the resumed record — the agent list should
             // match what the caller is setting up now. If it doesn't, we
@@ -238,6 +246,7 @@ impl AgentDialog {
             persistent,
             store: if persistent { store } else { None },
             flow_name,
+            flow_path,
             autosave,
             created_at,
         })
@@ -259,6 +268,7 @@ impl AgentDialog {
         let record = DialogStateRecord {
             id: self.id.clone(),
             flow_name: self.flow_name.clone(),
+            flow_path: self.flow_path.clone(),
             agent_names: self.agents.iter().map(|a| a.name.clone()).collect(),
             starter: self.starter.clone(),
             transcript,
@@ -745,9 +755,19 @@ impl AgentDialog {
                 .unwrap_or(60),
         );
 
+        // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
+        // tools can see them on their sandbox VMs (needed for sandbox-level
+        // primitives like `run_flow`).
+        let tool_ctx = ToolCallContext {
+            store: self.store.clone(),
+            eventbus: Some(self.eventbus.clone()),
+            depth: 0,
+        };
+
         let tool_result = match tokio::time::timeout(
             tool_timeout,
-            self.tool_registry.execute(&tool_call.function.name, args),
+            self.tool_registry
+                .execute(&tool_call.function.name, args, &tool_ctx),
         )
         .await
         {
@@ -883,11 +903,13 @@ impl UserData for AgentDialog {
             this.persist().await.map_err(mlua::Error::external)
         });
 
-        // dialog:delete() — remove the persisted record
+        // dialog:delete() — remove the persisted record, scoped to this
+        // dialog's flow so it can't touch another flow's session with the
+        // same id.
         methods.add_async_method("delete", |_, this, ()| async move {
             if let Some(ref store) = this.store {
                 store
-                    .delete_dialog_state(&this.id)
+                    .delete_dialog_state(this.flow_path.as_deref(), &this.id)
                     .await
                     .map_err(mlua::Error::external)?;
             }
@@ -934,6 +956,7 @@ pub async fn build_dialog(
     eventbus: EventBus,
     store: Option<Arc<dyn StateStore>>,
     flow_name: String,
+    flow_path: Option<String>,
 ) -> mlua::Result<AgentDialog> {
     let agents_table = table.get::<Table>("agents").map_err(|_| {
         mlua::Error::external(IronCrewError::Validation(
@@ -1074,6 +1097,7 @@ pub async fn build_dialog(
         id,
         store,
         flow_name,
+        flow_path,
         autosave,
     )
     .await
