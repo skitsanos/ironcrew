@@ -34,6 +34,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Fail fast if someone pushed a tag whose version doesn't match
+      # the crate's Cargo.toml — that combo otherwise ships an artifact
+      # whose embedded CARGO_PKG_VERSION disagrees with the GitHub
+      # release name and surprises downstream consumers.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (v$tag) does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -62,7 +75,7 @@ jobs:
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -79,7 +92,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -129,7 +142,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create or update release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           name: IronCrew ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
