@@ -249,6 +249,23 @@ pub fn parse_mcp_config(table: &mlua::Table) -> Result<McpConfig, mlua::Error> {
 mod tests {
     use super::*;
 
+    /// Serialize env-mutating tests. `cargo test` runs tests in parallel
+    /// by default, and the tests below flip process-wide env vars that
+    /// `validate_*` reads — without a shared lock they race. Every test
+    /// that touches `std::env::set_var` / `remove_var` must hold this
+    /// guard for its whole duration. Using `std::sync::Mutex` (not
+    /// `parking_lot`) avoids a new dependency.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // Poison recovery: a prior test that panicked while holding the
+        // lock would poison it. We don't care — the state we care about
+        // is reset by the next test's own cleanup.
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ── label validation ────────────────────────────────────────────────────
 
     #[test]
@@ -296,27 +313,25 @@ mod tests {
 
     #[test]
     fn allowlist_blocks_unknown_command() {
-        // SAFETY: single-threaded test; env mutation is safe here
+        let _guard = env_guard();
         unsafe { std::env::set_var("IRONCREW_MCP_ALLOWED_COMMANDS", "uvx,npx") };
         let result = validate_command_allowlist("malicious-binary");
-        // SAFETY: same
         unsafe { std::env::remove_var("IRONCREW_MCP_ALLOWED_COMMANDS") };
         assert!(result.is_err());
     }
 
     #[test]
     fn allowlist_permits_known_command() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe { std::env::set_var("IRONCREW_MCP_ALLOWED_COMMANDS", "uvx,npx") };
         let result = validate_command_allowlist("uvx");
-        // SAFETY: same
         unsafe { std::env::remove_var("IRONCREW_MCP_ALLOWED_COMMANDS") };
         assert!(result.is_ok());
     }
 
     #[test]
     fn allowlist_unset_allows_all() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe { std::env::remove_var("IRONCREW_MCP_ALLOWED_COMMANDS") };
         assert!(validate_command_allowlist("anything").is_ok());
     }
@@ -325,7 +340,7 @@ mod tests {
 
     #[test]
     fn localhost_blocked_without_flag() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe { std::env::remove_var("IRONCREW_MCP_ALLOW_LOCALHOST") };
         assert!(validate_mcp_http_url("http://localhost:8000/mcp").is_err());
         assert!(validate_mcp_http_url("http://127.0.0.1:8000/mcp").is_err());
@@ -333,17 +348,16 @@ mod tests {
 
     #[test]
     fn localhost_allowed_with_flag() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe { std::env::set_var("IRONCREW_MCP_ALLOW_LOCALHOST", "1") };
         let result = validate_mcp_http_url("http://localhost:8000/mcp");
-        // SAFETY: same
         unsafe { std::env::remove_var("IRONCREW_MCP_ALLOW_LOCALHOST") };
         assert!(result.is_ok());
     }
 
     #[test]
     fn private_ip_blocked() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("IRONCREW_MCP_ALLOW_LOCALHOST");
             std::env::remove_var("IRONCREW_ALLOW_PRIVATE_IPS");
@@ -354,7 +368,7 @@ mod tests {
 
     #[test]
     fn public_url_passes() {
-        // SAFETY: single-threaded test
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("IRONCREW_MCP_ALLOW_LOCALHOST");
             std::env::remove_var("IRONCREW_ALLOW_PRIVATE_IPS");

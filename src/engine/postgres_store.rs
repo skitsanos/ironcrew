@@ -5,7 +5,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
-use super::sessions::{ConversationRecord, DialogStateRecord};
+use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use super::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -45,6 +45,8 @@ impl PostgresStore {
             .map_err(|e| {
                 IronCrewError::Validation(format!("Failed to connect to PostgreSQL: {}", e))
             })?;
+
+        ensure_supported_postgres_version(&pool).await?;
 
         let table_name = format!("{}runs", table_prefix);
         let conversations_table = format!("{}conversations", table_prefix);
@@ -204,12 +206,69 @@ impl PostgresStore {
             })?;
         }
 
+        // Add flow_path column for schemas predating Phase-1 HITL support.
+        // Guarded with IF NOT EXISTS for idempotency (matches the pattern
+        // used for total_tokens / cached_tokens / tags above).
+        let session_migrations: &[(&str, String)] = &[
+            (
+                "conversations.flow_path",
+                format!("ALTER TABLE {ct} ADD COLUMN IF NOT EXISTS flow_path TEXT"),
+            ),
+            (
+                "dialogs.flow_path",
+                format!("ALTER TABLE {dt} ADD COLUMN IF NOT EXISTS flow_path TEXT"),
+            ),
+        ];
+        for (label, sql) in session_migrations {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Migration for '{}': {}", label, e);
+            }
+        }
+
+        // Enforce the documented `(flow_path, id)` uniqueness for sessions.
+        // Earlier versions used `id` as the sole PRIMARY KEY, which meant a
+        // save from flow-B would overwrite flow-A's session with the same
+        // id. PostgreSQL 15+ is required so we can use `NULLS NOT DISTINCT`
+        // and preserve deterministic uniqueness for legacy `flow_path IS NULL`
+        // rows as well.
+        let session_uniqueness: &[(&str, String)] = &[
+            (
+                "conversations: drop legacy id PK",
+                format!("ALTER TABLE {ct} DROP CONSTRAINT IF EXISTS {ct}_pkey"),
+            ),
+            (
+                "dialogs: drop legacy id PK",
+                format!("ALTER TABLE {dt} DROP CONSTRAINT IF EXISTS {dt}_pkey"),
+            ),
+            (
+                "conversations: composite unique (flow_path, id)",
+                format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_{ct}_flow_id \
+                     ON {ct} (flow_path, id) NULLS NOT DISTINCT"
+                ),
+            ),
+            (
+                "dialogs: composite unique (flow_path, id)",
+                format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_{dt}_flow_id \
+                     ON {dt} (flow_path, id) NULLS NOT DISTINCT"
+                ),
+            ),
+        ];
+        for (label, sql) in session_uniqueness {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Session uniqueness '{}': {}", label, e);
+            }
+        }
+
         // Session indexes — updated_at helps "list recent sessions" queries
         let session_indexes = [
             format!("CREATE INDEX IF NOT EXISTS idx_{ct}_updated_at ON {ct} (updated_at DESC)"),
             format!("CREATE INDEX IF NOT EXISTS idx_{ct}_flow_name ON {ct} (flow_name)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{ct}_flow_path ON {ct} (flow_path)"),
             format!("CREATE INDEX IF NOT EXISTS idx_{dt}_updated_at ON {dt} (updated_at DESC)"),
             format!("CREATE INDEX IF NOT EXISTS idx_{dt}_flow_name ON {dt} (flow_name)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{dt}_flow_path ON {dt} (flow_path)"),
         ];
         for sql in &session_indexes {
             if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
@@ -225,6 +284,38 @@ impl PostgresStore {
         );
         Ok(())
     }
+}
+
+async fn ensure_supported_postgres_version(pool: &PgPool) -> Result<()> {
+    let version_str: String = sqlx::query("SHOW server_version_num")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            IronCrewError::Validation(format!(
+                "Failed to determine PostgreSQL server version: {}",
+                e
+            ))
+        })?
+        .try_get(0)
+        .map_err(|e| IronCrewError::Validation(format!("Invalid PostgreSQL version row: {}", e)))?;
+
+    let version_num: i32 = version_str.parse().map_err(|e| {
+        IronCrewError::Validation(format!(
+            "Failed to parse PostgreSQL server_version_num '{}': {}",
+            version_str, e
+        ))
+    })?;
+
+    if version_num < 150000 {
+        return Err(IronCrewError::Validation(format!(
+            "PostgreSQL 15+ is required; connected server reports version {}. \
+IronCrew relies on PostgreSQL 15 features for flow-scoped session uniqueness \
+and targets extension-capable deployments such as pgvector-enabled installs.",
+            version_str
+        )));
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -431,10 +522,13 @@ impl StateStore for PostgresStore {
         let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
             IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
         })?;
+        // Upsert keyed by (flow_path, id) so two flows with the same
+        // session id keep independent rows. Matches the composite
+        // uniqueness index added in `bootstrap`.
         let sql = format!(
-            "INSERT INTO {t} (id, flow_name, agent_name, messages, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4::jsonb, $5, $6) \
-             ON CONFLICT (id) DO UPDATE SET \
+            "INSERT INTO {t} (id, flow_name, flow_path, agent_name, messages, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7) \
+             ON CONFLICT (flow_path, id) DO UPDATE SET \
                flow_name = EXCLUDED.flow_name, \
                agent_name = EXCLUDED.agent_name, \
                messages = EXCLUDED.messages, \
@@ -444,6 +538,7 @@ impl StateStore for PostgresStore {
         sqlx::query(&sql)
             .bind(&record.id)
             .bind(&record.flow_name)
+            .bind(&record.flow_path)
             .bind(&record.agent_name)
             .bind(&messages_json)
             .bind(&record.created_at)
@@ -456,14 +551,22 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
-    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>> {
+    async fn get_conversation(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<ConversationRecord>> {
+        // Flow-scoped lookup: when `flow_path` is Some, require an exact
+        // match. `$2::TEXT IS NULL` lets the same query serve global
+        // (unscoped) admin lookups.
         let sql = format!(
-            "SELECT id, flow_name, agent_name, messages::text, created_at, updated_at \
-             FROM {} WHERE id = $1",
+            "SELECT id, flow_name, flow_path, agent_name, messages::text, created_at, updated_at \
+             FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.conversations_table
         );
         let row_opt = sqlx::query(&sql)
             .bind(id)
+            .bind(flow_path)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| {
@@ -482,6 +585,9 @@ impl StateStore for PostgresStore {
             flow_name: row
                 .try_get("flow_name")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            flow_path: row
+                .try_get("flow_path")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
             agent_name: row
                 .try_get("agent_name")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,
@@ -495,16 +601,93 @@ impl StateStore for PostgresStore {
         }))
     }
 
-    async fn delete_conversation(&self, id: &str) -> Result<()> {
-        let sql = format!("DELETE FROM {} WHERE id = $1", self.conversations_table);
+    async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        let sql = format!(
+            "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
+            self.conversations_table
+        );
         sqlx::query(&sql)
             .bind(id)
+            .bind(flow_path)
             .execute(&self.pool)
             .await
             .map_err(|e| {
                 IronCrewError::Validation(format!("PostgreSQL delete_conversation error: {}", e))
             })?;
         Ok(())
+    }
+
+    async fn list_conversations(
+        &self,
+        flow_path: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        let sql = format!(
+            "SELECT id, flow_path, agent_name, messages::text, created_at, updated_at \
+             FROM {} \
+             WHERE ($1::TEXT IS NULL OR flow_path = $1) \
+             ORDER BY updated_at DESC \
+             LIMIT $2 OFFSET $3",
+            self.conversations_table
+        );
+        let limit_i = if limit == 0 { i64::MAX } else { limit as i64 };
+        let rows = sqlx::query(&sql)
+            .bind(flow_path)
+            .bind(limit_i)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL list_conversations error: {}", e))
+            })?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let messages_str: String = row
+                .try_get("messages")
+                .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+            let msgs: Vec<crate::llm::provider::ChatMessage> =
+                serde_json::from_str(&messages_str).unwrap_or_default();
+            let turn_count = msgs.iter().filter(|m| m.role == "user").count();
+            summaries.push(ConversationSummary {
+                id: row
+                    .try_get("id")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                flow_path: row
+                    .try_get("flow_path")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                agent_name: row
+                    .try_get("agent_name")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                updated_at: row
+                    .try_get("updated_at")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                turn_count,
+            });
+        }
+        Ok(summaries)
+    }
+
+    async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} \
+             WHERE ($1::TEXT IS NULL OR flow_path = $1)",
+            self.conversations_table
+        );
+        let row = sqlx::query(&sql)
+            .bind(flow_path)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!("PostgreSQL count_conversations error: {}", e))
+            })?;
+        let count: i64 = row
+            .try_get(0)
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+        Ok(count as u64)
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
@@ -514,11 +697,14 @@ impl StateStore for PostgresStore {
         let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
             IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
         })?;
+        // Upsert keyed by (flow_path, id) — see `save_conversation` for
+        // the rationale. Matches the composite uniqueness index added
+        // in `bootstrap`.
         let sql = format!(
             "INSERT INTO {t} \
-             (id, flow_name, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
-             VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7, $8, $9, $10) \
-             ON CONFLICT (id) DO UPDATE SET \
+             (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11) \
+             ON CONFLICT (flow_path, id) DO UPDATE SET \
                flow_name = EXCLUDED.flow_name, \
                agent_names = EXCLUDED.agent_names, \
                starter = EXCLUDED.starter, \
@@ -532,6 +718,7 @@ impl StateStore for PostgresStore {
         sqlx::query(&sql)
             .bind(&record.id)
             .bind(&record.flow_name)
+            .bind(&record.flow_path)
             .bind(&agents_json)
             .bind(&record.starter)
             .bind(&transcript_json)
@@ -548,15 +735,20 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
-    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>> {
+    async fn get_dialog_state(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<DialogStateRecord>> {
         let sql = format!(
-            "SELECT id, flow_name, agent_names::text, starter, transcript::text, \
+            "SELECT id, flow_name, flow_path, agent_names::text, starter, transcript::text, \
              next_index, stopped, stop_reason, created_at, updated_at \
-             FROM {} WHERE id = $1",
+             FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.dialogs_table
         );
         let row_opt = sqlx::query(&sql)
             .bind(id)
+            .bind(flow_path)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| {
@@ -581,6 +773,9 @@ impl StateStore for PostgresStore {
             flow_name: row
                 .try_get("flow_name")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+            flow_path: row
+                .try_get("flow_path")
+                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
             agent_names: serde_json::from_str(&agents_str).unwrap_or_default(),
             starter: row
                 .try_get("starter")
@@ -602,10 +797,14 @@ impl StateStore for PostgresStore {
         }))
     }
 
-    async fn delete_dialog_state(&self, id: &str) -> Result<()> {
-        let sql = format!("DELETE FROM {} WHERE id = $1", self.dialogs_table);
+    async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        let sql = format!(
+            "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
+            self.dialogs_table
+        );
         sqlx::query(&sql)
             .bind(id)
+            .bind(flow_path)
             .execute(&self.pool)
             .await
             .map_err(|e| {

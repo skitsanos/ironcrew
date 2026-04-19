@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -68,7 +68,7 @@ impl Tool for FileReadTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| IronCrewError::ToolExecution {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::Result;
 
@@ -27,6 +27,14 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 
+    /// Register a tool that's already wrapped in `Arc`. Lets the caller
+    /// keep a second strong reference to the same instance (e.g. so
+    /// `Runtime::set_self_ref` can reach back into `LuaScriptTool`s to
+    /// populate their weak runtime refs without `Any`-downcasting).
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
@@ -47,13 +55,18 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolCallContext,
+    ) -> Result<String> {
         let tool = self.tools.get(name).ok_or_else(|| {
             crate::utils::error::IronCrewError::ToolExecution {
                 tool: name.to_string(),
                 message: "Tool not found".into(),
             }
         })?;
-        tool.execute(args).await
+        tool.execute(args, ctx).await
     }
 }

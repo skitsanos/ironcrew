@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
-use crate::engine::sessions::{ConversationRecord, DialogStateRecord};
+use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 
 /// Pluggable storage backend for run records and persistent sessions
@@ -35,27 +35,64 @@ pub trait StateStore: Send + Sync {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
-    /// Upsert a conversation record, keyed by `record.id`.
+    /// Upsert a conversation record. The `(flow_path, id)` pair is the
+    /// effective unique key — a legacy record with `flow_path = None` is
+    /// only reachable when the caller also passes `None` (by convention, a
+    /// global-scope lookup, as used by the `ironcrew inspect` CLI).
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
-    /// Look up a conversation by id. Returns `Ok(None)` when the id does
-    /// not exist — this is how `crew:conversation({id = ...})` distinguishes
-    /// a fresh session from a resumed one.
-    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>>;
-    async fn delete_conversation(&self, id: &str) -> Result<()>;
+    /// Look up a conversation by `(flow_path, id)`. Returns `Ok(None)` when
+    /// no record matches — which is how `crew:conversation({id = ...})`
+    /// distinguishes a fresh session from a resumed one. When `flow_path`
+    /// is `Some(..)`, the query is strictly scoped: a record belonging to a
+    /// different flow (or to no flow, `flow_path = NULL`) is invisible.
+    /// When `flow_path` is `None`, any matching `id` is returned — only
+    /// use this form for admin paths that are not tied to a specific flow.
+    async fn get_conversation(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<ConversationRecord>>;
+    /// Delete a conversation scoped by `(flow_path, id)`. Same semantics as
+    /// `get_conversation`: a delete with `flow_path = Some(..)` will not
+    /// touch records belonging to another flow.
+    async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()>;
 
-    /// Upsert a dialog state record, keyed by `record.id`.
+    /// Paginated list of conversation summaries, newest first by updated_at.
+    /// When `flow_path` is `Some`, only records whose `flow_path` matches are
+    /// returned. When `None`, all records are returned regardless of flow.
+    async fn list_conversations(
+        &self,
+        flow_path: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationSummary>>;
+
+    /// Count of conversations matching the flow filter.
+    async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64>;
+
+    /// Upsert a dialog state record. Keyed by `(flow_path, id)` — same
+    /// scoping rules as conversations (see `get_conversation` docs).
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
-    /// Look up a dialog state by id. Returns `Ok(None)` when the id does
-    /// not exist.
-    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>>;
-    async fn delete_dialog_state(&self, id: &str) -> Result<()>;
+    /// Look up a dialog by `(flow_path, id)`. Returns `Ok(None)` when no
+    /// record matches. Flow-scope semantics match `get_conversation`:
+    /// `Some(path)` requires an exact flow match (legacy records with
+    /// `flow_path = None` are invisible); `None` is the global admin
+    /// lookup.
+    async fn get_dialog_state(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<DialogStateRecord>>;
+    /// Delete a dialog by `(flow_path, id)`. Never touches another
+    /// flow's record when `flow_path` is `Some(..)`.
+    async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()>;
 }
 
 /// Create a StateStore based on environment configuration.
 ///
 /// `IRONCREW_STORE=json` (default) — JSON files in the given directory
 /// `IRONCREW_STORE=sqlite` — SQLite database
-/// `IRONCREW_STORE=postgres` — PostgreSQL (requires `postgres` feature)
+/// `IRONCREW_STORE=postgres` — PostgreSQL 15+ (requires `postgres` feature)
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
 /// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases

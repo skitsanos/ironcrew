@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tera::{Context, Tera};
 
-use super::Tool;
+use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -38,7 +38,7 @@ impl Tool for TemplateRenderTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let template_str =
             args["template"]
                 .as_str()

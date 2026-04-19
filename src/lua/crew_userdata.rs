@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
@@ -18,7 +18,8 @@ use crate::mcp::{McpConfig, McpConnectionManager};
 use super::conversation::build_conversation;
 use super::dialog::build_dialog;
 use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
-use super::parsers::{agent_from_lua_table, load_agents_from_files, task_from_lua_table};
+use super::parsers::{agent_from_lua_table, task_from_lua_table};
+use super::subflow::{SubflowContext, SubflowDepth, invoke_subflow};
 
 // ---------------------------------------------------------------------------
 // LuaCrew — Lua userdata wrapping a Crew + Runtime
@@ -108,148 +109,32 @@ impl UserData for LuaCrew {
         methods.add_async_method(
             "subworkflow",
             |lua, this, (path, options): (String, Option<Table>)| async move {
-                // Resolve path relative to the project directory.
-                let flow_path = {
-                    let flow_path = Path::new(&path);
-                    if flow_path.as_os_str().is_empty()
-                        || flow_path.is_absolute()
-                        || flow_path.components().any(|c| {
-                            matches!(
-                                c,
-                                Component::ParentDir
-                                    | Component::RootDir
-                                    | Component::Prefix(_)
-                                    | Component::CurDir
-                            )
-                        })
-                    {
-                        return Err(mlua::Error::external(IronCrewError::Validation(
-                            "Invalid subworkflow path".into(),
-                        )));
-                    }
-
-                    let project_dir = this.project_dir.clone();
-                    let candidate = project_dir.join(flow_path);
-                    let base = project_dir
-                        .canonicalize()
-                        .unwrap_or_else(|_| project_dir.clone());
-                    let canonical = candidate.canonicalize().map_err(|e| {
-                        mlua::Error::external(IronCrewError::Validation(format!(
-                            "Failed to resolve subworkflow '{}': {}",
-                            path, e
-                        )))
-                    })?;
-
-                    if !canonical.starts_with(&base) {
-                        return Err(mlua::Error::external(IronCrewError::Validation(
-                            "Subworkflow path escapes project directory".into(),
-                        )));
-                    }
-
-                    canonical
-                };
-
-                if !flow_path.is_file() {
-                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                        "Subworkflow not found: {}",
-                        flow_path.display()
-                    ))));
-                }
-
-                // Parse options
+                // Parse options — `output_key` wraps the result in a single-field
+                // table, `input` gets JSON-bridged to the sub-flow's global `input`.
                 let output_key: Option<String> =
                     options.as_ref().and_then(|o| o.get("output_key").ok());
                 let input_table: Option<Table> = options.as_ref().and_then(|o| o.get("input").ok());
-
-                // Serialize input to JSON so we can transfer between Lua states
                 let input_json: Option<serde_json::Value> = match input_table {
                     Some(ref t) => Some(lua_table_to_json(t)?),
                     None => None,
                 };
 
-                // Load and execute the subworkflow
-                let sub_lua =
-                    crate::lua::sandbox::create_crew_lua().map_err(mlua::Error::external)?;
+                // Current depth lives on the parent VM's app-data; when this
+                // method is called from top-level crew.lua it's 0.
+                let depth = lua.app_data_ref::<SubflowDepth>().map(|d| d.0).unwrap_or(0);
+                // Prefer the API-injected EventBus (keeps SSE events flowing
+                // through the same channel as the parent crew).
+                let eventbus = lua.app_data_ref::<EventBus>().map(|e| e.clone());
 
-                // Register the same constructors
-                super::api::register_agent_constructor(&sub_lua)?;
-
-                // Load agents from sub-project if it's a directory
-                let sub_dir = flow_path.parent().unwrap_or(Path::new("."));
-                let sub_agents_dir = sub_dir.join("agents");
-                let sub_agent_files = if sub_agents_dir.is_dir() {
-                    std::fs::read_dir(&sub_agents_dir)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.path())
-                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lua"))
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![]
+                let ctx = SubflowContext {
+                    runtime: this.runtime.clone(),
+                    project_dir: Arc::new(this.project_dir.clone()),
+                    depth,
+                    eventbus,
+                    output_key,
                 };
-                let sub_agents =
-                    load_agents_from_files(&sub_agent_files).map_err(mlua::Error::external)?;
 
-                // Register Crew.new() for the sub-workflow with its own runtime
-                let sub_project_dir = sub_dir.to_path_buf();
-                super::api::register_crew_constructor(
-                    &sub_lua,
-                    this.runtime.clone(),
-                    sub_agents,
-                    sub_project_dir,
-                )?;
-
-                // If input mapping provided, set it as globals
-                if let Some(json) = &input_json {
-                    let input_value = json_value_to_lua(&sub_lua, json)?;
-                    sub_lua.globals().set("input", input_value)?;
-                }
-
-                // Execute the subworkflow script
-                let script = std::fs::read_to_string(&flow_path)
-                    .map_err(|e| mlua::Error::external(IronCrewError::Io(e)))?;
-
-                let sub_result: Value = sub_lua.load(&script).eval_async().await?;
-
-                // Return the result, optionally wrapped under output_key
-                if let Some(key) = output_key {
-                    let wrapper = lua.create_table()?;
-                    // Transfer the value between Lua states by serializing through JSON
-                    let json_str = match sub_result {
-                        Value::Table(t) => {
-                            let json = lua_table_to_json(&t)?;
-                            serde_json::to_string(&json).map_err(|e| {
-                                mlua::Error::external(IronCrewError::Validation(format!(
-                                    "Failed to serialize subworkflow output: {}",
-                                    e
-                                )))
-                            })?
-                        }
-                        Value::String(s) => s.to_str()?.to_string(),
-                        _ => String::new(),
-                    };
-                    wrapper.set(key, json_str)?;
-                    Ok(Value::Table(wrapper))
-                } else {
-                    // Transfer between Lua states via JSON serialization
-                    match sub_result {
-                        Value::Table(t) => {
-                            let json = lua_table_to_json(&t)?;
-                            let transferred = json_value_to_lua(&lua, &json)?;
-                            Ok(transferred)
-                        }
-                        Value::String(s) => {
-                            let s = s.to_str()?.to_string();
-                            Ok(Value::String(lua.create_string(&s)?))
-                        }
-                        Value::Integer(i) => Ok(Value::Integer(i)),
-                        Value::Number(n) => Ok(Value::Number(n)),
-                        Value::Boolean(b) => Ok(Value::Boolean(b)),
-                        Value::Nil => Ok(Value::Nil),
-                        _ => Ok(Value::Nil),
-                    }
-                }
+                invoke_subflow(&lua, path, input_json, &ctx).await
             },
         );
 
@@ -423,6 +308,15 @@ impl UserData for LuaCrew {
             // before the persistence layer was added.
             let store = this.get_or_init_store().await.ok();
 
+            // Derive flow_path from the project directory's last segment
+            // so records created via the Lua-only path can still be looked
+            // up via the HTTP/CLI per-flow list views.
+            let flow_path = this
+                .project_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+
             let conv = build_conversation(
                 table,
                 &agents,
@@ -433,6 +327,7 @@ impl UserData for LuaCrew {
                 eventbus,
                 store,
                 flow_name,
+                flow_path,
                 this.project_dir.clone(),
                 reqwest::Client::new(),
             )
@@ -462,6 +357,17 @@ impl UserData for LuaCrew {
             // ephemeral mode if the store can't be created.
             let store = this.get_or_init_store().await.ok();
 
+            // Mirror the conversation path: derive the flow_path slug from
+            // the project directory so dialog records are namespaced by
+            // flow. Without this, dialogs would still save with
+            // `flow_path = None` and cross-flow id collisions would be
+            // possible.
+            let flow_path = this
+                .project_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+
             let dialog = build_dialog(
                 &lua,
                 table,
@@ -473,6 +379,7 @@ impl UserData for LuaCrew {
                 eventbus,
                 store,
                 flow_name,
+                flow_path,
             )
             .await?;
             Ok(dialog)

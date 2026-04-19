@@ -1,8 +1,18 @@
 # Storage Backends
 
 IronCrew uses a pluggable storage system for persisting run records, powered by
-the `StateStore` trait. Each flow gets its own store instance based on its
-`.ironcrew` directory, keeping data isolated between flows.
+the `StateStore` trait. Its lifetime depends on the mode:
+
+- **`ironcrew serve`** — a **single store instance is bootstrapped once at
+  server startup** (see `cmd_serve` in `src/cli/server.rs`) and shared across
+  every request handler. Postgres migrations run once at boot; the SQLx
+  connection pool is shared across all flows and all concurrent requests.
+- **`ironcrew run` / `ironcrew inspect` (CLI one-shot)** — each invocation
+  creates its own store instance scoped to the flow's `.ironcrew` directory,
+  then tears it down when the process exits.
+
+The rest of this document assumes the `serve` singleton model unless stated
+otherwise.
 
 ## Available Backends
 
@@ -10,7 +20,7 @@ the `StateStore` trait. Each flow gets its own store instance based on its
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |
 | SQLite | `sqlite` | Single-server and Docker deployments, faster queries |
-| PostgreSQL | `postgres` | Production cloud, multi-instance, shared state |
+| PostgreSQL | `postgres` | Production cloud, multi-instance, shared state. PostgreSQL 15+ required |
 
 ## Configuration
 
@@ -20,9 +30,13 @@ Environment variables control storage:
 |----------|-------------|---------|
 | `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
-| `DATABASE_URL` | PostgreSQL connection string (required when `IRONCREW_STORE=postgres`) | — |
+| `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) | — |
 | `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases. Only alphanumeric and underscore allowed (`^[a-zA-Z0-9_]*$`) | `""` (table = `runs`) |
-| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size | `10` |
+| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (sized for concurrent HTTP requests, not per-flow) | `10` |
+| `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` | `20` |
+| `IRONCREW_RUNS_MAX_LIMIT` | Hard cap on `?limit=` for run listing | `100` |
+| `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/conversations` | `20` |
+| `IRONCREW_CONVERSATIONS_MAX_LIMIT` | Hard cap on `?limit=` for conversation listing | `100` |
 
 **Note:** The `.ironcrew/` directory is created with `0o700` permissions on Unix
 to prevent other users from reading run history.
@@ -153,6 +167,10 @@ IRONCREW_STORE=postgres
 DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
 ```
 
+**Version requirement:** PostgreSQL 15 or newer is required. IronCrew depends
+on PostgreSQL 15 features for flow-scoped session uniqueness and is intended
+for extension-capable deployments such as installations that use `pgvector`.
+
 **Advantages:**
 - Shared state across multiple IronCrew instances
 - **JSONB columns** for `task_results` and `tags` — query into JSON natively with SQL
@@ -162,6 +180,7 @@ DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
 
 **Limitations:**
 - Requires an external PostgreSQL server
+- Requires PostgreSQL 15+
 - Adds compile-time dependency on `sqlx`
 
 ### Schema
@@ -310,14 +329,52 @@ pub trait StateStore: Send + Sync {
 
     // ─── Persistent sessions ────────────────────────────────────────
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
-    async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>>;
-    async fn delete_conversation(&self, id: &str) -> Result<()>;
+    async fn get_conversation(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<ConversationRecord>>;
+    async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()>;
+
+    async fn list_conversations(
+        &self,
+        flow_path: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationSummary>>;
+    async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64>;
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
     async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>>;
     async fn delete_dialog_state(&self, id: &str) -> Result<()>;
 }
 ```
+
+### Conversation scoping (`flow_path`)
+
+Conversations and dialogs are keyed by the composite `(flow_path, id)` pair,
+not by `id` alone. This means two different flows can use the same session
+id (`"alice-support"`) without colliding.
+
+- `flow_path = Some(slug)` passed to `get_conversation` /
+  `delete_conversation` / `list_conversations` / `count_conversations`
+  means **"only records belonging to this flow"**. Legacy records written
+  before the column existed have `flow_path = NULL` and are **invisible**
+  to scoped queries.
+- `flow_path = None` passed to `get_conversation` / `delete_conversation`
+  is an **admin / global lookup** — it matches any record with the given
+  `id` regardless of which flow (if any) owns it. The `ironcrew inspect`
+  CLI uses this form.
+- **JSON backend:** records live at
+  `<conversations_dir>/<flow>/<id>.json` (flow-namespaced subdirectories).
+  Legacy flat paths `<conversations_dir>/<id>.json` are still readable as
+  a fallback for in-place upgrades.
+- **SQL backends:** the `{prefix}conversations` and `{prefix}dialogs`
+  tables have a `flow_path TEXT` column added via idempotent
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (Postgres) / `ALTER TABLE
+  ... ADD COLUMN flow_path TEXT` guarded against "duplicate column"
+  errors (SQLite). Indexes `idx_{prefix}conversations_flow_path` and
+  `idx_{prefix}dialogs_flow_path` back flow-scoped listing queries.
 
 `ListRunsFilter` has three optional fields: `status`, `tag`, and `since`
 (RFC3339 timestamp). All three are composed with `AND` when multiple are
@@ -332,16 +389,92 @@ existing id overwrites the prior record.
 
 ### Session storage layout
 
-| Backend     | Conversations                                   | Dialogs                                    |
-|-------------|--------------------------------------------------|--------------------------------------------|
-| `json`      | `.ironcrew/conversations/<id>.json`             | `.ironcrew/dialogs/<id>.json`              |
-| `sqlite`    | `conversations` table in `.ironcrew/ironcrew.db` | `dialogs` table in the same file           |
-| `postgres`  | `{prefix}conversations` table                    | `{prefix}dialogs` table                    |
+| Backend     | Conversations                                            | Dialogs                                             |
+|-------------|-----------------------------------------------------------|------------------------------------------------------|
+| `json`      | `.ironcrew/conversations/<flow>/<id>.json`                | `.ironcrew/dialogs/<flow>/<id>.json`                 |
+| `sqlite`    | `conversations` table in `.ironcrew/ironcrew.db`          | `dialogs` table in the same file                     |
+| `postgres`  | `{prefix}conversations` table                             | `{prefix}dialogs` table                              |
 
-All JSON subdirectories are created at `0o700` on Unix. SQLite and
-PostgreSQL tables are created on first connect via `CREATE TABLE IF NOT
-EXISTS`, with GIN indexes on the JSONB columns (PostgreSQL) for future
-filtering support.
+Flow-namespaced subdirectories in the JSON backend keep sessions isolated
+per flow; a legacy flat `<id>.json` layout from earlier versions is still
+readable as a fallback. All JSON subdirectories are created at `0o700` on
+Unix. SQLite and PostgreSQL tables are created on first connect via
+`CREATE TABLE IF NOT EXISTS`. PostgreSQL also creates B-tree indexes on
+`flow_path` (`idx_{prefix}conversations_flow_path`,
+`idx_{prefix}dialogs_flow_path`) and `updated_at` to back flow-scoped
+listing queries.
+
+### Session table schema (PostgreSQL)
+
+```sql
+CREATE TABLE IF NOT EXISTS {prefix}conversations (
+    id          TEXT PRIMARY KEY,
+    flow_name   TEXT NOT NULL,
+    agent_name  TEXT NOT NULL,
+    messages    JSONB NOT NULL DEFAULT '[]',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+ALTER TABLE {prefix}conversations ADD COLUMN IF NOT EXISTS flow_path TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_{prefix}conversations_updated_at
+    ON {prefix}conversations (updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{prefix}conversations_flow_name
+    ON {prefix}conversations (flow_name);
+CREATE INDEX IF NOT EXISTS idx_{prefix}conversations_flow_path
+    ON {prefix}conversations (flow_path);
+
+CREATE TABLE IF NOT EXISTS {prefix}dialogs (
+    id          TEXT PRIMARY KEY,
+    flow_name   TEXT NOT NULL,
+    agent_names JSONB NOT NULL DEFAULT '[]',
+    starter     TEXT NOT NULL,
+    transcript  JSONB NOT NULL DEFAULT '[]',
+    next_index  INTEGER NOT NULL,
+    stopped     BOOLEAN NOT NULL DEFAULT FALSE,
+    stop_reason TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+ALTER TABLE {prefix}dialogs ADD COLUMN IF NOT EXISTS flow_path TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_{prefix}dialogs_updated_at
+    ON {prefix}dialogs (updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{prefix}dialogs_flow_name
+    ON {prefix}dialogs (flow_name);
+CREATE INDEX IF NOT EXISTS idx_{prefix}dialogs_flow_path
+    ON {prefix}dialogs (flow_path);
+```
+
+### Session table schema (SQLite)
+
+```sql
+CREATE TABLE IF NOT EXISTS conversations (
+    id         TEXT PRIMARY KEY,
+    flow_name  TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    messages   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- Idempotent migration for pre-flow_path schemas (duplicate-column errors
+-- are swallowed):
+ALTER TABLE conversations ADD COLUMN flow_path TEXT;
+
+CREATE TABLE IF NOT EXISTS dialogs (
+    id          TEXT PRIMARY KEY,
+    flow_name   TEXT NOT NULL,
+    agent_names TEXT NOT NULL,
+    starter     TEXT NOT NULL,
+    transcript  TEXT NOT NULL,
+    next_index  INTEGER NOT NULL,
+    stopped     INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+ALTER TABLE dialogs ADD COLUMN flow_path TEXT;
+```
 
 ### Session ID validation
 

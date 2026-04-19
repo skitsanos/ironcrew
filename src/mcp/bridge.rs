@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::llm::provider::ToolSchema;
 use crate::mcp::client::McpClient;
 use crate::mcp::config::make_tool_name;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolCallContext};
 use crate::utils::error::{IronCrewError, Result};
 
 /// Default maximum tool result size (256 KB).
@@ -90,7 +90,7 @@ impl Tool for McpBridgeTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let result = self
             .client
             .call_tool(&self.server_tool_name, args)

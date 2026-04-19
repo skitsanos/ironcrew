@@ -20,6 +20,7 @@ fn sample_conversation(id: &str) -> ConversationRecord {
     ConversationRecord {
         id: id.into(),
         flow_name: "test flow".into(),
+        flow_path: None,
         agent_name: "assistant".into(),
         messages: vec![
             ChatMessage::system("You are helpful"),
@@ -35,6 +36,7 @@ fn sample_dialog(id: &str) -> DialogStateRecord {
     DialogStateRecord {
         id: id.into(),
         flow_name: "debate".into(),
+        flow_path: None,
         agent_names: vec!["alice".into(), "bob".into()],
         starter: "Debate the topic".into(),
         transcript: vec![
@@ -68,7 +70,7 @@ async fn conversation_round_trip() {
 
     store.save_conversation(&record).await.unwrap();
     let loaded = store
-        .get_conversation("chat-round-trip")
+        .get_conversation(None, "chat-round-trip")
         .await
         .unwrap()
         .expect("saved record should load");
@@ -85,7 +87,7 @@ async fn conversation_round_trip() {
 #[tokio::test]
 async fn conversation_missing_returns_none() {
     let (_dir, store) = fresh_store();
-    let result = store.get_conversation("never-saved").await.unwrap();
+    let result = store.get_conversation(None, "never-saved").await.unwrap();
     assert!(result.is_none());
 }
 
@@ -101,7 +103,7 @@ async fn conversation_save_is_upsert() {
     store.save_conversation(&record).await.unwrap();
 
     let loaded = store
-        .get_conversation("upsert-chat")
+        .get_conversation(None, "upsert-chat")
         .await
         .unwrap()
         .unwrap();
@@ -115,11 +117,20 @@ async fn conversation_delete() {
     let record = sample_conversation("delete-me");
     store.save_conversation(&record).await.unwrap();
 
-    store.delete_conversation("delete-me").await.unwrap();
-    assert!(store.get_conversation("delete-me").await.unwrap().is_none());
+    store.delete_conversation(None, "delete-me").await.unwrap();
+    assert!(
+        store
+            .get_conversation(None, "delete-me")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Deleting a missing id is a no-op, not an error
-    store.delete_conversation("never-existed").await.unwrap();
+    store
+        .delete_conversation(None, "never-existed")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -129,7 +140,7 @@ async fn dialog_state_round_trip() {
 
     store.save_dialog_state(&record).await.unwrap();
     let loaded = store
-        .get_dialog_state("debate-42")
+        .get_dialog_state(None, "debate-42")
         .await
         .unwrap()
         .expect("saved record should load");
@@ -155,7 +166,7 @@ async fn dialog_state_preserves_stop_flag() {
 
     store.save_dialog_state(&record).await.unwrap();
     let loaded = store
-        .get_dialog_state("stopped-early")
+        .get_dialog_state(None, "stopped-early")
         .await
         .unwrap()
         .unwrap();
@@ -169,7 +180,7 @@ async fn dialog_state_missing_returns_none() {
     let (_dir, store) = fresh_store();
     assert!(
         store
-            .get_dialog_state("never-saved")
+            .get_dialog_state(None, "never-saved")
             .await
             .unwrap()
             .is_none()
@@ -195,7 +206,7 @@ async fn dialog_state_save_is_upsert() {
     store.save_dialog_state(&record).await.unwrap();
 
     let loaded = store
-        .get_dialog_state("upsert-dialog")
+        .get_dialog_state(None, "upsert-dialog")
         .await
         .unwrap()
         .unwrap();
@@ -209,10 +220,13 @@ async fn dialog_state_delete() {
     let record = sample_dialog("delete-dialog");
     store.save_dialog_state(&record).await.unwrap();
 
-    store.delete_dialog_state("delete-dialog").await.unwrap();
+    store
+        .delete_dialog_state(None, "delete-dialog")
+        .await
+        .unwrap();
     assert!(
         store
-            .get_dialog_state("delete-dialog")
+            .get_dialog_state(None, "delete-dialog")
             .await
             .unwrap()
             .is_none()
@@ -235,8 +249,8 @@ async fn runs_and_sessions_are_independent() {
 
     // A conversation and a dialog with the same id can coexist because
     // they're stored separately.
-    let conv = store.get_conversation("shared-id").await.unwrap();
-    let dlg = store.get_dialog_state("shared-id").await.unwrap();
+    let conv = store.get_conversation(None, "shared-id").await.unwrap();
+    let dlg = store.get_dialog_state(None, "shared-id").await.unwrap();
     assert!(conv.is_some());
     assert!(dlg.is_some());
     assert_eq!(conv.unwrap().agent_name, "assistant");

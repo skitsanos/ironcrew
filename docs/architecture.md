@@ -23,6 +23,29 @@ IronCrew separates the heavy lifting (LLM calls, HTTP, parallel scheduling, tool
 
 **Lua Scripts** -- User-authored workflow definitions. The entrypoint is `crew.lua`, with optional `agents/` and `tools/` directories for declarative definitions.
 
+### Sandbox Primitives
+
+Every Lua VM IronCrew creates has a small set of sandbox-level globals and
+helpers that live alongside `Crew.new` / `Agent.new`:
+
+- **`run_flow(path, input)`** — sandbox-level async Lua function
+  (`src/lua/subflow.rs`) that runs another Lua flow in a freshly-constructed
+  child VM. The path is resolved relative to the calling VM's project
+  directory and must not escape it; `input` is an optional table passed as
+  the `input` global of the child VM. Returns the child's final Lua
+  expression bridged through JSON. Available from any VM — `crew.lua`,
+  `tools/*.lua` custom tools, conversational agents' tool-call handlers —
+  without going through a `Crew` instance.
+- **`IRONCREW_MODE`** — Lua global set to `"run"` by `ironcrew run` and
+  `"chat"` by `ironcrew chat` before the entrypoint script executes. Flows
+  that mix task-based and conversational use should guard their top-level
+  `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so
+  chat-mode boot-up doesn't trigger a full task execution.
+- **`IRONCREW_MAX_FLOW_DEPTH`** — environment variable (default `5`) that
+  caps recursive `run_flow`/`crew:subworkflow` nesting. Each child VM
+  inherits `depth + 1`; exceeding the cap fails fast with a validation
+  error.
+
 ## Project Structure
 
 IronCrew supports two modes: **directory mode** and **single-file mode**.
@@ -57,7 +80,7 @@ If a `config.lua` file exists at the project root, it is auto-loaded before
 -- config.lua
 return {
     provider = "anthropic",
-    model = "claude-haiku-4-5-20251001",
+    model = "claude-haiku-4-5",
     max_concurrent = 4,
 }
 ```
@@ -257,6 +280,57 @@ reasoning-capable providers (Anthropic, OpenAI Responses, DeepSeek, Kimi).
 Each `crew:run()` saves a `RunRecord` with task results, token usage, timing,
 tags, reasoning (when captured), and status (success, partial failure, or failed).
 
+### Sub-flow Events
+
+`run_flow()` and `crew:subworkflow()` emit `log` events through the caller's
+EventBus so nested execution is visible in the same SSE stream as the parent
+run:
+
+- `run_flow: <path>` — emitted when a sub-flow starts
+- `run_flow done: <path> (<ms>ms)` — emitted when it finishes
+
+Sub-flow execution reuses the parent's `Runtime` (tool registry, provider
+configuration) but runs in a fresh VM with its own `Crew`, memory, and
+message bus. JSON is the only transfer medium between VMs.
+
+### Server-wide Store Singleton
+
+`ironcrew serve` bootstraps a single `Arc<dyn StateStore>` at startup
+(`cmd_serve` in `src/api/mod.rs`) and hands the same handle to every
+request via `AppState.store`. This keeps Postgres migrations and table
+checks one-shot, shares a single connection pool across conversations and
+runs, and ensures all handlers see a consistent view of persisted state.
+
+## Cross-Flow Isolation
+
+Starting with the multi-flow server, `ConversationRecord` and `DialogRecord`
+are keyed by `(flow_path, id)` rather than `id` alone. This lets different
+flows reuse the same conversation ids (e.g. `"default"`) without colliding
+on the store.
+
+**On-disk layout (JSON backend):**
+
+```
+.ironcrew/
+  conversations/
+    <flow>/<id>.json        # scoped records
+    <id>.json               # legacy flat records (flow_path = None)
+  dialogs/
+    <flow>/<id>.json
+    <id>.json               # legacy flat records
+```
+
+The flow segment is a sanitized last path component of the flow directory.
+SQL backends store the same `(flow_path, id)` pair as a composite unique
+key.
+
+Scoped lookups (`get_conversation`, `list_conversations` with a flow
+filter) never see legacy flat records whose `flow_path` is `None`; those
+remain reachable only via global / admin queries (`flow_path = None` on
+the lookup side). This is deliberate: legacy records predate multi-flow
+isolation and are intentionally invisible to per-flow callers to avoid
+cross-flow leakage.
+
 ## Provider Architecture
 
 IronCrew supports three provider types via the `LlmProvider` trait:
@@ -282,3 +356,37 @@ Run records are persisted via a pluggable `StateStore` trait:
 Set `IRONCREW_STORE` to `sqlite` or `postgres` to switch backends. See
 [Storage](storage.md) for full configuration and [CLI Reference](cli.md) for
 all env vars.
+
+### Tool Trait Signature
+
+The `Tool::execute` trait signature now accepts a `&ToolCallContext`
+instead of no context object:
+
+```rust
+async fn execute(
+    &self,
+    args: serde_json::Value,
+    ctx: &ToolCallContext,
+) -> Result<String>;
+```
+
+`ToolCallContext` carries the shared `StateStore`, the caller's `EventBus`,
+and the current sub-flow nesting `depth`. Built-in tools ignore every
+field, but `LuaScriptTool` uses it to seed the per-call Lua VM's app-data
+so `run_flow()` called from inside a custom Lua tool reaches the right
+runtime and respects the depth cap. **This is a breaking change for
+anyone implementing the `Tool` trait in Rust** — add the parameter (usually
+as `_ctx`) to every `execute` implementation.
+
+## Graceful Shutdown
+
+The API server (`ironcrew serve`) handles `SIGTERM` and `Ctrl+C` for
+graceful shutdown: active chat sessions are dropped (closing their SSE
+broadcast channels so subscribers unblock), active crew runs are aborted,
+and MCP stdio children are reaped. A post-signal hard deadline —
+`IRONCREW_SHUTDOWN_TIMEOUT_SECS` (default `10`) — bounds how long the
+drain is allowed to take before the process exits anyway. A final
+`IRONCREW_SHUTDOWN_DRAIN_MS` (default `1000`) window gives background
+tasks spawned from `Drop` paths time to complete. See
+[Cloud Deployment](cloud-deployment.md#graceful-shutdown) for tuning on
+Kubernetes / Railway.

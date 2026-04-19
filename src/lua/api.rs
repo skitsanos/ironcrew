@@ -9,6 +9,7 @@ use crate::engine::crew::{Crew, ProviderConfig};
 use crate::engine::memory::{MemoryConfig, MemoryStore};
 use crate::engine::model_router::ModelRouter;
 use crate::engine::runtime::Runtime;
+use crate::engine::store::StateStore;
 use crate::llm::anthropic::{AnthropicConfig, AnthropicProvider, ServerTool};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::openai_responses::{
@@ -36,6 +37,29 @@ pub use super::parsers::{
 // ---------------------------------------------------------------------------
 // Global registrations
 // ---------------------------------------------------------------------------
+
+/// Marker type — when set as app-data on a Lua VM, signals that the VM is
+/// being driven in chat REPL / HTTP conversation mode rather than the default
+/// `run`-the-crew mode. Triggers:
+///   1. Setting the `IRONCREW_MODE = "chat"` Lua global, and
+///   2. Caching the most recently constructed `LuaCrew` userdata in the
+///      registry under the `__ironcrew_chat_crew` slot so the chat harness
+///      can retrieve it after the entrypoint script returns.
+#[derive(Clone, Copy)]
+pub struct ChatMode;
+
+/// Registry key where `register_crew_constructor` stashes the most recently
+/// constructed `LuaCrew` userdata when `ChatMode` app-data is set. Pulled by
+/// the chat CLI / HTTP `start` handler to locate the crew that was just built
+/// by the entrypoint script.
+pub const CHAT_CREW_REGISTRY_KEY: &str = "__ironcrew_chat_crew";
+
+/// Set the canonical `IRONCREW_MODE` Lua global. Users guard top-level
+/// `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so the
+/// same `crew.lua` works for both `ironcrew run` and `ironcrew chat`.
+pub fn set_ironcrew_mode(lua: &Lua, mode: &str) -> LuaResult<()> {
+    lua.globals().set("IRONCREW_MODE", mode.to_string())
+}
 
 /// Register the env() global function in Lua.
 #[allow(dead_code)] // used in integration tests
@@ -73,6 +97,24 @@ pub fn register_crew_constructor(
     let crew_table = lua.create_table()?;
     let agents = Arc::new(preloaded_agents);
     let project_dir = Arc::new(project_dir);
+
+    // Defense-in-depth: seed sub-flow app-data on this VM too. The primary
+    // seeding happens in `setup_crew_runtime`, but some callers (tests,
+    // embeddings) build VMs directly and skip that path. Only `set` keys
+    // that aren't already present so we don't stomp on a nested caller's
+    // depth counter.
+    if lua.app_data_ref::<Arc<Runtime>>().is_none() {
+        lua.set_app_data(runtime.clone());
+    }
+    if lua.app_data_ref::<Arc<PathBuf>>().is_none() {
+        lua.set_app_data(project_dir.clone());
+    }
+    if lua
+        .app_data_ref::<crate::lua::subflow::SubflowDepth>()
+        .is_none()
+    {
+        lua.set_app_data(crate::lua::subflow::SubflowDepth(0));
+    }
 
     let new_fn = lua.create_function(move |lua, table: Table| {
         let project_dir = (*project_dir).clone();
@@ -361,19 +403,41 @@ pub fn register_crew_constructor(
             Err(_) => None,
         };
 
-        Ok(LuaCrew {
+        // If the host (e.g. the HTTP server) has provided a shared store
+        // via app_data, prefill the LuaCrew's `OnceCell` with it so every
+        // Lua-triggered store access reuses the server-wide `Arc` — no
+        // re-bootstrap and no extra Postgres pool per request.
+        let store_cell = tokio::sync::OnceCell::new();
+        if let Some(shared) = lua.app_data_ref::<Arc<dyn StateStore>>() {
+            let _ = store_cell.set(shared.clone());
+        }
+
+        let lua_crew = LuaCrew {
             crew: Arc::new(Mutex::new(crew)),
             runtime: runtime.clone(),
             custom_provider,
             project_dir,
-            store: tokio::sync::OnceCell::new(),
+            store: store_cell,
             #[cfg(feature = "mcp")]
             mcp_config,
             #[cfg(feature = "mcp")]
             mcp_manager: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "mcp")]
             mcp_tool_registry: Arc::new(tokio::sync::Mutex::new(None)),
-        })
+        };
+
+        // In chat mode, stash the userdata in the registry so the CLI/HTTP
+        // harness can pick it back up once the entrypoint script returns.
+        // We do this by constructing an AnyUserData and retrieving it via
+        // create_userdata, then storing it under a named registry slot.
+        if lua.app_data_ref::<ChatMode>().is_some() {
+            let ud = lua.create_userdata(lua_crew)?;
+            lua.set_named_registry_value(CHAT_CREW_REGISTRY_KEY, ud.clone())?;
+            return Ok(mlua::Value::UserData(ud));
+        }
+
+        let ud = lua.create_userdata(lua_crew)?;
+        Ok(mlua::Value::UserData(ud))
     })?;
 
     crew_table.set("new", new_fn)?;

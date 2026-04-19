@@ -1,7 +1,10 @@
 # Tools
 
 Tools are functions that agents can invoke during task execution. IronCrew ships
-with 9 built-in tools and supports custom tools written in Lua.
+with 8 built-in tools by default (9 when the opt-in `shell` tool is enabled via
+`IRONCREW_ALLOW_SHELL=1`) and supports custom tools written in Lua. Additional
+tools can be contributed by MCP servers configured on the crew (see
+[MCP Tools](#mcp-tools) below).
 
 ## Built-in Tools
 
@@ -202,11 +205,128 @@ Custom tools run in a restricted sandbox (no `os`, `io`, `require`, `loadfile`,
 `dofile`). A `fs` namespace scoped to the project directory is available
 (`fs.read(path)`, `fs.write(path, content)`).
 
-**Tools cannot make HTTP calls.** The `http` global is not registered in the
-tool sandbox. If your tool needs remote data, fetch it in `crew.lua` (where
-`http` is available) and pass it via context, memory, or task results.
-Alternatively, the agent can call the built-in `http_request` tool directly
-without writing a custom Lua tool wrapper.
+**Tools cannot call `http.*` directly.** The `http` global is not registered in
+the tool sandbox. You have three options when a custom tool needs remote data:
+
+1. **Delegate to a sub-flow via `run_flow`** (recommended for composing logic) —
+   custom tools can call [`run_flow(path, input)`](#run_flow-sub-crew-delegation)
+   to invoke a sub-crew Lua script that *does* have `http` access. The sub-flow
+   runs in its own sandboxed VM and its result is JSON-bridged back to the tool.
+2. **Fetch the data in `crew.lua`** (where `http` is available) and pass it via
+   context, memory, or task results.
+3. **Let the agent call the built-in `http_request` tool** directly — no custom
+   Lua tool wrapper required.
+
+---
+
+## `run_flow` (sub-crew delegation)
+
+`run_flow(path, input)` is a sandbox-level primitive that invokes another
+IronCrew Lua script (a "sub-flow") and returns its result into the caller's VM.
+It lets `crew.lua` and custom tools compose crews without spawning a new
+process.
+
+### Signature
+
+```
+run_flow(path[, input]) -> value
+```
+
+| Arg     | Type                          | Description |
+|---------|-------------------------------|-------------|
+| `path`  | string                        | Path to the sub-flow Lua script, relative to the caller's project directory. Must stay inside the project root. |
+| `input` | Lua table / primitive (optional) | Passed to the sub-flow as the global variable `input`. |
+
+The return value is whatever the sub-flow's final Lua expression yields
+(typically a `return { ... }` at the end of the script), marshalled across the
+VM boundary via JSON.
+
+### Semantics
+
+- **Synchronous from Lua's perspective, async under the hood.** Callers just
+  receive the return value; IronCrew awaits the sub-flow on the Tokio runtime.
+- **Fresh Lua VM per sub-flow.** Each invocation builds a new sandboxed VM
+  (same sandbox rules as the parent crew: no `os`, `io`, `require`, `loadfile`,
+  `dofile`; `http`, `fs`, `template`, `regex`, `json_parse`, etc. are
+  available). Sub-flows do not inherit memory, tasks, or agents from the caller.
+- **Agents auto-load.** The sub-flow's directory is scanned for `agents/*.lua`
+  just like a top-level crew.
+- **Available in both sandboxes.** `run_flow` is registered on the top-level
+  crew Lua VM *and* on the per-tool Lua VM used by custom `tools/*.lua` files
+  (including tools invoked during a `crew:conversation()` tool-call loop). This
+  is the key feature: **custom tools can delegate to sub-crews in-process**,
+  bypassing the tool-sandbox restrictions on `http` and friends.
+
+### Path validation
+
+- `path` must be relative.
+- Absolute paths, paths containing `..`, and symlink traversal that escapes the
+  caller's project root are rejected with a validation error.
+- The resolved path must exist and must be a file.
+
+### Recursion cap
+
+Nested `run_flow` calls are counted against `IRONCREW_MAX_FLOW_DEPTH` (default
+`5`). Each nested invocation increments the depth; exceeding the limit raises a
+validation error (`run_flow depth exceeded: already at N (limit N)`).
+
+### Relationship to `crew:subworkflow(...)`
+
+`run_flow` and `crew:subworkflow` share the same underlying implementation.
+Differences:
+
+| Feature                    | `run_flow(path, input)`                           | `crew:subworkflow(...)`                          |
+|----------------------------|---------------------------------------------------|--------------------------------------------------|
+| Where it's callable        | Any sandbox — crew VM **and** custom tool VMs     | Top-level crew VM only                           |
+| `output_key` wrapping      | Not supported; returns the raw sub-flow value     | Optional — wraps result as `{ [key] = <value> }` |
+| Target                     | A Lua script file                                 | A Lua script file                                |
+
+Use `run_flow` from custom tools or when you want the unwrapped value;
+`crew:subworkflow` remains useful when you want the result pre-wrapped into a
+named key for merging into memory/results.
+
+### Example: delegating a custom tool to a sub-crew
+
+```lua
+-- tools/delegator.lua
+return {
+    name = "delegator",
+    description = "Delegates work to sub-crew",
+    parameters = {
+        x = { type = "integer", description = "Value to forward", required = true },
+    },
+    execute = function(args)
+        return run_flow("subs/math/math.lua", { x = args.x })
+    end,
+}
+```
+
+The sub-flow `subs/math/math.lua` runs in its own sandbox with its own
+`agents/` folder and can use `http`, `fs`, and crew/agent constructors
+normally.
+
+---
+
+## MCP Tools
+
+When a crew configures `mcp_servers`, each tool exported by a connected MCP
+server is registered in IronCrew's tool registry under the canonical name
+`mcp__<server>__<tool>` (see `src/mcp/config.rs`). Agents list them in their
+`tools = { ... }` field like any other tool:
+
+```lua
+crew:add_agent(Agent.new({
+    name = "dev",
+    goal = "Inspect repo state",
+    tools = { "mcp__git__git_status", "mcp__git__git_log" },
+}))
+```
+
+See [Crews](crews.md) for `mcp_servers` configuration.
+
+**Result size cap.** MCP tool results are size-capped at
+`IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` (default `262144` / 256 KB). Oversized
+results are truncated with a marker appended.
 
 ---
 
@@ -216,13 +336,19 @@ IronCrew exposes Lua globals in two distinct sandboxes:
 
 | Sandbox | Where it runs | What's available |
 |---------|---------------|------------------|
-| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace** |
-| **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access — but **no `http`** |
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace** and `run_flow` |
+| **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access and `run_flow` — but **no `http`** |
 
-> **Important constraint:** Custom Lua tools cannot make HTTP calls. The `http`
-> global is only available in the crew sandbox. If a tool needs to fetch remote
-> data, either fetch it in `crew.lua` and pass it via memory/context, or use the
-> built-in `http_request` tool (which is invoked by the LLM, not by Lua code).
+> **Important constraint:** Custom Lua tools cannot call `http.*` directly. The
+> `http` global is only registered in the crew sandbox. If a tool needs remote
+> data, either delegate to a sub-flow via
+> [`run_flow`](#run_flow-sub-crew-delegation) (which *does* get `http` in its
+> own sandbox), fetch the data in `crew.lua` and pass it through
+> memory/context, or let the agent invoke the built-in `http_request` tool.
+
+The `run_flow(path, input?)` primitive (see [`run_flow`](#run_flow-sub-crew-delegation))
+is available in **both sandboxes** — it's the recommended way to compose crews
+from inside custom tools.
 
 ### Utility Functions
 

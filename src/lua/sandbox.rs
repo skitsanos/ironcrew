@@ -405,6 +405,12 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
     lua.globals().set("http", http_table)?;
 
+    // Sandbox-level `run_flow(path, input)` — lets any Lua VM (crew.lua,
+    // custom tools, conversation tool-call handlers) delegate to a sub-flow.
+    // Registration is unconditional; the function itself errors out at call
+    // time if the VM lacks the runtime/project_dir app-data (parse-time VMs).
+    crate::lua::subflow::register_run_flow(lua)?;
+
     Ok(())
 }
 

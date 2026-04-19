@@ -1,4 +1,5 @@
 use ironcrew::tools::Tool;
+use ironcrew::tools::ToolCallContext;
 use ironcrew::tools::file_read_glob::FileReadGlobTool;
 use ironcrew::tools::hash::HashTool;
 use ironcrew::tools::template_render::TemplateRenderTool;
@@ -8,8 +9,9 @@ use serde_json::json;
 #[tokio::test]
 async fn test_hash_sha256() {
     let tool = HashTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({"text": "hello", "algorithm": "sha256"}))
+        .execute(json!({"text": "hello", "algorithm": "sha256"}), &ctx)
         .await
         .unwrap();
     assert_eq!(
@@ -21,8 +23,9 @@ async fn test_hash_sha256() {
 #[tokio::test]
 async fn test_hash_md5() {
     let tool = HashTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({"text": "hello", "algorithm": "md5"}))
+        .execute(json!({"text": "hello", "algorithm": "md5"}), &ctx)
         .await
         .unwrap();
     assert_eq!(result, "5d41402abc4b2a76b9719d911017c592");
@@ -31,11 +34,15 @@ async fn test_hash_md5() {
 #[tokio::test]
 async fn test_template_render_basic() {
     let tool = TemplateRenderTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({
-            "template": "Hello {{ name }}! You are {{ age }} years old.",
-            "data": {"name": "Alice", "age": 30}
-        }))
+        .execute(
+            json!({
+                "template": "Hello {{ name }}! You are {{ age }} years old.",
+                "data": {"name": "Alice", "age": 30}
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
     assert_eq!(result, "Hello Alice! You are 30 years old.");
@@ -44,11 +51,15 @@ async fn test_template_render_basic() {
 #[tokio::test]
 async fn test_template_render_with_loop() {
     let tool = TemplateRenderTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({
-            "template": "{% for item in items %}{{ item }},{% endfor %}",
-            "data": {"items": ["a", "b", "c"]}
-        }))
+        .execute(
+            json!({
+                "template": "{% for item in items %}{{ item }},{% endfor %}",
+                "data": {"items": ["a", "b", "c"]}
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
     assert_eq!(result, "a,b,c,");
@@ -57,11 +68,15 @@ async fn test_template_render_with_loop() {
 #[tokio::test]
 async fn test_template_render_with_conditional() {
     let tool = TemplateRenderTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({
-            "template": "{% if active %}Active{% else %}Inactive{% endif %}",
-            "data": {"active": true}
-        }))
+        .execute(
+            json!({
+                "template": "{% if active %}Active{% else %}Inactive{% endif %}",
+                "data": {"active": true}
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
     assert_eq!(result, "Active");
@@ -75,7 +90,11 @@ async fn test_file_read_glob_basic() {
     std::fs::write(dir.path().join("c.md"), "content c").unwrap();
 
     let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
-    let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
+    let ctx = ToolCallContext::default();
+    let result = tool
+        .execute(json!({"pattern": "*.txt"}), &ctx)
+        .await
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     // v2.6.0: output is an object, not a bare array
     let files = parsed["files"].as_array().unwrap();
@@ -101,7 +120,11 @@ async fn test_file_read_glob_file_count_cap() {
     }
 
     let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
-    let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
+    let ctx = ToolCallContext::default();
+    let result = tool
+        .execute(json!({"pattern": "*.txt"}), &ctx)
+        .await
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
     assert_eq!(parsed["file_count"], 2);
@@ -115,25 +138,32 @@ async fn test_file_read_glob_file_count_cap() {
 #[tokio::test]
 async fn test_file_read_glob_traversal_blocked() {
     let tool = FileReadGlobTool::new(None);
-    let result = tool.execute(json!({"pattern": "../etc/*.conf"})).await;
+    let ctx = ToolCallContext::default();
+    let result = tool
+        .execute(json!({"pattern": "../etc/*.conf"}), &ctx)
+        .await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_validate_schema_valid() {
     let tool = ValidateSchemaTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({
-            "data": r#"{"name": "Alice", "age": 30}"#,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "age": {"type": "integer"}
-                },
-                "required": ["name", "age"]
-            }
-        }))
+        .execute(
+            json!({
+                "data": r#"{"name": "Alice", "age": 30}"#,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age": {"type": "integer"}
+                    },
+                    "required": ["name", "age"]
+                }
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -143,17 +173,21 @@ async fn test_validate_schema_valid() {
 #[tokio::test]
 async fn test_validate_schema_invalid() {
     let tool = ValidateSchemaTool::new();
+    let ctx = ToolCallContext::default();
     let result = tool
-        .execute(json!({
-            "data": r#"{"name": 123}"#,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"}
-                },
-                "required": ["name"]
-            }
-        }))
+        .execute(
+            json!({
+                "data": r#"{"name": 123}"#,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    },
+                    "required": ["name"]
+                }
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
