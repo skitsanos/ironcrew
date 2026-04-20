@@ -465,6 +465,16 @@ impl UserData for LuaCrew {
         // crew:conversation({agent = ..., model = ..., stream = ..., ...})
         // Creates a stateful multi-turn conversation bound to this crew.
         methods.add_async_method("conversation", |lua, this, table: Table| async move {
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Also covers
+            // MCP augmentation so conversations see the same augmented
+            // registry as crew:run().
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
+
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -502,7 +512,7 @@ impl UserData for LuaCrew {
                 table,
                 &agents,
                 provider,
-                this.runtime.tool_registry.clone(),
+                tool_registry,
                 &default_model,
                 max_tool_rounds,
                 eventbus,
@@ -519,6 +529,16 @@ impl UserData for LuaCrew {
         // crew:dialog({agents = {"name", ...}, starter = ..., ...})
         // Creates an agent-to-agent dialog with perspective-flipped histories.
         methods.add_async_method("dialog", |lua, this, table: Table| async move {
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Dialogs get
+            // the same augmented registry (built-ins + MCP + AgentAsTool)
+            // as crew:run() and crew:conversation().
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
+
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -554,7 +574,7 @@ impl UserData for LuaCrew {
                 table,
                 &agents,
                 provider,
-                this.runtime.tool_registry.clone(),
+                tool_registry,
                 &default_model,
                 max_tool_rounds,
                 eventbus,

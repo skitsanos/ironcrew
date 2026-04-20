@@ -569,6 +569,13 @@ impl AgentDialog {
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
         let has_tools = !tool_schemas.is_empty();
 
+        // Snapshot the turn index BEFORE tool dispatch so nested tool events
+        // attribute correctly to `<dialog_id>:t<turn_idx>`. `next_index` is
+        // the 0-based index of the turn we're about to produce — the same
+        // value that ends up in `DialogTurn.index` after execute_turn
+        // increments it post-LLM-loop.
+        let turn_idx = *self.next_index.lock().await;
+
         // For streaming, prefix the output with [agent_name]
         if self.stream {
             eprint!("\x1b[1m[{}]\x1b[0m ", agent.name);
@@ -632,7 +639,9 @@ impl AgentDialog {
             ));
 
             for tool_call in &response.tool_calls {
-                let result_text = self.execute_tool_call(tool_call).await;
+                let result_text = self
+                    .execute_tool_call(tool_call, &agent.name, turn_idx)
+                    .await;
                 working_messages.push(ChatMessage::tool(&tool_call.id, &result_text));
             }
         }
@@ -744,7 +753,12 @@ impl AgentDialog {
         result
     }
 
-    async fn execute_tool_call(&self, tool_call: &ToolCallRequest) -> String {
+    async fn execute_tool_call(
+        &self,
+        tool_call: &ToolCallRequest,
+        caller_agent: &str,
+        turn_idx: usize,
+    ) -> String {
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
@@ -757,12 +771,16 @@ impl AgentDialog {
 
         // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
         // tools can see them on their sandbox VMs (needed for sandbox-level
-        // primitives like `run_flow`).
+        // primitives like `run_flow`). `caller_scope` uses the
+        // `<dialog_id>:t<turn_idx>` shape so nested events (agent-as-tool,
+        // run_flow, etc.) attribute to the exact turn that triggered them.
         let tool_ctx = ToolCallContext {
             store: self.store.clone(),
             eventbus: Some(self.eventbus.clone()),
             depth: 0,
-            ..Default::default()
+            tool_registry: Some(self.tool_registry.clone()),
+            caller_agent: Some(caller_agent.to_string()),
+            caller_scope: Some(format!("{}:t{}", self.id, turn_idx)),
         };
 
         let tool_result = match tokio::time::timeout(
