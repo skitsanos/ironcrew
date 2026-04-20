@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use mlua::{Function, Result as LuaResult, Table};
 
-use crate::engine::agent::{Agent, ResponseFormat};
+use crate::engine::agent::{Agent, ResponseFormat, validate_agent_tool_name};
 use crate::engine::task::Task;
 use crate::lua::sandbox::create_tool_lua;
 use crate::utils::error::{IronCrewError, Result};
@@ -40,6 +40,11 @@ pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
                 .collect()
         })
         .unwrap_or_default();
+
+    // Validate any agent__<name> entries before we materialise the struct.
+    for tool in &tools {
+        validate_agent_tool_name(tool).map_err(mlua::Error::external)?;
+    }
 
     let response_format = parse_response_format(table)?;
 
