@@ -52,6 +52,14 @@ pub struct LuaCrew {
     /// Stored here so subsequent runs don't re-register MCP tools on each call.
     #[cfg(feature = "mcp")]
     pub mcp_tool_registry: Arc<Mutex<Option<crate::tools::registry::ToolRegistry>>>,
+    /// Lazy-finalized agent-as-tool registry. Populated on first
+    /// entry-point call (run / conversation / dialog / chat). Caches
+    /// both Ok and Err results — the same bad config always produces
+    /// the same error without re-running validation. To fix a bad
+    /// config, construct a fresh Crew via Crew.new().
+    #[allow(dead_code)] // wired into entry points in Tasks 11 & 12
+    pub(crate) agent_tools_finalized:
+        OnceCell<std::result::Result<Arc<FinalizedAgentTools>, String>>,
 }
 
 impl LuaCrew {
@@ -64,6 +72,24 @@ impl LuaCrew {
             .await?;
         Ok(store.clone())
     }
+
+    /// Ensure agent-as-tool finalization has run for this crew.
+    /// The result is cached: a second call returns the same
+    /// `Arc<FinalizedAgentTools>` on success, or the same error
+    /// string (wrapped as IronCrewError::Validation) on failure.
+    #[allow(dead_code)] // called by entry points in Tasks 11 & 12
+    pub(crate) async fn ensure_agent_tools_finalized(
+        &self,
+    ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
+        let result = self
+            .agent_tools_finalized
+            .get_or_init(|| async { finalize_agent_tools(self).await.map_err(|e| e.to_string()) })
+            .await;
+        match result {
+            Ok(ft) => Ok(ft.clone()),
+            Err(msg) => Err(IronCrewError::Validation(msg.clone())),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,11 +100,11 @@ impl LuaCrew {
 /// defaults captured at finalization time. Built once per `LuaCrew` on the
 /// first entry-point call (crew:run / :conversation / :dialog / :chat) and
 /// then reused for the lifetime of the crew.
-#[allow(dead_code)] // wired up in Task 10+ (cache field + entry-point plumbing)
 pub(crate) struct FinalizedAgentTools {
     /// Augmented registry = built-ins (+ MCP if present) + one
     /// `AgentAsTool` per distinct `agent__<name>` reference found across
     /// the crew's agent tool lists.
+    #[allow(dead_code)] // consumed by entry points in Tasks 11 & 12
     pub registry: crate::tools::registry::ToolRegistry,
     /// Crew-wide default model, captured so per-`AgentAsTool` callers
     /// don't need to re-lock the crew to find it.
@@ -101,7 +127,7 @@ pub(crate) struct FinalizedAgentTools {
 /// Errors if a reference points at an unknown agent name — this is a
 /// crew authoring bug, not a runtime failure, so we surface it eagerly
 /// rather than letting the LLM discover it at tool-call time.
-#[allow(dead_code)] // wired up in Task 10+ (cache field + entry-point plumbing)
+#[allow(dead_code)] // called by ensure_agent_tools_finalized, wired in Tasks 11 & 12
 pub(crate) async fn finalize_agent_tools(
     lua_crew: &LuaCrew,
 ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
