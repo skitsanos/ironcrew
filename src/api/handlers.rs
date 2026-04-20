@@ -389,6 +389,8 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
         CrewEvent::TaskRetry { .. } => "task_retry",
         CrewEvent::ToolCall { .. } => "tool_call",
         CrewEvent::ToolResult { .. } => "tool_result",
+        CrewEvent::AgentToolStarted { .. } => "agent_tool_started",
+        CrewEvent::AgentToolCompleted { .. } => "agent_tool_completed",
         CrewEvent::MessageSent { .. } => "message_sent",
         CrewEvent::CollaborationTurn { .. } => "collaboration_turn",
         CrewEvent::ConversationStarted { .. } => "conversation_started",

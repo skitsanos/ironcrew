@@ -77,6 +77,30 @@ pub enum CrewEvent {
         duration_ms: u64,
     },
 
+    // ─── Agent-as-tool lifecycle ────────────────────────────────────────────
+    /// Bracket event fired when an orchestrator agent invokes another agent
+    /// via `agent__<name>` as a tool. `caller` is the orchestrator's name;
+    /// `callee` is the invoked agent's name (bare, without the `agent__`
+    /// prefix). Emitted once, immediately before the sub-agent runs.
+    #[serde(rename = "agent_tool_started")]
+    AgentToolStarted {
+        caller: String,
+        callee: String,
+        prompt: String,
+    },
+
+    /// Bracket event fired when an agent-as-tool invocation completes.
+    /// `success` is false only if the invocation errored out at the
+    /// Rust/provider level — a sub-agent that returned a low-quality
+    /// reply still counts as success.
+    #[serde(rename = "agent_tool_completed")]
+    AgentToolCompleted {
+        caller: String,
+        callee: String,
+        duration_ms: u64,
+        success: bool,
+    },
+
     // ─── Agent messages ─────────────────────────────────────────────────────
     #[serde(rename = "message_sent")]
     MessageSent {
@@ -300,6 +324,33 @@ impl EventBus {
             max_replay_bytes,
             current_bytes: Arc::new(RwLock::new(0)),
         }
+    }
+}
+
+#[cfg(test)]
+mod event_shape_tests {
+    use super::*;
+
+    #[test]
+    fn agent_tool_events_serialize_with_expected_tags() {
+        let started = CrewEvent::AgentToolStarted {
+            caller: "coord".into(),
+            callee: "researcher".into(),
+            prompt: "find facts".into(),
+        };
+        let completed = CrewEvent::AgentToolCompleted {
+            caller: "coord".into(),
+            callee: "researcher".into(),
+            duration_ms: 42,
+            success: true,
+        };
+        let started_json = serde_json::to_value(&started).unwrap();
+        assert_eq!(started_json["event"], "agent_tool_started");
+        assert_eq!(started_json["data"]["caller"], "coord");
+
+        let completed_json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(completed_json["event"], "agent_tool_completed");
+        assert_eq!(completed_json["data"]["duration_ms"], 42);
     }
 }
 
