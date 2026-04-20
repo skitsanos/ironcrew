@@ -566,6 +566,8 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
         CrewEvent::TaskThinking { .. } => "task_thinking",
         CrewEvent::ToolCall { .. } => "tool_call",
         CrewEvent::ToolResult { .. } => "tool_result",
+        CrewEvent::AgentToolStarted { .. } => "agent_tool_started",
+        CrewEvent::AgentToolCompleted { .. } => "agent_tool_completed",
         _ => "log",
     }
 }
@@ -650,6 +652,8 @@ fn is_conversation_event(event: &CrewEvent) -> bool {
             | CrewEvent::TaskThinking { .. }
             | CrewEvent::ToolCall { .. }
             | CrewEvent::ToolResult { .. }
+            | CrewEvent::AgentToolStarted { .. }
+            | CrewEvent::AgentToolCompleted { .. }
     )
 }
 
