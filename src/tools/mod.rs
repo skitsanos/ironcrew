@@ -18,22 +18,57 @@ use crate::llm::provider::ToolSchema;
 use crate::utils::error::Result;
 use async_trait::async_trait;
 
-/// Context handed to every `Tool::execute` invocation.
-///
-/// Primarily used by `LuaScriptTool` to seed the per-call Lua VM's app-data
-/// so that sandbox-level primitives like `run_flow()` can reach the runtime,
-/// the shared store, and the current subflow depth. Built-in tools ignore
-/// every field — the parameter is kept as `&ToolCallContext` (not optional)
-/// so call sites make the intent explicit.
-#[derive(Clone, Default)]
+/// Runtime context passed to every `Tool::execute` call. Fields are
+/// populated by the caller and read by tools that need them; most
+/// built-in tools ignore the whole thing.
+#[derive(Default, Clone)]
 pub struct ToolCallContext {
-    /// Shared state store (if the caller has one instantiated).
+    /// Persistent session store (conversation/dialog records). `None`
+    /// in CLI one-shot paths that don't need persistence.
     pub store: Option<Arc<dyn StateStore>>,
-    /// EventBus the caller wants log/telemetry events routed through.
+
+    /// Event bus for telemetry. `None` in test contexts where events
+    /// aren't observed.
     pub eventbus: Option<EventBus>,
-    /// Current subflow nesting depth. Sub-flows spawned from the tool inherit
-    /// `depth + 1`. Root callers pass `0`.
+
+    /// Sub-flow / agent-tool nesting depth. Checked against
+    /// `IRONCREW_MAX_FLOW_DEPTH` by delegation primitives.
     pub depth: usize,
+
+    /// Caller's augmented tool registry (built-ins + MCP tools + agent-tools).
+    /// Agent-as-tool invocations read this so the sub-agent inherits
+    /// the caller's tool view. `None` in admin/CLI-run paths that haven't
+    /// built an augmented view.
+    pub tool_registry: Option<registry::ToolRegistry>,
+
+    /// Name of the agent whose tool-call loop triggered this dispatch.
+    /// Used by `AgentAsTool` to attribute `AgentToolStarted` /
+    /// `AgentToolCompleted` events. `None` when the caller is a
+    /// top-level script outside any agent loop.
+    pub caller_agent: Option<String>,
+
+    /// Correlation identifier for the outer orchestration context
+    /// (task name, conversation id, dialog id, etc.). Used as the
+    /// `task` field on nested `ToolCall` / `ToolResult` / `TaskThinking`
+    /// events so sub-agent activity is attributable to the parent.
+    /// Propagated unchanged through agent-as-tool nesting.
+    pub caller_scope: Option<String>,
+}
+
+impl std::fmt::Debug for ToolCallContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallContext")
+            .field("store", &self.store.as_ref().map(|_| "<StateStore>"))
+            .field("eventbus", &self.eventbus.as_ref().map(|_| "<EventBus>"))
+            .field("depth", &self.depth)
+            .field(
+                "tool_registry",
+                &self.tool_registry.as_ref().map(|_| "<ToolRegistry>"),
+            )
+            .field("caller_agent", &self.caller_agent)
+            .field("caller_scope", &self.caller_scope)
+            .finish()
+    }
 }
 
 #[async_trait]
