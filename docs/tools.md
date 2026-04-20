@@ -219,6 +219,24 @@ the tool sandbox. You have three options when a custom tool needs remote data:
 
 ---
 
+## Delegation primitives
+
+IronCrew gives you three primitives for running specialist work from
+a top-level agent or crew:
+
+| Primitive | When | Flavor |
+|---|---|---|
+| `agent__<name>` (tool entry) | one agent delegates a single question to another agent defined on the same crew | chat-driven, ephemeral |
+| `run_flow("<path>")` (Lua global) | top-level script or tool calls a sub-crew's full pipeline | programmatic, depth-bounded |
+| `crew:subworkflow(child_crew)` | Rust/Lua code structures nested crews at construction time | compile-time composition |
+
+All three share the `IRONCREW_MAX_FLOW_DEPTH` cap (default `5`) so deeply-nested
+delegation doesn't run away.
+
+See [docs/agents.md](agents.md#agent-as-tool) for agent-as-tool usage and examples.
+
+---
+
 ## `run_flow` (sub-crew delegation)
 
 `run_flow(path, input)` is a sandbox-level primitive that invokes another
