@@ -84,3 +84,45 @@ async fn run_single_agent_turn_single_pass() {
     assert_eq!(last.role, "assistant");
     assert_eq!(last.content.as_deref(), Some("stub-reply-hello"));
 }
+
+/// Design invariant guard: the headless helper must NEVER emit any
+/// `Conversation*` event — those are session-scoped and belong to
+/// `LuaConversationInner::run_turn`. Emitting them from the helper would
+/// leak spurious events into agent-as-tool / subflow callers that have no
+/// conversation id to attribute.
+#[tokio::test]
+async fn run_single_agent_turn_does_not_emit_conversation_events() {
+    use ironcrew::engine::eventbus::{CrewEvent, EventBus};
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(EchoProvider);
+    let agent = Agent {
+        name: "tester".into(),
+        goal: "invariant guard".into(),
+        ..Default::default()
+    };
+    let bus = EventBus::new(64);
+    let mut rx = bus.subscribe();
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+    let ctx = ToolCallContext {
+        eventbus: Some(bus),
+        ..Default::default()
+    };
+
+    let _ = run_single_agent_turn(&agent, &provider, "stub", 5, Some(50), &mut history, &ctx)
+        .await
+        .expect("helper returned Ok");
+
+    // Drain any events; none may be a ConversationStarted/Turn/Thinking.
+    while let Ok(event) = rx.try_recv() {
+        let is_conv = matches!(
+            event.as_ref(),
+            CrewEvent::ConversationStarted { .. }
+                | CrewEvent::ConversationTurn { .. }
+                | CrewEvent::ConversationThinking { .. },
+        );
+        assert!(
+            !is_conv,
+            "ephemeral helper leaked conversation event: {event:?}"
+        );
+    }
+}
