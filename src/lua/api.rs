@@ -424,6 +424,7 @@ pub fn register_crew_constructor(
             mcp_manager: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "mcp")]
             mcp_tool_registry: Arc::new(tokio::sync::Mutex::new(None)),
+            agent_tools_finalized: tokio::sync::OnceCell::new(),
         };
 
         // In chat mode, stash the userdata in the registry so the CLI/HTTP
