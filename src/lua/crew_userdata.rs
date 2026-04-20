@@ -10,6 +10,7 @@ use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
+use crate::tools::agent_as_tool::AgentAsTool;
 use crate::utils::error::{IronCrewError, Result};
 
 #[cfg(feature = "mcp")]
@@ -63,6 +64,137 @@ impl LuaCrew {
             .await?;
         Ok(store.clone())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-as-tool finalization
+// ---------------------------------------------------------------------------
+
+/// Snapshot of a crew's agent-as-tool registrations plus the per-crew
+/// defaults captured at finalization time. Built once per `LuaCrew` on the
+/// first entry-point call (crew:run / :conversation / :dialog / :chat) and
+/// then reused for the lifetime of the crew.
+#[allow(dead_code)] // wired up in Task 10+ (cache field + entry-point plumbing)
+pub(crate) struct FinalizedAgentTools {
+    /// Augmented registry = built-ins (+ MCP if present) + one
+    /// `AgentAsTool` per distinct `agent__<name>` reference found across
+    /// the crew's agent tool lists.
+    pub registry: crate::tools::registry::ToolRegistry,
+    /// Crew-wide default model, captured so per-`AgentAsTool` callers
+    /// don't need to re-lock the crew to find it.
+    #[allow(dead_code)] // captured for observability / future use
+    pub default_model: String,
+    /// Crew-wide tool-round cap, mirrored into each `AgentAsTool`.
+    #[allow(dead_code)]
+    pub max_tool_rounds: usize,
+    /// Resolved conversation history cap (see
+    /// `conversation::default_max_history`).
+    #[allow(dead_code)]
+    pub max_history: Option<usize>,
+}
+
+/// Finalize agent-as-tool registrations for a crew. Runs once per
+/// `LuaCrew` on first entry-point call. Returns an augmented tool
+/// registry containing built-ins + MCP (if present) + one `AgentAsTool`
+/// per distinct `agent__<name>` reference across all agents' tool lists.
+///
+/// Errors if a reference points at an unknown agent name — this is a
+/// crew authoring bug, not a runtime failure, so we surface it eagerly
+/// rather than letting the LLM discover it at tool-call time.
+#[allow(dead_code)] // wired up in Task 10+ (cache field + entry-point plumbing)
+pub(crate) async fn finalize_agent_tools(
+    lua_crew: &LuaCrew,
+) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
+    // 1. Snapshot everything we need off the crew under a short lock.
+    let (agents, default_model, max_tool_rounds) = {
+        let crew_guard = lua_crew.crew.lock().await;
+        (
+            crew_guard.agents.clone(),
+            crew_guard.provider_config.model.clone(),
+            crew_guard.max_tool_rounds,
+        )
+    };
+    let max_history = crate::lua::conversation::default_max_history();
+
+    // 2. Collect distinct `agent__<name>` suffixes across every agent's
+    //    tools list. BTreeSet gives stable ordering for deterministic
+    //    registration and cheap dedup.
+    let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for a in &agents {
+        for t in &a.tools {
+            if let Some(suffix) = t.strip_prefix("agent__") {
+                needed.insert(suffix.to_string());
+            }
+        }
+    }
+
+    // 3. Start with the base registry. If MCP is compiled in and the
+    //    augmented registry has already been built, layer on top of that
+    //    instead of the bare runtime registry — agent tools should see
+    //    MCP tools too.
+    #[cfg(feature = "mcp")]
+    let base_registry = {
+        let guard = lua_crew.mcp_tool_registry.lock().await;
+        guard
+            .clone()
+            .unwrap_or_else(|| lua_crew.runtime.tool_registry.clone())
+    };
+    #[cfg(not(feature = "mcp"))]
+    let base_registry = lua_crew.runtime.tool_registry.clone();
+
+    let mut registry = base_registry;
+
+    // 4. Resolve provider + project_dir + weak runtime handle once.
+    let provider: Arc<dyn LlmProvider> = match &lua_crew.custom_provider {
+        Some(p) => p.clone(),
+        None => lua_crew.runtime.provider.clone(),
+    };
+    let project_dir = Arc::new(lua_crew.project_dir.clone());
+
+    // Obtain `Weak<Runtime>` by upgrading the runtime's stored self-ref
+    // and re-downgrading. `set_self_ref` is called from
+    // `setup_crew_runtime`; if we get here without it, something is
+    // wrong with bootstrap and we refuse to finalize.
+    let runtime_arc = lua_crew.runtime.upgrade_self().ok_or_else(|| {
+        IronCrewError::Validation(
+            "Agent-as-tool: Runtime self-ref not initialized (set_self_ref \
+             was not called after Arc::new); cannot finalize agent tools"
+                .into(),
+        )
+    })?;
+    let runtime_weak: std::sync::Weak<Runtime> = Arc::downgrade(&runtime_arc);
+    drop(runtime_arc);
+
+    // 5. Build one `AgentAsTool` per distinct callee, validating that
+    //    each referenced name resolves to an actual agent.
+    for callee in &needed {
+        let agent = agents.iter().find(|a| &a.name == callee).ok_or_else(|| {
+            IronCrewError::Validation(format!(
+                "Agent-as-tool: unknown agent '{}' referenced in a tools list \
+                 (as 'agent__{}'); no agent by that name was added to the crew",
+                callee, callee
+            ))
+        })?;
+
+        let resolved_model = agent.model.clone().unwrap_or_else(|| default_model.clone());
+        let tool = AgentAsTool::new(
+            agent.clone(),
+            provider.clone(),
+            runtime_weak.clone(),
+            resolved_model,
+            max_tool_rounds,
+            max_history,
+            project_dir.clone(),
+        );
+        registry.register_arc(Arc::new(tool));
+    }
+
+    Ok(Arc::new(FinalizedAgentTools {
+        registry,
+        default_model,
+        max_tool_rounds,
+        max_history,
+    }))
 }
 
 impl UserData for LuaCrew {
