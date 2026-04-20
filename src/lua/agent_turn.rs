@@ -38,7 +38,7 @@ use crate::utils::error::{IronCrewError, Result};
 ///   `TaskThinking` events. `None` suppresses telemetry silently.
 /// * `ctx.caller_scope` supplies the `task` field on events. When
 ///   absent, falls back to `agent__<agent.name>`.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_single_agent_turn(
     agent: &Agent,
     provider: &Arc<dyn LlmProvider>,
@@ -171,7 +171,6 @@ pub async fn run_single_agent_turn(
 
 /// Trim `history` in-place if it exceeds `limit` non-system messages.
 /// Preserves the system message at index 0.
-#[allow(dead_code)]
 fn enforce_history_cap(history: &mut Vec<ChatMessage>, max_history: Option<usize>) {
     let Some(cap) = max_history else {
         return;

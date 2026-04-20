@@ -12,7 +12,6 @@
 //! bouncing back through the Lua VM.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
 use tokio::sync::Mutex;
@@ -21,9 +20,7 @@ use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::sessions::{ConversationRecord, validate_session_id};
 use crate::engine::store::StateStore;
-use crate::llm::provider::{
-    ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
-};
+use crate::llm::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk};
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
@@ -235,13 +232,41 @@ impl LuaConversationInner {
     }
 
     /// Run a single send/respond round (with tool-call loop) and return the
-    /// full ChatResponse plus any reasoning captured across tool rounds.
+    /// assistant text plus any reasoning captured across tool rounds.
+    ///
+    /// Thin wrapper over `run_turn_with_ctx` that supplies a default
+    /// (empty) caller context — the conversation's own `store`, `eventbus`,
+    /// and `tool_registry` fill in the helper's `ToolCallContext`.
     pub async fn run_turn(
         &self,
         user_message: &str,
         images: Option<Vec<crate::llm::provider::ImageInput>>,
     ) -> Result<(String, Option<String>), IronCrewError> {
-        // Append the user message to history
+        self.run_turn_with_ctx(user_message, images, &ToolCallContext::default())
+            .await
+    }
+
+    /// `run_turn` variant that threads an explicit `ToolCallContext`
+    /// through to the shared single-turn helper. Used by callers
+    /// (agent-as-tool, nested sub-flows) that already have
+    /// `depth` / `caller_scope` / `caller_agent` populated and want those
+    /// values preserved on any nested dispatch this turn triggers.
+    ///
+    /// `caller_ctx` semantics — per field, the helper context is built as
+    /// "caller's value, falling back to the conversation's own":
+    ///   * `store`          — caller override, else `self.store`
+    ///   * `eventbus`       — caller override, else `self.eventbus`
+    ///   * `tool_registry`  — caller override, else `self.tool_registry`
+    ///   * `depth`          — taken from caller (unchanged)
+    ///   * `caller_scope`   — taken from caller, else `self.id`
+    ///   * `caller_agent`   — always this conversation's agent name
+    pub async fn run_turn_with_ctx(
+        &self,
+        user_message: &str,
+        images: Option<Vec<crate::llm::provider::ImageInput>>,
+        caller_ctx: &ToolCallContext,
+    ) -> Result<(String, Option<String>), IronCrewError> {
+        // 1. Append the user message to history.
         {
             let mut history = self.messages.lock().await;
             if let Some(imgs) = images {
@@ -252,128 +277,135 @@ impl LuaConversationInner {
             self.enforce_history_cap(&mut history);
         }
 
-        let tool_schemas = self.tool_registry.schemas_for(&self.agent.tools);
-        let has_tools = !tool_schemas.is_empty();
+        let has_tools = !self.agent.tools.is_empty();
 
-        let mut accumulated_reasoning = String::new();
-        let mut rounds = 0usize;
-
-        loop {
-            // Snapshot the current message list for the request
-            let messages_snapshot: Vec<ChatMessage> = {
-                let history = self.messages.lock().await;
-                history.clone()
+        // 2. Streaming special case — preserve the original stream+no-tools
+        //    path. The headless helper does not support streaming (Task 6
+        //    scope), so when the caller opted into streaming and the agent
+        //    has no tools, we keep the original inline branch.
+        let (content, reasoning) = if self.stream && !has_tools {
+            self.run_turn_streaming_no_tools().await?
+        } else {
+            // 3. Non-streaming (or tools-present) path: delegate to the
+            //    shared helper under the history lock. The lock is held
+            //    across the helper's awaits on purpose — `self.messages`
+            //    has a single writer per turn, and releasing it mid-turn
+            //    would let a concurrent caller interleave user messages.
+            //    `tokio::sync::Mutex` is await-safe so this is fine.
+            let helper_ctx = ToolCallContext {
+                store: caller_ctx.store.clone().or_else(|| self.store.clone()),
+                eventbus: Some(
+                    caller_ctx
+                        .eventbus
+                        .clone()
+                        .unwrap_or_else(|| self.eventbus.clone()),
+                ),
+                depth: caller_ctx.depth,
+                tool_registry: Some(
+                    caller_ctx
+                        .tool_registry
+                        .clone()
+                        .unwrap_or_else(|| self.tool_registry.clone()),
+                ),
+                caller_agent: Some(self.agent.name.clone()),
+                caller_scope: Some(
+                    caller_ctx
+                        .caller_scope
+                        .clone()
+                        .unwrap_or_else(|| self.id.clone()),
+                ),
             };
 
-            let request = ChatRequest {
-                messages: messages_snapshot,
-                model: self.model.clone(),
-                temperature: self.agent.temperature,
-                max_tokens: self.agent.max_tokens,
-                response_format: self.agent.response_format.clone(),
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-            };
+            let mut history = self.messages.lock().await;
+            crate::lua::agent_turn::run_single_agent_turn(
+                &self.agent,
+                &self.provider,
+                &self.model,
+                self.max_tool_rounds,
+                self.max_history,
+                &mut history,
+                &helper_ctx,
+            )
+            .await?
+        };
 
-            let response: ChatResponse = if self.stream && !has_tools {
-                self.call_streaming(request).await?
-            } else if has_tools {
-                self.provider
-                    .chat_with_tools(request, &tool_schemas)
-                    .await?
-            } else {
-                self.provider.chat(request).await?
-            };
+        // 4. Compute turn index and emit conversation lifecycle events.
+        //    `turn_index` is 0-based: the number of user messages already
+        //    in history (including the one we just pushed) minus 1.
+        let turn_index = {
+            let history = self.messages.lock().await;
+            history
+                .iter()
+                .filter(|m| m.role == "user")
+                .count()
+                .saturating_sub(1)
+        };
 
-            if let Some(ref r) = response.reasoning {
-                if !accumulated_reasoning.is_empty() {
-                    accumulated_reasoning.push('\n');
-                }
-                accumulated_reasoning.push_str(r);
-            }
+        self.eventbus.emit(CrewEvent::ConversationTurn {
+            conversation_id: self.id.clone(),
+            agent: self.agent.name.clone(),
+            turn_index,
+            user_message: user_message.to_string(),
+            assistant_message: content.clone(),
+        });
 
-            // No tool calls → final response
-            if response.tool_calls.is_empty() {
-                let content = response
-                    .content
-                    .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
-
-                let turn_index = {
-                    let mut history = self.messages.lock().await;
-                    history.push(ChatMessage::assistant(Some(content.clone()), None));
-                    self.enforce_history_cap(&mut history);
-                    // Each completed turn adds 2 messages (user + assistant) on top of system.
-                    // turn_index is 0-based: count of user messages already in history minus 1.
-                    history
-                        .iter()
-                        .filter(|m| m.role == "user")
-                        .count()
-                        .saturating_sub(1)
-                };
-
-                let reasoning = if accumulated_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(accumulated_reasoning)
-                };
-
-                // Emit SSE events for this completed turn
-                self.eventbus.emit(CrewEvent::ConversationTurn {
-                    conversation_id: self.id.clone(),
-                    agent: self.agent.name.clone(),
-                    turn_index,
-                    user_message: user_message.to_string(),
-                    assistant_message: content.clone(),
-                });
-
-                if let Some(ref r) = reasoning {
-                    self.eventbus.emit(CrewEvent::ConversationThinking {
-                        conversation_id: self.id.clone(),
-                        agent: self.agent.name.clone(),
-                        turn_index,
-                        content: r.clone(),
-                    });
-                }
-
-                // Autosave after each successful turn (no-op for sessions
-                // without a store or with autosave disabled).
-                if self.autosave
-                    && self.persistent
-                    && let Err(e) = self.persist().await
-                {
-                    tracing::warn!("Autosave failed for conversation '{}': {}", self.id, e);
-                }
-
-                return Ok((content, reasoning));
-            }
-
-            // Tool round
-            rounds += 1;
-            if rounds > self.max_tool_rounds {
-                return Err(IronCrewError::Validation(format!(
-                    "Conversation exceeded max tool rounds ({}) for agent '{}'",
-                    self.max_tool_rounds, self.agent.name
-                )));
-            }
-
-            // Append the assistant's tool-call request to history
-            {
-                let mut history = self.messages.lock().await;
-                history.push(ChatMessage::assistant(
-                    response.content.clone(),
-                    Some(response.tool_calls.clone()),
-                ));
-                self.enforce_history_cap(&mut history);
-            }
-
-            // Execute each tool call and append results
-            for tool_call in &response.tool_calls {
-                let result_text = self.execute_tool_call(tool_call).await;
-                let mut history = self.messages.lock().await;
-                history.push(ChatMessage::tool(&tool_call.id, &result_text));
-                self.enforce_history_cap(&mut history);
-            }
+        if let Some(ref r) = reasoning {
+            self.eventbus.emit(CrewEvent::ConversationThinking {
+                conversation_id: self.id.clone(),
+                agent: self.agent.name.clone(),
+                turn_index,
+                content: r.clone(),
+            });
         }
+
+        // 5. Autosave after each successful turn (no-op for sessions
+        //    without a store or with autosave disabled).
+        if self.autosave
+            && self.persistent
+            && let Err(e) = self.persist().await
+        {
+            tracing::warn!("Autosave failed for conversation '{}': {}", self.id, e);
+        }
+
+        Ok((content, reasoning))
+    }
+
+    /// Streaming no-tools turn. The user message has already been pushed
+    /// by the caller; this method issues one streaming provider call,
+    /// appends the assistant reply, and returns (content, reasoning).
+    ///
+    /// Tool-call rounds are not supported here by design — the shared
+    /// helper owns that path and does not stream. Callers must check
+    /// `has_tools` before dispatching to this method.
+    async fn run_turn_streaming_no_tools(&self) -> Result<(String, Option<String>), IronCrewError> {
+        let messages_snapshot: Vec<ChatMessage> = {
+            let history = self.messages.lock().await;
+            history.clone()
+        };
+
+        let request = ChatRequest {
+            messages: messages_snapshot,
+            model: self.model.clone(),
+            temperature: self.agent.temperature,
+            max_tokens: self.agent.max_tokens,
+            response_format: self.agent.response_format.clone(),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let response = self.call_streaming(request).await?;
+
+        let content = response
+            .content
+            .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+
+        {
+            let mut history = self.messages.lock().await;
+            history.push(ChatMessage::assistant(Some(content.clone()), None));
+            self.enforce_history_cap(&mut history);
+        }
+
+        Ok((content, response.reasoning))
     }
 
     /// Stream a request to stderr (with dim reasoning) and return the response.
@@ -406,50 +438,6 @@ impl LuaConversationInner {
         let result = self.provider.chat_stream(request, tx).await;
         print_handle.await.ok();
         result
-    }
-
-    /// Execute a single tool call with the configured timeout, returning a
-    /// human-readable result string (errors are stringified into the message).
-    async fn execute_tool_call(&self, tool_call: &ToolCallRequest) -> String {
-        let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-        let tool_timeout = Duration::from_secs(
-            std::env::var("IRONCREW_TOOL_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-        );
-
-        // Seed the tool-call context with the store + eventbus this
-        // conversation is already using. `LuaScriptTool` pulls these back out
-        // on its sandbox Lua VM so custom tools can call `run_flow` and have
-        // it inherit the same store/SSE channel as the parent conversation.
-        let tool_ctx = ToolCallContext {
-            store: self.store.clone(),
-            eventbus: Some(self.eventbus.clone()),
-            depth: 0,
-            ..Default::default()
-        };
-
-        let tool_result = match tokio::time::timeout(
-            tool_timeout,
-            self.tool_registry
-                .execute(&tool_call.function.name, args, &tool_ctx),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(IronCrewError::ToolExecution {
-                tool: tool_call.function.name.clone(),
-                message: format!("Tool timed out after {}s", tool_timeout.as_secs()),
-            }),
-        };
-
-        match tool_result {
-            Ok(output) => output,
-            Err(e) => format!("Tool error: {}", e),
-        }
     }
 
     /// Trim history if it exceeds the configured cap. Always preserves the
