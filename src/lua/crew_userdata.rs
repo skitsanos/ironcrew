@@ -57,7 +57,6 @@ pub struct LuaCrew {
     /// both Ok and Err results — the same bad config always produces
     /// the same error without re-running validation. To fix a bad
     /// config, construct a fresh Crew via Crew.new().
-    #[allow(dead_code)] // wired into entry points in Tasks 11 & 12
     pub(crate) agent_tools_finalized:
         OnceCell<std::result::Result<Arc<FinalizedAgentTools>, String>>,
 }
@@ -77,7 +76,6 @@ impl LuaCrew {
     /// The result is cached: a second call returns the same
     /// `Arc<FinalizedAgentTools>` on success, or the same error
     /// string (wrapped as IronCrewError::Validation) on failure.
-    #[allow(dead_code)] // called by entry points in Tasks 11 & 12
     pub(crate) async fn ensure_agent_tools_finalized(
         &self,
     ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
@@ -104,19 +102,7 @@ pub(crate) struct FinalizedAgentTools {
     /// Augmented registry = built-ins (+ MCP if present) + one
     /// `AgentAsTool` per distinct `agent__<name>` reference found across
     /// the crew's agent tool lists.
-    #[allow(dead_code)] // consumed by entry points in Tasks 11 & 12
     pub registry: crate::tools::registry::ToolRegistry,
-    /// Crew-wide default model, captured so per-`AgentAsTool` callers
-    /// don't need to re-lock the crew to find it.
-    #[allow(dead_code)] // captured for observability / future use
-    pub default_model: String,
-    /// Crew-wide tool-round cap, mirrored into each `AgentAsTool`.
-    #[allow(dead_code)]
-    pub max_tool_rounds: usize,
-    /// Resolved conversation history cap (see
-    /// `conversation::default_max_history`).
-    #[allow(dead_code)]
-    pub max_history: Option<usize>,
 }
 
 /// Finalize agent-as-tool registrations for a crew. Runs once per
@@ -127,7 +113,6 @@ pub(crate) struct FinalizedAgentTools {
 /// Errors if a reference points at an unknown agent name — this is a
 /// crew authoring bug, not a runtime failure, so we surface it eagerly
 /// rather than letting the LLM discover it at tool-call time.
-#[allow(dead_code)] // called by ensure_agent_tools_finalized, wired in Tasks 11 & 12
 pub(crate) async fn finalize_agent_tools(
     lua_crew: &LuaCrew,
 ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
@@ -193,12 +178,11 @@ pub(crate) async fn finalize_agent_tools(
 
     let mut registry = base_registry;
 
-    // 4. Resolve provider + project_dir + weak runtime handle once.
+    // 4. Resolve provider + weak runtime handle once.
     let provider: Arc<dyn LlmProvider> = match &lua_crew.custom_provider {
         Some(p) => p.clone(),
         None => lua_crew.runtime.provider.clone(),
     };
-    let project_dir = Arc::new(lua_crew.project_dir.clone());
 
     // Obtain `Weak<Runtime>` by upgrading the runtime's stored self-ref
     // and re-downgrading. `set_self_ref` is called from
@@ -233,17 +217,11 @@ pub(crate) async fn finalize_agent_tools(
             resolved_model,
             max_tool_rounds,
             max_history,
-            project_dir.clone(),
         );
         registry.register_arc(Arc::new(tool));
     }
 
-    Ok(Arc::new(FinalizedAgentTools {
-        registry,
-        default_model,
-        max_tool_rounds,
-        max_history,
-    }))
+    Ok(Arc::new(FinalizedAgentTools { registry }))
 }
 
 impl UserData for LuaCrew {
