@@ -347,10 +347,15 @@ mod event_shape_tests {
         let started_json = serde_json::to_value(&started).unwrap();
         assert_eq!(started_json["event"], "agent_tool_started");
         assert_eq!(started_json["data"]["caller"], "coord");
+        assert_eq!(started_json["data"]["callee"], "researcher");
+        assert_eq!(started_json["data"]["prompt"], "find facts");
 
         let completed_json = serde_json::to_value(&completed).unwrap();
         assert_eq!(completed_json["event"], "agent_tool_completed");
+        assert_eq!(completed_json["data"]["caller"], "coord");
+        assert_eq!(completed_json["data"]["callee"], "researcher");
         assert_eq!(completed_json["data"]["duration_ms"], 42);
+        assert_eq!(completed_json["data"]["success"], true);
     }
 }
 
