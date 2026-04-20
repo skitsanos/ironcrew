@@ -25,6 +25,22 @@ use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
+/// Resolve the default max_history cap when no explicit Lua-side value is
+/// provided. Honors `IRONCREW_CONVERSATION_MAX_HISTORY` (0 → unbounded),
+/// falling back to a safe 50-message cap. Shared with non-conversation
+/// consumers (e.g. `AgentAsTool` finalization) so they apply the same
+/// policy as the user-facing `crew:conversation()` path.
+pub(crate) fn default_max_history() -> Option<usize> {
+    let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    match env_default {
+        Some(0) => None, // env var explicitly disables the cap
+        Some(n) => Some(n),
+        None => Some(50), // safe default
+    }
+}
+
 /// Shared inner state of a conversation. All methods live here so that
 /// non-Lua consumers (HTTP API, CLI REPL) can call them via
 /// `Arc<LuaConversationInner>` without a Lua round-trip.
@@ -700,16 +716,7 @@ pub async fn build_conversation(
     let max_history: Option<usize> = match table.get::<usize>("max_history") {
         Ok(0) => None, // explicit unbounded opt-in
         Ok(n) => Some(n),
-        Err(_) => {
-            let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
-            match env_default {
-                Some(0) => None, // env var explicitly disables the cap
-                Some(n) => Some(n),
-                None => Some(50), // safe default
-            }
-        }
+        Err(_) => default_max_history(),
     };
 
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
