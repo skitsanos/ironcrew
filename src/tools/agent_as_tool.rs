@@ -13,7 +13,6 @@
 //!    the caller's augmented tool registry so the sub-agent sees
 //!    built-ins + MCP tools + sibling agent-tools.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -31,7 +30,6 @@ use crate::utils::error::{IronCrewError, Result};
 /// constructed during lazy crew finalization (one per distinct
 /// `agent__<name>` reference) and registered alongside built-ins and
 /// MCP tools so another agent's LLM can call them by name.
-#[allow(dead_code)] // wired up in Tasks 9 + 10 (lazy finalization + registration)
 pub struct AgentAsTool {
     /// Fully qualified tool name — always `agent__<agent.name>`.
     name: String,
@@ -46,17 +44,12 @@ pub struct AgentAsTool {
     resolved_model: String,
     max_tool_rounds: usize,
     max_history: Option<usize>,
-    /// Retained for future per-tool path scoping (e.g. file tools).
-    #[allow(dead_code)]
-    project_dir: Arc<PathBuf>,
     /// Pre-computed description so `Tool::description(&self) -> &str`
     /// can return a stable borrow without leaking memory.
     description_cached: String,
 }
 
 impl AgentAsTool {
-    #[allow(dead_code, clippy::too_many_arguments)]
-    // wired up in Tasks 9 + 10 (lazy finalization + registration)
     pub fn new(
         agent: Agent,
         provider: Arc<dyn LlmProvider>,
@@ -64,7 +57,6 @@ impl AgentAsTool {
         resolved_model: String,
         max_tool_rounds: usize,
         max_history: Option<usize>,
-        project_dir: Arc<PathBuf>,
     ) -> Self {
         let name = format!("agent__{}", agent.name);
         let description_cached = format!(
@@ -80,7 +72,6 @@ impl AgentAsTool {
             resolved_model,
             max_tool_rounds,
             max_history,
-            project_dir,
             description_cached,
         }
     }
@@ -192,7 +183,7 @@ impl Tool for AgentAsTool {
             bus.emit(CrewEvent::AgentToolCompleted {
                 caller: caller_name,
                 callee: self.agent.name.clone(),
-                duration_ms: started.elapsed().as_millis() as u64,
+                duration_ms: started.elapsed().as_millis().max(1) as u64,
                 success: turn_result.is_ok(),
             });
         }

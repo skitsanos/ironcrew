@@ -8,7 +8,6 @@
 //! Two cases are intentionally skipped with pointers to the primary test
 //! site — see the `test_06_*` and `test_07_*` stubs.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -193,7 +192,6 @@ fn build_tool(
         resolved_model.into(),
         5,
         Some(50),
-        Arc::new(PathBuf::from("/tmp")),
     )
 }
 
@@ -664,21 +662,22 @@ async fn test_09_bracket_events_fire_on_invocation() {
     assert_eq!(caller, "coordinator");
     assert_eq!(callee, "researcher");
 
-    let (caller2, callee2, success) = events
+    let (caller2, callee2, duration_ms, success) = events
         .iter()
         .find_map(|e| match e.as_ref() {
             CrewEvent::AgentToolCompleted {
                 caller,
                 callee,
+                duration_ms,
                 success,
-                ..
-            } => Some((caller.clone(), callee.clone(), *success)),
+            } => Some((caller.clone(), callee.clone(), *duration_ms, *success)),
             _ => None,
         })
         .expect("AgentToolCompleted must exist");
     assert_eq!(caller2, "coordinator");
     assert_eq!(callee2, "researcher");
     assert!(success, "successful turn should set success=true");
+    assert!(duration_ms > 0, "duration_ms should be positive");
 }
 
 /// Test 10 — Inner tool events (`ToolCall` + `ToolResult`) fire for
