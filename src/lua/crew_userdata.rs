@@ -157,13 +157,36 @@ pub(crate) async fn finalize_agent_tools(
     // 3. Start with the base registry. If MCP is compiled in and the
     //    augmented registry has already been built, layer on top of that
     //    instead of the bare runtime registry — agent tools should see
-    //    MCP tools too.
+    //    MCP tools too. If MCP is configured but not yet connected,
+    //    connect all servers now and cache the augmented registry +
+    //    manager on the LuaCrew for reuse.
     #[cfg(feature = "mcp")]
     let base_registry = {
-        let guard = lua_crew.mcp_tool_registry.lock().await;
-        guard
-            .clone()
-            .unwrap_or_else(|| lua_crew.runtime.tool_registry.clone())
+        let cached = {
+            let guard = lua_crew.mcp_tool_registry.lock().await;
+            guard.clone()
+        };
+        if let Some(registry) = cached {
+            registry
+        } else if let Some(ref mcp_cfg) = lua_crew.mcp_config {
+            if mcp_cfg.is_empty() {
+                lua_crew.runtime.tool_registry.clone()
+            } else {
+                let mut registry = lua_crew.runtime.tool_registry.clone();
+                let manager = McpConnectionManager::connect_all(mcp_cfg, &mut registry).await?;
+                {
+                    let mut guard = lua_crew.mcp_manager.lock().await;
+                    *guard = Some(manager);
+                }
+                {
+                    let mut guard = lua_crew.mcp_tool_registry.lock().await;
+                    *guard = Some(registry.clone());
+                }
+                registry
+            }
+        } else {
+            lua_crew.runtime.tool_registry.clone()
+        }
     };
     #[cfg(not(feature = "mcp"))]
     let base_registry = lua_crew.runtime.tool_registry.clone();
@@ -546,45 +569,16 @@ impl UserData for LuaCrew {
         methods.add_async_method("run", |lua, this, ()| async move {
             let run_start = chrono::Utc::now();
 
-            // ── MCP: connect once and register tools, then reuse the cached registry ──
-            #[cfg(feature = "mcp")]
-            let tool_registry = {
-                // Check if the augmented registry is already cached
-                let cached = {
-                    let guard = this.mcp_tool_registry.lock().await;
-                    guard.clone()
-                };
-
-                if let Some(registry) = cached {
-                    // Fast path: reuse cached augmented registry
-                    registry
-                } else if let Some(ref mcp_cfg) = this.mcp_config {
-                    if mcp_cfg.is_empty() {
-                        this.runtime.tool_registry.clone()
-                    } else {
-                        // First run: connect all MCP servers and register their tools
-                        let mut registry = this.runtime.tool_registry.clone();
-                        let manager = McpConnectionManager::connect_all(mcp_cfg, &mut registry)
-                            .await
-                            .map_err(mlua::Error::external)?;
-                        // Cache both the manager and the augmented registry
-                        {
-                            let mut guard = this.mcp_manager.lock().await;
-                            *guard = Some(manager);
-                        }
-                        {
-                            let mut guard = this.mcp_tool_registry.lock().await;
-                            *guard = Some(registry.clone());
-                        }
-                        registry
-                    }
-                } else {
-                    this.runtime.tool_registry.clone()
-                }
-            };
-
-            #[cfg(not(feature = "mcp"))]
-            let tool_registry = this.runtime.tool_registry.clone();
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Also handles
+            // MCP augmentation internally (finalize_agent_tools layers agent
+            // tools on top of the MCP-augmented registry), so this is a
+            // drop-in replacement for the previous ad-hoc registry assembly.
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
 
             let mut crew = this.crew.lock().await;
 
