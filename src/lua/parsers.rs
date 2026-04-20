@@ -247,6 +247,15 @@ pub fn load_tool_defs_from_files(files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
                 e
             ))
         })?;
+        if tool_def.name.starts_with("agent__") {
+            return Err(IronCrewError::Validation(format!(
+                "Custom Lua tool at {} uses the reserved prefix 'agent__' \
+                 (tool name '{}'). This prefix is reserved for agent-as-tool \
+                 references.",
+                file.display(),
+                tool_def.name
+            )));
+        }
         tracing::info!("Loaded tool '{}' from {}", tool_def.name, file.display());
         tools.push(tool_def);
     }
