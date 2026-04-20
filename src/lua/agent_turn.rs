@@ -304,16 +304,28 @@ mod tests {
         }
     }
 
+    // ── env-var serialisation guard ──────────────────────────────────────────
+
+    /// Serializes tests that mutate process-wide env vars. `cargo test` runs
+    /// tests in parallel threads inside a single process; without this lock the
+    /// `IRONCREW_TOOL_TIMEOUT` reads/writes race between the three tests below.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ── Tests ────────────────────────────────────────────────────────────────
 
     /// The per-tool timeout must fire when a tool hangs and the result message
     /// must contain the "timed out" string so callers can detect it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_single_agent_turn_tool_timeout_returns_error_string() {
+        let _guard = env_guard();
         // Use a 1-second timeout so the test finishes quickly.
-        // SAFETY: test environment only; cargo test runs each test in its own
-        // thread so set_var races are not a concern in practice, and this is
-        // the only test that writes this var.
         unsafe {
             std::env::set_var("IRONCREW_TOOL_TIMEOUT", "1");
         }
@@ -383,6 +395,7 @@ mod tests {
     /// back to 60.
     #[test]
     fn tool_timeout_secs_defaults_to_60() {
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("IRONCREW_TOOL_TIMEOUT");
         }
@@ -392,6 +405,7 @@ mod tests {
     /// Sanity-check `tool_timeout_secs()`: valid env var is parsed.
     #[test]
     fn tool_timeout_secs_reads_env_var() {
+        let _guard = env_guard();
         unsafe {
             std::env::set_var("IRONCREW_TOOL_TIMEOUT", "120");
         }
