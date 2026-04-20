@@ -283,3 +283,47 @@ pub fn load_agents_from_files(files: &[PathBuf]) -> Result<Vec<Agent>> {
     }
     Ok(agents)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod parser_agent_tool_validation {
+    use super::*;
+    use mlua::Lua;
+
+    #[test]
+    fn agent_from_lua_table_rejects_malformed_agent_tool_name() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("name", "coordinator").unwrap();
+        table.set("goal", "route asks").unwrap();
+        let tools = lua.create_sequence_from(vec!["agent__BadCase"]).unwrap();
+        table.set("tools", tools).unwrap();
+
+        let result = agent_from_lua_table(&table);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("agent__BadCase"),
+            "error should mention the malformed name, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_from_lua_table_accepts_valid_agent_tool_name() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("name", "coordinator").unwrap();
+        table.set("goal", "route asks").unwrap();
+        let tools = lua.create_sequence_from(vec!["agent__researcher"]).unwrap();
+        table.set("tools", tools).unwrap();
+
+        let result = agent_from_lua_table(&table);
+        assert!(
+            result.is_ok(),
+            "valid agent tool name rejected: {:?}",
+            result.err()
+        );
+    }
+}
