@@ -223,6 +223,55 @@ or `nil` to keep it unchanged.
 - Hooks do **not** run for error handler tasks or collaborative task synthesis
   calls.
 
+## Agent-as-tool
+
+An agent can invoke another agent as a tool by listing `agent__<name>`
+in its `tools` array. When the orchestrator's LLM calls the tool,
+the named agent runs a full tool-call loop (its own tools, its own
+system prompt) and returns a single string response.
+
+### Example
+
+```lua
+crew:add_agent(Agent.new({
+    name  = "coordinator",
+    goal  = "Route user asks to the right specialist",
+    tools = { "agent__researcher", "agent__writer" },
+}))
+
+crew:add_agent(Agent.new({
+    name  = "researcher",
+    goal  = "Find concrete facts on a topic",
+    tools = { "http_request", "web_scrape" },
+}))
+
+crew:add_agent(Agent.new({
+    name  = "writer",
+    goal  = "Polish findings into readable prose",
+}))
+```
+
+### Rules
+
+- The callee must be an agent defined on the same crew.
+- Agent name format: the suffix after `agent__` must start with a
+  lowercase ASCII letter and contain only ASCII alphanumerics, `_`, or
+  `-`. The fully composed `agent__<name>` is capped at 64 characters.
+- Nested delegation is bounded by `IRONCREW_MAX_FLOW_DEPTH` (default
+  `5`), shared with `run_flow` and `crew:subworkflow`.
+- The sub-agent is ephemeral per invocation — no persistence, no autosave.
+
+### When to use
+
+Pick the lightest delegation primitive that covers the shape:
+
+| Need | Use |
+|---|---|
+| "Ask one specialist a question" | `agent__<name>` |
+| "Run a multi-step pipeline" (tasks with `depends_on`) | `run_flow` / `crew:subworkflow` |
+
+See [docs/tools.md](tools.md#delegation-primitives) for the full comparison.
+
 ## Best Practices
 
 - **Name agents by role**, not capability: `"researcher"`, `"editor"`, `"analyst"` --
