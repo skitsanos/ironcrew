@@ -429,6 +429,7 @@ impl LuaConversationInner {
             store: self.store.clone(),
             eventbus: Some(self.eventbus.clone()),
             depth: 0,
+            ..Default::default()
         };
 
         let tool_result = match tokio::time::timeout(
