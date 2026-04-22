@@ -196,6 +196,10 @@ sub-flow via `run_flow`, so the UI can render progress during the turn):**
 - `task_thinking`
 - `tool_call`
 - `tool_result`
+- `agent_tool_started` — fires immediately before a sub-agent runs via
+  `agent__<name>`; fields: `caller`, `callee`, `prompt`
+- `agent_tool_completed` — fires when the sub-agent returns; fields:
+  `caller`, `callee`, `duration_ms`, `success`
 
 The stream also emits a `keepalive` comment every 15 seconds so proxies
 don't idle the connection out.

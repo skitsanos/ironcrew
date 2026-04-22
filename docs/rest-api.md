@@ -135,6 +135,8 @@ full untruncated output.
 | `task_retry`         | `task`, `attempt`, `max_retries`, `backoff_secs`, `error`     | Task being retried after failure             |
 | `tool_call`          | `task`, `tool`                                                | Agent invoked a tool                         |
 | `tool_result`        | `task`, `tool`, `success`, `duration_ms`                      | Tool returned a result                       |
+| `agent_tool_started` | `caller`, `callee`, `prompt`                                  | Fires immediately before a sub-agent runs via `agent__<name>`. `caller` and `callee` are bare agent names. Used by UIs to scope the nested `tool_call` / `tool_result` events under a single marker. |
+| `agent_tool_completed` | `caller`, `callee`, `duration_ms`, `success`                | Fires when the sub-agent returns. `success` is `false` only if the invocation errored at the Rust/provider level — a sub-agent that returned a low-quality reply still counts as `success: true`. |
 | `collaboration_turn` | `task`, `agent`, `turn`, `content`                            | A turn in a collaborative task               |
 | `conversation_started` | `conversation_id`, `agent`                                  | A `crew:conversation()` was created          |
 | `conversation_turn`  | `conversation_id`, `agent`, `turn_index`, `user_message`, `assistant_message` | Single completed turn (`send`/`ask`) |

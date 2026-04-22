@@ -69,7 +69,11 @@ pub struct SubflowContext {
 /// Resolve the max flow depth from the environment, falling back to
 /// `DEFAULT_MAX_FLOW_DEPTH`. Parsed on each call so tests can adjust the cap
 /// via `std::env::set_var` without restarting the process.
-fn max_flow_depth() -> usize {
+///
+/// Public so `AgentAsTool` can share the same cap when guarding
+/// agent-as-tool delegation depth (see
+/// `docs/superpowers/specs/2026-04-20-agent-as-tool-design.md`).
+pub fn max_flow_depth() -> usize {
     std::env::var("IRONCREW_MAX_FLOW_DEPTH")
         .ok()
         .and_then(|v| v.parse().ok())

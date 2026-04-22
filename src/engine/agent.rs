@@ -1,6 +1,46 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::utils::error::IronCrewError;
+
+/// Validate a single entry in an agent's `tools` list. Returns an error for
+/// malformed `agent__<name>` entries; silently accepts any other string
+/// (built-ins, MCP tools, custom Lua tools — those get their own validation
+/// elsewhere).
+///
+/// Rules for the `agent__` prefix:
+/// * Total length ≤ 64 characters (OpenAI/Anthropic function-name cap).
+/// * Suffix (`agent__` stripped) must be non-empty.
+/// * Suffix first character: ASCII lowercase letter (`[a-z]`).
+/// * Remaining characters: ASCII alphanumeric, `_`, or `-`.
+pub(crate) fn validate_agent_tool_name(name: &str) -> Result<(), IronCrewError> {
+    if !name.starts_with("agent__") {
+        return Ok(());
+    }
+    if name.len() > 64 {
+        return Err(IronCrewError::Validation(format!(
+            "Agent tool name '{}' exceeds 64 characters (OpenAI/Anthropic function-name cap)",
+            name
+        )));
+    }
+    let suffix = &name["agent__".len()..];
+    let valid = !suffix.is_empty()
+        && suffix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err(IronCrewError::Validation(format!(
+            "Agent tool name '{}' is malformed: suffix must start with [a-z] and contain only [a-zA-Z0-9_-]",
+            name
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResponseFormat {
     Text,
@@ -119,5 +159,71 @@ impl AgentSelector {
         };
 
         0.4 * cap_score + 0.3 * tool_score + 0.3 * goal_score
+    }
+}
+
+#[cfg(test)]
+mod agent_validation_tests {
+    use super::*;
+
+    /// Helper: validate a list of tool name strings, returning the first error
+    /// (or Ok if all pass). Mirrors what `agent_from_lua_table` does at parse
+    /// time so that tests exercise the same logic path.
+    fn validate_tools(tools: Vec<&str>) -> Result<(), IronCrewError> {
+        for t in &tools {
+            validate_agent_tool_name(t)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn valid_agent_tool_names_accepted() {
+        for t in [
+            "agent__researcher",
+            "agent__writer",
+            "agent__a1b2",
+            "agent__short",
+            "agent__with-hyphen",
+            "agent__with_underscore",
+        ] {
+            assert!(validate_tools(vec![t]).is_ok(), "rejected: {}", t);
+        }
+    }
+
+    #[test]
+    fn agent_tool_uppercase_rejected() {
+        let err = validate_tools(vec!["agent__BadCase"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent__"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn agent_tool_starts_with_digit_rejected() {
+        assert!(validate_tools(vec!["agent__1start"]).is_err());
+    }
+
+    #[test]
+    fn agent_tool_empty_suffix_rejected() {
+        assert!(validate_tools(vec!["agent__"]).is_err());
+    }
+
+    #[test]
+    fn agent_tool_name_too_long_rejected() {
+        // "agent__" (7 chars) + 58 chars = 65, exceeds 64
+        let long = format!("agent__{}", "a".repeat(58));
+        assert!(validate_tools(vec![&long]).is_err());
+    }
+
+    #[test]
+    fn agent_tool_exactly_64_chars_accepted() {
+        // "agent__" (7 chars) + 57 chars = 64, exact limit
+        let boundary = format!("agent__{}", "a".repeat(57));
+        assert!(validate_tools(vec![&boundary]).is_ok());
+    }
+
+    #[test]
+    fn regular_tool_names_still_accepted() {
+        assert!(validate_tools(vec!["http_request", "file_read", "mcp__git__git_status"]).is_ok());
     }
 }
