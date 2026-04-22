@@ -10,6 +10,7 @@ use crate::engine::messagebus::{Message, MessageType};
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
+use crate::tools::agent_as_tool::AgentAsTool;
 use crate::utils::error::{IronCrewError, Result};
 
 #[cfg(feature = "mcp")]
@@ -51,6 +52,13 @@ pub struct LuaCrew {
     /// Stored here so subsequent runs don't re-register MCP tools on each call.
     #[cfg(feature = "mcp")]
     pub mcp_tool_registry: Arc<Mutex<Option<crate::tools::registry::ToolRegistry>>>,
+    /// Lazy-finalized agent-as-tool registry. Populated on first
+    /// entry-point call (run / conversation / dialog / chat). Caches
+    /// both Ok and Err results — the same bad config always produces
+    /// the same error without re-running validation. To fix a bad
+    /// config, construct a fresh Crew via Crew.new().
+    pub(crate) agent_tools_finalized:
+        OnceCell<std::result::Result<Arc<FinalizedAgentTools>, String>>,
 }
 
 impl LuaCrew {
@@ -63,6 +71,157 @@ impl LuaCrew {
             .await?;
         Ok(store.clone())
     }
+
+    /// Ensure agent-as-tool finalization has run for this crew.
+    /// The result is cached: a second call returns the same
+    /// `Arc<FinalizedAgentTools>` on success, or the same error
+    /// string (wrapped as IronCrewError::Validation) on failure.
+    pub(crate) async fn ensure_agent_tools_finalized(
+        &self,
+    ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
+        let result = self
+            .agent_tools_finalized
+            .get_or_init(|| async { finalize_agent_tools(self).await.map_err(|e| e.to_string()) })
+            .await;
+        match result {
+            Ok(ft) => Ok(ft.clone()),
+            Err(msg) => Err(IronCrewError::Validation(msg.clone())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-as-tool finalization
+// ---------------------------------------------------------------------------
+
+/// Snapshot of a crew's agent-as-tool registrations plus the per-crew
+/// defaults captured at finalization time. Built once per `LuaCrew` on the
+/// first entry-point call (crew:run / :conversation / :dialog / :chat) and
+/// then reused for the lifetime of the crew.
+pub(crate) struct FinalizedAgentTools {
+    /// Augmented registry = built-ins (+ MCP if present) + one
+    /// `AgentAsTool` per distinct `agent__<name>` reference found across
+    /// the crew's agent tool lists.
+    pub registry: crate::tools::registry::ToolRegistry,
+}
+
+/// Finalize agent-as-tool registrations for a crew. Runs once per
+/// `LuaCrew` on first entry-point call. Returns an augmented tool
+/// registry containing built-ins + MCP (if present) + one `AgentAsTool`
+/// per distinct `agent__<name>` reference across all agents' tool lists.
+///
+/// Errors if a reference points at an unknown agent name — this is a
+/// crew authoring bug, not a runtime failure, so we surface it eagerly
+/// rather than letting the LLM discover it at tool-call time.
+pub(crate) async fn finalize_agent_tools(
+    lua_crew: &LuaCrew,
+) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
+    // 1. Snapshot everything we need off the crew under a short lock.
+    let (agents, default_model, max_tool_rounds) = {
+        let crew_guard = lua_crew.crew.lock().await;
+        (
+            crew_guard.agents.clone(),
+            crew_guard.provider_config.model.clone(),
+            crew_guard.max_tool_rounds,
+        )
+    };
+    let max_history = crate::lua::conversation::default_max_history();
+
+    // 2. Collect distinct `agent__<name>` suffixes across every agent's
+    //    tools list. BTreeSet gives stable ordering for deterministic
+    //    registration and cheap dedup.
+    let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for a in &agents {
+        for t in &a.tools {
+            if let Some(suffix) = t.strip_prefix("agent__") {
+                needed.insert(suffix.to_string());
+            }
+        }
+    }
+
+    // 3. Start with the base registry. If MCP is compiled in and the
+    //    augmented registry has already been built, layer on top of that
+    //    instead of the bare runtime registry — agent tools should see
+    //    MCP tools too. If MCP is configured but not yet connected,
+    //    connect all servers now and cache the augmented registry +
+    //    manager on the LuaCrew for reuse.
+    #[cfg(feature = "mcp")]
+    let base_registry = {
+        let cached = {
+            let guard = lua_crew.mcp_tool_registry.lock().await;
+            guard.clone()
+        };
+        if let Some(registry) = cached {
+            registry
+        } else if let Some(ref mcp_cfg) = lua_crew.mcp_config {
+            if mcp_cfg.is_empty() {
+                lua_crew.runtime.tool_registry.clone()
+            } else {
+                let mut registry = lua_crew.runtime.tool_registry.clone();
+                let manager = McpConnectionManager::connect_all(mcp_cfg, &mut registry).await?;
+                {
+                    let mut guard = lua_crew.mcp_manager.lock().await;
+                    *guard = Some(manager);
+                }
+                {
+                    let mut guard = lua_crew.mcp_tool_registry.lock().await;
+                    *guard = Some(registry.clone());
+                }
+                registry
+            }
+        } else {
+            lua_crew.runtime.tool_registry.clone()
+        }
+    };
+    #[cfg(not(feature = "mcp"))]
+    let base_registry = lua_crew.runtime.tool_registry.clone();
+
+    let mut registry = base_registry;
+
+    // 4. Resolve provider + weak runtime handle once.
+    let provider: Arc<dyn LlmProvider> = match &lua_crew.custom_provider {
+        Some(p) => p.clone(),
+        None => lua_crew.runtime.provider.clone(),
+    };
+
+    // Obtain `Weak<Runtime>` by upgrading the runtime's stored self-ref
+    // and re-downgrading. `set_self_ref` is called from
+    // `setup_crew_runtime`; if we get here without it, something is
+    // wrong with bootstrap and we refuse to finalize.
+    let runtime_arc = lua_crew.runtime.upgrade_self().ok_or_else(|| {
+        IronCrewError::Validation(
+            "Agent-as-tool: Runtime self-ref not initialized (set_self_ref \
+             was not called after Arc::new); cannot finalize agent tools"
+                .into(),
+        )
+    })?;
+    let runtime_weak: std::sync::Weak<Runtime> = Arc::downgrade(&runtime_arc);
+    drop(runtime_arc);
+
+    // 5. Build one `AgentAsTool` per distinct callee, validating that
+    //    each referenced name resolves to an actual agent.
+    for callee in &needed {
+        let agent = agents.iter().find(|a| &a.name == callee).ok_or_else(|| {
+            IronCrewError::Validation(format!(
+                "Agent-as-tool: unknown agent '{}' referenced in a tools list \
+                 (as 'agent__{}'); no agent by that name was added to the crew",
+                callee, callee
+            ))
+        })?;
+
+        let resolved_model = agent.model.clone().unwrap_or_else(|| default_model.clone());
+        let tool = AgentAsTool::new(
+            agent.clone(),
+            provider.clone(),
+            runtime_weak.clone(),
+            resolved_model,
+            max_tool_rounds,
+            max_history,
+        );
+        registry.register_arc(Arc::new(tool));
+    }
+
+    Ok(Arc::new(FinalizedAgentTools { registry }))
 }
 
 impl UserData for LuaCrew {
@@ -284,6 +443,16 @@ impl UserData for LuaCrew {
         // crew:conversation({agent = ..., model = ..., stream = ..., ...})
         // Creates a stateful multi-turn conversation bound to this crew.
         methods.add_async_method("conversation", |lua, this, table: Table| async move {
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Also covers
+            // MCP augmentation so conversations see the same augmented
+            // registry as crew:run().
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
+
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -321,7 +490,7 @@ impl UserData for LuaCrew {
                 table,
                 &agents,
                 provider,
-                this.runtime.tool_registry.clone(),
+                tool_registry,
                 &default_model,
                 max_tool_rounds,
                 eventbus,
@@ -338,6 +507,16 @@ impl UserData for LuaCrew {
         // crew:dialog({agents = {"name", ...}, starter = ..., ...})
         // Creates an agent-to-agent dialog with perspective-flipped histories.
         methods.add_async_method("dialog", |lua, this, table: Table| async move {
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Dialogs get
+            // the same augmented registry (built-ins + MCP + AgentAsTool)
+            // as crew:run() and crew:conversation().
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
+
             let crew = this.crew.lock().await;
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
@@ -373,7 +552,7 @@ impl UserData for LuaCrew {
                 table,
                 &agents,
                 provider,
-                this.runtime.tool_registry.clone(),
+                tool_registry,
                 &default_model,
                 max_tool_rounds,
                 eventbus,
@@ -388,45 +567,16 @@ impl UserData for LuaCrew {
         methods.add_async_method("run", |lua, this, ()| async move {
             let run_start = chrono::Utc::now();
 
-            // ── MCP: connect once and register tools, then reuse the cached registry ──
-            #[cfg(feature = "mcp")]
-            let tool_registry = {
-                // Check if the augmented registry is already cached
-                let cached = {
-                    let guard = this.mcp_tool_registry.lock().await;
-                    guard.clone()
-                };
-
-                if let Some(registry) = cached {
-                    // Fast path: reuse cached augmented registry
-                    registry
-                } else if let Some(ref mcp_cfg) = this.mcp_config {
-                    if mcp_cfg.is_empty() {
-                        this.runtime.tool_registry.clone()
-                    } else {
-                        // First run: connect all MCP servers and register their tools
-                        let mut registry = this.runtime.tool_registry.clone();
-                        let manager = McpConnectionManager::connect_all(mcp_cfg, &mut registry)
-                            .await
-                            .map_err(mlua::Error::external)?;
-                        // Cache both the manager and the augmented registry
-                        {
-                            let mut guard = this.mcp_manager.lock().await;
-                            *guard = Some(manager);
-                        }
-                        {
-                            let mut guard = this.mcp_tool_registry.lock().await;
-                            *guard = Some(registry.clone());
-                        }
-                        registry
-                    }
-                } else {
-                    this.runtime.tool_registry.clone()
-                }
-            };
-
-            #[cfg(not(feature = "mcp"))]
-            let tool_registry = this.runtime.tool_registry.clone();
+            // Lazy agent-as-tool finalization — fails fast with a validation
+            // error if any agent__<name> refs an unknown agent. Also handles
+            // MCP augmentation internally (finalize_agent_tools layers agent
+            // tools on top of the MCP-augmented registry), so this is a
+            // drop-in replacement for the previous ad-hoc registry assembly.
+            let finalized = this
+                .ensure_agent_tools_finalized()
+                .await
+                .map_err(mlua::Error::external)?;
+            let tool_registry = finalized.registry.clone();
 
             let mut crew = this.crew.lock().await;
 

@@ -309,7 +309,12 @@ impl<'a> TaskExecutionContext<'a> {
                         .unwrap_or(60),
                 );
 
-                let tool_ctx = ToolCallContext::default();
+                let tool_ctx = ToolCallContext {
+                    tool_registry: Some(self.tool_registry.clone()),
+                    caller_agent: Some(self.agent.name.clone()),
+                    caller_scope: Some(self.task.name.clone()),
+                    ..ToolCallContext::default()
+                };
                 let tool_result = match tokio::time::timeout(
                     tool_timeout,
                     self.tool_registry
