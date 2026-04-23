@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # keyless cosign signing via GitHub OIDC
 
 env:
   CARGO_TERM_COLOR: always
@@ -104,6 +105,37 @@ jobs:
           cat release/*.sha256 >> release/checksums.txt
           cat release/checksums.txt
 
+      # CycloneDX SBOM generated from Cargo.lock via Syft. Lands in the
+      # release bundle as ironcrew-<tag>-sbom.cdx.json so downstream
+      # consumers can audit the dependency tree of a specific release.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: release/ironcrew-${{ github.ref_name }}-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # Keyless signing: cosign fetches an OIDC token from GitHub and
+      # requests a short-lived certificate from Fulcio. No secrets or
+      # static keys involved. Produces <artifact>.sig and <artifact>.pem
+      # next to each signed file; verifiers use `cosign verify-blob`.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release artifacts with cosign
+        run: |
+          cd release
+          for artifact in *.tar.gz ironcrew-${GITHUB_REF_NAME}-sbom.cdx.json; do
+            [ -f "$artifact" ] || continue
+            echo "Signing $artifact"
+            cosign sign-blob --yes \
+              --output-signature "$artifact.sig" \
+              --output-certificate "$artifact.pem" \
+              "$artifact"
+          done
+
       - name: Extract release notes from tag annotation
         id: notes
         run: |
@@ -138,6 +170,21 @@ jobs:
             echo 'chmod +x ironcrew'
             echo 'sudo mv ironcrew /usr/local/bin/'
             echo '```'
+            echo ''
+            echo '### Verifying signatures'
+            echo ''
+            echo 'Each archive is signed with [cosign](https://github.com/sigstore/cosign) via keyless GitHub OIDC:'
+            echo ''
+            echo '```bash'
+            echo 'cosign verify-blob \'
+            echo '  --certificate ironcrew-linux-amd64.tar.gz.pem \'
+            echo '  --signature ironcrew-linux-amd64.tar.gz.sig \'
+            echo "  --certificate-identity-regexp '^https://github.com/skitsanos/ironcrew' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo '  ironcrew-linux-amd64.tar.gz'
+            echo '```'
+            echo ''
+            echo 'The SBOM is at `ironcrew-${{ github.ref_name }}-sbom.cdx.json` (CycloneDX 1.x).'
             echo 'RELEASE_EOF'
           } >> "$GITHUB_OUTPUT"
 
