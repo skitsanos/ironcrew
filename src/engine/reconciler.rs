@@ -15,7 +15,6 @@ use chrono::Utc;
 use crate::engine::store::StateStore;
 use crate::utils::error::Result;
 
-#[allow(dead_code)]
 pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
     let count = store.reconcile_abandoned_runs(&now).await?;
