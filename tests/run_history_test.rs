@@ -196,3 +196,36 @@ async fn test_list_runs_summary_filters() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].run_id, "a");
 }
+
+#[test]
+fn run_status_running_serde_roundtrip() {
+    let status = RunStatus::Running;
+    let json = serde_json::to_string(&status).unwrap();
+    assert_eq!(json, "\"Running\"");
+    let back: RunStatus = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, RunStatus::Running);
+    assert_eq!(format!("{}", status), "running");
+}
+
+#[test]
+fn run_status_abandoned_serde_roundtrip() {
+    let status = RunStatus::Abandoned;
+    let json = serde_json::to_string(&status).unwrap();
+    assert_eq!(json, "\"Abandoned\"");
+    let back: RunStatus = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, RunStatus::Abandoned);
+    assert_eq!(format!("{}", status), "abandoned");
+}
+
+#[test]
+fn run_status_existing_variants_unchanged() {
+    // Regression guard: the three existing variants must still deserialize
+    // from their existing JSON representation (no breaking change to
+    // already-persisted records).
+    let success: RunStatus = serde_json::from_str("\"Success\"").unwrap();
+    assert_eq!(success, RunStatus::Success);
+    let partial: RunStatus = serde_json::from_str("\"PartialFailure\"").unwrap();
+    assert_eq!(partial, RunStatus::PartialFailure);
+    let failed: RunStatus = serde_json::from_str("\"Failed\"").unwrap();
+    assert_eq!(failed, RunStatus::Failed);
+}
