@@ -320,52 +320,6 @@ and targets extension-capable deployments such as pgvector-enabled installs.",
 
 #[async_trait]
 impl StateStore for PostgresStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
-        let task_results_json = serde_json::to_string(&record.task_results).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
-        })?;
-        let tags_json = serde_json::to_string(&record.tags)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
-
-        let sql = format!(
-            "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb)
-             ON CONFLICT (run_id) DO UPDATE SET
-                flow_name = EXCLUDED.flow_name,
-                status = EXCLUDED.status,
-                started_at = EXCLUDED.started_at,
-                finished_at = EXCLUDED.finished_at,
-                duration_ms = EXCLUDED.duration_ms,
-                task_results = EXCLUDED.task_results,
-                agent_count = EXCLUDED.agent_count,
-                task_count = EXCLUDED.task_count,
-                total_tokens = EXCLUDED.total_tokens,
-                cached_tokens = EXCLUDED.cached_tokens,
-                tags = EXCLUDED.tags",
-            self.table_name
-        );
-
-        sqlx::query(&sql)
-            .bind(&record.run_id)
-            .bind(&record.flow_name)
-            .bind(record.status.to_string())
-            .bind(&record.started_at)
-            .bind(&record.finished_at)
-            .bind(record.duration_ms as i64)
-            .bind(&task_results_json)
-            .bind(record.agent_count as i32)
-            .bind(record.task_count as i32)
-            .bind(record.total_tokens as i32)
-            .bind(record.cached_tokens as i32)
-            .bind(&tags_json)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL insert error: {}", e)))?;
-
-        tracing::info!("Run saved to PostgreSQL: {}", record.run_id);
-        Ok(record.run_id.clone())
-    }
-
     async fn save_run_intent(
         &self,
         suggested_id: Option<String>,

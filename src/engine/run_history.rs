@@ -329,16 +329,6 @@ impl JsonFileStore {
 
 #[async_trait]
 impl StateStore for JsonFileStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
-        let filename = format!("{}.json", record.run_id);
-        let path = self.runs_dir.join(&filename);
-        let json = serde_json::to_string_pretty(record)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize run: {}", e)))?;
-        std::fs::write(&path, json)?;
-        tracing::info!("Run saved: {} -> {}", record.run_id, path.display());
-        Ok(record.run_id.clone())
-    }
-
     async fn save_run_intent(
         &self,
         suggested_id: Option<String>,

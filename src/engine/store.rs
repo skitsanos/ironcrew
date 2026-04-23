@@ -10,20 +10,11 @@ use crate::utils::error::Result;
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
 
-    /// Single-shot write of a terminal RunRecord. Superseded for the
-    /// `crew:run()` path by the two-phase `save_run_intent` +
-    /// `update_run_completion` split, but retained for tests that need
-    /// to seed history directly.
-    #[allow(dead_code)]
-    async fn save_run(&self, record: &RunRecord) -> Result<String>;
-
     /// Called when a run starts. Writes a RunRecord with status=Running,
     /// empty task_results, finished_at="", duration_ms=0, total_tokens=0,
     /// cached_tokens=0. Returns the generated run_id (or the suggested_id
     /// if `Some` — used by the HTTP handler to pre-allocate an id before
     /// the flow runs so SSE subscribers can join mid-flight).
-    // TODO(task-8): remove when the HTTP run handler calls this directly.
-    #[allow(dead_code)]
     async fn save_run_intent(
         &self,
         suggested_id: Option<String>,
@@ -37,8 +28,7 @@ pub trait StateStore: Send + Sync {
     /// Called when a run completes (success, partial failure, or hard
     /// failure). Transitions a Running record to a terminal state.
     /// Returns an error if the run_id doesn't exist or isn't Running.
-    // TODO(task-8): remove dead_code allow when the HTTP run handler calls this directly.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     async fn update_run_completion(
         &self,
         run_id: &str,
@@ -55,7 +45,7 @@ pub trait StateStore: Send + Sync {
     /// finished_at = `now` and leaving task_results untouched. Returns
     /// the count of records reconciled. Idempotent — a second immediate
     /// call returns 0.
-    // TODO(task-8): remove dead_code allow when startup reconciler calls this.
+    // TODO(task-9): remove #[allow(dead_code)] when startup reconciler calls this.
     #[allow(dead_code)]
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize>;
 
