@@ -10,6 +10,11 @@ use crate::utils::error::Result;
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
 
+    /// Single-shot write of a terminal RunRecord. Superseded for the
+    /// `crew:run()` path by the two-phase `save_run_intent` +
+    /// `update_run_completion` split, but retained for tests that need
+    /// to seed history directly.
+    #[allow(dead_code)]
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
 
     /// Called when a run starts. Writes a RunRecord with status=Running,
