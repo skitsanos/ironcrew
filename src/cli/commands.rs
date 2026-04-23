@@ -15,6 +15,19 @@ pub async fn cmd_run(
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
+    // Sweep orphaned Running records from a prior crashed ironcrew run
+    // process before this invocation's own save_run_intent writes. Safe:
+    // reconcile only touches status='running' rows; the new run's intent
+    // hasn't been written yet.
+    let ironcrew_dir = loader.project_dir().join(".ironcrew");
+    if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await {
+        let _ = crate::engine::reconciler::reconcile_stuck_runs(&store)
+            .await
+            .map_err(|e| {
+                tracing::debug!("Reconciler failed (non-fatal): {e}");
+            });
+    }
+
     // In --json mode, suppress Lua print() by marking via app_data
     if json_output {
         lua.set_app_data(JsonOutputMode);
