@@ -197,6 +197,8 @@ pub struct RunRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RunStatus {
+    Running,
+    Abandoned,
     Success,
     PartialFailure,
     Failed,
@@ -205,6 +207,8 @@ pub enum RunStatus {
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RunStatus::Running => write!(f, "running"),
+            RunStatus::Abandoned => write!(f, "abandoned"),
             RunStatus::Success => write!(f, "success"),
             RunStatus::PartialFailure => write!(f, "partial_failure"),
             RunStatus::Failed => write!(f, "failed"),
