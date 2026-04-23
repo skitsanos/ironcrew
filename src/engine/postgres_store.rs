@@ -368,31 +368,90 @@ impl StateStore for PostgresStore {
 
     async fn save_run_intent(
         &self,
-        _suggested_id: Option<String>,
-        _flow_name: &str,
-        _started_at: &str,
-        _agent_count: usize,
-        _task_count: usize,
-        _tags: &[String],
+        suggested_id: Option<String>,
+        flow_name: &str,
+        started_at: &str,
+        agent_count: usize,
+        task_count: usize,
+        tags: &[String],
     ) -> Result<String> {
-        unimplemented!("save_run_intent — landed in Task 3")
+        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let tags_json = serde_json::to_string(tags)
+            .map_err(|e| IronCrewError::Validation(format!("Tags serialize: {}", e)))?;
+        let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
+            .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
+        let sql = format!(
+            "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+             VALUES ($1, $2, 'running', $3, '', 0, $4::jsonb, $5, $6, 0, 0, $7::jsonb)",
+            self.table_name
+        );
+        sqlx::query(&sql)
+            .bind(&run_id)
+            .bind(flow_name)
+            .bind(started_at)
+            .bind(&empty_tasks)
+            .bind(agent_count as i64)
+            .bind(task_count as i64)
+            .bind(&tags_json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG insert intent: {}", e)))?;
+        tracing::debug!("Run intent saved: {}", run_id);
+        Ok(run_id)
     }
 
     async fn update_run_completion(
         &self,
-        _run_id: &str,
-        _status: RunStatus,
-        _finished_at: &str,
-        _duration_ms: u64,
-        _task_results: Vec<crate::engine::task::TaskResult>,
-        _total_tokens: u32,
-        _cached_tokens: u32,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: &str,
+        duration_ms: u64,
+        task_results: Vec<crate::engine::task::TaskResult>,
+        total_tokens: u32,
+        cached_tokens: u32,
     ) -> Result<()> {
-        unimplemented!("update_run_completion — landed in Task 3")
+        let task_results_json = serde_json::to_string(&task_results)
+            .map_err(|e| IronCrewError::Validation(format!("task_results serialize: {}", e)))?;
+        let sql = format!(
+            "UPDATE {}
+             SET status = $1, finished_at = $2, duration_ms = $3,
+                 task_results = $4::jsonb, total_tokens = $5, cached_tokens = $6
+             WHERE run_id = $7 AND status = 'running'",
+            self.table_name
+        );
+        let result = sqlx::query(&sql)
+            .bind(status.to_string())
+            .bind(finished_at)
+            .bind(duration_ms as i64)
+            .bind(&task_results_json)
+            .bind(total_tokens as i32)
+            .bind(cached_tokens as i32)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG update completion: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found or not in Running state",
+                run_id
+            )));
+        }
+        tracing::info!("Run completion saved: {} ({})", run_id, status);
+        Ok(())
     }
 
-    async fn reconcile_abandoned_runs(&self, _now: &str) -> Result<usize> {
-        unimplemented!("reconcile_abandoned_runs — landed in Task 3")
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let sql = format!(
+            "UPDATE {} SET status = 'abandoned', finished_at = $1 WHERE status = 'running'",
+            self.table_name
+        );
+        let result = sqlx::query(&sql)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG reconcile: {}", e)))?;
+        Ok(result.rows_affected() as usize)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -879,6 +938,8 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
         status: match status_str.as_str() {
             "success" => RunStatus::Success,
             "partial_failure" => RunStatus::PartialFailure,
+            "running" => RunStatus::Running,
+            "abandoned" => RunStatus::Abandoned,
             _ => RunStatus::Failed,
         },
         started_at: row
@@ -931,6 +992,8 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
         status: match status_str.as_str() {
             "success" => RunStatus::Success,
             "partial_failure" => RunStatus::PartialFailure,
+            "running" => RunStatus::Running,
+            "abandoned" => RunStatus::Abandoned,
             _ => RunStatus::Failed,
         },
         started_at: row
