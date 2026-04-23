@@ -45,8 +45,6 @@ pub trait StateStore: Send + Sync {
     /// finished_at = `now` and leaving task_results untouched. Returns
     /// the count of records reconciled. Idempotent — a second immediate
     /// call returns 0.
-    // TODO(task-9): remove #[allow(dead_code)] when startup reconciler calls this.
-    #[allow(dead_code)]
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize>;
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;

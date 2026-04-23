@@ -22,6 +22,15 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         .await
         .map_err(|e| IronCrewError::Validation(format!("Failed to init store: {}", e)))?;
 
+    // Flip any runs left in Running state by a prior crashed ironcrew
+    // serve process. Single-instance assumption (see docs/superpowers/
+    // specs/2026-04-23-stuck-run-reconciler-design.md §11).
+    let _ = crate::engine::reconciler::reconcile_stuck_runs(&store)
+        .await
+        .map_err(|e| {
+            tracing::error!("Reconciler failed (non-fatal): {e}");
+        });
+
     let state = Arc::new(api::AppState {
         flows_dir: flows_dir.clone(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
