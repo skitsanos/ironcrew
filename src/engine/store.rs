@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
+use crate::engine::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 
@@ -11,6 +11,46 @@ pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
 
     async fn save_run(&self, record: &RunRecord) -> Result<String>;
+
+    /// Called when a run starts. Writes a RunRecord with status=Running,
+    /// empty task_results, finished_at="", duration_ms=0, total_tokens=0,
+    /// cached_tokens=0. Returns the generated run_id (or the suggested_id
+    /// if `Some` — used by the HTTP handler to pre-allocate an id before
+    /// the flow runs so SSE subscribers can join mid-flight).
+    #[allow(dead_code)]
+    async fn save_run_intent(
+        &self,
+        suggested_id: Option<String>,
+        flow_name: &str,
+        started_at: &str,
+        agent_count: usize,
+        task_count: usize,
+        tags: &[String],
+    ) -> Result<String>;
+
+    /// Called when a run completes (success, partial failure, or hard
+    /// failure). Transitions a Running record to a terminal state.
+    /// Returns an error if the run_id doesn't exist or isn't Running.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: &str,
+        duration_ms: u64,
+        task_results: Vec<crate::engine::task::TaskResult>,
+        total_tokens: u32,
+        cached_tokens: u32,
+    ) -> Result<()>;
+
+    /// Called once at ironcrew {run,serve} startup. Atomically flips
+    /// every record whose status is Running to Abandoned, setting
+    /// finished_at = `now` and leaving task_results untouched. Returns
+    /// the count of records reconciled. Idempotent — a second immediate
+    /// call returns 0.
+    #[allow(dead_code)]
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize>;
+
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
 
     /// Paginated, metadata-only list view. Returns summaries without
