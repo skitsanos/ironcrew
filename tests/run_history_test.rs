@@ -1,6 +1,37 @@
 use ironcrew::engine::run_history::{JsonFileStore, ListRunsFilter, RunRecord, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
+use ironcrew::utils::error::IronCrewError;
+
+/// Test helper: write a Running intent + immediately update to
+/// terminal state. Mirrors the pre-Task 8 `save_run` call shape so
+/// list/filter tests don't have to know about the two-phase flow.
+async fn save_completed_run(
+    store: &JsonFileStore,
+    record: &RunRecord,
+) -> Result<(), IronCrewError> {
+    store
+        .save_run_intent(
+            Some(record.run_id.clone()),
+            &record.flow_name,
+            &record.started_at,
+            record.agent_count,
+            record.task_count,
+            &record.tags,
+        )
+        .await?;
+    store
+        .update_run_completion(
+            &record.run_id,
+            record.status.clone(),
+            &record.finished_at,
+            record.duration_ms,
+            record.task_results.clone(),
+            record.total_tokens,
+            record.cached_tokens,
+        )
+        .await
+}
 
 fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) -> RunRecord {
     RunRecord {
@@ -47,7 +78,7 @@ async fn test_save_and_load_run() {
         tags: vec![],
     };
 
-    history.save_run(&record).await.unwrap();
+    save_completed_run(&history, &record).await.unwrap();
 
     let loaded = history.get_run("test-run-123").await.unwrap();
     assert_eq!(loaded.run_id, "test-run-123");
@@ -74,7 +105,7 @@ async fn test_delete_run() {
         cached_tokens: 0,
         tags: vec![],
     };
-    history.save_run(&record).await.unwrap();
+    save_completed_run(&history, &record).await.unwrap();
 
     history.delete_run("to-delete").await.unwrap();
     assert!(history.get_run("to-delete").await.is_err());
@@ -93,15 +124,17 @@ async fn test_list_runs_summary_pagination() {
     let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     for i in 0..5 {
-        history
-            .save_run(&make_record(
+        save_completed_run(
+            &history,
+            &make_record(
                 &format!("run-{}", i),
                 RunStatus::Success,
                 &format!("2026-03-18T12:00:0{}Z", i),
                 vec![],
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
     }
 
     // Page 1 — first 2 newest-first
@@ -131,33 +164,39 @@ async fn test_list_runs_summary_filters() {
     let dir = tempfile::tempdir().unwrap();
     let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
-    history
-        .save_run(&make_record(
+    save_completed_run(
+        &history,
+        &make_record(
             "a",
             RunStatus::Success,
             "2026-03-18T10:00:00Z",
             vec!["prod".into(), "fast".into()],
-        ))
-        .await
-        .unwrap();
-    history
-        .save_run(&make_record(
+        ),
+    )
+    .await
+    .unwrap();
+    save_completed_run(
+        &history,
+        &make_record(
             "b",
             RunStatus::Failed,
             "2026-03-18T11:00:00Z",
             vec!["prod".into()],
-        ))
-        .await
-        .unwrap();
-    history
-        .save_run(&make_record(
+        ),
+    )
+    .await
+    .unwrap();
+    save_completed_run(
+        &history,
+        &make_record(
             "c",
             RunStatus::Success,
             "2026-03-18T12:00:00Z",
             vec!["dev".into()],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
 
     // Status filter
     let filter = ListRunsFilter {
@@ -301,26 +340,20 @@ async fn json_store_reconcile_abandoned_selectivity() {
         .await
         .unwrap();
 
-    // One Success, one Failed — use save_run for terminal records until
-    // Task 8 removes it; this mirrors the CLI-only / legacy write path.
-    store
-        .save_run(&make_record(
-            "s1",
-            RunStatus::Success,
-            "2026-04-23T09:00:00Z",
-            vec![],
-        ))
-        .await
-        .unwrap();
-    store
-        .save_run(&make_record(
-            "f1",
-            RunStatus::Failed,
-            "2026-04-23T09:30:00Z",
-            vec![],
-        ))
-        .await
-        .unwrap();
+    // One Success, one Failed — use the two-phase helper so save_run
+    // (removed in Task 8) is no longer needed.
+    save_completed_run(
+        &store,
+        &make_record("s1", RunStatus::Success, "2026-04-23T09:00:00Z", vec![]),
+    )
+    .await
+    .unwrap();
+    save_completed_run(
+        &store,
+        &make_record("f1", RunStatus::Failed, "2026-04-23T09:30:00Z", vec![]),
+    )
+    .await
+    .unwrap();
 
     let count = store
         .reconcile_abandoned_runs("2026-04-23T10:05:00Z")

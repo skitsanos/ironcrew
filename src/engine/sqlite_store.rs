@@ -177,42 +177,6 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
 
 #[async_trait]
 impl StateStore for SqliteStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-
-        let task_results_json = serde_json::to_string(&record.task_results).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
-        })?;
-        let tags_json = serde_json::to_string(&record.tags)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
-
-        conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                record.run_id,
-                record.flow_name,
-                record.status.to_string(),
-                record.started_at,
-                record.finished_at,
-                record.duration_ms as i64,
-                task_results_json,
-                record.agent_count as i64,
-                record.task_count as i64,
-                record.total_tokens as i64,
-                record.cached_tokens as i64,
-                tags_json,
-            ],
-        )
-        .map_err(|e| IronCrewError::Validation(format!("SQLite insert error: {}", e)))?;
-
-        tracing::info!("Run saved to SQLite: {}", record.run_id);
-        Ok(record.run_id.clone())
-    }
-
     async fn save_run_intent(
         &self,
         suggested_id: Option<String>,

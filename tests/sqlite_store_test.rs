@@ -2,10 +2,38 @@
 //! and reconcile selectivity. Uses an in-memory SQLite via temp file
 //! so no shared state leaks between tests.
 
-use ironcrew::engine::run_history::RunStatus;
+use ironcrew::engine::run_history::{RunRecord, RunStatus};
 use ironcrew::engine::sqlite_store::SqliteStore;
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
+use ironcrew::utils::error::IronCrewError;
+
+/// Test helper: write a Running intent + immediately update to
+/// terminal state. Mirrors the pre-Task 8 `save_run` call shape so
+/// reconcile-selectivity tests don't have to know about the two-phase flow.
+async fn save_completed_run(store: &SqliteStore, record: &RunRecord) -> Result<(), IronCrewError> {
+    store
+        .save_run_intent(
+            Some(record.run_id.clone()),
+            &record.flow_name,
+            &record.started_at,
+            record.agent_count,
+            record.task_count,
+            &record.tags,
+        )
+        .await?;
+    store
+        .update_run_completion(
+            &record.run_id,
+            record.status.clone(),
+            &record.finished_at,
+            record.duration_ms,
+            record.task_results.clone(),
+            record.total_tokens,
+            record.cached_tokens,
+        )
+        .await
+}
 
 fn fresh_store() -> SqliteStore {
     let dir = tempfile::tempdir().unwrap();
@@ -70,7 +98,6 @@ async fn sqlite_store_intent_completion_roundtrip() {
 
 #[tokio::test]
 async fn sqlite_store_reconcile_abandoned_selectivity() {
-    use ironcrew::engine::run_history::RunRecord;
     let store = fresh_store();
 
     // Two Running records via the intent API
@@ -83,7 +110,8 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
         .await
         .unwrap();
 
-    // One Success, one Failed via legacy save_run (removed in Task 8)
+    // One Success, one Failed — use the two-phase helper so save_run
+    // (removed in Task 8) is no longer needed.
     let success = RunRecord {
         run_id: "s1".into(),
         flow_name: "f".into(),
@@ -98,14 +126,14 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
         cached_tokens: 0,
         tags: vec![],
     };
-    store.save_run(&success).await.unwrap();
+    save_completed_run(&store, &success).await.unwrap();
 
     let failed = RunRecord {
         run_id: "f1".into(),
         status: RunStatus::Failed,
         ..success.clone()
     };
-    store.save_run(&failed).await.unwrap();
+    save_completed_run(&store, &failed).await.unwrap();
 
     let count = store
         .reconcile_abandoned_runs("2026-04-23T10:05:00Z")
