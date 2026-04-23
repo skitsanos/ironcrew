@@ -339,6 +339,35 @@ impl StateStore for JsonFileStore {
         Ok(record.run_id.clone())
     }
 
+    async fn save_run_intent(
+        &self,
+        _suggested_id: Option<String>,
+        _flow_name: &str,
+        _started_at: &str,
+        _agent_count: usize,
+        _task_count: usize,
+        _tags: &[String],
+    ) -> Result<String> {
+        unimplemented!("save_run_intent — landed in Task 3")
+    }
+
+    async fn update_run_completion(
+        &self,
+        _run_id: &str,
+        _status: RunStatus,
+        _finished_at: &str,
+        _duration_ms: u64,
+        _task_results: Vec<crate::engine::task::TaskResult>,
+        _total_tokens: u32,
+        _cached_tokens: u32,
+    ) -> Result<()> {
+        unimplemented!("update_run_completion — landed in Task 3")
+    }
+
+    async fn reconcile_abandoned_runs(&self, _now: &str) -> Result<usize> {
+        unimplemented!("reconcile_abandoned_runs — landed in Task 3")
+    }
+
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
