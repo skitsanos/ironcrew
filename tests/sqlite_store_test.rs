@@ -37,6 +37,7 @@ async fn sqlite_store_intent_completion_roundtrip() {
     assert_eq!(r.status, RunStatus::Running);
     assert_eq!(r.finished_at, "");
     assert_eq!(r.agent_count, 2);
+    assert_eq!(r.task_count, 3);
     assert_eq!(r.tags, vec!["dev".to_string()]);
 
     store
