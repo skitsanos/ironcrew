@@ -229,3 +229,127 @@ fn run_status_existing_variants_unchanged() {
     let failed: RunStatus = serde_json::from_str("\"Failed\"").unwrap();
     assert_eq!(failed, RunStatus::Failed);
 }
+
+#[tokio::test]
+async fn json_store_intent_completion_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+
+    let run_id = store
+        .save_run_intent(
+            Some("test-intent-1".into()),
+            "demo-flow",
+            "2026-04-23T10:00:00Z",
+            2,
+            3,
+            &["dev".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_id, "test-intent-1");
+
+    let r = store.get_run(&run_id).await.unwrap();
+    assert_eq!(r.status, RunStatus::Running);
+    assert_eq!(r.finished_at, "");
+    assert_eq!(r.duration_ms, 0);
+    assert_eq!(r.agent_count, 2);
+    assert_eq!(r.task_count, 3);
+    assert!(r.task_results.is_empty());
+
+    store
+        .update_run_completion(
+            &run_id,
+            RunStatus::Success,
+            "2026-04-23T10:00:05Z",
+            5000,
+            vec![TaskResult {
+                task: "answer".into(),
+                agent: "assistant".into(),
+                output: "hi".into(),
+                success: true,
+                duration_ms: 4500,
+                token_usage: None,
+                reasoning: None,
+            }],
+            100,
+            20,
+        )
+        .await
+        .unwrap();
+
+    let r = store.get_run(&run_id).await.unwrap();
+    assert_eq!(r.status, RunStatus::Success);
+    assert_eq!(r.finished_at, "2026-04-23T10:00:05Z");
+    assert_eq!(r.duration_ms, 5000);
+    assert_eq!(r.task_results.len(), 1);
+    assert_eq!(r.total_tokens, 100);
+    assert_eq!(r.cached_tokens, 20);
+}
+
+#[tokio::test]
+async fn json_store_reconcile_abandoned_selectivity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+
+    // Two Running records
+    store
+        .save_run_intent(Some("r1".into()), "f", "2026-04-23T10:00:00Z", 1, 1, &[])
+        .await
+        .unwrap();
+    store
+        .save_run_intent(Some("r2".into()), "f", "2026-04-23T10:01:00Z", 1, 1, &[])
+        .await
+        .unwrap();
+
+    // One Success, one Failed — use save_run for terminal records until
+    // Task 8 removes it; this mirrors the CLI-only / legacy write path.
+    store
+        .save_run(&make_record(
+            "s1",
+            RunStatus::Success,
+            "2026-04-23T09:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    store
+        .save_run(&make_record(
+            "f1",
+            RunStatus::Failed,
+            "2026-04-23T09:30:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    let count = store
+        .reconcile_abandoned_runs("2026-04-23T10:05:00Z")
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    assert_eq!(
+        store.get_run("r1").await.unwrap().status,
+        RunStatus::Abandoned
+    );
+    assert_eq!(
+        store.get_run("r1").await.unwrap().finished_at,
+        "2026-04-23T10:05:00Z"
+    );
+    assert_eq!(
+        store.get_run("r2").await.unwrap().status,
+        RunStatus::Abandoned
+    );
+    assert_eq!(
+        store.get_run("s1").await.unwrap().status,
+        RunStatus::Success
+    );
+    assert_eq!(store.get_run("f1").await.unwrap().status, RunStatus::Failed);
+
+    // Idempotency: a second call finds nothing.
+    let second = store
+        .reconcile_abandoned_runs("2026-04-23T10:06:00Z")
+        .await
+        .unwrap();
+    assert_eq!(second, 0);
+}
