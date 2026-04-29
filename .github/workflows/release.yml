@@ -122,7 +122,7 @@ jobs:
       # static keys involved. Produces <artifact>.sig and <artifact>.pem
       # next to each signed file; verifiers use `cosign verify-blob`.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.1
 
       - name: Sign release artifacts with cosign
         run: |
