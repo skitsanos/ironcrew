@@ -197,6 +197,8 @@ pub struct RunRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RunStatus {
+    Running,
+    Abandoned,
     Success,
     PartialFailure,
     Failed,
@@ -205,6 +207,8 @@ pub enum RunStatus {
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RunStatus::Running => write!(f, "running"),
+            RunStatus::Abandoned => write!(f, "abandoned"),
             RunStatus::Success => write!(f, "success"),
             RunStatus::PartialFailure => write!(f, "partial_failure"),
             RunStatus::Failed => write!(f, "failed"),
@@ -325,14 +329,105 @@ impl JsonFileStore {
 
 #[async_trait]
 impl StateStore for JsonFileStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
+    async fn save_run_intent(
+        &self,
+        suggested_id: Option<String>,
+        flow_name: &str,
+        started_at: &str,
+        agent_count: usize,
+        task_count: usize,
+        tags: &[String],
+    ) -> Result<String> {
+        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let record = RunRecord {
+            run_id: run_id.clone(),
+            flow_name: flow_name.to_string(),
+            status: RunStatus::Running,
+            started_at: started_at.to_string(),
+            finished_at: String::new(),
+            duration_ms: 0,
+            task_results: Vec::new(),
+            agent_count,
+            task_count,
+            total_tokens: 0,
+            cached_tokens: 0,
+            tags: tags.to_vec(),
+        };
         let filename = format!("{}.json", record.run_id);
         let path = self.runs_dir.join(&filename);
-        let json = serde_json::to_string_pretty(record)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize run: {}", e)))?;
+        let json = serde_json::to_string_pretty(&record).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize run intent: {}", e))
+        })?;
         std::fs::write(&path, json)?;
-        tracing::info!("Run saved: {} -> {}", record.run_id, path.display());
-        Ok(record.run_id.clone())
+        tracing::debug!("Run intent saved: {} -> {}", run_id, path.display());
+        Ok(run_id)
+    }
+
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: &str,
+        duration_ms: u64,
+        task_results: Vec<crate::engine::task::TaskResult>,
+        total_tokens: u32,
+        cached_tokens: u32,
+    ) -> Result<()> {
+        let filename = format!("{}.json", run_id);
+        let path = self.runs_dir.join(&filename);
+        if !path.exists() {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found (update_run_completion)",
+                run_id
+            )));
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let mut record: RunRecord = serde_json::from_str(&data)
+            .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
+        if record.status != RunStatus::Running {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' is not in Running state (status={})",
+                run_id, record.status
+            )));
+        }
+        record.status = status;
+        record.finished_at = finished_at.to_string();
+        record.duration_ms = duration_ms;
+        record.task_results = task_results;
+        record.total_tokens = total_tokens;
+        record.cached_tokens = cached_tokens;
+        let json = serde_json::to_string_pretty(&record).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize run completion: {}", e))
+        })?;
+        std::fs::write(&path, json)?;
+        tracing::info!("Run completion saved: {} ({})", run_id, record.status);
+        Ok(())
+    }
+
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let mut count: usize = 0;
+        for entry in std::fs::read_dir(&self.runs_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)?;
+            let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
+                continue;
+            };
+            if record.status != RunStatus::Running {
+                continue;
+            }
+            record.status = RunStatus::Abandoned;
+            record.finished_at = now.to_string();
+            let json = serde_json::to_string_pretty(&record).map_err(|e| {
+                IronCrewError::Validation(format!("Failed to serialize reconciled run: {}", e))
+            })?;
+            std::fs::write(&path, json)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {

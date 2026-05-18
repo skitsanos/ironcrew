@@ -570,14 +570,56 @@ impl UserData for LuaCrew {
             // Lazy agent-as-tool finalization — fails fast with a validation
             // error if any agent__<name> refs an unknown agent. Also handles
             // MCP augmentation internally (finalize_agent_tools layers agent
-            // tools on top of the MCP-augmented registry), so this is a
-            // drop-in replacement for the previous ad-hoc registry assembly.
+            // tools on top of the MCP-augmented registry).
             let finalized = this
                 .ensure_agent_tools_finalized()
                 .await
                 .map_err(mlua::Error::external)?;
             let tool_registry = finalized.registry.clone();
 
+            // Snapshot values we need for the intent write BEFORE locking the crew.
+            let (flow_name_for_intent, agent_count_for_intent, task_count_for_intent) = {
+                let crew_guard = this.crew.lock().await;
+                (
+                    crew_guard.goal.clone(),
+                    crew_guard.agents.len(),
+                    crew_guard.tasks.len(),
+                )
+            };
+
+            // Pre-assigned run_id from the API handler (via app_data) takes precedence.
+            let pre_assigned_run_id: Option<String> =
+                lua.app_data_ref::<String>().map(|r| r.clone());
+
+            // Tags from CLI --tag flags or API input
+            let tags: Vec<String> = lua
+                .app_data_ref::<Vec<String>>()
+                .map(|t| t.clone())
+                .unwrap_or_default();
+
+            // Phase 1: write the Running intent. Fatal on failure — if we can't
+            // record the intent we shouldn't run the flow.
+            let store = this
+                .get_or_init_store()
+                .await
+                .map_err(mlua::Error::external)?;
+
+            let run_id = store
+                .save_run_intent(
+                    pre_assigned_run_id,
+                    &flow_name_for_intent,
+                    &run_start.to_rfc3339(),
+                    agent_count_for_intent,
+                    task_count_for_intent,
+                    &tags,
+                )
+                .await
+                .map_err(mlua::Error::external)?;
+            lua.globals()
+                .set("__ironcrew_last_run_id", run_id.clone())?;
+
+            // Phase 2: run the crew, catching both Ok and Err so we can always
+            // write completion.
             let mut crew = this.crew.lock().await;
 
             // If an EventBus was injected via Lua app_data (from API handler), use it.
@@ -589,39 +631,57 @@ impl UserData for LuaCrew {
                 Some(p) => p.clone(),
                 None => this.runtime.provider.clone(),
             };
-            let results = crew
-                .run(provider, &tool_registry)
-                .await
-                .map_err(mlua::Error::external)?;
+
+            let run_outcome = crew.run(provider, &tool_registry).await;
 
             let run_end = chrono::Utc::now();
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
 
-            // Save run history before returning so API callers can resolve this exact run.
-            // If the API handler injected a run_id via app_data, use it for consistency.
-            let pre_assigned_run_id: Option<String> =
-                lua.app_data_ref::<String>().map(|r| r.clone());
-            let mut record = crew.create_run_record(
-                pre_assigned_run_id,
-                &results,
-                &run_start.to_rfc3339(),
-                &run_end.to_rfc3339(),
-                total_ms,
-            );
-
-            // Attach tags from CLI --tag flags or API input
-            if let Some(tags) = lua.app_data_ref::<Vec<String>>() {
-                record.tags = tags.clone();
-            }
-            let store = this
-                .get_or_init_store()
-                .await
-                .map_err(mlua::Error::external)?;
-            let run_id = store
-                .save_run(&record)
-                .await
-                .map_err(mlua::Error::external)?;
-            lua.globals().set("__ironcrew_last_run_id", run_id)?;
+            let results = match run_outcome {
+                Ok(results) => {
+                    // Derive status + totals via the existing create_run_record helper.
+                    let mut record = crew.create_run_record(
+                        Some(run_id.clone()),
+                        &results,
+                        &run_start.to_rfc3339(),
+                        &run_end.to_rfc3339(),
+                        total_ms,
+                    );
+                    record.tags = tags.clone();
+                    // FATAL on failure: --json mode and the HTTP handler re-fetch
+                    // the record from the store; a lingering Running record would
+                    // surface as the response. Reconciler will sweep it later.
+                    store
+                        .update_run_completion(
+                            &run_id,
+                            record.status.clone(),
+                            &run_end.to_rfc3339(),
+                            total_ms,
+                            record.task_results.clone(),
+                            record.total_tokens,
+                            record.cached_tokens,
+                        )
+                        .await
+                        .map_err(mlua::Error::external)?;
+                    results
+                }
+                Err(e) => {
+                    // Best-effort completion on the error path: swallow errors
+                    // because the caller's failure takes precedence.
+                    let _ = store
+                        .update_run_completion(
+                            &run_id,
+                            crate::engine::run_history::RunStatus::Failed,
+                            &run_end.to_rfc3339(),
+                            total_ms,
+                            Vec::new(),
+                            0,
+                            0,
+                        )
+                        .await;
+                    return Err(mlua::Error::external(e));
+                }
+            };
 
             // Convert results to Lua table
             let results_table = lua.create_table()?;

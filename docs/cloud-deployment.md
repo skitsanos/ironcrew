@@ -89,6 +89,7 @@ Production deployments should set these at minimum:
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
 | `IRONCREW_MAX_RESPONSE_SIZE` | `52428800` (50 MB) | Caps `http_request` tool responses. |
 | `IRONCREW_ENV_BLOCKLIST` | comma-separated secrets | Augments the built-in blocklist so Lua `env()` cannot read them. |
+| `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Whitelist that bypasses every block rule (default + suffix + blocklist). Use to grant a crew explicit access to specific secrets (e.g. `AZURE_OPENAI_API_KEY`). See [docs/sandbox.md](sandbox.md). |
 
 ### Secrets handling
 

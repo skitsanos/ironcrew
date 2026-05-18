@@ -177,40 +177,98 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
 
 #[async_trait]
 impl StateStore for SqliteStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
+    async fn save_run_intent(
+        &self,
+        suggested_id: Option<String>,
+        flow_name: &str,
+        started_at: &str,
+        agent_count: usize,
+        task_count: usize,
+        tags: &[String],
+    ) -> Result<String> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-
-        let task_results_json = serde_json::to_string(&record.task_results).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
-        })?;
-        let tags_json = serde_json::to_string(&record.tags)
+        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let tags_json = serde_json::to_string(tags)
             .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
 
         conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+             VALUES (?1, ?2, 'running', ?3, '', 0, '[]', ?4, ?5, 0, 0, ?6)",
             rusqlite::params![
-                record.run_id,
-                record.flow_name,
-                record.status.to_string(),
-                record.started_at,
-                record.finished_at,
-                record.duration_ms as i64,
-                task_results_json,
-                record.agent_count as i64,
-                record.task_count as i64,
-                record.total_tokens as i64,
-                record.cached_tokens as i64,
+                run_id,
+                flow_name,
+                started_at,
+                agent_count as i64,
+                task_count as i64,
                 tags_json,
             ],
         )
-        .map_err(|e| IronCrewError::Validation(format!("SQLite insert error: {}", e)))?;
+        .map_err(|e| IronCrewError::Validation(format!("SQLite insert intent: {}", e)))?;
+        tracing::debug!("Run intent saved: {}", run_id);
+        Ok(run_id)
+    }
 
-        tracing::info!("Run saved to SQLite: {}", record.run_id);
-        Ok(record.run_id.clone())
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: &str,
+        duration_ms: u64,
+        task_results: Vec<crate::engine::task::TaskResult>,
+        total_tokens: u32,
+        cached_tokens: u32,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let task_results_json = serde_json::to_string(&task_results).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
+        })?;
+
+        let rows = conn
+            .execute(
+                "UPDATE runs
+                 SET status = ?1, finished_at = ?2, duration_ms = ?3,
+                     task_results = ?4, total_tokens = ?5, cached_tokens = ?6
+                 WHERE run_id = ?7 AND status = 'running'",
+                rusqlite::params![
+                    status.to_string(),
+                    finished_at,
+                    duration_ms as i64,
+                    task_results_json,
+                    total_tokens as i64,
+                    cached_tokens as i64,
+                    run_id,
+                ],
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite update completion: {}", e)))?;
+
+        if rows == 0 {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found or not in Running state",
+                run_id
+            )));
+        }
+        tracing::info!("Run completion saved: {} ({})", run_id, status);
+        Ok(())
+    }
+
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let rows = conn
+            .execute(
+                "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status = 'running'",
+                rusqlite::params![now],
+            )
+            .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;
+        Ok(rows)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -237,6 +295,8 @@ impl StateStore for SqliteStore {
                     status: match status_str.as_str() {
                         "success" => RunStatus::Success,
                         "partial_failure" => RunStatus::PartialFailure,
+                        "running" => RunStatus::Running,
+                        "abandoned" => RunStatus::Abandoned,
                         _ => RunStatus::Failed,
                     },
                     started_at: row.get(3)?,
@@ -331,6 +391,8 @@ impl StateStore for SqliteStore {
                     status: match status_str.as_str() {
                         "success" => RunStatus::Success,
                         "partial_failure" => RunStatus::PartialFailure,
+                        "running" => RunStatus::Running,
+                        "abandoned" => RunStatus::Abandoned,
                         _ => RunStatus::Failed,
                     },
                     started_at: row.get(3)?,

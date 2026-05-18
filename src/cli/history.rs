@@ -45,6 +45,8 @@ pub async fn cmd_runs(
 
     for run in &runs {
         let status_display = match run.status {
+            RunStatus::Running => "running",
+            RunStatus::Abandoned => "abandoned",
             RunStatus::Success => "success",
             RunStatus::PartialFailure => "partial",
             RunStatus::Failed => "failed",
