@@ -124,7 +124,7 @@ jobs:
       # (the separate .sig / .pem outputs from v2 are replaced).
       # Verifiers use `cosign verify-blob --bundle ...`.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign release artifacts with cosign
         run: |
