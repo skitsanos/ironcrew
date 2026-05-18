@@ -119,8 +119,10 @@ jobs:
 
       # Keyless signing: cosign fetches an OIDC token from GitHub and
       # requests a short-lived certificate from Fulcio. No secrets or
-      # static keys involved. Produces <artifact>.sig and <artifact>.pem
-      # next to each signed file; verifiers use `cosign verify-blob`.
+      # static keys involved. Cosign v3 bundles the signature and
+      # certificate into a single <artifact>.bundle JSON file
+      # (the separate .sig / .pem outputs from v2 are replaced).
+      # Verifiers use `cosign verify-blob --bundle ...`.
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
@@ -131,8 +133,7 @@ jobs:
             [ -f "$artifact" ] || continue
             echo "Signing $artifact"
             cosign sign-blob --yes \
-              --output-signature "$artifact.sig" \
-              --output-certificate "$artifact.pem" \
+              --bundle "$artifact.bundle" \
               "$artifact"
           done
 
@@ -177,8 +178,7 @@ jobs:
             echo ''
             echo '```bash'
             echo 'cosign verify-blob \'
-            echo '  --certificate ironcrew-linux-amd64.tar.gz.pem \'
-            echo '  --signature ironcrew-linux-amd64.tar.gz.sig \'
+            echo '  --bundle ironcrew-linux-amd64.tar.gz.bundle \'
             echo "  --certificate-identity-regexp '^https://github.com/skitsanos/ironcrew' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
             echo '  ironcrew-linux-amd64.tar.gz'
