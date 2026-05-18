@@ -320,50 +320,92 @@ and targets extension-capable deployments such as pgvector-enabled installs.",
 
 #[async_trait]
 impl StateStore for PostgresStore {
-    async fn save_run(&self, record: &RunRecord) -> Result<String> {
-        let task_results_json = serde_json::to_string(&record.task_results).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
-        })?;
-        let tags_json = serde_json::to_string(&record.tags)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
-
+    async fn save_run_intent(
+        &self,
+        suggested_id: Option<String>,
+        flow_name: &str,
+        started_at: &str,
+        agent_count: usize,
+        task_count: usize,
+        tags: &[String],
+    ) -> Result<String> {
+        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let tags_json = serde_json::to_string(tags)
+            .map_err(|e| IronCrewError::Validation(format!("Tags serialize: {}", e)))?;
+        let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
+            .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
         let sql = format!(
             "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb)
-             ON CONFLICT (run_id) DO UPDATE SET
-                flow_name = EXCLUDED.flow_name,
-                status = EXCLUDED.status,
-                started_at = EXCLUDED.started_at,
-                finished_at = EXCLUDED.finished_at,
-                duration_ms = EXCLUDED.duration_ms,
-                task_results = EXCLUDED.task_results,
-                agent_count = EXCLUDED.agent_count,
-                task_count = EXCLUDED.task_count,
-                total_tokens = EXCLUDED.total_tokens,
-                cached_tokens = EXCLUDED.cached_tokens,
-                tags = EXCLUDED.tags",
+             VALUES ($1, $2, 'running', $3, '', 0, $4::jsonb, $5, $6, 0, 0, $7::jsonb)",
             self.table_name
         );
-
         sqlx::query(&sql)
-            .bind(&record.run_id)
-            .bind(&record.flow_name)
-            .bind(record.status.to_string())
-            .bind(&record.started_at)
-            .bind(&record.finished_at)
-            .bind(record.duration_ms as i64)
-            .bind(&task_results_json)
-            .bind(record.agent_count as i32)
-            .bind(record.task_count as i32)
-            .bind(record.total_tokens as i32)
-            .bind(record.cached_tokens as i32)
+            .bind(&run_id)
+            .bind(flow_name)
+            .bind(started_at)
+            .bind(&empty_tasks)
+            .bind(agent_count as i64)
+            .bind(task_count as i64)
             .bind(&tags_json)
             .execute(&self.pool)
             .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL insert error: {}", e)))?;
+            .map_err(|e| IronCrewError::Validation(format!("PG insert intent: {}", e)))?;
+        tracing::debug!("Run intent saved: {}", run_id);
+        Ok(run_id)
+    }
 
-        tracing::info!("Run saved to PostgreSQL: {}", record.run_id);
-        Ok(record.run_id.clone())
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: &str,
+        duration_ms: u64,
+        task_results: Vec<crate::engine::task::TaskResult>,
+        total_tokens: u32,
+        cached_tokens: u32,
+    ) -> Result<()> {
+        let task_results_json = serde_json::to_string(&task_results)
+            .map_err(|e| IronCrewError::Validation(format!("task_results serialize: {}", e)))?;
+        let sql = format!(
+            "UPDATE {}
+             SET status = $1, finished_at = $2, duration_ms = $3,
+                 task_results = $4::jsonb, total_tokens = $5, cached_tokens = $6
+             WHERE run_id = $7 AND status = 'running'",
+            self.table_name
+        );
+        let result = sqlx::query(&sql)
+            .bind(status.to_string())
+            .bind(finished_at)
+            .bind(duration_ms as i64)
+            .bind(&task_results_json)
+            .bind(total_tokens as i32)
+            .bind(cached_tokens as i32)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG update completion: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found or not in Running state",
+                run_id
+            )));
+        }
+        tracing::info!("Run completion saved: {} ({})", run_id, status);
+        Ok(())
+    }
+
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let sql = format!(
+            "UPDATE {} SET status = 'abandoned', finished_at = $1 WHERE status = 'running'",
+            self.table_name
+        );
+        let result = sqlx::query(&sql)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG reconcile: {}", e)))?;
+        Ok(result.rows_affected() as usize)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -850,6 +892,8 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
         status: match status_str.as_str() {
             "success" => RunStatus::Success,
             "partial_failure" => RunStatus::PartialFailure,
+            "running" => RunStatus::Running,
+            "abandoned" => RunStatus::Abandoned,
             _ => RunStatus::Failed,
         },
         started_at: row
@@ -902,6 +946,8 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
         status: match status_str.as_str() {
             "success" => RunStatus::Success,
             "partial_failure" => RunStatus::PartialFailure,
+            "running" => RunStatus::Running,
+            "abandoned" => RunStatus::Abandoned,
             _ => RunStatus::Failed,
         },
         started_at: row

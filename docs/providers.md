@@ -144,9 +144,10 @@ Azure is not covered by the URL-based key auto-detection table below, so the
 key falls back to `OPENAI_API_KEY`. In practice you have two options:
 
 1. Export your Azure key as `OPENAI_API_KEY` before running `ironcrew`.
-2. Relax the sandbox blocklist (see [docs/sandbox.md](sandbox.md)) so the Lua
-   `env("AZURE_OPENAI_API_KEY")` call is permitted, then pass `api_key`
-   explicitly.
+2. Grant the Lua sandbox explicit access to the Azure var via
+   `IRONCREW_ENV_ALLOWLIST=AZURE_OPENAI_API_KEY` (see
+   [docs/sandbox.md](sandbox.md#granting-explicit-access--ironcrew_env_allowlist)),
+   then call `api_key = env("AZURE_OPENAI_API_KEY")` in `crew.lua`.
 
 ## Anthropic Native (`provider = "anthropic"`)
 

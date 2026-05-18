@@ -369,6 +369,7 @@ be set in the shell or in `.env` files.
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` to allow HTTP requests to private/loopback IPs (SSRF protection disabled) |
 | `IRONCREW_ENV_BLOCKLIST` | Comma-separated additional env var names to block from Lua `env()` |
+| `IRONCREW_ENV_ALLOWLIST` | Comma-separated env var names to expose to Lua `env()`, overriding the default + custom blocklists |
 
 **Tool Resource Budgets:**
 

@@ -214,9 +214,10 @@ internal services.
 **Environment variable security.** Lua `env()` blocks sensitive variables by
 default: `DATABASE_URL`, `IRONCREW_API_TOKEN`, `IRONCREW_PG_TABLE_PREFIX`,
 and any variable ending with `_API_KEY`, `_SECRET`, `_TOKEN`, or
-`_PASSWORD`. Add custom names to `IRONCREW_ENV_BLOCKLIST` (comma-separated).
-This prevents Lua scripts from exfiltrating secrets into task output. See
-`src/lua/sandbox.rs` for the authoritative list.
+`_PASSWORD`. Extend the deny set via `IRONCREW_ENV_BLOCKLIST`; grant
+explicit per-var access via `IRONCREW_ENV_ALLOWLIST` (overrides every
+block rule). Both are comma-separated, case-insensitive. See
+[docs/sandbox.md](sandbox.md) for the resolution order.
 
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
