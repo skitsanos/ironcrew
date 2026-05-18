@@ -35,7 +35,18 @@ fn get_or_compile_regex(pattern: &str) -> mlua::Result<regex::Regex> {
 /// Register utility global functions available in all Lua sandboxes.
 pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // env() — blocks sensitive variables by default.
-    // IRONCREW_ENV_BLOCKLIST can override (comma-separated patterns).
+    //
+    // Two env vars tune the behavior at runtime:
+    //   * IRONCREW_ENV_ALLOWLIST — comma-separated exact names that bypass
+    //     ALL block rules (hardcoded defaults, suffix patterns, and the
+    //     custom blocklist). Use to expose specific secrets to your own
+    //     crews (e.g. `AZURE_OPENAI_API_KEY`).
+    //   * IRONCREW_ENV_BLOCKLIST — comma-separated names to ADD to the
+    //     deny set.
+    //
+    // The allowlist is checked first and wins over every block rule, so
+    // operators can grant precise per-var access without disabling the
+    // generic `*_API_KEY` etc. patterns for the rest of the codebase.
     let env_fn = lua.create_function(|_, name: String| {
         const DEFAULT_BLOCKED: &[&str] = &[
             "DATABASE_URL",
@@ -46,7 +57,18 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 
         let upper = name.to_uppercase();
 
-        // Check custom blocklist from env (comma-separated exact names)
+        // 1. Allowlist wins — operator has explicitly opted in to this name.
+        let allowlist = std::env::var("IRONCREW_ENV_ALLOWLIST").unwrap_or_default();
+        if allowlist
+            .split(',')
+            .map(|s| s.trim())
+            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(&name))
+        {
+            return Ok(std::env::var(&name).ok());
+        }
+
+        // 2. Otherwise apply the deny set: defaults + suffix patterns +
+        //    custom blocklist.
         let custom_blocked = std::env::var("IRONCREW_ENV_BLOCKLIST").unwrap_or_default();
         let custom: Vec<&str> = custom_blocked.split(',').map(|s| s.trim()).collect();
 
@@ -645,5 +667,113 @@ fn validate_tool_fs_path(base_dir: &Path, path: &str) -> LuaResult<PathBuf> {
             }
         }
         Ok(joined)
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use mlua::Lua;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Shared lock for tests that mutate process env. Matches the pattern
+    /// used in `src/mcp/config.rs` and `src/lua/agent_turn.rs`.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn new_lua() -> Lua {
+        let lua = Lua::new();
+        super::register_lua_globals(&lua).unwrap();
+        lua
+    }
+
+    /// SAFETY: env mutations are serialized via `env_guard()`. Tests in
+    /// this module are the only place these vars are written.
+    fn set(name: &str, value: &str) {
+        unsafe { std::env::set_var(name, value) };
+    }
+    fn unset(name: &str) {
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn allowlist_unblocks_default_api_key_suffix() {
+        let _guard = env_guard();
+        set("AZURE_OPENAI_API_KEY", "sk-azure-test");
+        set("IRONCREW_ENV_ALLOWLIST", "AZURE_OPENAI_API_KEY");
+
+        let lua = new_lua();
+        let got: Option<String> = lua
+            .load(r#"return env("AZURE_OPENAI_API_KEY")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("sk-azure-test"));
+
+        unset("AZURE_OPENAI_API_KEY");
+        unset("IRONCREW_ENV_ALLOWLIST");
+    }
+
+    #[test]
+    fn allowlist_unblocks_default_blocked_exact_name() {
+        let _guard = env_guard();
+        set("DATABASE_URL", "postgres://localhost/test");
+        set("IRONCREW_ENV_ALLOWLIST", "DATABASE_URL");
+
+        let lua = new_lua();
+        let got: Option<String> = lua.load(r#"return env("DATABASE_URL")"#).eval().unwrap();
+        assert_eq!(got.as_deref(), Some("postgres://localhost/test"));
+
+        unset("DATABASE_URL");
+        unset("IRONCREW_ENV_ALLOWLIST");
+    }
+
+    #[test]
+    fn allowlist_overrides_custom_blocklist() {
+        let _guard = env_guard();
+        set("MY_PUBLIC_VAR", "visible");
+        set("IRONCREW_ENV_BLOCKLIST", "MY_PUBLIC_VAR");
+        set("IRONCREW_ENV_ALLOWLIST", "MY_PUBLIC_VAR");
+
+        let lua = new_lua();
+        let got: Option<String> = lua.load(r#"return env("MY_PUBLIC_VAR")"#).eval().unwrap();
+        assert_eq!(got.as_deref(), Some("visible"));
+
+        unset("MY_PUBLIC_VAR");
+        unset("IRONCREW_ENV_BLOCKLIST");
+        unset("IRONCREW_ENV_ALLOWLIST");
+    }
+
+    #[test]
+    fn no_allowlist_still_blocks_api_key_suffix() {
+        let _guard = env_guard();
+        set("SOME_OTHER_API_KEY", "sk-secret");
+        unset("IRONCREW_ENV_ALLOWLIST");
+
+        let lua = new_lua();
+        let got: Option<String> = lua
+            .load(r#"return env("SOME_OTHER_API_KEY")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(
+            got, None,
+            "*_API_KEY must still be blocked without an allowlist entry"
+        );
+
+        unset("SOME_OTHER_API_KEY");
+    }
+
+    #[test]
+    fn empty_allowlist_entry_does_not_unblock_anything() {
+        let _guard = env_guard();
+        set("DATABASE_URL", "postgres://localhost/test");
+        set("IRONCREW_ENV_ALLOWLIST", ",,,"); // empty entries
+
+        let lua = new_lua();
+        let got: Option<String> = lua.load(r#"return env("DATABASE_URL")"#).eval().unwrap();
+        assert_eq!(got, None, "empty allowlist tokens must not match anything");
+
+        unset("DATABASE_URL");
+        unset("IRONCREW_ENV_ALLOWLIST");
     }
 }
