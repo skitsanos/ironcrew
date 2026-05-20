@@ -1,8 +1,25 @@
 #![cfg(feature = "postgres")]
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+
+/// Upper bound on the per-retry backoff delay during store init.
+const CONNECT_BACKOFF_CAP_MS: u64 = 30_000;
+
+/// Exponential backoff delay before the next connection retry.
+///
+/// `attempt` is 1-based (1 = delay before the first retry). The delay doubles
+/// each attempt, starting from `base_ms`, capped at `cap_ms`. Saturating math
+/// keeps large attempt counts from overflowing.
+fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
+    let factor = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    Duration::from_millis(base_ms.saturating_mul(factor).min(cap_ms))
+}
 
 use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
 use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
@@ -38,13 +55,46 @@ impl PostgresStore {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
 
-        let pool = PgPoolOptions::new()
-            .max_connections(max_conn)
-            .connect(database_url)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("Failed to connect to PostgreSQL: {}", e))
-            })?;
+        // Retries *after* the initial attempt. With backoff this rides out a
+        // transient database outage (e.g. a platform restart) so a brief blip
+        // doesn't crash the process and burn a container restart per attempt.
+        let retries: u32 = std::env::var("IRONCREW_DB_CONNECT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let backoff_base_ms: u64 = std::env::var("IRONCREW_DB_CONNECT_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000);
+
+        let mut attempt: u32 = 0;
+        let pool = loop {
+            attempt += 1;
+            match PgPoolOptions::new()
+                .max_connections(max_conn)
+                .connect(database_url)
+                .await
+            {
+                Ok(pool) => break pool,
+                Err(e) => {
+                    if attempt > retries {
+                        return Err(IronCrewError::Validation(format!(
+                            "Failed to connect to PostgreSQL after {} attempt(s): {}",
+                            attempt, e
+                        )));
+                    }
+                    let delay = retry_backoff(attempt, backoff_base_ms, CONNECT_BACKOFF_CAP_MS);
+                    tracing::warn!(
+                        "PostgreSQL connection attempt {}/{} failed: {}; retrying in {:?}",
+                        attempt,
+                        retries + 1,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        };
 
         ensure_supported_postgres_version(&pool).await?;
 
@@ -963,4 +1013,32 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
         cached_tokens: cached_tokens as u32,
         tags: serde_json::from_str(&tags_str).unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_exponentially_then_caps() {
+        let base = 1_000;
+        let cap = CONNECT_BACKOFF_CAP_MS;
+        assert_eq!(retry_backoff(1, base, cap), Duration::from_millis(1_000));
+        assert_eq!(retry_backoff(2, base, cap), Duration::from_millis(2_000));
+        assert_eq!(retry_backoff(3, base, cap), Duration::from_millis(4_000));
+        assert_eq!(retry_backoff(4, base, cap), Duration::from_millis(8_000));
+        assert_eq!(retry_backoff(5, base, cap), Duration::from_millis(16_000));
+        // 1_000 * 2^5 = 32_000 -> capped at 30_000
+        assert_eq!(retry_backoff(6, base, cap), Duration::from_millis(cap));
+        assert_eq!(retry_backoff(10, base, cap), Duration::from_millis(cap));
+    }
+
+    #[test]
+    fn backoff_does_not_overflow_on_large_attempts() {
+        // Shift would exceed u64 width; must saturate to the cap, not panic.
+        assert_eq!(
+            retry_backoff(1_000, 1_000, CONNECT_BACKOFF_CAP_MS),
+            Duration::from_millis(CONNECT_BACKOFF_CAP_MS)
+        );
+    }
 }
