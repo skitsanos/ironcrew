@@ -386,3 +386,102 @@ async fn json_store_reconcile_abandoned_selectivity() {
         .unwrap();
     assert_eq!(second, 0);
 }
+
+#[test]
+fn audit_event_serde_roundtrip() {
+    use ironcrew::engine::audit::AuditEvent;
+
+    let event = AuditEvent {
+        id: "abc-123".into(),
+        timestamp: "2026-05-21T10:00:00Z".into(),
+        action: "flow.run.delete".into(),
+        flow_path: Some("chat-http".into()),
+        target: Some("run-xyz".into()),
+        actor: Some("alice@example.com".into()),
+        source_ip: Some("203.0.113.7".into()),
+        success: true,
+        status_code: 200,
+        metadata: Some(serde_json::json!({"tags": ["prod"]})),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let back: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, event);
+}
+
+#[test]
+fn audit_filter_matches_only_matching_dimensions() {
+    use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+
+    let event = AuditEvent {
+        id: "x".into(),
+        timestamp: "2026-05-21T10:00:00Z".into(),
+        action: "flow.run.delete".into(),
+        flow_path: Some("chat-http".into()),
+        target: Some("r1".into()),
+        actor: Some("alice".into()),
+        source_ip: Some("127.0.0.1".into()),
+        success: true,
+        status_code: 200,
+        metadata: None,
+    };
+
+    // Empty filter matches anything.
+    assert!(AuditFilter::default().matches(&event));
+
+    // Matching dimensions pass.
+    assert!(
+        AuditFilter {
+            flow_path: Some("chat-http".into()),
+            action: Some("flow.run.delete".into()),
+            actor: Some("alice".into()),
+            since: Some("2026-05-21T00:00:00Z".into()),
+            until: Some("2026-05-22T00:00:00Z".into()),
+            success: Some(true),
+        }
+        .matches(&event)
+    );
+
+    // Mismatched dimensions fail.
+    assert!(
+        !AuditFilter {
+            flow_path: Some("other-flow".into()),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+    assert!(
+        !AuditFilter {
+            action: Some("flow.run.start".into()),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+    assert!(
+        !AuditFilter {
+            actor: Some("bob".into()),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+    assert!(
+        !AuditFilter {
+            since: Some("2026-05-22T00:00:00Z".into()),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+    assert!(
+        !AuditFilter {
+            until: Some("2026-05-21T09:00:00Z".into()),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+    assert!(
+        !AuditFilter {
+            success: Some(false),
+            ..Default::default()
+        }
+        .matches(&event)
+    );
+}
