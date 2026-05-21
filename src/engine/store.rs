@@ -128,12 +128,10 @@ pub trait StateStore: Send + Sync {
 
     /// Append an audit event. The backend generates a UUID v4 and
     /// writes it into the event's `id` field. Returns the generated id.
-    #[allow(dead_code)]
     async fn save_audit_event(&self, event: &AuditEvent) -> Result<String>;
 
     /// Paginated list of audit events matching the filter, sorted
     /// newest-first by `timestamp`. `limit = 0` means unlimited.
-    #[allow(dead_code)]
     async fn list_audit_events(
         &self,
         filter: &AuditFilter,
@@ -143,7 +141,6 @@ pub trait StateStore: Send + Sync {
 
     /// Count of events matching the filter. Paired with
     /// `list_audit_events` to provide `total` in paginated responses.
-    #[allow(dead_code)]
     async fn count_audit_events(&self, filter: &AuditFilter) -> Result<u64>;
 }
 
