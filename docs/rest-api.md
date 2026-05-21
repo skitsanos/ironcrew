@@ -361,6 +361,70 @@ auto-create. The hard cap on simultaneously-active sessions is
 See [docs/chat.md](chat.md) for the full reference, request/response
 shapes, and a worked curl session.
 
+## GET /audit
+
+Returns the audit log of state-changing API actions, sorted newest-first
+with pagination.
+
+### Query parameters
+
+| Param | Type | Notes |
+|---|---|---|
+| `flow` | string | Filter by `flow_path` (exact match). |
+| `action` | string | One of `flow.run.start`, `flow.run.abort`, `flow.run.delete`, `conversation.start`, `conversation.delete`. |
+| `actor` | string | Exact match against the `X-Audit-Actor` value at write time. |
+| `since` | RFC3339 timestamp | Inclusive lower bound. |
+| `until` | RFC3339 timestamp | Exclusive upper bound. |
+| `success` | `true` / `false` | Filter to only successful or only failed attempts. |
+| `limit` | int | Page size. Default `IRONCREW_AUDIT_DEFAULT_LIMIT` (50). Capped at `IRONCREW_AUDIT_MAX_LIMIT` (500). |
+| `offset` | int | Skip the first N rows. Default 0. |
+
+### Response
+
+```json
+{
+  "events": [
+    {
+      "id": "f3e1c2a8-...",
+      "timestamp": "2026-05-21T10:00:00Z",
+      "action": "flow.run.delete",
+      "flow_path": "chat-http",
+      "target": "run-xyz",
+      "actor": "alice@example.com",
+      "source_ip": "203.0.113.7",
+      "success": true,
+      "status_code": 200,
+      "metadata": null
+    }
+  ],
+  "total": 1234,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+### `X-Audit-Actor` header
+
+Every state-changing endpoint accepts an optional `X-Audit-Actor`
+request header. The value is recorded into the audit event's `actor`
+field. Voluntary, validated (≤256 chars, no control characters,
+trimmed). Future JWT integration will override with the `sub` claim.
+
+### Authorization
+
+Same `IRONCREW_API_TOKEN` as the other protected endpoints. No
+dedicated audit token today. Reads of the audit log are not
+themselves audited.
+
+### Trust-proxy mode
+
+When running behind a reverse proxy (Nginx, Envoy, AWS ALB, etc.),
+set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the first hop
+of `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
+Without the env var set, an attacker hitting the server directly could
+forge their IP by sending an `X-Forwarded-For` header; the gate
+prevents that.
+
 ## Health Check
 
 ```bash
