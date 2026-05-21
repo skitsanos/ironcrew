@@ -904,6 +904,23 @@ impl StateStore for PostgresStore {
             })?;
         Ok(())
     }
+
+    async fn save_audit_event(&self, _event: &crate::engine::audit::AuditEvent) -> Result<String> {
+        unimplemented!("save_audit_event — landed in Task 5")
+    }
+
+    async fn list_audit_events(
+        &self,
+        _filter: &crate::engine::audit::AuditFilter,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
+        unimplemented!("list_audit_events — landed in Task 5")
+    }
+
+    async fn count_audit_events(&self, _filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
+        unimplemented!("count_audit_events — landed in Task 5")
+    }
 }
 
 fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
