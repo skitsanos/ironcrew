@@ -20,8 +20,6 @@ const METADATA_MAX_BYTES: usize = 2 * 1024;
 const ACTOR_MAX_LEN: usize = 256;
 
 #[allow(clippy::too_many_arguments)]
-// TODO(task-8): remove allow when handlers call record
-#[allow(dead_code)]
 pub async fn record(
     store: &Arc<dyn StateStore>,
     action: &str,
