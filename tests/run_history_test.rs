@@ -485,3 +485,232 @@ fn audit_filter_matches_only_matching_dimensions() {
         .matches(&event)
     );
 }
+
+#[tokio::test]
+async fn json_store_audit_event_roundtrip() {
+    use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+
+    let event = AuditEvent {
+        id: String::new(), // overwritten by the backend
+        timestamp: "2026-05-21T10:00:00Z".into(),
+        action: "flow.run.delete".into(),
+        flow_path: Some("chat-http".into()),
+        target: Some("run-xyz".into()),
+        actor: Some("alice@example.com".into()),
+        source_ip: Some("203.0.113.7".into()),
+        success: true,
+        status_code: 200,
+        metadata: Some(serde_json::json!({"tags": ["prod"]})),
+    };
+
+    let id = store.save_audit_event(&event).await.unwrap();
+    assert!(!id.is_empty());
+
+    let events = store
+        .list_audit_events(&AuditFilter::default(), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let saved = &events[0];
+    assert_eq!(saved.id, id);
+    assert_eq!(saved.timestamp, "2026-05-21T10:00:00Z");
+    assert_eq!(saved.action, "flow.run.delete");
+    assert_eq!(saved.flow_path.as_deref(), Some("chat-http"));
+    assert_eq!(saved.target.as_deref(), Some("run-xyz"));
+    assert_eq!(saved.actor.as_deref(), Some("alice@example.com"));
+    assert_eq!(saved.source_ip.as_deref(), Some("203.0.113.7"));
+    assert!(saved.success);
+    assert_eq!(saved.status_code, 200);
+    assert_eq!(saved.metadata, Some(serde_json::json!({"tags": ["prod"]})));
+}
+
+#[tokio::test]
+async fn json_store_audit_filter_selectivity() {
+    use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+
+    for (i, (flow, action, actor, success)) in [
+        ("flow-a", "flow.run.start", "alice", true),
+        ("flow-a", "flow.run.delete", "alice", true),
+        ("flow-b", "flow.run.start", "bob", false),
+        ("flow-b", "conversation.start", "alice", true),
+        ("flow-a", "conversation.delete", "bob", false),
+    ]
+    .iter()
+    .enumerate()
+    {
+        store
+            .save_audit_event(&AuditEvent {
+                id: String::new(),
+                timestamp: format!("2026-05-21T10:0{}:00Z", i),
+                action: (*action).into(),
+                flow_path: Some((*flow).into()),
+                target: None,
+                actor: Some((*actor).into()),
+                source_ip: None,
+                success: *success,
+                status_code: if *success { 200 } else { 500 },
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let all = store
+        .list_audit_events(&AuditFilter::default(), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+
+    let by_flow = store
+        .list_audit_events(
+            &AuditFilter {
+                flow_path: Some("flow-a".into()),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_flow.len(), 3);
+
+    let by_action = store
+        .list_audit_events(
+            &AuditFilter {
+                action: Some("flow.run.start".into()),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_action.len(), 2);
+
+    let by_actor = store
+        .list_audit_events(
+            &AuditFilter {
+                actor: Some("alice".into()),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_actor.len(), 3);
+
+    let by_success = store
+        .list_audit_events(
+            &AuditFilter {
+                success: Some(false),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_success.len(), 2);
+
+    let by_since = store
+        .list_audit_events(
+            &AuditFilter {
+                since: Some("2026-05-21T10:02:00Z".into()),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_since.len(), 3);
+
+    let by_until = store
+        .list_audit_events(
+            &AuditFilter {
+                until: Some("2026-05-21T10:02:00Z".into()),
+                ..Default::default()
+            },
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_until.len(), 2);
+
+    assert_eq!(
+        store
+            .count_audit_events(&AuditFilter {
+                flow_path: Some("flow-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn json_store_audit_pagination_newest_first() {
+    use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+
+    for i in 0..12 {
+        store
+            .save_audit_event(&AuditEvent {
+                id: String::new(),
+                timestamp: format!("2026-05-21T10:{:02}:00Z", i),
+                action: format!("action-{i}"),
+                flow_path: None,
+                target: None,
+                actor: None,
+                source_ip: None,
+                success: true,
+                status_code: 200,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let page1 = store
+        .list_audit_events(&AuditFilter::default(), 5, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 5);
+    assert_eq!(page1[0].action, "action-11");
+    assert_eq!(page1[4].action, "action-7");
+
+    let page2 = store
+        .list_audit_events(&AuditFilter::default(), 5, 5)
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 5);
+    assert_eq!(page2[0].action, "action-6");
+    assert_eq!(page2[4].action, "action-2");
+
+    let page3 = store
+        .list_audit_events(&AuditFilter::default(), 5, 10)
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 2);
+    assert_eq!(page3[0].action, "action-1");
+    assert_eq!(page3[1].action, "action-0");
+
+    assert_eq!(
+        store
+            .count_audit_events(&AuditFilter::default())
+            .await
+            .unwrap(),
+        12
+    );
+}
