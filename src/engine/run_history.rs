@@ -293,24 +293,31 @@ fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
 /// JSON file-based store rooted at an `.ironcrew/` directory.
 ///
 /// Each record type gets its own subdirectory: `runs/`, `conversations/`,
-/// and `dialogs/`. All three are owner-only (0o700) on Unix since they
-/// may contain sensitive model output.
+/// `dialogs/`, and `audit_events/`. All four are owner-only (0o700) on
+/// Unix since they may contain sensitive model output.
 pub struct JsonFileStore {
     runs_dir: PathBuf,
     conversations_dir: PathBuf,
     dialogs_dir: PathBuf,
+    audit_events_dir: PathBuf,
 }
 
 impl JsonFileStore {
     /// Create (or open) a JSON-backed store inside the given `.ironcrew/`
-    /// directory. The directory — and the three subdirectories it contains
+    /// directory. The directory — and the four subdirectories it contains
     /// — are created with `create_dir_all` if they don't already exist.
     pub fn new(ironcrew_dir: PathBuf) -> Result<Self> {
         let runs_dir = ironcrew_dir.join("runs");
         let conversations_dir = ironcrew_dir.join("conversations");
         let dialogs_dir = ironcrew_dir.join("dialogs");
+        let audit_events_dir = ironcrew_dir.join("audit_events");
 
-        for dir in [&runs_dir, &conversations_dir, &dialogs_dir] {
+        for dir in [
+            &runs_dir,
+            &conversations_dir,
+            &dialogs_dir,
+            &audit_events_dir,
+        ] {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
@@ -323,6 +330,7 @@ impl JsonFileStore {
             runs_dir,
             conversations_dir,
             dialogs_dir,
+            audit_events_dir,
         })
     }
 }
@@ -677,20 +685,73 @@ impl StateStore for JsonFileStore {
         Ok(())
     }
 
-    async fn save_audit_event(&self, _event: &crate::engine::audit::AuditEvent) -> Result<String> {
-        unimplemented!("save_audit_event — landed in Task 3")
+    async fn save_audit_event(&self, event: &crate::engine::audit::AuditEvent) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Filename prefixed by timestamp (normalized — replace ':' with
+        // '-' so a reverse-sorted directory listing is newest-first).
+        let ts_safe = event.timestamp.replace(':', "-");
+        let filename = format!("{}-{}.json", ts_safe, id);
+        let path = self.audit_events_dir.join(&filename);
+
+        let mut to_write = event.clone();
+        to_write.id = id.clone();
+
+        let json = serde_json::to_string_pretty(&to_write).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize audit event: {}", e))
+        })?;
+        std::fs::write(&path, json)?;
+        tracing::debug!("Audit event saved: {} -> {}", id, path.display());
+        Ok(id)
     }
 
     async fn list_audit_events(
         &self,
-        _filter: &crate::engine::audit::AuditFilter,
-        _limit: usize,
-        _offset: usize,
+        filter: &crate::engine::audit::AuditFilter,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
-        unimplemented!("list_audit_events — landed in Task 3")
+        let mut events: Vec<crate::engine::audit::AuditEvent> = Vec::new();
+        for entry in std::fs::read_dir(&self.audit_events_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)?;
+            let Ok(event) = serde_json::from_str::<crate::engine::audit::AuditEvent>(&data) else {
+                continue;
+            };
+            if !filter.matches(&event) {
+                continue;
+            }
+            events.push(event);
+        }
+
+        events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        let start = offset.min(events.len());
+        events.drain(..start);
+        if limit > 0 && events.len() > limit {
+            events.truncate(limit);
+        }
+        Ok(events)
     }
 
-    async fn count_audit_events(&self, _filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        unimplemented!("count_audit_events — landed in Task 3")
+    async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
+        let mut count: u64 = 0;
+        for entry in std::fs::read_dir(&self.audit_events_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)?;
+            if let Ok(event) = serde_json::from_str::<crate::engine::audit::AuditEvent>(&data)
+                && filter.matches(&event)
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 }
