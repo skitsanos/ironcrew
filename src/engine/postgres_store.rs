@@ -31,6 +31,7 @@ pub struct PostgresStore {
     table_name: String,
     conversations_table: String,
     dialogs_table: String,
+    audit_events_table: String,
 }
 
 impl PostgresStore {
@@ -101,12 +102,14 @@ impl PostgresStore {
         let table_name = format!("{}runs", table_prefix);
         let conversations_table = format!("{}conversations", table_prefix);
         let dialogs_table = format!("{}dialogs", table_prefix);
+        let audit_events_table = format!("{}audit_events", table_prefix);
 
         let store = Self {
             pool,
             table_name: table_name.clone(),
             conversations_table,
             dialogs_table,
+            audit_events_table,
         };
         store.bootstrap().await?;
 
@@ -326,11 +329,43 @@ impl PostgresStore {
             }
         }
 
+        // 6. Audit events table
+        let at = &self.audit_events_table;
+        let audit_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {at} (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                flow_path   TEXT,
+                target      TEXT,
+                actor       TEXT,
+                source_ip   TEXT,
+                success     BOOLEAN NOT NULL,
+                status_code INTEGER NOT NULL,
+                metadata    JSONB
+            )"
+        );
+        sqlx::query(&audit_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("Failed to create {at} table: {e}")))?;
+
+        let audit_indexes: &[String] = &[
+            format!("CREATE INDEX IF NOT EXISTS idx_{at}_timestamp_desc ON {at} (timestamp DESC)"),
+            format!("CREATE INDEX IF NOT EXISTS idx_{at}_flow_path ON {at} (flow_path)"),
+        ];
+        for sql in audit_indexes {
+            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+                tracing::warn!("Audit index creation: {}", e);
+            }
+        }
+
         tracing::debug!(
-            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}'",
+            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}'",
             self.table_name,
             self.conversations_table,
-            self.dialogs_table
+            self.dialogs_table,
+            self.audit_events_table
         );
         Ok(())
     }
@@ -905,21 +940,202 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
-    async fn save_audit_event(&self, _event: &crate::engine::audit::AuditEvent) -> Result<String> {
-        unimplemented!("save_audit_event — landed in Task 5")
+    async fn save_audit_event(&self, event: &crate::engine::audit::AuditEvent) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let sql = format!(
+            "INSERT INTO {at}
+             (id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)",
+            at = self.audit_events_table
+        );
+        let metadata_str = match &event.metadata {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| IronCrewError::Validation(format!("Metadata serialize: {}", e)))?,
+            ),
+            None => None,
+        };
+        sqlx::query(&sql)
+            .bind(&id)
+            .bind(&event.timestamp)
+            .bind(&event.action)
+            .bind(&event.flow_path)
+            .bind(&event.target)
+            .bind(&event.actor)
+            .bind(&event.source_ip)
+            .bind(event.success)
+            .bind(event.status_code as i32)
+            .bind(metadata_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG insert audit: {}", e)))?;
+        tracing::debug!("Audit event saved: {}", id);
+        Ok(id)
     }
 
     async fn list_audit_events(
         &self,
-        _filter: &crate::engine::audit::AuditFilter,
-        _limit: usize,
-        _offset: usize,
+        filter: &crate::engine::audit::AuditFilter,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
-        unimplemented!("list_audit_events — landed in Task 5")
+        let mut sql = format!(
+            "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata::text
+             FROM {}",
+            self.audit_events_table
+        );
+        let mut clauses: Vec<String> = Vec::new();
+        let mut idx = 0usize;
+
+        if filter.flow_path.is_some() {
+            idx += 1;
+            clauses.push(format!("flow_path = ${}", idx));
+        }
+        if filter.action.is_some() {
+            idx += 1;
+            clauses.push(format!("action = ${}", idx));
+        }
+        if filter.actor.is_some() {
+            idx += 1;
+            clauses.push(format!("actor = ${}", idx));
+        }
+        if filter.since.is_some() {
+            idx += 1;
+            clauses.push(format!("timestamp >= ${}", idx));
+        }
+        if filter.until.is_some() {
+            idx += 1;
+            clauses.push(format!("timestamp < ${}", idx));
+        }
+        if filter.success.is_some() {
+            idx += 1;
+            clauses.push(format!("success = ${}", idx));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY timestamp DESC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+        if offset > 0 {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+
+        let mut q = sqlx::query(&sql);
+        if let Some(ref v) = filter.flow_path {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.action {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.actor {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.since {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.until {
+            q = q.bind(v);
+        }
+        if let Some(s) = filter.success {
+            q = q.bind(s);
+        }
+
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG list audit: {}", e)))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let metadata_str: Option<String> = row.try_get("metadata").ok().flatten();
+            events.push(crate::engine::audit::AuditEvent {
+                id: row
+                    .try_get("id")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                timestamp: row
+                    .try_get("timestamp")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                action: row
+                    .try_get("action")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                flow_path: row.try_get("flow_path").ok(),
+                target: row.try_get("target").ok(),
+                actor: row.try_get("actor").ok(),
+                source_ip: row.try_get("source_ip").ok(),
+                success: row
+                    .try_get("success")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
+                status_code: row
+                    .try_get::<i32, _>("status_code")
+                    .map_err(|e| IronCrewError::Validation(e.to_string()))?
+                    as u16,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            });
+        }
+        Ok(events)
     }
 
-    async fn count_audit_events(&self, _filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        unimplemented!("count_audit_events — landed in Task 5")
+    async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
+        let mut sql = format!("SELECT COUNT(*) FROM {}", self.audit_events_table);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut idx = 0usize;
+        if filter.flow_path.is_some() {
+            idx += 1;
+            clauses.push(format!("flow_path = ${}", idx));
+        }
+        if filter.action.is_some() {
+            idx += 1;
+            clauses.push(format!("action = ${}", idx));
+        }
+        if filter.actor.is_some() {
+            idx += 1;
+            clauses.push(format!("actor = ${}", idx));
+        }
+        if filter.since.is_some() {
+            idx += 1;
+            clauses.push(format!("timestamp >= ${}", idx));
+        }
+        if filter.until.is_some() {
+            idx += 1;
+            clauses.push(format!("timestamp < ${}", idx));
+        }
+        if filter.success.is_some() {
+            idx += 1;
+            clauses.push(format!("success = ${}", idx));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(ref v) = filter.flow_path {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.action {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.actor {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.since {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.until {
+            q = q.bind(v);
+        }
+        if let Some(s) = filter.success {
+            q = q.bind(s);
+        }
+
+        let count = q
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG count audit: {}", e)))?;
+        Ok(count as u64)
     }
 }
 
