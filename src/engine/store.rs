@@ -132,6 +132,10 @@ pub trait StateStore: Send + Sync {
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
 /// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases
+/// `IRONCREW_DB_POOL_SIZE=10` — max PostgreSQL connections in the pool
+/// `IRONCREW_DB_CONNECT_RETRIES=10` — retries (after the first attempt) when the
+///   database is unreachable at startup, with exponential backoff
+/// `IRONCREW_DB_CONNECT_BACKOFF_MS=1000` — base backoff between connect retries
 ///
 /// Returns an `Arc` so the same instance can be shared across the crew's
 /// `run()`, `conversation()`, and `dialog()` call paths without re-opening
