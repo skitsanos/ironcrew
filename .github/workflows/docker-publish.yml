@@ -1,0 +1,97 @@
+name: Docker Publish
+
+# Publishes the multi-arch Docker image to Docker Hub. Deliberately decoupled
+# from release.yml (which builds binaries) so image pushes happen ONLY:
+#   1. Manually via the Actions tab (workflow_dispatch) — pushes :latest.
+#   2. Automatically when a GitHub Release is published — pushes :<version> + :latest.
+#
+# Both paths reuse the signed linux-amd64/arm64 tarballs release.yml already
+# produced, so there is no recompilation here (~1-2 min end to end).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v2.16.0). Defaults to the latest release."
+        required: false
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read # gh release download needs read access to release assets
+
+env:
+  IMAGE: skitsanos/ironcrew
+
+jobs:
+  publish:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Resolve which release tag to publish:
+      #   - release event   -> the tag that triggered it
+      #   - manual + input   -> the provided tag
+      #   - manual, no input -> the latest published release
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve a release tag to publish"
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing image for tag $tag (version $version)"
+
+      # Pull the prebuilt binaries from that release and lay them out where
+      # docker/runtime.Dockerfile expects them: dist/linux/<arch>/ironcrew.
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'ironcrew-linux-amd64.tar.gz' \
+            --pattern 'ironcrew-linux-arm64.tar.gz'
+          tar xzf ironcrew-linux-amd64.tar.gz -C dist/linux/amd64
+          tar xzf ironcrew-linux-arm64.tar.gz -C dist/linux/arm64
+          test -x dist/linux/amd64/ironcrew
+          test -x dist/linux/arm64/ironcrew
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/runtime.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.version }}
+            ${{ env.IMAGE }}:latest
