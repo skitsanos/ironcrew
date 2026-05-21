@@ -10,13 +10,14 @@
 //! an unknown id returns 404 (never auto-creates).
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
 };
 use mlua::AnyUserData;
@@ -203,10 +204,43 @@ fn flow_segment(path: &std::path::Path) -> String {
 pub async fn start_conversation(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<StartReq>>,
 ) -> Result<Json<StartResp>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    let agent_for_audit = req.agent.clone();
 
+    let result = start_conversation_inner(state.clone(), flow.clone(), id.clone(), req).await;
+
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
+    let metadata = agent_for_audit.map(|a| serde_json::json!({ "agent": a }));
+
+    crate::api::audit::record(
+        &state.store,
+        "conversation.start",
+        Some(&flow),
+        Some(&id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        metadata,
+    )
+    .await;
+
+    result
+}
+
+async fn start_conversation_inner(
+    state: Arc<AppState>,
+    flow: String,
+    id: String,
+    req: StartReq,
+) -> Result<Json<StartResp>, (StatusCode, Json<ErrorResponse>)> {
     let flow_path_resolved =
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
@@ -664,29 +698,54 @@ fn is_conversation_event(event: &CrewEvent) -> bool {
 pub async fn delete_conversation(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path_resolved =
-        resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
-    validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = async {
+        let flow_path_resolved =
+            resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
+        validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
-    let flow_slug = flow_segment(&flow_path_resolved);
-    let key = (flow_slug.clone(), id.clone());
+        let flow_slug = flow_segment(&flow_path_resolved);
+        let key = (flow_slug.clone(), id.clone());
 
-    // Drop the in-memory handle first.
-    {
-        let mut map = state.active_conversations.write().await;
-        map.remove(&key);
+        // Drop the in-memory handle first.
+        {
+            let mut map = state.active_conversations.write().await;
+            map.remove(&key);
+        }
+
+        // Then remove the persisted record, scoped to this flow so a delete
+        // can never touch another flow's session with the same id.
+        state
+            .store
+            .delete_conversation(Some(&flow_slug), &id)
+            .await
+            .map_err(|e| map_err_to_response(&e))?;
+
+        Ok(Json(serde_json::json!({ "deleted": id })))
     }
+    .await;
 
-    // Then remove the persisted record, scoped to this flow so a delete
-    // can never touch another flow's session with the same id.
-    state
-        .store
-        .delete_conversation(Some(&flow_slug), &id)
-        .await
-        .map_err(|e| map_err_to_response(&e))?;
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
 
-    Ok(Json(serde_json::json!({ "deleted": id })))
+    crate::api::audit::record(
+        &state.store,
+        "conversation.delete",
+        Some(&flow),
+        Some(&id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        None,
+    )
+    .await;
+
+    result
 }
 
 // ---------------------------------------------------------------------------
