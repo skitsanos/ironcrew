@@ -59,7 +59,24 @@ impl SqliteStore {
                 stop_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                flow_path   TEXT,
+                target      TEXT,
+                actor       TEXT,
+                source_ip   TEXT,
+                success     INTEGER NOT NULL,
+                status_code INTEGER NOT NULL,
+                metadata    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp_desc
+                ON audit_events (timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_flow_path
+                ON audit_events (flow_path);",
         )
         .map_err(|e| IronCrewError::Validation(format!("Failed to create SQLite tables: {}", e)))?;
 
@@ -783,20 +800,167 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
-    async fn save_audit_event(&self, _event: &crate::engine::audit::AuditEvent) -> Result<String> {
-        unimplemented!("save_audit_event — landed in Task 4")
+    async fn save_audit_event(&self, event: &crate::engine::audit::AuditEvent) -> Result<String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let metadata_json = match &event.metadata {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                IronCrewError::Validation(format!("Failed to serialize metadata: {}", e))
+            })?),
+            None => None,
+        };
+
+        conn.execute(
+            "INSERT INTO audit_events (id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                id,
+                event.timestamp,
+                event.action,
+                event.flow_path,
+                event.target,
+                event.actor,
+                event.source_ip,
+                if event.success { 1 } else { 0 },
+                event.status_code as i64,
+                metadata_json,
+            ],
+        )
+        .map_err(|e| IronCrewError::Validation(format!("SQLite insert audit event: {}", e)))?;
+        tracing::debug!("Audit event saved: {}", id);
+        Ok(id)
     }
 
     async fn list_audit_events(
         &self,
-        _filter: &crate::engine::audit::AuditFilter,
-        _limit: usize,
-        _offset: usize,
+        filter: &crate::engine::audit::AuditFilter,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
-        unimplemented!("list_audit_events — landed in Task 4")
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut sql = String::from(
+            "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata
+             FROM audit_events",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut clauses: Vec<&str> = Vec::new();
+
+        if filter.flow_path.is_some() {
+            clauses.push("flow_path = ?");
+            params.push(Box::new(filter.flow_path.clone().unwrap()));
+        }
+        if filter.action.is_some() {
+            clauses.push("action = ?");
+            params.push(Box::new(filter.action.clone().unwrap()));
+        }
+        if filter.actor.is_some() {
+            clauses.push("actor = ?");
+            params.push(Box::new(filter.actor.clone().unwrap()));
+        }
+        if filter.since.is_some() {
+            clauses.push("timestamp >= ?");
+            params.push(Box::new(filter.since.clone().unwrap()));
+        }
+        if filter.until.is_some() {
+            clauses.push("timestamp < ?");
+            params.push(Box::new(filter.until.clone().unwrap()));
+        }
+        if let Some(s) = filter.success {
+            clauses.push("success = ?");
+            params.push(Box::new(if s { 1i64 } else { 0i64 }));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY timestamp DESC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+        if offset > 0 {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare: {}", e)))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| &**b).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let metadata_json: Option<String> = row.get(9)?;
+                Ok(crate::engine::audit::AuditEvent {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    action: row.get(2)?,
+                    flow_path: row.get(3)?,
+                    target: row.get(4)?,
+                    actor: row.get(5)?,
+                    source_ip: row.get(6)?,
+                    success: row.get::<_, i64>(7)? != 0,
+                    status_code: row.get::<_, i64>(8)? as u16,
+                    metadata: metadata_json.and_then(|s| serde_json::from_str(&s).ok()),
+                })
+            })
+            .map_err(|e| IronCrewError::Validation(format!("SQLite query: {}", e)))?;
+
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(|e| IronCrewError::Validation(format!("SQLite row: {}", e)))?);
+        }
+        Ok(events)
     }
 
-    async fn count_audit_events(&self, _filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        unimplemented!("count_audit_events — landed in Task 4")
+    async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+
+        let mut sql = String::from("SELECT COUNT(*) FROM audit_events");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut clauses: Vec<&str> = Vec::new();
+        if filter.flow_path.is_some() {
+            clauses.push("flow_path = ?");
+            params.push(Box::new(filter.flow_path.clone().unwrap()));
+        }
+        if filter.action.is_some() {
+            clauses.push("action = ?");
+            params.push(Box::new(filter.action.clone().unwrap()));
+        }
+        if filter.actor.is_some() {
+            clauses.push("actor = ?");
+            params.push(Box::new(filter.actor.clone().unwrap()));
+        }
+        if filter.since.is_some() {
+            clauses.push("timestamp >= ?");
+            params.push(Box::new(filter.since.clone().unwrap()));
+        }
+        if filter.until.is_some() {
+            clauses.push("timestamp < ?");
+            params.push(Box::new(filter.until.clone().unwrap()));
+        }
+        if let Some(s) = filter.success {
+            clauses.push("success = ?");
+            params.push(Box::new(if s { 1i64 } else { 0i64 }));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| &**b).collect();
+        let count: i64 = conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+            .map_err(|e| IronCrewError::Validation(format!("SQLite count: {}", e)))?;
+        Ok(count as u64)
     }
 }
