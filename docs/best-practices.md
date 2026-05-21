@@ -219,6 +219,15 @@ explicit per-var access via `IRONCREW_ENV_ALLOWLIST` (overrides every
 block rule). Both are comma-separated, case-insensitive. See
 [docs/sandbox.md](sandbox.md) for the resolution order.
 
+**Audit log.** State-changing API actions (flow run start/abort/delete,
+conversation start/delete) are recorded in an append-only audit log
+served via `GET /audit`. Callers can self-label by sending an
+`X-Audit-Actor: alice@example.com` header — the value is voluntary,
+validated for length and control characters, and replaced by the JWT
+`sub` claim when JWT auth lands. Behind a reverse proxy, set
+`IRONCREW_TRUST_PROXY=1` so the recorder uses `X-Forwarded-For` for
+source-IP capture. See `docs/rest-api.md`.
+
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
 - `IRONCREW_MCP_ALLOWED_COMMANDS` — comma-separated allowlist of binary
