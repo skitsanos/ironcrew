@@ -174,7 +174,11 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         }
     };
 
-    let serve_fut = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    let serve_fut = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown);
 
     // Race the server against a post-signal timeout. The timeout future
     // first waits for the signal, then sleeps `shutdown_timeout_secs`;
