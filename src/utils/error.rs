@@ -23,6 +23,7 @@ pub enum IronCrewError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[cfg(feature = "mcp")]
     #[error("MCP error [{server}]: {message}")]
     Mcp { server: String, message: String },
 }
