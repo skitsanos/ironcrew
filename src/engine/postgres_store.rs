@@ -139,7 +139,7 @@ impl PostgresStore {
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             )"
         );
-        sqlx::query(&create_sql)
+        sqlx::query(sqlx::AssertSqlSafe(create_sql.to_string()))
             .execute(&self.pool)
             .await
             .map_err(|e| IronCrewError::Validation(format!("Failed to create {t} table: {e}")))?;
@@ -169,7 +169,10 @@ impl PostgresStore {
         ];
 
         for (col, sql) in migrations {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Migration for column '{}': {}", col, e);
             }
         }
@@ -201,7 +204,10 @@ impl PostgresStore {
         ];
 
         for (col, sql) in type_fixes {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Type fix for column '{}': {}", col, e);
             }
         }
@@ -218,7 +224,10 @@ impl PostgresStore {
         ];
 
         for sql in indexes {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Index creation: {}", e);
             }
         }
@@ -254,9 +263,12 @@ impl PostgresStore {
             ),
         ];
         for sql in &session_tables {
-            sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
-                IronCrewError::Validation(format!("Failed to create session table: {}", e))
-            })?;
+            sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("Failed to create session table: {}", e))
+                })?;
         }
 
         // Add flow_path column for schemas predating Phase-1 HITL support.
@@ -273,7 +285,10 @@ impl PostgresStore {
             ),
         ];
         for (label, sql) in session_migrations {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Migration for '{}': {}", label, e);
             }
         }
@@ -309,7 +324,10 @@ impl PostgresStore {
             ),
         ];
         for (label, sql) in session_uniqueness {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Session uniqueness '{}': {}", label, e);
             }
         }
@@ -324,7 +342,10 @@ impl PostgresStore {
             format!("CREATE INDEX IF NOT EXISTS idx_{dt}_flow_path ON {dt} (flow_path)"),
         ];
         for sql in &session_indexes {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Session index creation: {}", e);
             }
         }
@@ -345,7 +366,7 @@ impl PostgresStore {
                 metadata    JSONB
             )"
         );
-        sqlx::query(&audit_sql)
+        sqlx::query(sqlx::AssertSqlSafe(audit_sql.to_string()))
             .execute(&self.pool)
             .await
             .map_err(|e| IronCrewError::Validation(format!("Failed to create {at} table: {e}")))?;
@@ -355,7 +376,10 @@ impl PostgresStore {
             format!("CREATE INDEX IF NOT EXISTS idx_{at}_flow_path ON {at} (flow_path)"),
         ];
         for sql in audit_indexes {
-            if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&self.pool)
+                .await
+            {
                 tracing::warn!("Audit index creation: {}", e);
             }
         }
@@ -424,7 +448,7 @@ impl StateStore for PostgresStore {
              VALUES ($1, $2, 'running', $3, '', 0, $4::jsonb, $5, $6, 0, 0, $7::jsonb)",
             self.table_name
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&run_id)
             .bind(flow_name)
             .bind(started_at)
@@ -458,7 +482,7 @@ impl StateStore for PostgresStore {
              WHERE run_id = $7 AND status = 'running'",
             self.table_name
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(status.to_string())
             .bind(finished_at)
             .bind(duration_ms as i64)
@@ -485,7 +509,7 @@ impl StateStore for PostgresStore {
             "UPDATE {} SET status = 'abandoned', finished_at = $1 WHERE status = 'running'",
             self.table_name
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(now)
             .execute(&self.pool)
             .await
@@ -500,7 +524,7 @@ impl StateStore for PostgresStore {
             self.table_name
         );
 
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(run_id)
             .fetch_optional(&self.pool)
             .await
@@ -557,7 +581,7 @@ impl StateStore for PostgresStore {
         }
 
         // Bind parameters in the same order they appear in the SQL
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
         if let Some(ref status) = filter.status {
             query = query.bind(status);
         }
@@ -604,7 +628,7 @@ impl StateStore for PostgresStore {
             sql.push_str(&where_clauses.join(" AND "));
         }
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
         if let Some(ref status) = filter.status {
             query = query.bind(status);
         }
@@ -628,7 +652,7 @@ impl StateStore for PostgresStore {
     async fn delete_run(&self, run_id: &str) -> Result<()> {
         let sql = format!("DELETE FROM {} WHERE run_id = $1", self.table_name);
 
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(run_id)
             .execute(&self.pool)
             .await
@@ -662,7 +686,7 @@ impl StateStore for PostgresStore {
                updated_at = EXCLUDED.updated_at",
             t = self.conversations_table
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&record.id)
             .bind(&record.flow_name)
             .bind(&record.flow_path)
@@ -691,7 +715,7 @@ impl StateStore for PostgresStore {
              FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.conversations_table
         );
-        let row_opt = sqlx::query(&sql)
+        let row_opt = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(id)
             .bind(flow_path)
             .fetch_optional(&self.pool)
@@ -733,7 +757,7 @@ impl StateStore for PostgresStore {
             "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.conversations_table
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(id)
             .bind(flow_path)
             .execute(&self.pool)
@@ -759,7 +783,7 @@ impl StateStore for PostgresStore {
             self.conversations_table
         );
         let limit_i = if limit == 0 { i64::MAX } else { limit as i64 };
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(flow_path)
             .bind(limit_i)
             .bind(offset as i64)
@@ -804,7 +828,7 @@ impl StateStore for PostgresStore {
              WHERE ($1::TEXT IS NULL OR flow_path = $1)",
             self.conversations_table
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(flow_path)
             .fetch_one(&self.pool)
             .await
@@ -842,7 +866,7 @@ impl StateStore for PostgresStore {
                updated_at = EXCLUDED.updated_at",
             t = self.dialogs_table
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&record.id)
             .bind(&record.flow_name)
             .bind(&record.flow_path)
@@ -873,7 +897,7 @@ impl StateStore for PostgresStore {
              FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.dialogs_table
         );
-        let row_opt = sqlx::query(&sql)
+        let row_opt = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(id)
             .bind(flow_path)
             .fetch_optional(&self.pool)
@@ -929,7 +953,7 @@ impl StateStore for PostgresStore {
             "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.dialogs_table
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(id)
             .bind(flow_path)
             .execute(&self.pool)
@@ -955,7 +979,7 @@ impl StateStore for PostgresStore {
             ),
             None => None,
         };
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&id)
             .bind(&event.timestamp)
             .bind(&event.action)
@@ -1023,7 +1047,7 @@ impl StateStore for PostgresStore {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
 
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
         if let Some(ref v) = filter.flow_path {
             q = q.bind(v);
         }
@@ -1111,7 +1135,7 @@ impl StateStore for PostgresStore {
             sql.push_str(&clauses.join(" AND "));
         }
 
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.to_string()));
         if let Some(ref v) = filter.flow_path {
             q = q.bind(v);
         }
