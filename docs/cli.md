@@ -370,6 +370,9 @@ be set in the shell or in `.env` files.
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` to allow HTTP requests to private/loopback IPs (SSRF protection disabled) |
 | `IRONCREW_ENV_BLOCKLIST` | Comma-separated additional env var names to block from Lua `env()` |
 | `IRONCREW_ENV_ALLOWLIST` | Comma-separated env var names to expose to Lua `env()`, overriding the default + custom blocklists |
+| `IRONCREW_TRUST_PROXY` | Set to `1` to honor `X-Forwarded-For` for source-IP capture in audit events (only enable when running behind a trusted reverse proxy) |
+| `IRONCREW_AUDIT_DEFAULT_LIMIT` | Default page size on `GET /audit` (default `50`) |
+| `IRONCREW_AUDIT_MAX_LIMIT` | Hard cap on `GET /audit?limit=` (default `500`) |
 
 **Tool Resource Budgets:**
 

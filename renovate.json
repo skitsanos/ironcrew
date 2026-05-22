@@ -17,6 +17,12 @@
     {
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "non-major updates"
+    },
+    {
+      "matchCurrentVersion": "<1.0.0",
+      "matchUpdateTypes": ["minor"],
+      "groupName": "breaking sub-1.0 bumps",
+      "separateMinorPatch": true
     }
   ]
 }

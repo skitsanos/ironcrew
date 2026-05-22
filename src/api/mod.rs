@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod auth;
 pub mod conversations;
 pub mod handlers;
@@ -194,6 +195,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/flows/{flow}/conversations/{id}",
             delete(conversations::delete_conversation),
         )
+        .route("/audit", get(handlers::list_audit))
         .route("/nodes", get(list_nodes))
         .layer(axum::middleware::from_fn(auth::bearer_auth));
 

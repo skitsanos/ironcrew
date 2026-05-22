@@ -90,6 +90,9 @@ Production deployments should set these at minimum:
 | `IRONCREW_MAX_RESPONSE_SIZE` | `52428800` (50 MB) | Caps `http_request` tool responses. |
 | `IRONCREW_ENV_BLOCKLIST` | comma-separated secrets | Augments the built-in blocklist so Lua `env()` cannot read them. |
 | `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Whitelist that bypasses every block rule (default + suffix + blocklist). Use to grant a crew explicit access to specific secrets (e.g. `AZURE_OPENAI_API_KEY`). See [docs/sandbox.md](sandbox.md). |
+| `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
+| `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
+| `IRONCREW_AUDIT_MAX_LIMIT` | `500` | Hard cap on `GET /audit?limit=`. |
 
 ### Secrets handling
 
