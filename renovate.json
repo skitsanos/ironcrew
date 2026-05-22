@@ -21,8 +21,7 @@
     {
       "matchCurrentVersion": "<1.0.0",
       "matchUpdateTypes": ["minor"],
-      "groupName": "breaking sub-1.0 bumps",
-      "separateMinorPatch": true
+      "groupName": "breaking sub-1.0 bumps"
     }
   ]
 }
