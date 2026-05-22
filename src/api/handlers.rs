@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::Json,
     response::sse::{Event, Sse},
 };
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -67,12 +68,51 @@ pub async fn health() -> Json<serde_json::Value> {
 pub async fn run_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-
     let input = body.map(|Json(v)| v);
+
+    // Extract tags up front so the audit metadata can be populated even
+    // when flow resolution fails. Tags are user-controlled and bounded by
+    // the audit recorder's metadata clamp.
+    let tags_for_audit: Vec<String> = input
+        .as_ref()
+        .and_then(|v| v.get("tags"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let flow_path = match resolve_flow_path(&state, &flow) {
+        Ok(p) => p,
+        Err(e) => {
+            let resp = error_response(flow_status(&e), sanitize_error(&e));
+            let status_code = resp.0.as_u16();
+            let metadata = if !tags_for_audit.is_empty() {
+                Some(serde_json::json!({ "tags": tags_for_audit }))
+            } else {
+                None
+            };
+            crate::api::audit::record(
+                &state.store,
+                "flow.run.start",
+                Some(&flow),
+                None,
+                &headers,
+                Some(addr),
+                false,
+                status_code,
+                metadata,
+            )
+            .await;
+            return Err(resp);
+        }
+    };
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
@@ -184,11 +224,31 @@ pub async fn run_flow(
         state_clone.active_runs.write().await.remove(&run_id_clone);
     });
 
-    Ok(Json(serde_json::json!({
+    let response = Json(serde_json::json!({
         "run_id": run_id,
         "status": "started",
         "events_url": format!("/flows/{}/events/{}", flow_clone, run_id),
-    })))
+    }));
+
+    let metadata = if !tags_for_audit.is_empty() {
+        Some(serde_json::json!({ "tags": tags_for_audit }))
+    } else {
+        None
+    };
+    crate::api::audit::record(
+        &state.store,
+        "flow.run.start",
+        Some(&flow),
+        Some(&run_id),
+        &headers,
+        Some(addr),
+        true,
+        200,
+        metadata,
+    )
+    .await;
+
+    Ok(response)
 }
 
 /// Execute a crew from a flow path, injecting an EventBus, run_id, and optional input context.
@@ -354,23 +414,47 @@ pub async fn execute_crew_from_path(
 
 pub async fn abort_run(
     State(state): State<Arc<AppState>>,
-    Path((_flow, run_id)): Path<(String, String)>,
+    Path((flow, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let active_runs = state.active_runs.read().await;
-    let active_run = active_runs.get(&run_id).ok_or_else(|| {
-        error_response(
-            StatusCode::NOT_FOUND,
-            format!("Run '{}' not found or already completed", run_id),
-        )
-    })?;
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = {
+        let active_runs = state.active_runs.read().await;
+        match active_runs.get(&run_id) {
+            Some(active_run) => {
+                active_run.abort_handle.abort();
+                tracing::info!("Run {} aborted by client", run_id);
+                Ok(Json(serde_json::json!({
+                    "run_id": run_id,
+                    "status": "aborted",
+                })))
+            }
+            None => Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Run '{}' not found or already completed", run_id),
+            )),
+        }
+    };
 
-    active_run.abort_handle.abort();
-    tracing::info!("Run {} aborted by client", run_id);
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
 
-    Ok(Json(serde_json::json!({
-        "run_id": run_id,
-        "status": "aborted",
-    })))
+    crate::api::audit::record(
+        &state.store,
+        "flow.run.abort",
+        Some(&flow),
+        Some(&run_id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        None,
+    )
+    .await;
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -616,17 +700,40 @@ pub async fn get_run(
 pub async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let _ = resolve_ironcrew_dir(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = async {
+        resolve_ironcrew_dir(&state, &flow)
+            .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+        state
+            .store
+            .delete_run(&id)
+            .await
+            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+        Ok(Json(serde_json::json!({"deleted": id})))
+    }
+    .await;
 
-    state
-        .store
-        .delete_run(&id)
-        .await
-        .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
 
-    Ok(Json(serde_json::json!({"deleted": id})))
+    crate::api::audit::record(
+        &state.store,
+        "flow.run.delete",
+        Some(&flow),
+        Some(&id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        None,
+    )
+    .await;
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -807,4 +914,71 @@ mod truncate_tests {
         assert_eq!(truncate_utf8(s, 3), "你");
         assert_eq!(truncate_utf8(s, 6), "你好");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit log read endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListAuditQuery {
+    pub flow: Option<String>,
+    pub action: Option<String>,
+    pub actor: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub success: Option<bool>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ListAuditResponse {
+    pub events: Vec<crate::engine::audit::AuditEvent>,
+    pub total: u64,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+pub async fn list_audit(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ListAuditQuery>,
+) -> Result<Json<ListAuditResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let default_limit: usize = std::env::var("IRONCREW_AUDIT_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let max_limit: usize = std::env::var("IRONCREW_AUDIT_MAX_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let limit = params.limit.unwrap_or(default_limit).min(max_limit);
+    let offset = params.offset.unwrap_or(0);
+
+    let filter = crate::engine::audit::AuditFilter {
+        flow_path: params.flow,
+        action: params.action,
+        actor: params.actor,
+        since: params.since,
+        until: params.until,
+        success: params.success,
+    };
+
+    let events = state
+        .store
+        .list_audit_events(&filter, limit, offset)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total = state
+        .store
+        .count_audit_events(&filter)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ListAuditResponse {
+        events,
+        total,
+        limit,
+        offset,
+    }))
 }

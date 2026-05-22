@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::engine::audit::{AuditEvent, AuditFilter};
 use crate::engine::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
@@ -122,6 +123,25 @@ pub trait StateStore: Send + Sync {
     /// Delete a dialog by `(flow_path, id)`. Never touches another
     /// flow's record when `flow_path` is `Some(..)`.
     async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()>;
+
+    // ─── Audit log ──────────────────────────────────────────────────────────
+
+    /// Append an audit event. The backend generates a UUID v4 and
+    /// writes it into the event's `id` field. Returns the generated id.
+    async fn save_audit_event(&self, event: &AuditEvent) -> Result<String>;
+
+    /// Paginated list of audit events matching the filter, sorted
+    /// newest-first by `timestamp`. `limit = 0` means unlimited.
+    async fn list_audit_events(
+        &self,
+        filter: &AuditFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEvent>>;
+
+    /// Count of events matching the filter. Paired with
+    /// `list_audit_events` to provide `total` in paginated responses.
+    async fn count_audit_events(&self, filter: &AuditFilter) -> Result<u64>;
 }
 
 /// Create a StateStore based on environment configuration.

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod audit;
 pub mod collaborative;
 pub mod condition;
 pub mod crew;
