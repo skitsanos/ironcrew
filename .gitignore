@@ -12,6 +12,7 @@ TODO.md
 review.md
 remediation-plan.md
 graph.html
+output/
 
 # Staging dir for prebuilt binaries during docker-publish.yml image builds
 dist/
