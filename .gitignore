@@ -4,6 +4,7 @@
 *.swo
 .DS_Store
 .idea/
+.claude/settings.local.json
 .env.build
 docs/superpowers
 examples/clients
@@ -12,6 +13,7 @@ TODO.md
 review.md
 remediation-plan.md
 graph.html
+output/
 
 # Staging dir for prebuilt binaries during docker-publish.yml image builds
 dist/
