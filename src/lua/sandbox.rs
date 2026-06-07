@@ -126,6 +126,22 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     })?;
     lua.globals().set("base64_decode", b64_decode_fn)?;
 
+    // base64_decode_bytes(str) — like base64_decode but returns the raw
+    // decoded bytes as a Lua string without UTF-8 validation. Needed to parse
+    // binary layouts (e.g. salt||iv||ciphertext blobs) when using the
+    // low-level crypto primitives below.
+    let b64_decode_bytes_fn = lua.create_function(|lua, s: String| {
+        let bytes = STANDARD.decode(s.trim()).map_err(mlua::Error::external)?;
+        lua.create_string(&bytes)
+    })?;
+    lua.globals()
+        .set("base64_decode_bytes", b64_decode_bytes_fn)?;
+
+    // Symmetric-crypto primitives (PBKDF2-HMAC-SHA256 + AES-256-GCM decrypt).
+    // Lets flows decrypt secrets read from a store at runtime without the
+    // caller passing plaintext keys through the run input.
+    crate::lua::crypto::register_crypto_globals(lua)?;
+
     // log(level, msg...) — also emits to EventBus if available
     let log_fn = lua.create_function(|lua, args: mlua::Variadic<String>| {
         let args: Vec<String> = args.into_iter().collect();
