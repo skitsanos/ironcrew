@@ -2,6 +2,7 @@ pub mod agent_turn;
 pub mod api;
 pub mod conversation;
 pub mod crew_userdata;
+pub mod crypto;
 pub mod dialog;
 pub mod json;
 pub mod loader;
