@@ -71,13 +71,13 @@ pub fn install_require(lua: &Lua, roots: Vec<PathBuf>) -> LuaResult<()> {
         let relpath = module_name_to_relpath(&name).map_err(mlua::Error::external)?;
 
         let loaded: Table = lua.named_registry_value(LOADED_KEY)?;
-        let cached: Value = loaded.get(name.clone())?;
+        let cached: Value = loaded.get(name.as_str())?;
         if cached != Value::Nil {
             return Ok(cached);
         }
 
         let loading: Table = lua.named_registry_value(LOADING_KEY)?;
-        let in_progress: Value = loading.get(name.clone())?;
+        let in_progress: Value = loading.get(name.as_str())?;
         if in_progress != Value::Nil {
             return Err(mlua::Error::external(format!(
                 "circular require detected: '{name}'"
@@ -88,12 +88,12 @@ pub fn install_require(lua: &Lua, roots: Vec<PathBuf>) -> LuaResult<()> {
             .ok_or_else(|| mlua::Error::external(format!("module '{name}' not found in _lib")))?;
         let source = std::fs::read_to_string(&path).map_err(mlua::Error::external)?;
 
-        loading.set(name.clone(), true)?;
+        loading.set(name.as_str(), true)?;
         let outcome = lua
             .load(&source)
             .set_name(format!("@{}", path.display()))
             .eval::<Value>();
-        loading.set(name.clone(), Value::Nil)?; // clear regardless of outcome
+        loading.set(name.as_str(), Value::Nil)?; // clear regardless of outcome
 
         let value = outcome?;
         // Mirror stock Lua: a module that returns nothing caches as `true`.
@@ -102,7 +102,7 @@ pub fn install_require(lua: &Lua, roots: Vec<PathBuf>) -> LuaResult<()> {
         } else {
             value
         };
-        loaded.set(name.clone(), to_cache.clone())?;
+        loaded.set(name.as_str(), to_cache.clone())?;
         Ok(to_cache)
     })?;
 
@@ -220,5 +220,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found in _lib"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_name_errors_from_lua() {
+        let (lua, _d) = lib_vm(&[]);
+        let err = lua
+            .load("return require('../secret')")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid module name"), "got: {err}");
     }
 }
