@@ -546,8 +546,16 @@ async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::R
     Ok(result)
 }
 
-/// Create a Lua VM for crew.lua (full access context).
+/// Create a Lua VM for crew.lua (full access context), with no `require`
+/// library directories. `require` is unavailable in this variant.
 pub fn create_crew_lua() -> LuaResult<Lua> {
+    create_crew_lua_with_lib_dirs(Vec::new())
+}
+
+/// Create a crew VM whose `require` resolves Lua-source modules from `lib_dirs`
+/// (typically `<flow-dir>/_lib`). When `lib_dirs` is empty, `require` is not
+/// installed.
+pub fn create_crew_lua_with_lib_dirs(lib_dirs: Vec<PathBuf>) -> LuaResult<Lua> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::COROUTINE | StdLib::OS,
         mlua::LuaOptions::default(),
@@ -577,6 +585,7 @@ pub fn create_crew_lua() -> LuaResult<Lua> {
     .exec()?;
 
     register_lua_globals(&lua)?;
+    crate::lua::require::install_require(&lua, lib_dirs)?;
 
     Ok(lua)
 }

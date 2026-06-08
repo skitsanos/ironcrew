@@ -7,5 +7,6 @@ pub mod dialog;
 pub mod json;
 pub mod loader;
 pub mod parsers;
+pub mod require;
 pub mod sandbox;
 pub mod subflow;

@@ -16,9 +16,10 @@
 //! * `path` is resolved **relative to the calling VM's project directory**.
 //!   Absolute paths, `..` segments, empty paths, and paths that escape the
 //!   project root (even via symlinks) are rejected before anything runs.
-//! * The sub-flow executes in a freshly-constructed `create_crew_lua()` VM
-//!   with its own `Crew.new`/`Agent.new` constructors. All inter-VM data
-//!   transfer goes through JSON — no Lua values cross the boundary.
+//! * The sub-flow executes in a freshly-constructed
+//!   `create_crew_lua_with_lib_dirs` VM seeded with the sub-flow's own `_lib`
+//!   directory, with its own `Crew.new`/`Agent.new` constructors. All inter-VM
+//!   data transfer goes through JSON — no Lua values cross the boundary.
 //! * Depth is tracked through `SubflowDepth` app-data on each VM. Every
 //!   invocation increments it; the limit is `IRONCREW_MAX_FLOW_DEPTH`
 //!   (default 5) and exceeded calls fail fast with a validation error.
@@ -38,7 +39,7 @@ use crate::utils::error::IronCrewError;
 use super::api::{register_agent_constructor, register_crew_constructor};
 use super::json::{json_value_to_lua, lua_table_to_json};
 use super::parsers::load_agents_from_files;
-use super::sandbox::create_crew_lua;
+use super::sandbox::create_crew_lua_with_lib_dirs;
 
 /// Default maximum recursive `run_flow` depth. Overridable via the
 /// `IRONCREW_MAX_FLOW_DEPTH` environment variable.
@@ -127,7 +128,8 @@ fn validate_subflow_path(project_dir: &Path, path: &str) -> Result<PathBuf, Iron
 /// `crew:subworkflow` and `run_flow`.
 ///
 /// `lua` is the **caller's** VM — we use it only to JSON-bridge the result
-/// back out. The sub-flow runs in a fresh VM created via `create_crew_lua()`.
+/// back out. The sub-flow runs in a fresh VM created via
+/// `create_crew_lua_with_lib_dirs`, seeded with the sub-flow directory's `_lib`.
 pub async fn invoke_subflow(
     lua: &Lua,
     path: String,
@@ -163,14 +165,16 @@ pub async fn invoke_subflow(
     }
 
     // ── Build the sub-flow VM ──────────────────────────────────────────────
-    let sub_lua = create_crew_lua().map_err(mlua::Error::external)?;
-
-    // Seed app-data on the child VM so its own `run_flow` calls resolve
-    // against the sub-flow's directory (not the parent's).
+    // Compute the sub-flow's own directory first so its `_lib` (and its own
+    // `run_flow`) resolve against the sub-flow, not the parent.
     let sub_dir = flow_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| ctx.project_dir.as_ref().clone());
+
+    let sub_lua =
+        create_crew_lua_with_lib_dirs(vec![sub_dir.join("_lib")]).map_err(mlua::Error::external)?;
+
     let sub_project_dir_arc = Arc::new(sub_dir.clone());
     sub_lua.set_app_data(ctx.runtime.clone());
     sub_lua.set_app_data(sub_project_dir_arc.clone());
