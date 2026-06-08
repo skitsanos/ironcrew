@@ -61,6 +61,8 @@ my-project/
     writer.lua
   tools/            # Custom tool definitions (optional)
     my_tool.lua
+  _lib/             # Shared Lua modules, loaded via require() (optional)
+    textutil.lua
 ```
 
 When you run `ironcrew my-project/`, the loader:
@@ -69,6 +71,10 @@ When you run `ironcrew my-project/`, the loader:
 2. Discovers and loads all `agents/*.lua` files (auto-injected into every `Crew.new()`)
 3. Discovers and loads all `tools/*.lua` files (registered in the tool registry)
 4. Executes `crew.lua` as the entrypoint
+
+Modules under `_lib/` are **not** loaded eagerly — they are resolved on demand
+when a flow (or sub-flow) calls `require("name")`, which maps to
+`_lib/name.lua`. See [`docs/tools.md`](tools.md) (Shared Modules) for details.
 
 ### Project Defaults: `config.lua`
 

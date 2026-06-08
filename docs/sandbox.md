@@ -79,10 +79,17 @@ env("X") →
 
 ## What else the sandbox hardens
 
-- **No `require`, `dofile`, `loadfile`, `io.*`, `os.execute`** — Lua's
-  built-in I/O is removed. File access goes through built-in tools
-  (`file_read`, `file_write`) that enforce the project directory
-  boundary and per-file size caps.
+- **No `dofile`, `loadfile`, `io.*`, `os.execute`** — Lua's built-in I/O is
+  removed. File access goes through built-in tools (`file_read`, `file_write`)
+  that enforce the project directory boundary and per-file size caps.
+- **Scoped `require`** — flows and sub-flows can `require("name")` shared Lua
+  modules, but resolution is restricted to the flow's own `_lib/` directory
+  (`_lib/name.lua`). Absolute paths, `..` traversal, and path separators in the
+  name are rejected with a clean Lua error — no filesystem escape. The Lua
+  `package` stdlib is never enabled, so `package.loadlib` and C-module loading
+  are unavailable (Lua-source modules only). Modules run in the same sandbox as
+  the flow and gain no extra capabilities. See [`docs/tools.md`](tools.md)
+  (Shared Modules).
 - **SSRF protection on `http_request`** — `IRONCREW_HTTP_ALLOWLIST` /
   blocked private-IP ranges. See `docs/http-scaling.md`.
 - **Tool-arg validation** — every built-in tool validates its

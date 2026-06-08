@@ -49,7 +49,8 @@ ironcrew run . --input '{"topic": "Rust"}' --json 2>/dev/null | jq '.status'
 
 - **Default path:** `.` (current directory)
 - Loads `.env` (CWD first, then project dir), discovers `agents/*.lua`,
-`tools/*.lua`, and `crew.lua`. Run history is saved to `.ironcrew/runs/`.
+`tools/*.lua`, and `crew.lua`. Shared modules under `_lib/` are resolved on
+demand via `require()`. Run history is saved to `.ironcrew/runs/`.
 - In `--json` mode, Lua `print()` calls are suppressed and the full run record
 (status, tasks, token usage) is written to stdout as JSON. Tracing logs go to
 stderr, so piping works cleanly.
