@@ -379,7 +379,11 @@ from inside custom tools.
 | `json_parse(str)`    | value    | Parse a JSON string into a Lua value |
 | `json_stringify(val)` | string  | Serialize a Lua value to JSON |
 | `base64_encode(str)` | string   | Base64-encode a string |
-| `base64_decode(str)` | string   | Decode a base64 string |
+| `base64_decode(str)` | string   | Decode a base64 string (UTF-8 text) |
+| `base64_decode_bytes(str)` | string | Decode a base64 string to raw bytes (no UTF-8 validation) |
+| `pbkdf2_sha256(passphrase, salt, iterations, key_len)` | string | Derive a key via PBKDF2-HMAC-SHA256; returns raw key bytes |
+| `aes_256_gcm_decrypt(key, iv, ciphertext_with_tag)` | string | AES-256-GCM decrypt (16-byte tag appended to ciphertext); raises on auth failure |
+| `aes_gcm_decrypt_pbkdf2(blob_b64, passphrase, iterations?)` | string | Decrypt `base64(salt[16]‖iv[12]‖ct‖tag[16])`; PBKDF2-HMAC-SHA256 key derivation, `iterations` defaults to `600000` |
 | `log(level, msg)`    | nil      | Emit a log message (levels: trace, debug, info, warn, error) |
 | `validate_json(json_str, schema_table)` | table | Validate JSON against a schema; returns `{valid, errors}` |
 | `template(tpl_str, data_table)` | string | Render a Tera template with data (variables, loops, conditionals) |
@@ -411,6 +415,55 @@ local report = template([[
 {% endfor %}
 ]], json_parse(results.extract.output))
 ```
+
+### Crypto (decrypt secrets at runtime)
+
+Flows can decrypt secrets (e.g. API credentials) that are stored **encrypted at
+rest**, so the caller never has to pass plaintext keys through the run input.
+The supported on-disk format mirrors the Web Crypto API:
+
+- Cipher: **AES-256-GCM**, 12-byte IV, 16-byte (128-bit) auth tag appended to
+  the ciphertext.
+- Key derivation: **PBKDF2-HMAC-SHA256**, 16-byte salt, 32-byte derived key,
+  600 000 iterations by default.
+- Serialized blob = `base64( salt[16] ‖ iv[12] ‖ ciphertext ‖ tag[16] )`.
+
+All byte data (keys, IVs, salts, ciphertext, plaintext) is passed as Lua strings
+holding raw bytes — exactly like `base64_decode_bytes` returns.
+
+**Convenience helper** (recommended — matches the layout above):
+
+```lua
+-- Read an encrypted credential from your store (e.g. via http/Arango),
+-- then decrypt it in-process using a passphrase from the allow-listed env.
+local passphrase = env("CREDENTIAL_PASSPHRASE")  -- allow-list this var
+local plaintext  = aes_gcm_decrypt_pbkdf2(record.blob_b64, passphrase)
+-- iterations defaults to 600000; pass a 3rd arg to override.
+local creds = json_parse(plaintext)
+```
+
+**Low-level primitives** (if you need to parse a different byte layout):
+
+```lua
+local raw  = base64_decode_bytes(blob_b64)
+local salt = raw:sub(1, 16)
+local iv   = raw:sub(17, 28)
+local ct   = raw:sub(29)                          -- ciphertext + 16-byte tag
+local key  = pbkdf2_sha256(passphrase, salt, 600000, 32)
+local plaintext = aes_256_gcm_decrypt(key, iv, ct)
+```
+
+**Security:**
+
+- A wrong passphrase or tampered ciphertext raises a clean Lua error (no
+  partial plaintext, no panic). Tag verification is constant-time.
+- Plaintext and passphrases are never logged.
+- The passphrase is supplied by the flow via `env("…")`; make sure that
+  variable is allow-listed with `IRONCREW_ENV_ALLOWLIST` (sensitive-looking
+  names are blocked by default — see the `env()` security note above).
+
+> Encryption is intentionally **not** exposed — only decryption is required for
+> the read-secrets-at-runtime use case.
 
 ### Regex Namespace
 
