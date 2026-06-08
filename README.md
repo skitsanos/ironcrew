@@ -57,6 +57,10 @@ local results = crew:run()
 
 ## Quick Start
 
+> **Prerequisites:** Rust **1.96** or newer is the minimum supported toolchain
+> (some dependencies require it to compile). Install via [rustup](https://rustup.rs)
+> and run `rustup update stable`.
+
 ```bash
 # Build
 cargo build --release
