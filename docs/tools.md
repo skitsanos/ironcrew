@@ -354,7 +354,7 @@ IronCrew exposes Lua globals in two distinct sandboxes:
 
 | Sandbox | Where it runs | What's available |
 |---------|---------------|------------------|
-| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace** and `run_flow` |
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, and `require` (shared modules from `_lib/`) |
 | **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access and `run_flow` — but **no `http`** |
 
 > **Important constraint:** Custom Lua tools cannot call `http.*` directly. The
@@ -464,6 +464,65 @@ local plaintext = aes_256_gcm_decrypt(key, iv, ct)
 
 > Encryption is intentionally **not** exposed — only decryption is required for
 > the read-secrets-at-runtime use case.
+
+### Shared Modules (`require`)
+
+Flows and sub-flows can share Lua code with `require`, resolved **only** from a
+`_lib/` directory next to the flow. Instead of copy-pasting the
+credential-decrypt sequence above (or Arango helpers, env setup, …) into every
+flow, put it in one module:
+
+```lua
+-- _lib/credentials.lua
+local M = {}
+
+-- Fetch an encrypted credential blob from a store, then decrypt it in-process.
+function M.resolve(credential_id)
+    local resp = http.get("https://store.internal/credentials/" .. credential_id, {
+        headers = { Authorization = "Bearer " .. env("STORE_TOKEN") },
+    })
+    assert(resp.ok, "credential fetch failed: " .. tostring(resp.status))
+
+    local record = json_parse(resp.body)              -- { blob_b64 = "..." }
+    local plaintext = aes_gcm_decrypt_pbkdf2(record.blob_b64, env("ENCRYPTION_KEY"))
+    return json_parse(plaintext).token
+end
+
+return M
+```
+
+```lua
+-- any flow or sub-flow
+local credentials = require("credentials")
+local provider_api_key = credentials.resolve(input.credential_id)
+```
+
+**Resolution:**
+
+- `require("credentials")` loads `_lib/credentials.lua`. Dotted names map to
+  sub-paths: `require("auth.jwt")` → `_lib/auth/jwt.lua`.
+- Each flow resolves `require` from **its own** directory's `_lib`. A top-level
+  flow uses `<project_dir>/_lib`; a sub-flow invoked via `run_flow` uses the
+  sub-flow directory's `_lib`.
+- A module is plain Lua that returns a value (typically a table). It runs in the
+  **same sandbox** as the flow — it gets the globals on this page (`env`,
+  `json_*`, `base64_*`, the crypto helpers, `http`, `regex`, …) and no extra
+  capabilities.
+- Results are **cached**: requiring the same name twice runs the file once and
+  returns the same value. Circular requires raise a clean error rather than
+  hang.
+
+**Security:**
+
+- Resolution is restricted to `_lib/`. Absolute paths, `..` traversal, and path
+  separators in the name raise a clean Lua error — no filesystem escape.
+- The Lua `package` stdlib is never enabled, so `package.loadlib` and C-module
+  loading are unavailable. Lua-source modules only.
+- The tool sandbox (custom tools in `tools/`) does **not** get `require`.
+
+> Runnable example: [`examples/shared-modules`](../examples/shared-modules) — a
+> shared module used by both a top-level flow and a sub-flow, verifiable offline
+> with `ironcrew run examples/shared-modules`.
 
 ### Regex Namespace
 
