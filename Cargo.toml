@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 scraper = "0.27.0"
 dotenvy = "0.15.7"
 uuid = { version = "1.23.2", features = ["v4"] }
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.22.1"
 thiserror = "2.0.18"
 async-trait = "0.1.89"
@@ -44,7 +44,7 @@ regex = "1.12.3"
 futures = "0.3.32"
 async-stream = "0.3.6"
 axum = "0.8.9"
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
 tower-http = { version = "0.6.11", features = ["cors"] }
 rmcp = { version = "1.7.0", optional = true, default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "tower"] }
