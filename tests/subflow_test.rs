@@ -16,7 +16,7 @@ use ironcrew::lua::api::{
     register_crew_constructor,
 };
 use ironcrew::lua::loader::ProjectLoader;
-use ironcrew::lua::sandbox::create_crew_lua;
+use ironcrew::lua::sandbox::{create_crew_lua, create_crew_lua_with_lib_dirs};
 use ironcrew::lua::subflow::SubflowDepth;
 use ironcrew::tools::ToolCallContext;
 use ironcrew::utils::error::IronCrewError;
@@ -53,7 +53,8 @@ fn _unused_token_usage() -> TokenUsage {
 /// directory. Mirrors what `setup_crew_runtime` does, but uses
 /// `NoopProvider` so no LLM calls can slip through.
 fn build_fixture_lua(project_dir: &Path) -> (mlua::Lua, Arc<Runtime>) {
-    let lua = create_crew_lua().expect("create_crew_lua");
+    let lua = create_crew_lua_with_lib_dirs(vec![project_dir.join("_lib")])
+        .expect("create_crew_lua_with_lib_dirs");
     register_agent_constructor(&lua).expect("register_agent_constructor");
 
     let provider = Box::new(NoopProvider);
