@@ -3,8 +3,10 @@
 //! no network I/O, no subprocess spawning. The fake provider at the bottom
 //! of this file short-circuits any accidental `crew:run()` invocation.
 
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 use async_trait::async_trait;
 use ironcrew::engine::runtime::Runtime;
@@ -14,7 +16,7 @@ use ironcrew::lua::api::{
     register_crew_constructor,
 };
 use ironcrew::lua::loader::ProjectLoader;
-use ironcrew::lua::sandbox::create_crew_lua;
+use ironcrew::lua::sandbox::{create_crew_lua, create_crew_lua_with_lib_dirs};
 use ironcrew::lua::subflow::SubflowDepth;
 use ironcrew::tools::ToolCallContext;
 use ironcrew::utils::error::IronCrewError;
@@ -51,7 +53,8 @@ fn _unused_token_usage() -> TokenUsage {
 /// directory. Mirrors what `setup_crew_runtime` does, but uses
 /// `NoopProvider` so no LLM calls can slip through.
 fn build_fixture_lua(project_dir: &Path) -> (mlua::Lua, Arc<Runtime>) {
-    let lua = create_crew_lua().expect("create_crew_lua");
+    let lua = create_crew_lua_with_lib_dirs(vec![project_dir.join("_lib")])
+        .expect("create_crew_lua_with_lib_dirs");
     register_agent_constructor(&lua).expect("register_agent_constructor");
 
     let provider = Box::new(NoopProvider);
@@ -381,4 +384,32 @@ async fn legacy_subworkflow_still_works() {
         other => panic!("expected integer, got {:?}", other),
     };
     assert_eq!(doubled, 42);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Sub-flow require: sub-flow can load a module from its own _lib dir (#34)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn subflow_can_require_from_its_own_lib() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("_lib")).unwrap();
+    fs::write(
+        dir.path().join("_lib").join("greet.lua"),
+        "local M = {}\nfunction M.hi(name) return 'hi ' .. name end\nreturn M",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("greeter.lua"),
+        "local g = require('greet')\nreturn g.hi(input.name)",
+    )
+    .unwrap();
+
+    let (lua, _rt) = build_fixture_lua(dir.path());
+    let script = r#"
+        local r = run_flow("greeter.lua", { name = "ada" })
+        return r
+    "#;
+    let result: String = lua.load(script).eval_async().await.expect("eval");
+    assert_eq!(result, "hi ada");
 }
