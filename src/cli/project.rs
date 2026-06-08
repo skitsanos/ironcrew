@@ -8,7 +8,7 @@ use crate::lua::api::{
     register_crew_constructor, set_ironcrew_mode,
 };
 use crate::lua::loader::ProjectLoader;
-use crate::lua::sandbox::create_crew_lua;
+use crate::lua::sandbox::create_crew_lua_with_lib_dirs;
 use crate::utils::error::{IronCrewError, Result};
 
 /// Load a project from a path (file or directory), handling .env loading.
@@ -47,7 +47,8 @@ pub fn load_project(path: &Path) -> Result<ProjectLoader> {
 ///
 /// Returns the configured Lua VM and the shared Runtime.
 pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runtime>)> {
-    let lua = create_crew_lua().map_err(IronCrewError::Lua)?;
+    let lib_dir = loader.project_dir().join("_lib");
+    let lua = create_crew_lua_with_lib_dirs(vec![lib_dir]).map_err(IronCrewError::Lua)?;
 
     // Optionally load config.lua and store the resulting table as a Lua global.
     // Crew.new() will shallow-merge missing keys from this table at call time.
