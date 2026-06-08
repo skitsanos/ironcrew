@@ -1478,6 +1478,7 @@ dependencies = [
  "mlua",
  "regex",
  "reqwest",
+ "ring",
  "rmcp",
  "rusqlite",
  "scraper",
