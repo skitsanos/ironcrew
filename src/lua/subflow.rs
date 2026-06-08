@@ -16,9 +16,10 @@
 //! * `path` is resolved **relative to the calling VM's project directory**.
 //!   Absolute paths, `..` segments, empty paths, and paths that escape the
 //!   project root (even via symlinks) are rejected before anything runs.
-//! * The sub-flow executes in a freshly-constructed `create_crew_lua_with_lib_dirs` VM
-//!   seeded with the sub-flow's own `_lib` directory, with its own `Crew.new`/`Agent.new` constructors. All inter-VM data
-//!   transfer goes through JSON — no Lua values cross the boundary.
+//! * The sub-flow executes in a freshly-constructed
+//!   `create_crew_lua_with_lib_dirs` VM seeded with the sub-flow's own `_lib`
+//!   directory, with its own `Crew.new`/`Agent.new` constructors. All inter-VM
+//!   data transfer goes through JSON — no Lua values cross the boundary.
 //! * Depth is tracked through `SubflowDepth` app-data on each VM. Every
 //!   invocation increments it; the limit is `IRONCREW_MAX_FLOW_DEPTH`
 //!   (default 5) and exceeded calls fail fast with a validation error.
