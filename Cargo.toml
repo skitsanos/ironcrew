@@ -30,7 +30,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 scraper = "0.27.0"
 dotenvy = "0.15.7"
-uuid = { version = "1.23.2", features = ["v4"] }
+uuid = { version = "1.23.3", features = ["v4"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.22.1"
 thiserror = "2.0.18"
@@ -41,7 +41,7 @@ md-5 = "0.11"
 tera = "1.20.1"
 jsonschema = "0.46.5"
 glob = "0.3.3"
-regex = "1.12.3"
+regex = "1.12.4"
 futures = "0.3.32"
 async-stream = "0.3.6"
 axum = "0.8.9"
