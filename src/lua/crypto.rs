@@ -127,7 +127,13 @@ fn decrypt_blob_pbkdf2(
 pub fn register_crypto_globals(lua: &Lua) -> LuaResult<()> {
     // pbkdf2_sha256(passphrase, salt, iterations, key_len) -> raw key bytes
     let pbkdf2_fn = lua.create_function(
-        |lua, (passphrase, salt, iterations, key_len): (mlua::String, mlua::String, u32, usize)| {
+        |lua,
+         (passphrase, salt, iterations, key_len): (
+            mlua::LuaString,
+            mlua::LuaString,
+            u32,
+            usize,
+        )| {
             let key = derive_pbkdf2_sha256(
                 &passphrase.as_bytes(),
                 &salt.as_bytes(),
@@ -142,7 +148,7 @@ pub fn register_crypto_globals(lua: &Lua) -> LuaResult<()> {
 
     // aes_256_gcm_decrypt(key, iv, ciphertext_with_tag) -> plaintext bytes
     let aes_decrypt_fn = lua.create_function(
-        |lua, (key, iv, ciphertext): (mlua::String, mlua::String, mlua::String)| {
+        |lua, (key, iv, ciphertext): (mlua::LuaString, mlua::LuaString, mlua::LuaString)| {
             let plaintext =
                 aes_256_gcm_decrypt(&key.as_bytes(), &iv.as_bytes(), &ciphertext.as_bytes())
                     .map_err(mlua::Error::external)?;
@@ -153,7 +159,7 @@ pub fn register_crypto_globals(lua: &Lua) -> LuaResult<()> {
 
     // aes_gcm_decrypt_pbkdf2(blob_b64, passphrase, iterations?) -> plaintext bytes
     let convenience_fn = lua.create_function(
-        |lua, (blob_b64, passphrase, iterations): (String, mlua::String, Option<u32>)| {
+        |lua, (blob_b64, passphrase, iterations): (String, mlua::LuaString, Option<u32>)| {
             let iterations = iterations.unwrap_or(DEFAULT_PBKDF2_ITERATIONS);
             let plaintext = decrypt_blob_pbkdf2(&blob_b64, &passphrase.as_bytes(), iterations)
                 .map_err(mlua::Error::external)?;
