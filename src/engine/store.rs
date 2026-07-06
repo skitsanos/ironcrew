@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
-use crate::engine::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+use crate::engine::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunSummary,
+};
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 
@@ -13,33 +15,15 @@ pub trait StateStore: Send + Sync {
 
     /// Called when a run starts. Writes a RunRecord with status=Running,
     /// empty task_results, finished_at="", duration_ms=0, total_tokens=0,
-    /// cached_tokens=0. Returns the generated run_id (or the suggested_id
+    /// cached_tokens=0. Returns the generated run_id (or `intent.suggested_id`
     /// if `Some` — used by the HTTP handler to pre-allocate an id before
     /// the flow runs so SSE subscribers can join mid-flight).
-    async fn save_run_intent(
-        &self,
-        suggested_id: Option<String>,
-        flow_name: &str,
-        started_at: &str,
-        agent_count: usize,
-        task_count: usize,
-        tags: &[String],
-    ) -> Result<String>;
+    async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
 
     /// Called when a run completes (success, partial failure, or hard
     /// failure). Transitions a Running record to a terminal state.
     /// Returns an error if the run_id doesn't exist or isn't Running.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_run_completion(
-        &self,
-        run_id: &str,
-        status: RunStatus,
-        finished_at: &str,
-        duration_ms: u64,
-        task_results: Vec<crate::engine::task::TaskResult>,
-        total_tokens: u32,
-        cached_tokens: u32,
-    ) -> Result<()>;
+    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()>;
 
     /// Called once at ironcrew {run,serve} startup. Atomically flips
     /// every record whose status is Running to Abandoned, setting

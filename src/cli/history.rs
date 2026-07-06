@@ -23,6 +23,8 @@ pub async fn cmd_runs(
     let store = create_store(ironcrew_dir).await?;
 
     let filter = ListRunsFilter {
+        // CLI history lists all runs in the project's local store; no flow scope.
+        flow: None,
         status: status_filter.map(|s| s.to_string()),
         tag: tag_filter.map(|s| s.to_string()),
         since: since_filter.map(|s| s.to_string()),

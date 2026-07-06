@@ -43,14 +43,15 @@ mod tests {
 
         // Seed one Running record via the intent API.
         store
-            .save_run_intent(
-                Some("orphan-1".into()),
-                "flow-a",
-                "2026-04-23T10:00:00Z",
-                1,
-                1,
-                &[],
-            )
+            .save_run_intent(crate::engine::run_history::RunIntent {
+                suggested_id: Some("orphan-1".into()),
+                flow_name: "flow-a".into(),
+                flow: "flow-a".into(),
+                started_at: "2026-04-23T10:00:00Z".into(),
+                agent_count: 1,
+                task_count: 1,
+                ..Default::default()
+            })
             .await
             .unwrap();
 

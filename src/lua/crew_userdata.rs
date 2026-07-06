@@ -588,6 +588,18 @@ impl UserData for LuaCrew {
                 )
             };
 
+            // Flow slug = project directory's last segment, matching how the
+            // conversation/dialog paths derive their flow scope. Lets the
+            // per-flow run endpoints scope this record so one flow can't read
+            // or delete another's runs. Empty for standalone-file runs with no
+            // enclosing flow directory.
+            let flow_slug = this
+                .project_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
             // Pre-assigned run_id from the API handler (via app_data) takes precedence.
             let pre_assigned_run_id: Option<String> =
                 lua.app_data_ref::<String>().map(|r| r.clone());
@@ -606,14 +618,15 @@ impl UserData for LuaCrew {
                 .map_err(mlua::Error::external)?;
 
             let run_id = store
-                .save_run_intent(
-                    pre_assigned_run_id,
-                    &flow_name_for_intent,
-                    &run_start.to_rfc3339(),
-                    agent_count_for_intent,
-                    task_count_for_intent,
-                    &tags,
-                )
+                .save_run_intent(crate::engine::run_history::RunIntent {
+                    suggested_id: pre_assigned_run_id,
+                    flow_name: flow_name_for_intent,
+                    flow: flow_slug,
+                    started_at: run_start.to_rfc3339(),
+                    agent_count: agent_count_for_intent,
+                    task_count: task_count_for_intent,
+                    tags: tags.clone(),
+                })
                 .await
                 .map_err(mlua::Error::external)?;
             lua.globals()
@@ -655,12 +668,14 @@ impl UserData for LuaCrew {
                     store
                         .update_run_completion(
                             &run_id,
-                            record.status.clone(),
-                            &run_end.to_rfc3339(),
-                            total_ms,
-                            record.task_results.clone(),
-                            record.total_tokens,
-                            record.cached_tokens,
+                            crate::engine::run_history::RunCompletion {
+                                status: record.status.clone(),
+                                finished_at: run_end.to_rfc3339(),
+                                duration_ms: total_ms,
+                                task_results: record.task_results.clone(),
+                                total_tokens: record.total_tokens,
+                                cached_tokens: record.cached_tokens,
+                            },
                         )
                         .await
                         .map_err(mlua::Error::external)?;
@@ -672,12 +687,14 @@ impl UserData for LuaCrew {
                     let _ = store
                         .update_run_completion(
                             &run_id,
-                            crate::engine::run_history::RunStatus::Failed,
-                            &run_end.to_rfc3339(),
-                            total_ms,
-                            Vec::new(),
-                            0,
-                            0,
+                            crate::engine::run_history::RunCompletion {
+                                status: crate::engine::run_history::RunStatus::Failed,
+                                finished_at: run_end.to_rfc3339(),
+                                duration_ms: total_ms,
+                                task_results: Vec::new(),
+                                total_tokens: 0,
+                                cached_tokens: 0,
+                            },
                         )
                         .await;
                     return Err(mlua::Error::external(e));

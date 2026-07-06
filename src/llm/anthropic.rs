@@ -358,6 +358,11 @@ impl AnthropicProvider {
         use futures::StreamExt;
         let mut buffer = String::new();
         let mut current_event_type = String::new();
+        // Track terminal delivery so a mid-stream `error` event (e.g.
+        // `overloaded_error`) or a connection dropped before `message_stop`
+        // surfaces as an error instead of a silently-truncated success.
+        let mut stream_error: Option<String> = None;
+        let mut saw_message_stop = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(IronCrewError::Http)?;
@@ -475,11 +480,38 @@ impl AnthropicProvider {
                         }
                     }
                     "message_stop" => {
+                        saw_message_stop = true;
                         let _ = tx.send(StreamChunk::Done).await;
+                    }
+                    "error" => {
+                        // e.g. {"type":"error","error":{"type":"overloaded_error",
+                        //       "message":"Overloaded"}}
+                        let err = &parsed["error"];
+                        let kind = err["type"].as_str().unwrap_or("error");
+                        let msg = err["message"].as_str().unwrap_or("stream error");
+                        stream_error = Some(format!("{}: {}", kind, msg));
+                        break;
                     }
                     _ => {}
                 }
             }
+
+            if stream_error.is_some() {
+                break;
+            }
+        }
+
+        // A mid-stream error event, or a stream that ended before `message_stop`,
+        // means the response is incomplete — fail rather than return partial text.
+        if let Some(err) = stream_error {
+            return Err(IronCrewError::Provider(format!(
+                "Anthropic stream error — {err}"
+            )));
+        }
+        if !saw_message_stop {
+            return Err(IronCrewError::Provider(
+                "Anthropic stream ended before message_stop (truncated response)".into(),
+            ));
         }
 
         // Assemble tool calls from block states
