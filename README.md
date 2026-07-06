@@ -107,7 +107,17 @@ ironcrew run .
 
 ## Examples
 
-See [`examples/`](examples/) for working demos:
+See [`examples/`](examples/) for working demos. Most ship a `.env.example` —
+copy it to `.env` in that directory, add your API key, and run:
+
+```bash
+cp examples/simple/.env.example examples/simple/.env   # then edit .env
+ironcrew run examples/simple
+```
+
+The `.env.example` includes the `IRONCREW_ENV_ALLOWLIST` line each flow needs so
+its `env()` config resolves (see the Quick Start note above).
+
 
 **Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `shared-modules` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable` · `moderator-dialog`
 
