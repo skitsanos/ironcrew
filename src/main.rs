@@ -161,12 +161,44 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+/// The project/CWD path a command operates on, used to locate its `.env`.
+/// `None` for commands that don't target a project (`init`, `nodes`, `serve` —
+/// the server uses the CWD `.env` and process environment, never per-flow files).
+fn command_path(command: &Commands) -> Option<&std::path::Path> {
+    match command {
+        Commands::Run { path, .. }
+        | Commands::Validate { path }
+        | Commands::List { path }
+        | Commands::Fmt { path }
+        | Commands::Doctor { path }
+        | Commands::Export { path, .. }
+        | Commands::Graph { path, .. }
+        | Commands::Chat { path, .. } => Some(path),
+        Commands::Inspect { project, .. }
+        | Commands::Clean { project, .. }
+        | Commands::Runs { project, .. } => Some(project),
+        Commands::Init { .. } | Commands::Nodes | Commands::Serve { .. } => None,
+    }
+}
+
+fn main() {
     let cli = Cli::parse();
+
+    // Load `.env` BEFORE the async runtime starts. `dotenvy` mutates the
+    // environment via `std::env::set_var`, which is only sound while the process
+    // is single-threaded — doing it here (before any Tokio worker thread exists)
+    // avoids the data race that per-request loading caused. Loading before the
+    // logger also lets `IRONCREW_LOG` be set from `.env`.
+    cli::project::load_dotenv(command_path(&cli.command));
     utils::logger::init(cli.verbose);
 
-    let result = match cli.command {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime");
+
+    let result = runtime.block_on(async {
+        match cli.command {
         Commands::Run {
             path,
             input,
@@ -209,7 +241,8 @@ async fn main() {
             )
             .await
         }
-    };
+        }
+    });
 
     if let Err(e) = result {
         tracing::error!("{}", e);
