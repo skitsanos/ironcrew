@@ -212,6 +212,12 @@ object with `runs`, `total`, `limit`, and `offset` — **not** a bare array.
 Individual run summaries omit `task_results` so listings stay cheap even on
 stores with thousands of historical runs.
 
+Results are **scoped to the flow in the URL**: `GET /flows/A/runs` returns only
+runs launched under flow `A`, and `GET`/`DELETE /flows/A/runs/{id}` act only on
+a run belonging to `A` (a run from another flow reads as `404`). Runs recorded
+before this scoping was introduced carry no flow tag and are not visible through
+the per-flow endpoints.
+
 ```bash
 # First page (defaults: 20 per page, newest first)
 curl http://localhost:3000/flows/research-crew/runs

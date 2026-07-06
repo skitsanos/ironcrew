@@ -21,10 +21,29 @@ fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
     Duration::from_millis(base_ms.saturating_mul(factor).min(cap_ms))
 }
 
-use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+use super::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary,
+};
 use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use super::store::StateStore;
+use super::store_sql::{self, Dialect, SqlParam, WhereClause};
 use crate::utils::error::{IronCrewError, Result};
+
+/// Fold the shared builder's ordered params onto a sqlx query via `.bind`.
+/// The `success` filter is bound as a native `bool`, matching the `BOOLEAN`
+/// `success` column on the `audit_events` table.
+fn bind_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    params: &'q [SqlParam],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for p in params {
+        query = match p {
+            SqlParam::Text(s) => query.bind(s),
+            SqlParam::Bool(b) => query.bind(b),
+        };
+    }
+    query
+}
 
 pub struct PostgresStore {
     pool: PgPool,
@@ -126,6 +145,7 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS {t} (
                 run_id        TEXT PRIMARY KEY,
                 flow_name     TEXT NOT NULL,
+                flow          TEXT NOT NULL DEFAULT '',
                 status        TEXT NOT NULL,
                 started_at    TEXT NOT NULL,
                 finished_at   TEXT NOT NULL,
@@ -146,6 +166,10 @@ impl PostgresStore {
 
         // 2. Add missing columns (heal older schema versions)
         let migrations: &[(&str, &str)] = &[
+            (
+                "flow",
+                &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS flow TEXT NOT NULL DEFAULT ''"),
+            ),
             (
                 "total_tokens",
                 &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0"),
@@ -429,32 +453,27 @@ and targets extension-capable deployments such as pgvector-enabled installs.",
 
 #[async_trait]
 impl StateStore for PostgresStore {
-    async fn save_run_intent(
-        &self,
-        suggested_id: Option<String>,
-        flow_name: &str,
-        started_at: &str,
-        agent_count: usize,
-        task_count: usize,
-        tags: &[String],
-    ) -> Result<String> {
-        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let tags_json = serde_json::to_string(tags)
+    async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
+        let run_id = intent
+            .suggested_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let tags_json = serde_json::to_string(&intent.tags)
             .map_err(|e| IronCrewError::Validation(format!("Tags serialize: {}", e)))?;
         let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
             .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
         let sql = format!(
-            "INSERT INTO {} (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES ($1, $2, 'running', $3, '', 0, $4::jsonb, $5, $6, 0, 0, $7::jsonb)",
+            "INSERT INTO {} (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, 0, 0, $8::jsonb)",
             self.table_name
         );
         sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&run_id)
-            .bind(flow_name)
-            .bind(started_at)
+            .bind(&intent.flow_name)
+            .bind(&intent.flow)
+            .bind(&intent.started_at)
             .bind(&empty_tasks)
-            .bind(agent_count as i64)
-            .bind(task_count as i64)
+            .bind(intent.agent_count as i64)
+            .bind(intent.task_count as i64)
             .bind(&tags_json)
             .execute(&self.pool)
             .await
@@ -463,17 +482,8 @@ impl StateStore for PostgresStore {
         Ok(run_id)
     }
 
-    async fn update_run_completion(
-        &self,
-        run_id: &str,
-        status: RunStatus,
-        finished_at: &str,
-        duration_ms: u64,
-        task_results: Vec<crate::engine::task::TaskResult>,
-        total_tokens: u32,
-        cached_tokens: u32,
-    ) -> Result<()> {
-        let task_results_json = serde_json::to_string(&task_results)
+    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()> {
+        let task_results_json = serde_json::to_string(&completion.task_results)
             .map_err(|e| IronCrewError::Validation(format!("task_results serialize: {}", e)))?;
         let sql = format!(
             "UPDATE {}
@@ -483,12 +493,12 @@ impl StateStore for PostgresStore {
             self.table_name
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(status.to_string())
-            .bind(finished_at)
-            .bind(duration_ms as i64)
+            .bind(completion.status.to_string())
+            .bind(&completion.finished_at)
+            .bind(completion.duration_ms as i64)
             .bind(&task_results_json)
-            .bind(total_tokens as i32)
-            .bind(cached_tokens as i32)
+            .bind(completion.total_tokens as i32)
+            .bind(completion.cached_tokens as i32)
             .bind(run_id)
             .execute(&self.pool)
             .await
@@ -500,7 +510,7 @@ impl StateStore for PostgresStore {
                 run_id
             )));
         }
-        tracing::info!("Run completion saved: {} ({})", run_id, status);
+        tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
         Ok(())
     }
 
@@ -519,7 +529,7 @@ impl StateStore for PostgresStore {
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         let sql = format!(
-            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
+            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text
              FROM {} WHERE run_id = $1",
             self.table_name
         );
@@ -540,64 +550,27 @@ impl StateStore for PostgresStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunSummary>> {
-        // Build WHERE clause dynamically with numbered placeholders.
-        // Note: we NEVER select task_results — that's the whole point of
-        // the summary view. Without the heavy JSONB column, this query is
-        // effectively just an index scan on started_at.
+        // Shared WHERE builder keeps the tag containment identical to the
+        // SQLite backend. We NEVER select task_results — that's the whole
+        // point of the summary view. LIMIT/OFFSET stay inline (trusted
+        // integers) so the builder's `$N` numbering is left undisturbed.
+        let WhereClause { sql: where_sql, params } = store_sql::runs_where(filter, Dialect::Postgres);
         let mut sql = format!(
-            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, \
+            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
              agent_count, task_count, total_tokens, cached_tokens, tags::text \
-             FROM {}",
-            self.table_name
+             FROM {}{}",
+            self.table_name, where_sql
         );
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut next_idx = 1usize;
-
-        if filter.status.is_some() {
-            where_clauses.push(format!("status = ${}", next_idx));
-            next_idx += 1;
-        }
-        if filter.since.is_some() {
-            where_clauses.push(format!("started_at >= ${}", next_idx));
-            next_idx += 1;
-        }
-        if filter.tag.is_some() {
-            // JSONB @> for containment — uses the GIN index on tags
-            where_clauses.push(format!("tags @> ${}::jsonb", next_idx));
-            next_idx += 1;
-        }
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
         sql.push_str(" ORDER BY started_at DESC");
-
         if limit > 0 {
-            sql.push_str(&format!(" LIMIT ${}", next_idx));
-            next_idx += 1;
+            sql.push_str(&format!(" LIMIT {}", limit as i64));
             if offset > 0 {
-                sql.push_str(&format!(" OFFSET ${}", next_idx));
+                sql.push_str(&format!(" OFFSET {}", offset as i64));
             }
         }
 
-        // Bind parameters in the same order they appear in the SQL
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
-        if let Some(ref status) = filter.status {
-            query = query.bind(status);
-        }
-        if let Some(ref since) = filter.since {
-            query = query.bind(since);
-        }
-        if let Some(ref tag) = filter.tag {
-            // Wrap in a JSONB array: ["tag"]
-            query = query.bind(format!("[\"{}\"]", tag));
-        }
-        if limit > 0 {
-            query = query.bind(limit as i64);
-            if offset > 0 {
-                query = query.bind(offset as i64);
-            }
-        }
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
+        let query = bind_params(query, &params);
 
         let rows = query
             .fetch_all(&self.pool)
@@ -608,36 +581,11 @@ impl StateStore for PostgresStore {
     }
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
-        let mut sql = format!("SELECT COUNT(*) FROM {}", self.table_name);
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut next_idx = 1usize;
+        let WhereClause { sql: where_sql, params } = store_sql::runs_where(filter, Dialect::Postgres);
+        let sql = format!("SELECT COUNT(*) FROM {}{}", self.table_name, where_sql);
 
-        if filter.status.is_some() {
-            where_clauses.push(format!("status = ${}", next_idx));
-            next_idx += 1;
-        }
-        if filter.since.is_some() {
-            where_clauses.push(format!("started_at >= ${}", next_idx));
-            next_idx += 1;
-        }
-        if filter.tag.is_some() {
-            where_clauses.push(format!("tags @> ${}::jsonb", next_idx));
-        }
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
-        if let Some(ref status) = filter.status {
-            query = query.bind(status);
-        }
-        if let Some(ref since) = filter.since {
-            query = query.bind(since);
-        }
-        if let Some(ref tag) = filter.tag {
-            query = query.bind(format!("[\"{}\"]", tag));
-        }
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
+        let query = bind_params(query, &params);
 
         let row = query
             .fetch_one(&self.pool)
@@ -1003,42 +951,12 @@ impl StateStore for PostgresStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
+        let WhereClause { sql: where_sql, params } = store_sql::audit_where(filter, Dialect::Postgres);
         let mut sql = format!(
             "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata::text
-             FROM {}",
-            self.audit_events_table
+             FROM {}{}",
+            self.audit_events_table, where_sql
         );
-        let mut clauses: Vec<String> = Vec::new();
-        let mut idx = 0usize;
-
-        if filter.flow_path.is_some() {
-            idx += 1;
-            clauses.push(format!("flow_path = ${}", idx));
-        }
-        if filter.action.is_some() {
-            idx += 1;
-            clauses.push(format!("action = ${}", idx));
-        }
-        if filter.actor.is_some() {
-            idx += 1;
-            clauses.push(format!("actor = ${}", idx));
-        }
-        if filter.since.is_some() {
-            idx += 1;
-            clauses.push(format!("timestamp >= ${}", idx));
-        }
-        if filter.until.is_some() {
-            idx += 1;
-            clauses.push(format!("timestamp < ${}", idx));
-        }
-        if filter.success.is_some() {
-            idx += 1;
-            clauses.push(format!("success = ${}", idx));
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
         sql.push_str(" ORDER BY timestamp DESC");
         if limit > 0 {
             sql.push_str(&format!(" LIMIT {}", limit));
@@ -1047,25 +965,8 @@ impl StateStore for PostgresStore {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
 
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
-        if let Some(ref v) = filter.flow_path {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.action {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.actor {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.since {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.until {
-            q = q.bind(v);
-        }
-        if let Some(s) = filter.success {
-            q = q.bind(s);
-        }
+        let q = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
+        let q = bind_params(q, &params);
 
         let rows = q
             .fetch_all(&self.pool)
@@ -1103,56 +1004,15 @@ impl StateStore for PostgresStore {
     }
 
     async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        let mut sql = format!("SELECT COUNT(*) FROM {}", self.audit_events_table);
-        let mut clauses: Vec<String> = Vec::new();
-        let mut idx = 0usize;
-        if filter.flow_path.is_some() {
-            idx += 1;
-            clauses.push(format!("flow_path = ${}", idx));
-        }
-        if filter.action.is_some() {
-            idx += 1;
-            clauses.push(format!("action = ${}", idx));
-        }
-        if filter.actor.is_some() {
-            idx += 1;
-            clauses.push(format!("actor = ${}", idx));
-        }
-        if filter.since.is_some() {
-            idx += 1;
-            clauses.push(format!("timestamp >= ${}", idx));
-        }
-        if filter.until.is_some() {
-            idx += 1;
-            clauses.push(format!("timestamp < ${}", idx));
-        }
-        if filter.success.is_some() {
-            idx += 1;
-            clauses.push(format!("success = ${}", idx));
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
+        let WhereClause { sql: where_sql, params } = store_sql::audit_where(filter, Dialect::Postgres);
+        let sql = format!("SELECT COUNT(*) FROM {}{}", self.audit_events_table, where_sql);
 
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.to_string()));
-        if let Some(ref v) = filter.flow_path {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.action {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.actor {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.since {
-            q = q.bind(v);
-        }
-        if let Some(ref v) = filter.until {
-            q = q.bind(v);
-        }
-        if let Some(s) = filter.success {
-            q = q.bind(s);
+        for p in &params {
+            q = match p {
+                SqlParam::Text(s) => q.bind(s),
+                SqlParam::Bool(b) => q.bind(b),
+            };
         }
 
         let count = q
@@ -1196,13 +1056,10 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
         flow_name: row
             .try_get("flow_name")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        status: match status_str.as_str() {
-            "success" => RunStatus::Success,
-            "partial_failure" => RunStatus::PartialFailure,
-            "running" => RunStatus::Running,
-            "abandoned" => RunStatus::Abandoned,
-            _ => RunStatus::Failed,
-        },
+        flow: row
+            .try_get("flow")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        status: status_str.parse::<RunStatus>()?,
         started_at: row
             .try_get("started_at")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
@@ -1250,13 +1107,10 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
         flow_name: row
             .try_get("flow_name")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        status: match status_str.as_str() {
-            "success" => RunStatus::Success,
-            "partial_failure" => RunStatus::PartialFailure,
-            "running" => RunStatus::Running,
-            "abandoned" => RunStatus::Abandoned,
-            _ => RunStatus::Failed,
-        },
+        flow: row
+            .try_get("flow")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
+        status: status_str.parse::<RunStatus>()?,
         started_at: row
             .try_get("started_at")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,

@@ -1,4 +1,6 @@
-use ironcrew::engine::run_history::{JsonFileStore, ListRunsFilter, RunRecord, RunStatus};
+use ironcrew::engine::run_history::{
+    JsonFileStore, ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus,
+};
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
 use ironcrew::utils::error::IronCrewError;
@@ -11,24 +13,27 @@ async fn save_completed_run(
     record: &RunRecord,
 ) -> Result<(), IronCrewError> {
     store
-        .save_run_intent(
-            Some(record.run_id.clone()),
-            &record.flow_name,
-            &record.started_at,
-            record.agent_count,
-            record.task_count,
-            &record.tags,
-        )
+        .save_run_intent(RunIntent {
+            suggested_id: Some(record.run_id.clone()),
+            flow_name: record.flow_name.clone(),
+            flow: record.flow.clone(),
+            started_at: record.started_at.clone(),
+            agent_count: record.agent_count,
+            task_count: record.task_count,
+            tags: record.tags.clone(),
+        })
         .await?;
     store
         .update_run_completion(
             &record.run_id,
-            record.status.clone(),
-            &record.finished_at,
-            record.duration_ms,
-            record.task_results.clone(),
-            record.total_tokens,
-            record.cached_tokens,
+            RunCompletion {
+                status: record.status.clone(),
+                finished_at: record.finished_at.clone(),
+                duration_ms: record.duration_ms,
+                task_results: record.task_results.clone(),
+                total_tokens: record.total_tokens,
+                cached_tokens: record.cached_tokens,
+            },
         )
         .await
 }
@@ -37,6 +42,7 @@ fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) ->
     RunRecord {
         run_id: id.into(),
         flow_name: "test".into(),
+        flow: "test".into(),
         status,
         started_at: started.into(),
         finished_at: started.into(),
@@ -58,6 +64,7 @@ async fn test_save_and_load_run() {
     let record = RunRecord {
         run_id: "test-run-123".into(),
         flow_name: "test flow".into(),
+        flow: "test".into(),
         status: RunStatus::Success,
         started_at: "2026-03-18T12:00:00Z".into(),
         finished_at: "2026-03-18T12:00:05Z".into(),
@@ -94,6 +101,7 @@ async fn test_delete_run() {
     let record = RunRecord {
         run_id: "to-delete".into(),
         flow_name: "test".into(),
+        flow: "test".into(),
         status: RunStatus::Success,
         started_at: "2026-03-18T12:00:00Z".into(),
         finished_at: "2026-03-18T12:00:01Z".into(),
@@ -275,14 +283,15 @@ async fn json_store_intent_completion_roundtrip() {
     let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
 
     let run_id = store
-        .save_run_intent(
-            Some("test-intent-1".into()),
-            "demo-flow",
-            "2026-04-23T10:00:00Z",
-            2,
-            3,
-            &["dev".into()],
-        )
+        .save_run_intent(RunIntent {
+            suggested_id: Some("test-intent-1".into()),
+            flow_name: "demo-flow".into(),
+            flow: "demo-flow".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 2,
+            task_count: 3,
+            tags: vec!["dev".into()],
+        })
         .await
         .unwrap();
     assert_eq!(run_id, "test-intent-1");
@@ -298,20 +307,22 @@ async fn json_store_intent_completion_roundtrip() {
     store
         .update_run_completion(
             &run_id,
-            RunStatus::Success,
-            "2026-04-23T10:00:05Z",
-            5000,
-            vec![TaskResult {
-                task: "answer".into(),
-                agent: "assistant".into(),
-                output: "hi".into(),
-                success: true,
-                duration_ms: 4500,
-                token_usage: None,
-                reasoning: None,
-            }],
-            100,
-            20,
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-04-23T10:00:05Z".into(),
+                duration_ms: 5000,
+                task_results: vec![TaskResult {
+                    task: "answer".into(),
+                    agent: "assistant".into(),
+                    output: "hi".into(),
+                    success: true,
+                    duration_ms: 4500,
+                    token_usage: None,
+                    reasoning: None,
+                }],
+                total_tokens: 100,
+                cached_tokens: 20,
+            },
         )
         .await
         .unwrap();
@@ -332,11 +343,27 @@ async fn json_store_reconcile_abandoned_selectivity() {
 
     // Two Running records
     store
-        .save_run_intent(Some("r1".into()), "f", "2026-04-23T10:00:00Z", 1, 1, &[])
+        .save_run_intent(RunIntent {
+            suggested_id: Some("r1".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            ..Default::default()
+        })
         .await
         .unwrap();
     store
-        .save_run_intent(Some("r2".into()), "f", "2026-04-23T10:01:00Z", 1, 1, &[])
+        .save_run_intent(RunIntent {
+            suggested_id: Some("r2".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:01:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
