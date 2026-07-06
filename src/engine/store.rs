@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
-use crate::engine::run_history::{
-    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunSummary,
-};
+use crate::engine::run_history::{ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunSummary};
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 

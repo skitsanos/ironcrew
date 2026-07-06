@@ -524,7 +524,8 @@ impl OpenAiResponsesProvider {
         }
         if !saw_completed {
             return Err(IronCrewError::Provider(
-                "OpenAI Responses stream ended before response.completed (truncated response)".into(),
+                "OpenAI Responses stream ended before response.completed (truncated response)"
+                    .into(),
             ));
         }
 
