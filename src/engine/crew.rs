@@ -118,6 +118,10 @@ impl Crew {
         RunRecord {
             run_id: run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             flow_name: self.goal.clone(),
+            // In-memory assembly only. The persisted flow slug is written by
+            // `save_run_intent`; `update_run_completion` never overwrites it,
+            // so leaving this empty here does not affect stored scoping.
+            flow: String::new(),
             status,
             started_at: started_at.to_string(),
             finished_at: finished_at.to_string(),

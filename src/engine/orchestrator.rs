@@ -364,6 +364,7 @@ pub async fn run_crew(
                     &model,
                     crew.max_tool_rounds,
                     crew.stream,
+                    max_concurrent,
                     before_hook,
                     after_hook,
                 )

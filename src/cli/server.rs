@@ -36,6 +36,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         max_active_conversations: api::conversations::max_active_conversations(),
+        max_active_runs: api::handlers::max_active_runs(),
         store,
     });
 

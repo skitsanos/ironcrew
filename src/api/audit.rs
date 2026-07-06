@@ -98,7 +98,7 @@ fn clamp_metadata(value: serde_json::Value) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::engine::audit::{AuditEvent, AuditFilter};
-    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
     use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
     use crate::utils::error::{IronCrewError, Result};
     use async_trait::async_trait;
@@ -131,24 +131,14 @@ mod tests {
         // Boilerplate: other StateStore methods are not exercised in T4.
         async fn save_run_intent(
             &self,
-            _: Option<String>,
-            _: &str,
-            _: &str,
-            _: usize,
-            _: usize,
-            _: &[String],
+            _: crate::engine::run_history::RunIntent,
         ) -> Result<String> {
             unimplemented!()
         }
         async fn update_run_completion(
             &self,
             _: &str,
-            _: RunStatus,
-            _: &str,
-            _: u64,
-            _: Vec<crate::engine::task::TaskResult>,
-            _: u32,
-            _: u32,
+            _: crate::engine::run_history::RunCompletion,
         ) -> Result<()> {
             unimplemented!()
         }
