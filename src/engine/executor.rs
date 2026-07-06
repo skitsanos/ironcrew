@@ -285,10 +285,13 @@ impl<'a> TaskExecutionContext<'a> {
                 });
             }
 
-            // Add assistant message with tool calls (must include the tool_calls array)
-            messages.push(ChatMessage::assistant(
+            // Add assistant message with tool calls (must include the tool_calls
+            // array) and the provider's reasoning blocks, so extended-thinking
+            // providers can replay them on the next round.
+            messages.push(ChatMessage::assistant_with_blocks(
                 response.content.clone(),
                 Some(response.tool_calls.clone()),
+                response.raw_blocks.clone(),
             ));
 
             // Execute tool calls and add tool result messages

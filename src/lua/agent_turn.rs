@@ -132,10 +132,12 @@ pub async fn run_single_agent_turn(
             )));
         }
 
-        // Append the assistant's tool-call request to history.
-        history.push(ChatMessage::assistant(
+        // Append the assistant's tool-call request to history, carrying the
+        // provider's reasoning blocks for replay (extended thinking + tools).
+        history.push(ChatMessage::assistant_with_blocks(
             response.content.clone(),
             Some(response.tool_calls.clone()),
+            response.raw_blocks.clone(),
         ));
         enforce_history_cap(history, max_history);
 
@@ -235,6 +237,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 usage: None,
+                raw_blocks: None,
             })
         }
 
@@ -253,6 +256,7 @@ mod tests {
                     reasoning: None,
                     tool_calls: vec![],
                     usage: None,
+                    raw_blocks: None,
                 });
             }
 
@@ -269,6 +273,7 @@ mod tests {
                     },
                 }],
                 usage: None,
+                raw_blocks: None,
             })
         }
     }

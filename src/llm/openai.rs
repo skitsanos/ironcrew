@@ -269,6 +269,7 @@ impl OpenAiProvider {
             reasoning,
             tool_calls,
             usage,
+            raw_blocks: None,
         })
     }
 
@@ -457,6 +458,7 @@ impl OpenAiProvider {
             reasoning,
             tool_calls,
             usage: None,
+            raw_blocks: None,
         })
     }
 }
