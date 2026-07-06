@@ -128,8 +128,8 @@ local crew = Crew.new({
 ### Azure OpenAI
 
 Use your Azure deployment endpoint as the base URL. Omit `api_key` — the Lua
-sandbox's default `*_API_KEY` blocklist prevents `env("AZURE_OPENAI_API_KEY")`
-from resolving, so the key must come from the Rust side.
+sandbox's `env()` is fail-closed, so `env("AZURE_OPENAI_API_KEY")` returns `nil`
+unless the name is allowlisted; by default the key must come from the Rust side.
 
 ```lua
 local crew = Crew.new({
@@ -146,7 +146,7 @@ key falls back to `OPENAI_API_KEY`. In practice you have two options:
 1. Export your Azure key as `OPENAI_API_KEY` before running `ironcrew`.
 2. Grant the Lua sandbox explicit access to the Azure var via
    `IRONCREW_ENV_ALLOWLIST=AZURE_OPENAI_API_KEY` (see
-   [docs/sandbox.md](sandbox.md#granting-explicit-access--ironcrew_env_allowlist)),
+   [docs/sandbox.md](sandbox.md)),
    then call `api_key = env("AZURE_OPENAI_API_KEY")` in `crew.lua`.
 
 ## Anthropic Native (`provider = "anthropic"`)
@@ -281,8 +281,9 @@ Key resolution depends on the `provider` value.
 
 ### `provider = "openai"`
 
-1. Explicit `api_key` in the Crew config (note: Lua `env()` blocks `*_API_KEY`
-   by default, so this is usually not set — env var auto-detection handles it).
+1. Explicit `api_key` in the Crew config (note: Lua `env()` is fail-closed, so
+   `env("…_API_KEY")` returns `nil` unless allowlisted — this is usually left
+   unset and env var auto-detection handles the key Rust-side).
 2. Provider-specific env var based on the `base_url`:
 
 | URL contains                                     | Env var              |
