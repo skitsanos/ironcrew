@@ -9,8 +9,9 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     use axum::http;
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
-    // Load .env from CWD
-    dotenvy::dotenv().ok();
+    // `.env` is loaded once in `main` before the runtime starts; the server
+    // never mutates the environment per-request (that was a data race and a
+    // cross-flow secret-bleed source). Flows use the process environment.
 
     let flows_dir = std::fs::canonicalize(flows_dir).unwrap_or_else(|_| flows_dir.to_path_buf());
 

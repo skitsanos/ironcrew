@@ -15,8 +15,13 @@ ironcrew serve --flows-dir ./flows --port 3000
 | `--port`       | `3000`        | Port to bind to                      |
 | `--flows-dir`  | `.`           | Directory containing crew flow dirs  |
 
-The server loads `.env` from the current working directory on startup, so API keys
-set there are available to all flows.
+The server loads `.env` from the current working directory **once at startup**
+(before the async runtime starts), so API keys and config set there are available
+to every flow. In server mode a flow's own `.env` file is **not** loaded — flows
+read the shared process environment. Set per-deployment secrets at the process
+level (container env, systemd, the server's CWD `.env`), not in per-flow `.env`
+files. (This replaces the earlier per-request loading, which raced on the
+environment and could bleed one flow's secrets into another.)
 
 For production sizing, session-cap tuning, SSE proxy guidance, and horizontal
 scaling considerations, see [HTTP Scaling](http-scaling.md).
