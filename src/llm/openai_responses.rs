@@ -383,6 +383,11 @@ impl OpenAiResponsesProvider {
         use futures::StreamExt;
         let mut buffer = String::new();
         let mut current_event_type = String::new();
+        // Track terminal delivery: `response.failed`/`error`, or a stream that
+        // ends before `response.completed`, must fail rather than return
+        // partial content as a successful response.
+        let mut stream_error: Option<String> = None;
+        let mut saw_completed = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(IronCrewError::Http)?;
@@ -407,6 +412,7 @@ impl OpenAiResponsesProvider {
                 };
 
                 if data == "[DONE]" {
+                    saw_completed = true;
                     let _ = tx.send(StreamChunk::Done).await;
                     continue;
                 }
@@ -478,6 +484,7 @@ impl OpenAiResponsesProvider {
                         }
                     }
                     "response.completed" => {
+                        saw_completed = true;
                         if let Some(usage) = parsed["response"].get("usage").cloned() {
                             usage_data = Some(usage);
                         }
@@ -489,10 +496,27 @@ impl OpenAiResponsesProvider {
                             .or_else(|| parsed["response"]["error"]["message"].as_str())
                             .unwrap_or("Responses API stream error");
                         let _ = tx.send(StreamChunk::Error(err_msg.to_string())).await;
+                        stream_error = Some(err_msg.to_string());
+                        break;
                     }
                     _ => {}
                 }
             }
+
+            if stream_error.is_some() {
+                break;
+            }
+        }
+
+        if let Some(err) = stream_error {
+            return Err(IronCrewError::Provider(format!(
+                "OpenAI Responses stream error — {err}"
+            )));
+        }
+        if !saw_completed {
+            return Err(IronCrewError::Provider(
+                "OpenAI Responses stream ended before response.completed (truncated response)".into(),
+            ));
         }
 
         // Assemble tool calls from item states

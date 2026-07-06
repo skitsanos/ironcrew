@@ -53,6 +53,7 @@ pub async fn execute_foreach_task(
     model: &str,
     max_tool_rounds: usize,
     stream: bool,
+    max_concurrent: usize,
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
 ) -> Result<TaskResult> {
@@ -127,8 +128,8 @@ pub async fn execute_foreach_task(
             .map(|(idx, item)| build_item_task(task, &item_var, idx, items.len(), item))
             .collect();
 
-        // Build futures that borrow shared state — join_all runs them concurrently
-        // on the current task without spawning, so shared references are valid.
+        // Build futures that borrow shared state — they run concurrently on the
+        // current task without spawning, so shared references are valid.
         let futs: Vec<_> = item_tasks
             .iter()
             .map(|item_task| async {
@@ -168,7 +169,15 @@ pub async fn execute_foreach_task(
             })
             .collect();
 
-        let parallel_results = futures::future::join_all(futs).await;
+        // Bound the fan-out: `buffered` runs at most `max_concurrent` item
+        // futures at once (min 1), preserving input order so the index → output
+        // mapping below stays correct. Without this cap, a foreach over a large
+        // array would fire one LLM request per item simultaneously.
+        use futures::stream::StreamExt;
+        let parallel_results: Vec<_> = futures::stream::iter(futs)
+            .buffered(max_concurrent.max(1))
+            .collect()
+            .await;
 
         // Resize output vec to match items count
         foreach_outputs.resize(items.len(), String::new());

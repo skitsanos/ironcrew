@@ -126,6 +126,7 @@ Production deployments should set these at minimum:
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many turns. |
 | `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns. |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Max simultaneous live chat sessions (HTTP + CLI). Exceeding returns 503. |
+| `IRONCREW_MAX_ACTIVE_RUNS` | `100` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` (30 min) | Idle window after which a chat handle is evicted from memory. |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/conversations`. |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the conversation list endpoint. |
