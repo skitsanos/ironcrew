@@ -494,7 +494,10 @@ pub async fn post_message(
     // Load images (if any) before acquiring the turn lock.
     let images: Option<Vec<crate::llm::provider::ImageInput>> = match req.images {
         Some(paths) if !paths.is_empty() => {
-            let client = reqwest::Client::new();
+            // Use the shared client so image-URL fetches inherit the SSRF
+            // redirect policy (a fresh Client would follow redirects to
+            // private addresses unchecked).
+            let client = crate::tools::http_request::SHARED_HTTP_CLIENT.clone();
             let mut loaded = Vec::new();
             for p in paths {
                 let img = crate::llm::image::load_image(&p, &flow_path_resolved, &client)

@@ -211,13 +211,11 @@ by default. This prevents Lua scripts from probing internal networks. Override
 with `IRONCREW_ALLOW_PRIVATE_IPS=1` if your agents legitimately need to reach
 internal services.
 
-**Environment variable security.** Lua `env()` blocks sensitive variables by
-default: `DATABASE_URL`, `IRONCREW_API_TOKEN`, `IRONCREW_PG_TABLE_PREFIX`,
-and any variable ending with `_API_KEY`, `_SECRET`, `_TOKEN`, or
-`_PASSWORD`. Extend the deny set via `IRONCREW_ENV_BLOCKLIST`; grant
-explicit per-var access via `IRONCREW_ENV_ALLOWLIST` (overrides every
-block rule). Both are comma-separated, case-insensitive. See
-[docs/sandbox.md](sandbox.md) for the resolution order.
+**Environment variable security.** Lua `env()` is fail-closed: it reads
+**only** the variables whose exact names appear in `IRONCREW_ENV_ALLOWLIST`
+(comma-separated, case-insensitive); every other name returns `nil`. Opt in
+the specific non-secret vars your crew needs and nothing else. See
+[docs/sandbox.md](sandbox.md) for details and the migration note.
 
 **Audit log.** State-changing API actions (flow run start/abort/delete,
 conversation start/delete) are recorded in an append-only audit log
