@@ -69,12 +69,23 @@ cargo build --release
 ironcrew init my-crew
 cd my-crew
 
-# Configure
+# Configure — the provider reads the API key directly from the environment
 echo "OPENAI_API_KEY=sk-..." > .env
 
 # Run
 ironcrew run .
 ```
+
+> **Reading env vars from `crew.lua`.** Flow scripts reach the process
+> environment only through the sandboxed `env()` global, which is **fail-closed**:
+> it returns `nil` for every name **not** listed in `IRONCREW_ENV_ALLOWLIST`.
+> API keys are unaffected (the provider reads `OPENAI_API_KEY` etc. itself), but
+> any config a script pulls via `env()` — e.g. `env("OPENAI_MODEL")` or a custom
+> `env("OPENAI_BASE_URL")` — must be allowlisted, or it falls back to defaults:
+> ```bash
+> echo "IRONCREW_ENV_ALLOWLIST=OPENAI_MODEL,OPENAI_BASE_URL" >> .env
+> ```
+> See [Lua Sandbox → `env()`](docs/sandbox.md) for details.
 
 ## Documentation
 

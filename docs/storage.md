@@ -123,7 +123,8 @@ sqlite3 .ironcrew/ironcrew.db -json "SELECT * FROM runs ORDER BY started_at DESC
 ```sql
 CREATE TABLE runs (
     run_id        TEXT PRIMARY KEY,
-    flow_name     TEXT NOT NULL,
+    flow_name     TEXT NOT NULL,      -- crew goal (human-readable)
+    flow          TEXT NOT NULL DEFAULT '', -- flow slug the run was launched under (scoping key)
     status        TEXT NOT NULL,
     started_at    TEXT NOT NULL,
     finished_at   TEXT NOT NULL,
@@ -191,7 +192,8 @@ and `tags`, enabling native PostgreSQL JSON queries:
 ```sql
 CREATE TABLE IF NOT EXISTS runs (
     run_id        TEXT PRIMARY KEY,
-    flow_name     TEXT NOT NULL,
+    flow_name     TEXT NOT NULL,      -- crew goal (human-readable)
+    flow          TEXT NOT NULL DEFAULT '', -- flow slug the run was launched under (scoping key)
     status        TEXT NOT NULL,
     started_at    TEXT NOT NULL,
     finished_at   TEXT NOT NULL,
