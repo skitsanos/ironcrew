@@ -61,14 +61,6 @@ pub fn set_ironcrew_mode(lua: &Lua, mode: &str) -> LuaResult<()> {
     lua.globals().set("IRONCREW_MODE", mode.to_string())
 }
 
-/// Register the env() global function in Lua.
-#[allow(dead_code)] // used in integration tests
-pub fn register_env_function(lua: &Lua) -> LuaResult<()> {
-    let env_fn = lua.create_function(|_, name: String| Ok(std::env::var(&name).ok()))?;
-    lua.globals().set("env", env_fn)?;
-    Ok(())
-}
-
 /// Register Agent.new() constructor in Lua.
 /// Validates the table and returns it back (so crew:add_agent() receives a table).
 pub fn register_agent_constructor(lua: &Lua) -> LuaResult<()> {

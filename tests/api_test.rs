@@ -84,23 +84,43 @@ fn test_response_format_json_schema() {
 }
 
 #[test]
-fn test_env_function() {
+fn test_env_function_allowlist() {
+    // env() is fail-closed: only names in IRONCREW_ENV_ALLOWLIST are readable.
     let lua = create_crew_lua().unwrap();
-    register_env_function(&lua).unwrap();
 
-    unsafe { std::env::set_var("TEST_IRONCREW_VAR", "hello") };
-    let result: Option<String> = lua
-        .load(r#"return env("TEST_IRONCREW_VAR")"#)
+    unsafe {
+        std::env::set_var("TEST_IRONCREW_ALLOWED", "hello");
+        std::env::set_var("TEST_IRONCREW_SECRET", "s3cr3t");
+        std::env::set_var("IRONCREW_ENV_ALLOWLIST", "TEST_IRONCREW_ALLOWED");
+    }
+
+    // Allowlisted name is returned.
+    let allowed: Option<String> = lua
+        .load(r#"return env("TEST_IRONCREW_ALLOWED")"#)
         .eval()
         .unwrap();
-    assert_eq!(result, Some("hello".into()));
+    assert_eq!(allowed, Some("hello".into()));
 
-    let result: Option<String> = lua
+    // A set-but-not-allowlisted var is blocked (fail-closed), even though it
+    // exists in the process environment.
+    let blocked: Option<String> = lua
+        .load(r#"return env("TEST_IRONCREW_SECRET")"#)
+        .eval()
+        .unwrap();
+    assert_eq!(blocked, None);
+
+    // Unset + not allowlisted is also nil.
+    let missing: Option<String> = lua
         .load(r#"return env("NONEXISTENT_VAR_XYZ")"#)
         .eval()
         .unwrap();
-    assert_eq!(result, None);
-    unsafe { std::env::remove_var("TEST_IRONCREW_VAR") };
+    assert_eq!(missing, None);
+
+    unsafe {
+        std::env::remove_var("TEST_IRONCREW_ALLOWED");
+        std::env::remove_var("TEST_IRONCREW_SECRET");
+        std::env::remove_var("IRONCREW_ENV_ALLOWLIST");
+    }
 }
 
 #[test]

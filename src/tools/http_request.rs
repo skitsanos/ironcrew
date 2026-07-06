@@ -16,6 +16,7 @@ pub static SHARED_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .timeout(Duration::from_secs(30))
         .user_agent(format!("IronCrew/{}", env!("CARGO_PKG_VERSION")))
         .pool_max_idle_per_host(10)
+        .redirect(crate::utils::network::ssrf_redirect_policy())
         .build()
         .expect("Failed to build HTTP client")
 });
