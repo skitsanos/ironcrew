@@ -132,6 +132,13 @@ impl AnthropicProvider {
                 }
                 "assistant" => {
                     let mut blocks: Vec<Value> = Vec::new();
+                    // Replay captured thinking/redacted_thinking blocks FIRST and
+                    // verbatim (signatures intact). With extended thinking + tools,
+                    // Anthropic requires the thinking block to precede tool_use;
+                    // omitting or modifying it returns a 400.
+                    if let Some(ref raw) = msg.raw_blocks {
+                        blocks.extend(raw.iter().cloned());
+                    }
                     if let Some(ref content) = msg.content
                         && !content.is_empty()
                     {
@@ -550,6 +557,14 @@ impl AnthropicProvider {
                 total_tokens: input_tokens + output_tokens,
                 cached_tokens,
             }),
+            // The streaming path does not reconstruct replayable thinking blocks
+            // (that needs the per-block signature reassembled from signature
+            // deltas). It isn't required for the tool-use round-trip: the
+            // executor forces non-streaming whenever tools are present, and the
+            // non-streaming parser above captures the full blocks. If streaming
+            // is ever combined with a tool loop, add signature reconstruction
+            // here mirroring `parse_anthropic_response`.
+            raw_blocks: None,
         })
     }
 }
@@ -571,6 +586,10 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
     let mut text_parts: Vec<String> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
+    // Thinking blocks captured verbatim (with their `signature`) so the tool
+    // loop can replay them on the next turn — Anthropic 400s on a `tool_use`
+    // that isn't preceded by its `thinking` block when thinking is enabled.
+    let mut raw_blocks: Vec<Value> = Vec::new();
 
     for block in content_blocks {
         let block_type = block["type"].as_str().unwrap_or("");
@@ -593,10 +612,17 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
                 });
             }
             "thinking" => {
-                // Capture thinking blocks as reasoning
+                // Capture the readable text as reasoning AND the whole block
+                // (thinking + signature) verbatim for replay.
                 if let Some(text) = block["thinking"].as_str() {
                     reasoning_parts.push(text.to_string());
                 }
+                raw_blocks.push(block.clone());
+            }
+            "redacted_thinking" => {
+                // Opaque encrypted reasoning — no readable text, but it must be
+                // echoed back unchanged alongside any tool_use.
+                raw_blocks.push(block.clone());
             }
             "web_search_tool_result" => {
                 // Append search results as text for the agent to see
@@ -659,6 +685,11 @@ fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
         reasoning,
         tool_calls,
         usage,
+        raw_blocks: if raw_blocks.is_empty() {
+            None
+        } else {
+            Some(raw_blocks)
+        },
     })
 }
 
@@ -734,5 +765,95 @@ impl LlmProvider for AnthropicProvider {
         let body = self.build_body(&request, None);
         tracing::debug!("Anthropic streaming request");
         self.send_request_stream(body, tx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_captures_thinking_blocks_verbatim() {
+        let resp = json!({
+            "content": [
+                {"type": "thinking", "thinking": "let me think", "signature": "sig-abc"},
+                {"type": "text", "text": "hello"},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "x"}}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        });
+        let parsed = parse_anthropic_response(&resp).unwrap();
+        let raw = parsed.raw_blocks.expect("thinking block captured");
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0]["type"], "thinking");
+        // Signature preserved verbatim — the API rejects modified blocks.
+        assert_eq!(raw[0]["signature"], "sig-abc");
+        assert_eq!(raw[0]["thinking"], "let me think");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.reasoning.as_deref(), Some("let me think"));
+    }
+
+    #[test]
+    fn parse_without_thinking_has_no_raw_blocks() {
+        let resp = json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let parsed = parse_anthropic_response(&resp).unwrap();
+        assert!(parsed.raw_blocks.is_none());
+    }
+
+    #[test]
+    fn build_body_replays_thinking_before_tool_use() {
+        let provider = AnthropicProvider::new(
+            "k".into(),
+            None,
+            AnthropicConfig {
+                thinking_budget: Some(2048),
+                server_tools: vec![],
+            },
+        );
+        let thinking = json!({"type": "thinking", "thinking": "reasoning", "signature": "sig-1"});
+        let assistant = ChatMessage::assistant_with_blocks(
+            None,
+            Some(vec![ToolCallRequest {
+                id: "tu_1".into(),
+                call_type: "function".into(),
+                function: ToolCallFunction {
+                    name: "search".into(),
+                    arguments: "{\"q\":\"x\"}".into(),
+                },
+            }]),
+            Some(vec![thinking]),
+        );
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::user("hi"),
+                assistant,
+                ChatMessage::tool("tu_1", "result"),
+            ],
+            model: "claude-x".into(),
+            temperature: None,
+            max_tokens: None,
+            response_format: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let body = provider.build_body(&req, None);
+        let messages = body["messages"].as_array().unwrap();
+        let asst = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        let blocks = asst["content"].as_array().unwrap();
+        // Thinking block must come first, with its signature intact, before tool_use.
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "sig-1");
+        let think_pos = blocks.iter().position(|b| b["type"] == "thinking").unwrap();
+        let tool_pos = blocks.iter().position(|b| b["type"] == "tool_use").unwrap();
+        assert!(
+            think_pos < tool_pos,
+            "thinking block must precede tool_use to satisfy Anthropic"
+        );
     }
 }

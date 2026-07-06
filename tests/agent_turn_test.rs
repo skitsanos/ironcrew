@@ -35,6 +35,7 @@ impl LlmProvider for EchoProvider {
             reasoning: None,
             tool_calls: vec![],
             usage: None,
+            raw_blocks: None,
         })
     }
 

@@ -31,6 +31,15 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallRequest>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageInput>>,
+    /// Opaque provider-native blocks captured from the model's response and
+    /// replayed verbatim on the next request — Anthropic `thinking`/
+    /// `redacted_thinking` blocks (with their signatures) and OpenAI Responses
+    /// `reasoning` items. Extended thinking + tools requires these to be echoed
+    /// back unchanged; without them the provider rejects the follow-up turn
+    /// (Anthropic 400: `tool_use` must be preceded by its `thinking` block).
+    /// Ignored by providers that don't need it (OpenAI chat completions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_blocks: Option<Vec<serde_json::Value>>,
 }
 
 impl ChatMessage {
@@ -41,6 +50,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: None,
             images: None,
+            raw_blocks: None,
         }
     }
     pub fn user(content: &str) -> Self {
@@ -50,6 +60,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: None,
             images: None,
+            raw_blocks: None,
         }
     }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCallRequest>>) -> Self {
@@ -59,6 +70,23 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls,
             images: None,
+            raw_blocks: None,
+        }
+    }
+    /// Assistant turn that also carries the provider-native reasoning blocks
+    /// (`raw_blocks`) so extended-thinking round-trips replay them verbatim.
+    pub fn assistant_with_blocks(
+        content: Option<String>,
+        tool_calls: Option<Vec<ToolCallRequest>>,
+        raw_blocks: Option<Vec<serde_json::Value>>,
+    ) -> Self {
+        Self {
+            role: "assistant".into(),
+            content,
+            tool_call_id: None,
+            tool_calls,
+            images: None,
+            raw_blocks,
         }
     }
     pub fn tool(tool_call_id: &str, content: &str) -> Self {
@@ -68,6 +96,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
             images: None,
+            raw_blocks: None,
         }
     }
     pub fn user_with_images(content: &str, images: Vec<ImageInput>) -> Self {
@@ -81,6 +110,7 @@ impl ChatMessage {
             } else {
                 Some(images)
             },
+            raw_blocks: None,
         }
     }
 }
@@ -110,7 +140,7 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
     pub content: Option<String>,
     /// Accumulated reasoning/thinking text from the model (if any).
@@ -118,6 +148,10 @@ pub struct ChatResponse {
     pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
     pub usage: Option<TokenUsage>,
+    /// Provider-native reasoning blocks to replay verbatim on the next turn
+    /// (see [`ChatMessage::raw_blocks`]). The tool loop copies these onto the
+    /// assistant `ChatMessage` it appends to history.
+    pub raw_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

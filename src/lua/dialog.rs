@@ -632,10 +632,12 @@ impl AgentDialog {
                 )));
             }
 
-            // Append assistant tool-call request to working messages
-            working_messages.push(ChatMessage::assistant(
+            // Append assistant tool-call request to working messages, carrying
+            // the provider's reasoning blocks for replay (extended thinking).
+            working_messages.push(ChatMessage::assistant_with_blocks(
                 response.content.clone(),
                 Some(response.tool_calls.clone()),
+                response.raw_blocks.clone(),
             ));
 
             for tool_call in &response.tool_calls {

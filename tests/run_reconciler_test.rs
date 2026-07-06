@@ -66,6 +66,7 @@ impl ironcrew::llm::provider::LlmProvider for StubProvider {
             reasoning: None,
             tool_calls: vec![],
             usage: None,
+            raw_blocks: None,
         })
     }
 
