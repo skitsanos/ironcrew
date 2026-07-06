@@ -2,7 +2,9 @@
 //! and reconcile selectivity. Uses an in-memory SQLite via temp file
 //! so no shared state leaks between tests.
 
-use ironcrew::engine::run_history::{RunRecord, RunStatus};
+use ironcrew::engine::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus,
+};
 use ironcrew::engine::sqlite_store::SqliteStore;
 use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
@@ -13,24 +15,27 @@ use ironcrew::utils::error::IronCrewError;
 /// reconcile-selectivity tests don't have to know about the two-phase flow.
 async fn save_completed_run(store: &SqliteStore, record: &RunRecord) -> Result<(), IronCrewError> {
     store
-        .save_run_intent(
-            Some(record.run_id.clone()),
-            &record.flow_name,
-            &record.started_at,
-            record.agent_count,
-            record.task_count,
-            &record.tags,
-        )
+        .save_run_intent(RunIntent {
+            suggested_id: Some(record.run_id.clone()),
+            flow_name: record.flow_name.clone(),
+            flow: record.flow.clone(),
+            started_at: record.started_at.clone(),
+            agent_count: record.agent_count,
+            task_count: record.task_count,
+            tags: record.tags.clone(),
+        })
         .await?;
     store
         .update_run_completion(
             &record.run_id,
-            record.status.clone(),
-            &record.finished_at,
-            record.duration_ms,
-            record.task_results.clone(),
-            record.total_tokens,
-            record.cached_tokens,
+            RunCompletion {
+                status: record.status.clone(),
+                finished_at: record.finished_at.clone(),
+                duration_ms: record.duration_ms,
+                task_results: record.task_results.clone(),
+                total_tokens: record.total_tokens,
+                cached_tokens: record.cached_tokens,
+            },
         )
         .await
 }
@@ -49,14 +54,15 @@ async fn sqlite_store_intent_completion_roundtrip() {
     let store = fresh_store();
 
     let run_id = store
-        .save_run_intent(
-            Some("sqlite-intent-1".into()),
-            "demo-flow",
-            "2026-04-23T10:00:00Z",
-            2,
-            3,
-            &["dev".into()],
-        )
+        .save_run_intent(RunIntent {
+            suggested_id: Some("sqlite-intent-1".into()),
+            flow_name: "demo-flow".into(),
+            flow: "demo-flow".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 2,
+            task_count: 3,
+            tags: vec!["dev".into()],
+        })
         .await
         .unwrap();
     assert_eq!(run_id, "sqlite-intent-1");
@@ -71,20 +77,22 @@ async fn sqlite_store_intent_completion_roundtrip() {
     store
         .update_run_completion(
             &run_id,
-            RunStatus::Success,
-            "2026-04-23T10:00:05Z",
-            5000,
-            vec![TaskResult {
-                task: "answer".into(),
-                agent: "assistant".into(),
-                output: "hi".into(),
-                success: true,
-                duration_ms: 4500,
-                token_usage: None,
-                reasoning: None,
-            }],
-            100,
-            20,
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-04-23T10:00:05Z".into(),
+                duration_ms: 5000,
+                task_results: vec![TaskResult {
+                    task: "answer".into(),
+                    agent: "assistant".into(),
+                    output: "hi".into(),
+                    success: true,
+                    duration_ms: 4500,
+                    token_usage: None,
+                    reasoning: None,
+                }],
+                total_tokens: 100,
+                cached_tokens: 20,
+            },
         )
         .await
         .unwrap();
@@ -102,11 +110,27 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
 
     // Two Running records via the intent API
     store
-        .save_run_intent(Some("r1".into()), "f", "2026-04-23T10:00:00Z", 1, 1, &[])
+        .save_run_intent(RunIntent {
+            suggested_id: Some("r1".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            ..Default::default()
+        })
         .await
         .unwrap();
     store
-        .save_run_intent(Some("r2".into()), "f", "2026-04-23T10:01:00Z", 1, 1, &[])
+        .save_run_intent(RunIntent {
+            suggested_id: Some("r2".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:01:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
@@ -115,6 +139,7 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
     let success = RunRecord {
         run_id: "s1".into(),
         flow_name: "f".into(),
+        flow: "f".into(),
         status: RunStatus::Success,
         started_at: "2026-04-23T09:00:00Z".into(),
         finished_at: "2026-04-23T09:00:05Z".into(),
@@ -346,4 +371,99 @@ async fn sqlite_store_audit_pagination_newest_first() {
             .unwrap(),
         12
     );
+}
+
+/// H2: runs are scoped by flow slug — a `flow` filter must isolate one flow's
+/// runs from another's, both in the list view and the count.
+#[tokio::test]
+async fn sqlite_store_flow_scoping() {
+    let store = fresh_store();
+
+    // Two runs under flow "alpha", one under "beta".
+    for (id, flow) in [("a1", "alpha"), ("a2", "alpha"), ("b1", "beta")] {
+        store
+            .save_run_intent(RunIntent {
+                suggested_id: Some(id.into()),
+                flow_name: "goal".into(),
+                flow: flow.into(),
+                started_at: "2026-04-23T10:00:00Z".into(),
+                agent_count: 1,
+                task_count: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let alpha = ListRunsFilter {
+        flow: Some("alpha".into()),
+        ..Default::default()
+    };
+    let rows = store.list_runs_summary(&alpha, 10, 0).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.flow == "alpha"));
+    assert_eq!(store.count_runs(&alpha).await.unwrap(), 2);
+
+    let beta = ListRunsFilter {
+        flow: Some("beta".into()),
+        ..Default::default()
+    };
+    assert_eq!(store.count_runs(&beta).await.unwrap(), 1);
+
+    // A flow with no runs sees nothing (not everyone else's).
+    let ghost = ListRunsFilter {
+        flow: Some("ghost".into()),
+        ..Default::default()
+    };
+    assert_eq!(store.count_runs(&ghost).await.unwrap(), 0);
+}
+
+/// M5: the tag filter uses exact JSON-array containment (`json_each`), so a tag
+/// containing SQL-`LIKE` wildcards / quotes matches only itself — the old
+/// `tags LIKE '%"tag"%'` mis-handled these.
+#[tokio::test]
+async fn sqlite_store_tag_filter_exact_match() {
+    let store = fresh_store();
+
+    let tricky = "a%_\"b".to_string();
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("has-tricky".into()),
+            flow_name: "goal".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            tags: vec![tricky.clone()],
+        })
+        .await
+        .unwrap();
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("has-plain".into()),
+            flow_name: "goal".into(),
+            flow: "f".into(),
+            started_at: "2026-04-23T10:01:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            tags: vec!["plain".into()],
+        })
+        .await
+        .unwrap();
+
+    // Exact match finds the tricky-tagged run.
+    let exact = ListRunsFilter {
+        tag: Some(tricky),
+        ..Default::default()
+    };
+    let rows = store.list_runs_summary(&exact, 10, 0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, "has-tricky");
+
+    // A wildcard-y query string must NOT match via LIKE semantics.
+    let wildcard = ListRunsFilter {
+        tag: Some("a%".into()),
+        ..Default::default()
+    };
+    assert_eq!(store.count_runs(&wildcard).await.unwrap(), 0);
 }

@@ -22,6 +22,9 @@ use crate::engine::store::StateStore;
 pub struct ActiveRun {
     pub eventbus: EventBus,
     pub abort_handle: tokio::task::AbortHandle,
+    /// Flow slug this run belongs to, so `abort_run` can reject a request that
+    /// targets another flow's run without a store round-trip.
+    pub flow: String,
 }
 
 /// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
@@ -149,11 +152,6 @@ pub fn resolve_flow_path(state: &AppState, flow: &str) -> crate::utils::error::R
     }
 
     Ok(canonical)
-}
-
-/// Resolve the `.ironcrew` directory for a given flow (used by `create_store`).
-pub fn resolve_ironcrew_dir(state: &AppState, flow: &str) -> crate::utils::error::Result<PathBuf> {
-    Ok(resolve_flow_path(state, flow)?.join(".ironcrew"))
 }
 
 /// Build the router
