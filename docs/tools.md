@@ -416,6 +416,17 @@ local report = template([[
 ]], json_parse(results.extract.output))
 ```
 
+> **Tera 2.0 behavior (since IronCrew's tera upgrade):** template rendering is
+> now **strict about undefined variables** — referencing a variable that is not
+> in the data table (e.g. `{{ missing }}`) raises a render error instead of
+> producing an empty string. Make sure every variable a template references is
+> present in the data table, or guard it with `{% if missing %}…{% endif %}` /
+> optional chaining (`{{ a?.b }}`). Other tera 2.0 changes to be aware of:
+> array elements use bracket indexing (`items[0]`, not `items.0`), and a few
+> filters were renamed (`escape` → `escape_html`, `as_str` → `str`,
+> `divisibleby` → `divisible_by`, `linebreaksbr` → `newlines_to_br`). See the
+> [tera migration guide](https://github.com/Keats/tera/blob/master/MIGRATION.md).
+
 ### Crypto (decrypt secrets at runtime)
 
 Flows can decrypt secrets (e.g. API credentials) that are stored **encrypted at
