@@ -498,7 +498,8 @@ impl UserData for LuaCrew {
                 flow_name,
                 flow_path,
                 this.project_dir.clone(),
-                reqwest::Client::new(),
+                // Shared client carries the SSRF redirect policy for image-URL fetches.
+                crate::tools::http_request::SHARED_HTTP_CLIENT.clone(),
             )
             .await?;
             Ok(conv)
