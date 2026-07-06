@@ -345,6 +345,7 @@ be set in the shell or in `.env` files.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `100`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
+| `IRONCREW_MAX_ACTIVE_RUNS` | Hard cap on simultaneously in-flight flow runs (`POST /flows/{flow}/run`, default: `100`). Breaches return `503` |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | Idle timeout in seconds before an in-memory chat handle is evicted from RAM (default: `1800` = 30 min). The on-disk record stays untouched |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/conversations` (default: `20`) |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT` | Hard cap on the `limit` query parameter for `GET /flows/{flow}/conversations` (default: `100`) |
@@ -369,8 +370,7 @@ be set in the shell or in `.env` files.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` to allow HTTP requests to private/loopback IPs (SSRF protection disabled) |
-| `IRONCREW_ENV_BLOCKLIST` | Comma-separated additional env var names to block from Lua `env()` |
-| `IRONCREW_ENV_ALLOWLIST` | Comma-separated env var names to expose to Lua `env()`, overriding the default + custom blocklists |
+| `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read. Fail-closed: every name not listed returns `nil`. |
 | `IRONCREW_TRUST_PROXY` | Set to `1` to honor `X-Forwarded-For` for source-IP capture in audit events (only enable when running behind a trusted reverse proxy) |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | Default page size on `GET /audit` (default `50`) |
 | `IRONCREW_AUDIT_MAX_LIMIT` | Hard cap on `GET /audit?limit=` (default `500`) |

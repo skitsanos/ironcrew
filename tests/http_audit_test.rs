@@ -39,6 +39,7 @@ async fn spawn_test_server() -> SocketAddr {
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         max_active_conversations: 100,
+        max_active_runs: 100,
         store,
     });
 

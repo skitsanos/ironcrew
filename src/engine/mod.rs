@@ -19,5 +19,6 @@ pub mod runtime;
 pub mod sessions;
 pub mod sqlite_store;
 pub mod store;
+pub mod store_sql;
 pub mod task;
 pub mod task_runner;

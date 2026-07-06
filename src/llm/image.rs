@@ -21,15 +21,25 @@ pub async fn load_image(
 }
 
 fn load_image_from_file(path: &str, project_dir: &std::path::Path) -> Result<ImageInput> {
+    // Containment: resolve `..`/symlinks and require the result to stay within
+    // the project directory. Without this, `project_dir.join(path)` with an
+    // absolute path replaces the base entirely, and `../` walks out — letting a
+    // request read any image-extension file on the host and exfiltrate it.
     let full_path = project_dir.join(path);
-    if !full_path.exists() {
+    let canonical_base = project_dir
+        .canonicalize()
+        .map_err(|e| IronCrewError::Validation(format!("Invalid project directory: {}", e)))?;
+    let canonical_path = full_path.canonicalize().map_err(|_| {
+        IronCrewError::Validation(format!("Image file not found: {}", full_path.display()))
+    })?;
+    if !canonical_path.starts_with(&canonical_base) {
         return Err(IronCrewError::Validation(format!(
-            "Image file not found: {}",
-            full_path.display()
+            "Image path escapes project directory: {}",
+            path
         )));
     }
 
-    let bytes = std::fs::read(&full_path)?;
+    let bytes = std::fs::read(&canonical_path)?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(IronCrewError::Validation(format!(
             "Image too large: {} bytes (max {})",
@@ -38,13 +48,17 @@ fn load_image_from_file(path: &str, project_dir: &std::path::Path) -> Result<Ima
         )));
     }
 
-    let mime_type = mime_from_extension(&full_path)?;
+    let mime_type = mime_from_extension(&canonical_path)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     Ok(ImageInput { mime_type, data })
 }
 
 async fn load_image_from_url(url: &str, client: &reqwest::Client) -> Result<ImageInput> {
+    // SSRF protection: a remote image URL is attacker-influenced input, so it
+    // must not be able to reach cloud metadata or internal services.
+    crate::utils::network::validate_url_not_private(url).map_err(IronCrewError::Validation)?;
+
     let response = client
         .get(url)
         .send()

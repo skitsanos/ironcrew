@@ -112,14 +112,16 @@ impl Tool for McpBridgeTool {
         let is_error = result.is_error.unwrap_or(false);
 
         for content in &result.content {
-            match &content.raw {
-                rmcp::model::RawContent::Text(t) => {
+            // rmcp v2 flattened the `Content { raw: RawContent }` wrapper into
+            // a `ContentBlock` enum matched directly.
+            match content {
+                rmcp::model::ContentBlock::Text(t) => {
                     parts.push(t.text.clone());
                 }
-                rmcp::model::RawContent::Image(_) => {
+                rmcp::model::ContentBlock::Image(_) => {
                     parts.push("[image content omitted]".to_string());
                 }
-                rmcp::model::RawContent::Resource(r) => {
+                rmcp::model::ContentBlock::Resource(r) => {
                     // Extract embedded text resources
                     if let rmcp::model::ResourceContents::TextResourceContents { text, .. } =
                         &r.resource
@@ -127,11 +129,16 @@ impl Tool for McpBridgeTool {
                         parts.push(text.clone());
                     }
                 }
-                rmcp::model::RawContent::Audio(_) => {
+                rmcp::model::ContentBlock::Audio(_) => {
                     parts.push("[audio content omitted]".to_string());
                 }
-                rmcp::model::RawContent::ResourceLink(_) => {
+                rmcp::model::ContentBlock::ResourceLink(_) => {
                     parts.push("[resource link omitted]".to_string());
+                }
+                // ContentBlock is #[non_exhaustive] in rmcp v2 — tolerate any
+                // future content type rather than dropping the tool result.
+                _ => {
+                    parts.push("[unsupported content omitted]".to_string());
                 }
             }
         }

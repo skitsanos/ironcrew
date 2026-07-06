@@ -149,6 +149,15 @@ impl OpenAiResponsesProvider {
                     }));
                 }
                 "assistant" => {
+                    // Replay captured `reasoning` output items verbatim, before
+                    // the text/function_call items. The Responses API 400s in
+                    // stateless mode (store:false) when a `function_call` is sent
+                    // without its paired reasoning item for reasoning models.
+                    if let Some(ref raw) = msg.raw_blocks {
+                        for item in raw {
+                            input_items.push(item.clone());
+                        }
+                    }
                     // Text portion (if any)
                     if let Some(ref content) = msg.content
                         && !content.is_empty()
@@ -383,6 +392,11 @@ impl OpenAiResponsesProvider {
         use futures::StreamExt;
         let mut buffer = String::new();
         let mut current_event_type = String::new();
+        // Track terminal delivery: `response.failed`/`error`, or a stream that
+        // ends before `response.completed`, must fail rather than return
+        // partial content as a successful response.
+        let mut stream_error: Option<String> = None;
+        let mut saw_completed = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(IronCrewError::Http)?;
@@ -407,6 +421,7 @@ impl OpenAiResponsesProvider {
                 };
 
                 if data == "[DONE]" {
+                    saw_completed = true;
                     let _ = tx.send(StreamChunk::Done).await;
                     continue;
                 }
@@ -478,6 +493,7 @@ impl OpenAiResponsesProvider {
                         }
                     }
                     "response.completed" => {
+                        saw_completed = true;
                         if let Some(usage) = parsed["response"].get("usage").cloned() {
                             usage_data = Some(usage);
                         }
@@ -489,10 +505,28 @@ impl OpenAiResponsesProvider {
                             .or_else(|| parsed["response"]["error"]["message"].as_str())
                             .unwrap_or("Responses API stream error");
                         let _ = tx.send(StreamChunk::Error(err_msg.to_string())).await;
+                        stream_error = Some(err_msg.to_string());
+                        break;
                     }
                     _ => {}
                 }
             }
+
+            if stream_error.is_some() {
+                break;
+            }
+        }
+
+        if let Some(err) = stream_error {
+            return Err(IronCrewError::Provider(format!(
+                "OpenAI Responses stream error — {err}"
+            )));
+        }
+        if !saw_completed {
+            return Err(IronCrewError::Provider(
+                "OpenAI Responses stream ended before response.completed (truncated response)"
+                    .into(),
+            ));
         }
 
         // Assemble tool calls from item states
@@ -535,6 +569,11 @@ impl OpenAiResponsesProvider {
             reasoning,
             tool_calls,
             usage,
+            // Streaming doesn't reassemble full reasoning items (with
+            // encrypted_content) for replay. Not needed for the tool-use
+            // round-trip: the executor forces non-streaming when tools are
+            // present, and `parse_responses_response` captures them there.
+            raw_blocks: None,
         })
     }
 }
@@ -556,6 +595,10 @@ fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
     let mut text_parts: Vec<String> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
+    // Reasoning output items captured verbatim (including encrypted_content) so
+    // the tool loop can replay them — the Responses API 400s on a function_call
+    // sent without its paired reasoning item in stateless mode.
+    let mut raw_blocks: Vec<Value> = Vec::new();
 
     for item in output {
         let item_type = item["type"].as_str().unwrap_or("");
@@ -581,6 +624,8 @@ fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
                         }
                     }
                 }
+                // Keep the whole reasoning item (with encrypted_content) for replay.
+                raw_blocks.push(item.clone());
             }
             "function_call" => {
                 let call_id = item["call_id"].as_str().unwrap_or("").to_string();
@@ -640,6 +685,11 @@ fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
         reasoning,
         tool_calls,
         usage,
+        raw_blocks: if raw_blocks.is_empty() {
+            None
+        } else {
+            Some(raw_blocks)
+        },
     })
 }
 

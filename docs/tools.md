@@ -388,11 +388,11 @@ from inside custom tools.
 | `validate_json(json_str, schema_table)` | table | Validate JSON against a schema; returns `{valid, errors}` |
 | `template(tpl_str, data_table)` | string | Render a Tera template with data (variables, loops, conditionals) |
 
-**`env()` security:** Sensitive environment variables are blocked by default to
-prevent Lua scripts from exfiltrating secrets. Blocked variables:
-- `DATABASE_URL`, `IRONCREW_API_TOKEN`, `IRONCREW_PG_TABLE_PREFIX`
-- Any variable ending with `_API_KEY`, `_SECRET`, `_TOKEN`, or `_PASSWORD`
-- Custom names listed in `IRONCREW_ENV_BLOCKLIST` (comma-separated)
+**`env()` security:** `env()` is fail-closed — Lua scripts can read **only** the
+environment variables whose exact names are listed in `IRONCREW_ENV_ALLOWLIST`
+(comma-separated, case-insensitive). Every other name returns `nil` and logs a
+warning, so secrets are unreadable unless explicitly opted in. See
+[docs/sandbox.md](sandbox.md).
 
 ### Template Rendering
 
@@ -458,9 +458,9 @@ local plaintext = aes_256_gcm_decrypt(key, iv, ct)
 - A wrong passphrase or tampered ciphertext raises a clean Lua error (no
   partial plaintext, no panic). Tag verification is constant-time.
 - Plaintext and passphrases are never logged.
-- The passphrase is supplied by the flow via `env("…")`; make sure that
-  variable is allow-listed with `IRONCREW_ENV_ALLOWLIST` (sensitive-looking
-  names are blocked by default — see the `env()` security note above).
+- The passphrase is supplied by the flow via `env("…")`; you must add that
+  variable to `IRONCREW_ENV_ALLOWLIST`, since `env()` returns `nil` for any
+  name not on the allowlist — see the `env()` security note above.
 
 > Encryption is intentionally **not** exposed — only decryption is required for
 > the read-secrets-at-runtime use case.

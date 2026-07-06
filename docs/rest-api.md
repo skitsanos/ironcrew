@@ -15,8 +15,13 @@ ironcrew serve --flows-dir ./flows --port 3000
 | `--port`       | `3000`        | Port to bind to                      |
 | `--flows-dir`  | `.`           | Directory containing crew flow dirs  |
 
-The server loads `.env` from the current working directory on startup, so API keys
-set there are available to all flows.
+The server loads `.env` from the current working directory **once at startup**
+(before the async runtime starts), so API keys and config set there are available
+to every flow. In server mode a flow's own `.env` file is **not** loaded — flows
+read the shared process environment. Set per-deployment secrets at the process
+level (container env, systemd, the server's CWD `.env`), not in per-flow `.env`
+files. (This replaces the earlier per-request loading, which raced on the
+environment and could bleed one flow's secrets into another.)
 
 For production sizing, session-cap tuning, SSE proxy guidance, and horizontal
 scaling considerations, see [HTTP Scaling](http-scaling.md).
@@ -211,6 +216,12 @@ Paginated, metadata-only listing of past runs. The response body is an
 object with `runs`, `total`, `limit`, and `offset` — **not** a bare array.
 Individual run summaries omit `task_results` so listings stay cheap even on
 stores with thousands of historical runs.
+
+Results are **scoped to the flow in the URL**: `GET /flows/A/runs` returns only
+runs launched under flow `A`, and `GET`/`DELETE /flows/A/runs/{id}` act only on
+a run belonging to `A` (a run from another flow reads as `404`). Runs recorded
+before this scoping was introduced carry no flow tag and are not visible through
+the per-flow endpoints.
 
 ```bash
 # First page (defaults: 20 per page, newest first)

@@ -269,6 +269,7 @@ impl OpenAiProvider {
             reasoning,
             tool_calls,
             usage,
+            raw_blocks: None,
         })
     }
 
@@ -319,6 +320,11 @@ impl OpenAiProvider {
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
         let mut buffer = String::new();
+        // Track terminal delivery: a mid-stream `{"error": …}` chunk or a stream
+        // that ends before `data: [DONE]` must fail rather than return whatever
+        // partial content accumulated.
+        let mut stream_error: Option<String> = None;
+        let mut saw_done = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(IronCrewError::Http)?;
@@ -335,6 +341,7 @@ impl OpenAiProvider {
                 }
 
                 if line == "data: [DONE]" {
+                    saw_done = true;
                     let _ = tx.send(StreamChunk::Done).await;
                     continue;
                 }
@@ -342,6 +349,17 @@ impl OpenAiProvider {
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<Value>(data)
                 {
+                    // Some OpenAI-compatible servers report failures as an inline
+                    // `{"error": {...}}` data event mid-stream.
+                    if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
+                        let msg = err["message"]
+                            .as_str()
+                            .or_else(|| err.as_str())
+                            .unwrap_or("stream error");
+                        stream_error = Some(msg.to_string());
+                        break;
+                    }
+
                     let delta = &parsed["choices"][0]["delta"];
 
                     // Text content delta
@@ -389,6 +407,16 @@ impl OpenAiProvider {
                     }
                 }
             }
+
+            if stream_error.is_some() {
+                break;
+            }
+        }
+
+        if let Some(err) = stream_error {
+            return Err(IronCrewError::Provider(format!(
+                "OpenAI stream error — {err}"
+            )));
         }
 
         // Assemble tool calls from buffers
@@ -401,6 +429,17 @@ impl OpenAiProvider {
                 function: ToolCallFunction { name, arguments },
             })
             .collect();
+
+        // A stream that ended before `[DONE]` *and* produced nothing is a
+        // truncated/dropped connection — fail with a clear message instead of
+        // the misleading "Empty response from LLM" downstream. We don't fail a
+        // content-bearing stream on a missing `[DONE]`, since some
+        // OpenAI-compatible providers omit that terminal marker.
+        if !saw_done && full_content.is_empty() && tool_calls.is_empty() {
+            return Err(IronCrewError::Provider(
+                "OpenAI stream ended before [DONE] with no content (truncated response)".into(),
+            ));
+        }
 
         let content = if full_content.is_empty() {
             None
@@ -419,6 +458,7 @@ impl OpenAiProvider {
             reasoning,
             tool_calls,
             usage: None,
+            raw_blocks: None,
         })
     }
 }

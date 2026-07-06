@@ -161,55 +161,92 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+/// The project/CWD path a command operates on, used to locate its `.env`.
+/// `None` for commands that don't target a project (`init`, `nodes`, `serve` —
+/// the server uses the CWD `.env` and process environment, never per-flow files).
+fn command_path(command: &Commands) -> Option<&std::path::Path> {
+    match command {
+        Commands::Run { path, .. }
+        | Commands::Validate { path }
+        | Commands::List { path }
+        | Commands::Fmt { path }
+        | Commands::Doctor { path }
+        | Commands::Export { path, .. }
+        | Commands::Graph { path, .. }
+        | Commands::Chat { path, .. } => Some(path),
+        Commands::Inspect { project, .. }
+        | Commands::Clean { project, .. }
+        | Commands::Runs { project, .. } => Some(project),
+        Commands::Init { .. } | Commands::Nodes | Commands::Serve { .. } => None,
+    }
+}
+
+fn main() {
     let cli = Cli::parse();
+
+    // Load `.env` BEFORE the async runtime starts. `dotenvy` mutates the
+    // environment via `std::env::set_var`, which is only sound while the process
+    // is single-threaded — doing it here (before any Tokio worker thread exists)
+    // avoids the data race that per-request loading caused. Loading before the
+    // logger also lets `IRONCREW_LOG` be set from `.env`.
+    cli::project::load_dotenv(command_path(&cli.command));
     utils::logger::init(cli.verbose);
 
-    let result = match cli.command {
-        Commands::Run {
-            path,
-            input,
-            json,
-            tag,
-        } => cli::commands::cmd_run(&path, input.as_deref(), json, tag).await,
-        Commands::Validate { path } => cli::commands::cmd_validate(&path),
-        Commands::List { path } => cli::commands::cmd_list(&path),
-        Commands::Init { name } => cli::commands::cmd_init(&name),
-        Commands::Nodes => cli::commands::cmd_nodes(),
-        Commands::Inspect { run_id, project } => cli::history::cmd_inspect(&project, &run_id).await,
-        Commands::Clean { project, keep, all } => {
-            cli::history::cmd_clean(&project, keep, all).await
-        }
-        Commands::Serve {
-            host,
-            port,
-            flows_dir,
-        } => cli::server::cmd_serve(&host, port, &flows_dir).await,
-        Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
-        Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
-        Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
-        Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
-        Commands::Chat { path, agent, id } => cli::chat::cmd_chat(&path, agent, id).await,
-        Commands::Runs {
-            status,
-            tag,
-            since,
-            limit,
-            offset,
-            project,
-        } => {
-            cli::history::cmd_runs(
-                &project,
-                status.as_deref(),
-                tag.as_deref(),
-                since.as_deref(),
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime");
+
+    let result = runtime.block_on(async {
+        match cli.command {
+            Commands::Run {
+                path,
+                input,
+                json,
+                tag,
+            } => cli::commands::cmd_run(&path, input.as_deref(), json, tag).await,
+            Commands::Validate { path } => cli::commands::cmd_validate(&path),
+            Commands::List { path } => cli::commands::cmd_list(&path),
+            Commands::Init { name } => cli::commands::cmd_init(&name),
+            Commands::Nodes => cli::commands::cmd_nodes(),
+            Commands::Inspect { run_id, project } => {
+                cli::history::cmd_inspect(&project, &run_id).await
+            }
+            Commands::Clean { project, keep, all } => {
+                cli::history::cmd_clean(&project, keep, all).await
+            }
+            Commands::Serve {
+                host,
+                port,
+                flows_dir,
+            } => cli::server::cmd_serve(&host, port, &flows_dir).await,
+            Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
+            Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
+            Commands::Export { path, output } => {
+                cli::commands::cmd_export(&path, output.as_deref())
+            }
+            Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
+            Commands::Chat { path, agent, id } => cli::chat::cmd_chat(&path, agent, id).await,
+            Commands::Runs {
+                status,
+                tag,
+                since,
                 limit,
                 offset,
-            )
-            .await
+                project,
+            } => {
+                cli::history::cmd_runs(
+                    &project,
+                    status.as_deref(),
+                    tag.as_deref(),
+                    since.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await
+            }
         }
-    };
+    });
 
     if let Err(e) = result {
         tracing::error!("{}", e);

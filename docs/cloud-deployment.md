@@ -88,8 +88,7 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | **unset** | Only enable if MCP servers run as sidecars. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
 | `IRONCREW_MAX_RESPONSE_SIZE` | `52428800` (50 MB) | Caps `http_request` tool responses. |
-| `IRONCREW_ENV_BLOCKLIST` | comma-separated secrets | Augments the built-in blocklist so Lua `env()` cannot read them. |
-| `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Whitelist that bypasses every block rule (default + suffix + blocklist). Use to grant a crew explicit access to specific secrets (e.g. `AZURE_OPENAI_API_KEY`). See [docs/sandbox.md](sandbox.md). |
+| `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist: Lua `env()` reads **only** these exact names; every other var returns `nil`. Opt in the specific vars a crew needs (e.g. `APP_REGION,AZURE_OPENAI_API_KEY`). See [docs/sandbox.md](sandbox.md). |
 | `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
 | `IRONCREW_AUDIT_MAX_LIMIT` | `500` | Hard cap on `GET /audit?limit=`. |
@@ -98,7 +97,7 @@ Production deployments should set these at minimum:
 
 - **Never** bake API keys into the container image.
 - Mount them as environment variables via `Secret` (Kubernetes), `Environment Variables` (Railway), or equivalent.
-- IronCrew's Lua `env()` already blocks `*_API_KEY`, `*_SECRET`, `*_TOKEN`, `IRONCREW_API_TOKEN`, and others by default.
+- IronCrew's Lua `env()` is fail-closed: it reads only the exact names in `IRONCREW_ENV_ALLOWLIST` and returns `nil` for everything else, so secrets are unreadable from crew scripts unless explicitly opted in.
 - MCP stdio children do **not** inherit the parent environment by default — only `PATH`, `HOME`, `USER`, `LANG`, `LC_*`. Secrets are therefore isolated from spawned MCP servers unless you explicitly list them in `env = {...}` or set `inherit_env = true`.
 
 ---
@@ -126,6 +125,7 @@ Production deployments should set these at minimum:
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many turns. |
 | `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns. |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Max simultaneous live chat sessions (HTTP + CLI). Exceeding returns 503. |
+| `IRONCREW_MAX_ACTIVE_RUNS` | `100` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` (30 min) | Idle window after which a chat handle is evicted from memory. |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/conversations`. |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the conversation list endpoint. |

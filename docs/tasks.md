@@ -195,7 +195,7 @@ crew:add_foreach_task({
 - Each iteration gets `${item}` replaced with the current array element
 - Additional context is injected: `"Processing item 1/3: Rust"`
 - Items are processed sequentially by default
-- Set `foreach_parallel = true` to process all items concurrently
+- Set `foreach_parallel = true` to process items concurrently (bounded by `max_concurrent`)
 - The final output is a JSON array of individual results
 - If any item fails, the overall task still completes but with `success = false`
 
@@ -203,7 +203,7 @@ The source can be a task output (if the output is a JSON array) or a memory key.
 
 ### Parallel Foreach
 
-Add `foreach_parallel = true` to process all items concurrently instead of one
+Add `foreach_parallel = true` to process items concurrently instead of one
 at a time. This can significantly speed up foreach tasks when items are
 independent:
 
@@ -217,6 +217,12 @@ crew:add_foreach_task({
     agent = "analyst",
 })
 ```
+
+Concurrency is **bounded**: at most `max_concurrent` items run at once (the
+crew's `max_concurrent` setting, else `IRONCREW_DEFAULT_MAX_CONCURRENT`, else
+10). A foreach over a large array therefore won't fire one LLM request per item
+simultaneously — items beyond the cap queue and start as slots free up, while
+result order is preserved.
 
 ## Collaborative Tasks
 

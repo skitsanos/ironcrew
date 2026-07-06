@@ -63,6 +63,7 @@ impl LlmProvider for CannedProvider {
             reasoning: None,
             tool_calls: vec![],
             usage: None,
+            raw_blocks: None,
         })
     }
 
@@ -87,6 +88,7 @@ impl LlmProvider for CannedProvider {
                         },
                     }],
                     usage: None,
+                    raw_blocks: None,
                 });
             }
         }
@@ -141,6 +143,7 @@ impl LlmProvider for RecordingProvider {
             reasoning: None,
             tool_calls: vec![],
             usage: None,
+            raw_blocks: None,
         })
     }
     async fn chat_with_tools(

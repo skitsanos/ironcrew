@@ -15,7 +15,7 @@ use crate::utils::error::IronCrewError;
 
 use super::{
     AppState, ErrorResponse, ListRunsQuery, ListRunsResponse, RunCrewResponse, TaskResultResponse,
-    error_response, resolve_flow_path, resolve_ironcrew_dir,
+    error_response, resolve_flow_path,
 };
 
 fn flow_status(err: &IronCrewError) -> StatusCode {
@@ -114,6 +114,29 @@ pub async fn run_flow(
         }
     };
 
+    // Backpressure: cap simultaneously-active runs so a request loop can't
+    // exhaust memory / LLM quota by spawning unbounded crew VMs. Mirrors the
+    // active-conversation cap. Checked after flow resolution so path-traversal
+    // still 404s; a rejected run returns 503 (no state mutated, not audited —
+    // same posture as the conversation cap).
+    if state.active_runs.read().await.len() >= state.max_active_runs {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Active run limit reached ({} runs). Raise IRONCREW_MAX_ACTIVE_RUNS or wait for in-flight runs to finish.",
+                state.max_active_runs
+            ),
+        ));
+    }
+
+    // Flow slug the run will be scoped by — the resolved directory's last
+    // segment, matching what `crew:run()` stores in `RunRecord::flow`.
+    let flow_slug = flow_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
 
@@ -139,6 +162,7 @@ pub async fn run_flow(
         super::ActiveRun {
             eventbus: eventbus.clone(),
             abort_handle,
+            flow: flow_slug.clone(),
         },
     );
 
@@ -418,23 +442,38 @@ pub async fn abort_run(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = {
-        let active_runs = state.active_runs.read().await;
-        match active_runs.get(&run_id) {
-            Some(active_run) => {
-                active_run.abort_handle.abort();
-                tracing::info!("Run {} aborted by client", run_id);
-                Ok(Json(serde_json::json!({
-                    "run_id": run_id,
-                    "status": "aborted",
-                })))
+    // Scope to the flow in the URL: resolve it to the canonical slug and only
+    // abort a run that belongs to it, so `DELETE /flows/A/runs/{id}` can't
+    // cancel flow B's run.
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
+        match resolve_flow_path(&state, &flow) {
+            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
+            Ok(p) => {
+                let flow_slug = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let active_runs = state.active_runs.read().await;
+                match active_runs.get(&run_id) {
+                    Some(active_run) if active_run.flow == flow_slug => {
+                        active_run.abort_handle.abort();
+                        tracing::info!("Run {} aborted by client", run_id);
+                        Ok(Json(serde_json::json!({
+                            "run_id": run_id,
+                            "status": "aborted",
+                        })))
+                    }
+                    // Found but belongs to another flow → same 404 as
+                    // truly-missing, so the endpoint doesn't confirm the run
+                    // exists under a different flow.
+                    _ => Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Run '{}' not found or already completed", run_id),
+                    )),
+                }
             }
-            None => Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Run '{}' not found or already completed", run_id),
-            )),
-        }
-    };
+        };
 
     let (success, status_code) = match &result {
         Ok(_) => (true, 200u16),
@@ -624,6 +663,15 @@ pub async fn flow_events(
 // Run history (per-flow)
 // ---------------------------------------------------------------------------
 
+/// Cap on the number of simultaneously-active runs — reads
+/// `IRONCREW_MAX_ACTIVE_RUNS` once at boot (default 100).
+pub fn max_active_runs() -> usize {
+    std::env::var("IRONCREW_MAX_ACTIVE_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+}
+
 /// Default page size for `GET /flows/{flow}/runs` — override with `IRONCREW_RUNS_DEFAULT_LIMIT`.
 fn runs_default_limit() -> usize {
     std::env::var("IRONCREW_RUNS_DEFAULT_LIMIT")
@@ -646,10 +694,16 @@ pub async fn list_runs(
     Path(flow): Path<String>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<ListRunsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Flow path is still validated for traversal safety, but the store
-    // itself is the server-wide singleton from `AppState`.
-    let _ = resolve_ironcrew_dir(&state, &flow)
+    // Resolve the flow to its canonical slug and scope the query to it, so
+    // `GET /flows/A/runs` returns only flow A's runs (the store is a
+    // server-wide singleton shared across flows).
+    let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let flow_slug = flow_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let store = &state.store;
 
     let default_limit = runs_default_limit();
@@ -658,6 +712,7 @@ pub async fn list_runs(
     let offset = params.offset.unwrap_or(0);
 
     let filter = crate::engine::run_history::ListRunsFilter {
+        flow: Some(flow_slug),
         status: params.status.clone(),
         tag: params.tag.clone(),
         since: params.since.clone(),
@@ -685,14 +740,24 @@ pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _ = resolve_ironcrew_dir(&state, &flow)
+    let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let flow_slug = flow_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
     let record = state
         .store
         .get_run(&id)
         .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+
+    // Scope by flow: a run launched under a different flow is invisible here,
+    // reported as 404 rather than confirming it exists elsewhere.
+    if record.flow != flow_slug {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found", id),
+        ));
+    }
 
     Ok(Json(record))
 }
@@ -704,8 +769,25 @@ pub async fn delete_run(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = async {
-        resolve_ironcrew_dir(&state, &flow)
+        let flow_path = resolve_flow_path(&state, &flow)
             .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+        let flow_slug = flow_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+        // Verify the run belongs to this flow before deleting, so
+        // `DELETE /flows/A/runs/{id}` can't remove flow B's record. A run from
+        // another flow reads as 404, same as a missing one.
+        let record = state
+            .store
+            .get_run(&id)
+            .await
+            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+        if record.flow != flow_slug {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Run '{}' not found", id),
+            ));
+        }
+
         state
             .store
             .delete_run(&id)

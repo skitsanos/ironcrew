@@ -18,6 +18,7 @@ impl WebScrapeTool {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("IronCrew/0.1")
+            .redirect(crate::utils::network::ssrf_redirect_policy())
             .build()
             .expect("Failed to build HTTP client");
 
@@ -84,6 +85,14 @@ impl Tool for WebScrapeTool {
                 tool: "web_scrape".into(),
                 message: "Missing 'url' argument".into(),
             })?;
+
+        // SSRF protection: block private/internal IPs (parity with http_request).
+        crate::utils::network::validate_url_not_private(url).map_err(|e| {
+            IronCrewError::ToolExecution {
+                tool: "web_scrape".into(),
+                message: e,
+            }
+        })?;
 
         if !self.is_domain_allowed(url) {
             return Err(IronCrewError::ToolExecution {
