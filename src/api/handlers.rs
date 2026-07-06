@@ -114,6 +114,21 @@ pub async fn run_flow(
         }
     };
 
+    // Backpressure: cap simultaneously-active runs so a request loop can't
+    // exhaust memory / LLM quota by spawning unbounded crew VMs. Mirrors the
+    // active-conversation cap. Checked after flow resolution so path-traversal
+    // still 404s; a rejected run returns 503 (no state mutated, not audited —
+    // same posture as the conversation cap).
+    if state.active_runs.read().await.len() >= state.max_active_runs {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Active run limit reached ({} runs). Raise IRONCREW_MAX_ACTIVE_RUNS or wait for in-flight runs to finish.",
+                state.max_active_runs
+            ),
+        ));
+    }
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
 
@@ -623,6 +638,15 @@ pub async fn flow_events(
 // ---------------------------------------------------------------------------
 // Run history (per-flow)
 // ---------------------------------------------------------------------------
+
+/// Cap on the number of simultaneously-active runs — reads
+/// `IRONCREW_MAX_ACTIVE_RUNS` once at boot (default 100).
+pub fn max_active_runs() -> usize {
+    std::env::var("IRONCREW_MAX_ACTIVE_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+}
 
 /// Default page size for `GET /flows/{flow}/runs` — override with `IRONCREW_RUNS_DEFAULT_LIMIT`.
 fn runs_default_limit() -> usize {

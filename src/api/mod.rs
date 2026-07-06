@@ -39,6 +39,9 @@ pub struct AppState {
     /// Hard cap on `active_conversations.len()` — reads
     /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
     pub max_active_conversations: usize,
+    /// Hard cap on `active_runs.len()` — reads `IRONCREW_MAX_ACTIVE_RUNS`
+    /// once at boot. Backpressure against unbounded concurrent runs.
+    pub max_active_runs: usize,
     /// Server-wide persistence singleton. Bootstrapped once at
     /// `cmd_serve` startup and reused across every handler so Postgres
     /// migrations / table checks don't re-run per request, and so every

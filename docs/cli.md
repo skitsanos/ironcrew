@@ -345,6 +345,7 @@ be set in the shell or in `.env` files.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `100`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
+| `IRONCREW_MAX_ACTIVE_RUNS` | Hard cap on simultaneously in-flight flow runs (`POST /flows/{flow}/run`, default: `100`). Breaches return `503` |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | Idle timeout in seconds before an in-memory chat handle is evicted from RAM (default: `1800` = 30 min). The on-disk record stays untouched |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/conversations` (default: `20`) |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT` | Hard cap on the `limit` query parameter for `GET /flows/{flow}/conversations` (default: `100`) |
