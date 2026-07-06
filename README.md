@@ -69,12 +69,23 @@ cargo build --release
 ironcrew init my-crew
 cd my-crew
 
-# Configure
+# Configure — the provider reads the API key directly from the environment
 echo "OPENAI_API_KEY=sk-..." > .env
 
 # Run
 ironcrew run .
 ```
+
+> **Reading env vars from `crew.lua`.** Flow scripts reach the process
+> environment only through the sandboxed `env()` global, which is **fail-closed**:
+> it returns `nil` for every name **not** listed in `IRONCREW_ENV_ALLOWLIST`.
+> API keys are unaffected (the provider reads `OPENAI_API_KEY` etc. itself), but
+> any config a script pulls via `env()` — e.g. `env("OPENAI_MODEL")` or a custom
+> `env("OPENAI_BASE_URL")` — must be allowlisted, or it falls back to defaults:
+> ```bash
+> echo "IRONCREW_ENV_ALLOWLIST=OPENAI_MODEL,OPENAI_BASE_URL" >> .env
+> ```
+> See [Lua Sandbox → `env()`](docs/sandbox.md) for details.
 
 ## Documentation
 
@@ -96,7 +107,17 @@ ironcrew run .
 
 ## Examples
 
-See [`examples/`](examples/) for working demos:
+See [`examples/`](examples/) for working demos. Most ship a `.env.example` —
+copy it to `.env` in that directory, add your API key, and run:
+
+```bash
+cp examples/simple/.env.example examples/simple/.env   # then edit .env
+ironcrew run examples/simple
+```
+
+The `.env.example` includes the `IRONCREW_ENV_ALLOWLIST` line each flow needs so
+its `env()` config resolves (see the Quick Start note above).
+
 
 **Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `shared-modules` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable` · `moderator-dialog`
 

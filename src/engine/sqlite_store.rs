@@ -1,15 +1,33 @@
 use async_trait::async_trait;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use super::run_history::{ListRunsFilter, RunRecord, RunStatus, RunSummary};
+use super::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary,
+};
 use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use super::store::StateStore;
+use super::store_sql::{self, Dialect, SqlParam};
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
+}
+
+/// Map the shared `SqlParam` values to boxed `rusqlite::ToSql` trait objects so
+/// they can be passed to `params_from_iter`. Kept as a free fn so both
+/// `list`/`count` paths bind identically.
+fn to_sql_params(params: Vec<SqlParam>) -> Vec<Box<dyn rusqlite::types::ToSql>> {
+    params
+        .into_iter()
+        .map(|p| -> Box<dyn rusqlite::types::ToSql> {
+            match p {
+                SqlParam::Text(s) => Box::new(s),
+                SqlParam::Bool(b) => Box::new(b),
+            }
+        })
+        .collect()
 }
 
 impl SqliteStore {
@@ -26,6 +44,7 @@ impl SqliteStore {
             "CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
                 flow_name TEXT NOT NULL,
+                flow TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL,
@@ -95,6 +114,11 @@ impl SqliteStore {
             }
         }
 
+        // Add the `flow` column to existing `runs` tables (flow-scoping the run
+        // history). Detected via PRAGMA so we only ALTER when absent — mirrors
+        // `migrate_sessions_to_composite_unique`'s "check first" style.
+        migrate_runs_add_flow(&conn)?;
+
         // Enforce the documented `(flow_path, id)` uniqueness on sessions.
         // Older schemas had `id TEXT PRIMARY KEY`, which meant a save from
         // flow-B would overwrite flow-A's session if they shared an id.
@@ -110,9 +134,33 @@ impl SqliteStore {
         migrate_sessions_to_composite_unique(&conn)?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
+}
+
+/// Add the `flow` column to an existing `runs` table if it isn't already
+/// present. Checked via `PRAGMA table_info` so the ALTER runs at most once.
+fn migrate_runs_add_flow(conn: &rusqlite::Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(runs)")
+        .map_err(|e| IronCrewError::Validation(format!("SQLite pragma prepare: {}", e)))?;
+    let has_flow = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| IronCrewError::Validation(format!("SQLite pragma query: {}", e)))?
+        .filter_map(|c| c.ok())
+        .any(|name| name == "flow");
+    drop(stmt);
+
+    if !has_flow {
+        conn.execute(
+            "ALTER TABLE runs ADD COLUMN flow TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| IronCrewError::Validation(format!("SQLite runs add flow column: {}", e)))?;
+        tracing::info!("SQLite runs table migrated: added `flow` column");
+    }
+    Ok(())
 }
 
 /// Rebuild `conversations` and `dialogs` so the effective unique key is
@@ -192,149 +240,183 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
     Ok(())
 }
 
+/// Flatten a `spawn_blocking` join result: a panicked/cancelled blocking task
+/// becomes a `Validation` error, otherwise the inner `Result<T>` is returned.
+fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
+    match joined {
+        Ok(inner) => inner,
+        Err(e) => Err(IronCrewError::Validation(format!(
+            "SQLite blocking task failed: {}",
+            e
+        ))),
+    }
+}
+
 #[async_trait]
 impl StateStore for SqliteStore {
-    async fn save_run_intent(
-        &self,
-        suggested_id: Option<String>,
-        flow_name: &str,
-        started_at: &str,
-        agent_count: usize,
-        task_count: usize,
-        tags: &[String],
-    ) -> Result<String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let tags_json = serde_json::to_string(tags)
-            .map_err(|e| IronCrewError::Validation(format!("Failed to serialize tags: {}", e)))?;
+    async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
+        let conn = Arc::clone(&self.conn);
 
-        conn.execute(
-            "INSERT INTO runs (run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-             VALUES (?1, ?2, 'running', ?3, '', 0, '[]', ?4, ?5, 0, 0, ?6)",
-            rusqlite::params![
-                run_id,
-                flow_name,
-                started_at,
-                agent_count as i64,
-                task_count as i64,
-                tags_json,
-            ],
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let run_id = intent
+                    .suggested_id
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let tags_json = serde_json::to_string(&intent.tags).map_err(|e| {
+                    IronCrewError::Validation(format!("Failed to serialize tags: {}", e))
+                })?;
+
+                conn.execute(
+                    "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
+                     VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, 0, 0, ?7)",
+                    rusqlite::params![
+                        run_id,
+                        intent.flow_name,
+                        intent.flow,
+                        intent.started_at,
+                        intent.agent_count as i64,
+                        intent.task_count as i64,
+                        tags_json,
+                    ],
+                )
+                .map_err(|e| IronCrewError::Validation(format!("SQLite insert intent: {}", e)))?;
+                tracing::debug!("Run intent saved: {}", run_id);
+                Ok(run_id)
+            })
+            .await,
         )
-        .map_err(|e| IronCrewError::Validation(format!("SQLite insert intent: {}", e)))?;
-        tracing::debug!("Run intent saved: {}", run_id);
-        Ok(run_id)
     }
 
-    async fn update_run_completion(
-        &self,
-        run_id: &str,
-        status: RunStatus,
-        finished_at: &str,
-        duration_ms: u64,
-        task_results: Vec<crate::engine::task::TaskResult>,
-        total_tokens: u32,
-        cached_tokens: u32,
-    ) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-        let task_results_json = serde_json::to_string(&task_results).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize task_results: {}", e))
-        })?;
+    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
 
-        let rows = conn
-            .execute(
-                "UPDATE runs
-                 SET status = ?1, finished_at = ?2, duration_ms = ?3,
-                     task_results = ?4, total_tokens = ?5, cached_tokens = ?6
-                 WHERE run_id = ?7 AND status = 'running'",
-                rusqlite::params![
-                    status.to_string(),
-                    finished_at,
-                    duration_ms as i64,
-                    task_results_json,
-                    total_tokens as i64,
-                    cached_tokens as i64,
-                    run_id,
-                ],
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite update completion: {}", e)))?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let task_results_json =
+                    serde_json::to_string(&completion.task_results).map_err(|e| {
+                        IronCrewError::Validation(format!(
+                            "Failed to serialize task_results: {}",
+                            e
+                        ))
+                    })?;
 
-        if rows == 0 {
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' not found or not in Running state",
-                run_id
-            )));
-        }
-        tracing::info!("Run completion saved: {} ({})", run_id, status);
-        Ok(())
+                let rows = conn
+                    .execute(
+                        "UPDATE runs
+                         SET status = ?1, finished_at = ?2, duration_ms = ?3,
+                             task_results = ?4, total_tokens = ?5, cached_tokens = ?6
+                         WHERE run_id = ?7 AND status = 'running'",
+                        rusqlite::params![
+                            completion.status.to_string(),
+                            completion.finished_at,
+                            completion.duration_ms as i64,
+                            task_results_json,
+                            completion.total_tokens as i64,
+                            completion.cached_tokens as i64,
+                            run_id,
+                        ],
+                    )
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite update completion: {}", e))
+                    })?;
+
+                if rows == 0 {
+                    return Err(IronCrewError::Validation(format!(
+                        "Run '{}' not found or not in Running state",
+                        run_id
+                    )));
+                }
+                tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
+                Ok(())
+            })
+            .await,
+        )
     }
 
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-        let rows = conn
-            .execute(
-                "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status = 'running'",
-                rusqlite::params![now],
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;
-        Ok(rows)
+        let conn = Arc::clone(&self.conn);
+        let now = now.to_string();
+
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let rows = conn
+                    .execute(
+                        "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status = 'running'",
+                        rusqlite::params![now],
+                    )
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;
+                Ok(rows)
+            })
+            .await,
+        )
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE run_id = ?1",
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        let record = stmt
-            .query_row(rusqlite::params![run_id], |row| {
-                let status_str: String = row.get(2)?;
-                let task_results_json: String = row.get(6)?;
-                let tags_json: String = row.get(11)?;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE run_id = ?1",
+                    )
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
 
-                Ok(RunRecord {
-                    run_id: row.get(0)?,
-                    flow_name: row.get(1)?,
-                    status: match status_str.as_str() {
-                        "success" => RunStatus::Success,
-                        "partial_failure" => RunStatus::PartialFailure,
-                        "running" => RunStatus::Running,
-                        "abandoned" => RunStatus::Abandoned,
-                        _ => RunStatus::Failed,
-                    },
-                    started_at: row.get(3)?,
-                    finished_at: row.get(4)?,
-                    duration_ms: row.get::<_, i64>(5)? as u64,
-                    task_results: serde_json::from_str(&task_results_json).unwrap_or_default(),
-                    agent_count: row.get::<_, i64>(7)? as usize,
-                    task_count: row.get::<_, i64>(8)? as usize,
-                    total_tokens: row.get::<_, i64>(9)? as u32,
-                    cached_tokens: row.get::<_, i64>(10)? as u32,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                })
+                let record = stmt
+                    .query_row(rusqlite::params![run_id], |row| {
+                        let status_str: String = row.get(3)?;
+                        let task_results_json: String = row.get(7)?;
+                        let tags_json: String = row.get(12)?;
+
+                        Ok((
+                            RunRecord {
+                                run_id: row.get(0)?,
+                                flow_name: row.get(1)?,
+                                flow: row.get(2)?,
+                                // Placeholder — replaced below after decoding.
+                                status: RunStatus::Running,
+                                started_at: row.get(4)?,
+                                finished_at: row.get(5)?,
+                                duration_ms: row.get::<_, i64>(6)? as u64,
+                                task_results: serde_json::from_str(&task_results_json)
+                                    .unwrap_or_default(),
+                                agent_count: row.get::<_, i64>(8)? as usize,
+                                task_count: row.get::<_, i64>(9)? as usize,
+                                total_tokens: row.get::<_, i64>(10)? as u32,
+                                cached_tokens: row.get::<_, i64>(11)? as u32,
+                                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                            },
+                            status_str,
+                        ))
+                    })
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            IronCrewError::Validation(format!("Run '{}' not found", run_id))
+                        }
+                        _ => IronCrewError::Validation(format!("SQLite query error: {}", e)),
+                    })?;
+
+                let (mut record, status_str) = record;
+                record.status = status_str.parse::<RunStatus>()?;
+                Ok(record)
             })
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    IronCrewError::Validation(format!("Run '{}' not found", run_id))
-                }
-                _ => IronCrewError::Validation(format!("SQLite query error: {}", e)),
-            })?;
-
-        Ok(record)
+            .await,
+        )
     }
 
     async fn list_runs_summary(
@@ -343,198 +425,187 @@ impl StateStore for SqliteStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunSummary>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let wc = store_sql::runs_where(filter, Dialect::Sqlite);
 
-        // Build WHERE clause dynamically. NOTE: we never select task_results.
-        let mut sql = String::from(
-            "SELECT run_id, flow_name, status, started_at, finished_at, duration_ms, \
-             agent_count, task_count, total_tokens, cached_tokens, tags \
-             FROM runs",
-        );
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut next_idx = 1usize;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        if let Some(ref status) = filter.status {
-            where_clauses.push(format!("status = ?{}", next_idx));
-            params.push(Box::new(status.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref since) = filter.since {
-            where_clauses.push(format!("started_at >= ?{}", next_idx));
-            params.push(Box::new(since.clone()));
-            next_idx += 1;
-        }
-        // Tag filter uses LIKE on the JSON text — good enough for small tag
-        // sets. Quotes are added so "foo" doesn't accidentally match "foobar".
-        if let Some(ref tag) = filter.tag {
-            where_clauses.push(format!("tags LIKE ?{}", next_idx));
-            params.push(Box::new(format!("%\"{}\"%", tag)));
-            next_idx += 1;
-        }
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-        sql.push_str(" ORDER BY started_at DESC");
+                // NOTE: we never select task_results. LIMIT/OFFSET are trusted
+                // integer literals so the builder's placeholder numbering is
+                // undisturbed.
+                let mut sql = format!(
+                    "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
+                     agent_count, task_count, total_tokens, cached_tokens, tags \
+                     FROM runs{}",
+                    wc.sql
+                );
+                sql.push_str(" ORDER BY started_at DESC");
+                if limit > 0 {
+                    sql.push_str(&format!(" LIMIT {}", limit as i64));
+                    if offset > 0 {
+                        sql.push_str(&format!(" OFFSET {}", offset as i64));
+                    }
+                }
 
-        if limit > 0 {
-            sql.push_str(&format!(" LIMIT ?{}", next_idx));
-            params.push(Box::new(limit as i64));
-            next_idx += 1;
-            if offset > 0 {
-                sql.push_str(&format!(" OFFSET ?{}", next_idx));
-                params.push(Box::new(offset as i64));
-            }
-        }
+                let boxed = to_sql_params(wc.params);
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite prepare error: {}", e))
+                })?;
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(refs), |row| {
+                        let status_str: String = row.get(3)?;
+                        let tags_json: String = row.get(11)?;
+                        Ok((
+                            RunSummary {
+                                run_id: row.get(0)?,
+                                flow_name: row.get(1)?,
+                                flow: row.get(2)?,
+                                // Placeholder — replaced below after decoding.
+                                status: RunStatus::Running,
+                                started_at: row.get(4)?,
+                                finished_at: row.get(5)?,
+                                duration_ms: row.get::<_, i64>(6)? as u64,
+                                agent_count: row.get::<_, i64>(7)? as usize,
+                                task_count: row.get::<_, i64>(8)? as usize,
+                                total_tokens: row.get::<_, i64>(9)? as u32,
+                                cached_tokens: row.get::<_, i64>(10)? as u32,
+                                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                            },
+                            status_str,
+                        ))
+                    })
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
 
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let status_str: String = row.get(2)?;
-                let tags_json: String = row.get(10)?;
-                Ok(RunSummary {
-                    run_id: row.get(0)?,
-                    flow_name: row.get(1)?,
-                    status: match status_str.as_str() {
-                        "success" => RunStatus::Success,
-                        "partial_failure" => RunStatus::PartialFailure,
-                        "running" => RunStatus::Running,
-                        "abandoned" => RunStatus::Abandoned,
-                        _ => RunStatus::Failed,
-                    },
-                    started_at: row.get(3)?,
-                    finished_at: row.get(4)?,
-                    duration_ms: row.get::<_, i64>(5)? as u64,
-                    agent_count: row.get::<_, i64>(6)? as usize,
-                    task_count: row.get::<_, i64>(7)? as usize,
-                    total_tokens: row.get::<_, i64>(8)? as u32,
-                    cached_tokens: row.get::<_, i64>(9)? as u32,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                })
+                let mut summaries = Vec::new();
+                for row in rows {
+                    let (mut summary, status_str) = row.map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite row error: {}", e))
+                    })?;
+                    summary.status = status_str.parse::<RunStatus>()?;
+                    summaries.push(summary);
+                }
+                Ok(summaries)
             })
-            .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
-
-        let mut summaries = Vec::new();
-        for summary in rows.flatten() {
-            summaries.push(summary);
-        }
-        Ok(summaries)
+            .await,
+        )
     }
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let wc = store_sql::runs_where(filter, Dialect::Sqlite);
 
-        let mut sql = String::from("SELECT COUNT(*) FROM runs");
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut next_idx = 1usize;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        if let Some(ref status) = filter.status {
-            where_clauses.push(format!("status = ?{}", next_idx));
-            params.push(Box::new(status.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref since) = filter.since {
-            where_clauses.push(format!("started_at >= ?{}", next_idx));
-            params.push(Box::new(since.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref tag) = filter.tag {
-            where_clauses.push(format!("tags LIKE ?{}", next_idx));
-            params.push(Box::new(format!("%\"{}\"%", tag)));
-        }
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
+                let sql = format!("SELECT COUNT(*) FROM runs{}", wc.sql);
+                let boxed = to_sql_params(wc.params);
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let count: i64 = conn
-            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .map_err(|e| IronCrewError::Validation(format!("SQLite count error: {}", e)))?;
-        Ok(count as u64)
+                let count: i64 = conn
+                    .query_row(&sql, rusqlite::params_from_iter(refs), |row| row.get(0))
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite count error: {}", e)))?;
+                Ok(count as u64)
+            })
+            .await,
+        )
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
 
-        let affected = conn
-            .execute(
-                "DELETE FROM runs WHERE run_id = ?1",
-                rusqlite::params![run_id],
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite delete error: {}", e)))?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        if affected == 0 {
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' not found",
-                run_id
-            )));
-        }
-        Ok(())
+                let affected = conn
+                    .execute(
+                        "DELETE FROM runs WHERE run_id = ?1",
+                        rusqlite::params![run_id],
+                    )
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite delete error: {}", e))
+                    })?;
+
+                if affected == 0 {
+                    return Err(IronCrewError::Validation(format!(
+                        "Run '{}' not found",
+                        run_id
+                    )));
+                }
+                Ok(())
+            })
+            .await,
+        )
     }
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let record = record.clone();
 
-        let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
-        })?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        // SQLite's `UNIQUE(flow_path, id)` does not consider `NULL`
-        // values equal, so legacy/global records need an explicit
-        // delete-first step to preserve the store's upsert contract.
-        if record.flow_path.is_none() {
-            conn.execute(
-                "DELETE FROM conversations WHERE id = ?1 AND flow_path IS NULL",
-                rusqlite::params![record.id],
-            )
-            .map_err(|e| {
-                IronCrewError::Validation(format!(
-                    "SQLite save_conversation delete-old-null-scope error: {}",
-                    e
-                ))
-            })?;
-        }
+                let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
+                    IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
+                })?;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO conversations \
-             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                record.id,
-                record.flow_name,
-                record.flow_path,
-                record.agent_name,
-                messages_json,
-                record.created_at,
-                record.updated_at,
-            ],
+                // SQLite's `UNIQUE(flow_path, id)` does not consider `NULL`
+                // values equal, so legacy/global records need an explicit
+                // delete-first step to preserve the store's upsert contract.
+                if record.flow_path.is_none() {
+                    conn.execute(
+                        "DELETE FROM conversations WHERE id = ?1 AND flow_path IS NULL",
+                        rusqlite::params![record.id],
+                    )
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!(
+                            "SQLite save_conversation delete-old-null-scope error: {}",
+                            e
+                        ))
+                    })?;
+                }
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO conversations \
+                     (id, flow_name, flow_path, agent_name, messages, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        record.id,
+                        record.flow_name,
+                        record.flow_path,
+                        record.agent_name,
+                        messages_json,
+                        record.created_at,
+                        record.updated_at,
+                    ],
+                )
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite save_conversation error: {}", e))
+                })?;
+                Ok(())
+            })
+            .await,
         )
-        .map_err(|e| IronCrewError::Validation(format!("SQLite save_conversation error: {}", e)))?;
-        Ok(())
     }
 
     async fn get_conversation(
@@ -542,58 +613,74 @@ impl StateStore for SqliteStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<ConversationRecord>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
+        let id = id.to_string();
 
-        // Flow-scoped lookup: when `flow_path` is Some, require an exact
-        // match. The SQL guards prevent cross-flow reads on the same id.
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at \
-                 FROM conversations \
-                 WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        let row = stmt
-            .query_row(rusqlite::params![id, flow_path], |row| {
-                let messages_json: String = row.get(4)?;
-                Ok(ConversationRecord {
-                    id: row.get(0)?,
-                    flow_name: row.get(1)?,
-                    flow_path: row.get(2)?,
-                    agent_name: row.get(3)?,
-                    messages: serde_json::from_str(&messages_json).unwrap_or_default(),
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
+                // Flow-scoped lookup: when `flow_path` is Some, require an exact
+                // match. The SQL guards prevent cross-flow reads on the same id.
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at \
+                         FROM conversations \
+                         WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
+                    )
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+                let row = stmt
+                    .query_row(rusqlite::params![id, flow_path], |row| {
+                        let messages_json: String = row.get(4)?;
+                        Ok(ConversationRecord {
+                            id: row.get(0)?,
+                            flow_name: row.get(1)?,
+                            flow_path: row.get(2)?,
+                            agent_name: row.get(3)?,
+                            messages: serde_json::from_str(&messages_json).unwrap_or_default(),
+                            created_at: row.get(5)?,
+                            updated_at: row.get(6)?,
+                        })
+                    })
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(IronCrewError::Validation(format!(
+                            "SQLite get_conversation error: {}",
+                            other
+                        ))),
+                    })?;
+                Ok(row)
             })
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(IronCrewError::Validation(format!(
-                    "SQLite get_conversation error: {}",
-                    other
-                ))),
-            })?;
-        Ok(row)
+            .await,
+        )
     }
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-        conn.execute(
-            "DELETE FROM conversations WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
-            rusqlite::params![id, flow_path],
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
+        let id = id.to_string();
+
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                conn.execute(
+                    "DELETE FROM conversations WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
+                    rusqlite::params![id, flow_path],
+                )
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite delete_conversation error: {}", e))
+                })?;
+                Ok(())
+            })
+            .await,
         )
-        .map_err(|e| {
-            IronCrewError::Validation(format!("SQLite delete_conversation error: {}", e))
-        })?;
-        Ok(())
     }
 
     async fn list_conversations(
@@ -602,139 +689,162 @@ impl StateStore for SqliteStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversationSummary>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
 
-        let mut sql = String::from(
-            "SELECT id, flow_path, agent_name, messages, created_at, updated_at \
-             FROM conversations",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut next_idx = 1usize;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        if let Some(fp) = flow_path {
-            sql.push_str(&format!(" WHERE flow_path = ?{}", next_idx));
-            params.push(Box::new(fp.to_string()));
-            next_idx += 1;
-        }
-        sql.push_str(" ORDER BY updated_at DESC");
-        if limit > 0 {
-            sql.push_str(&format!(" LIMIT ?{}", next_idx));
-            params.push(Box::new(limit as i64));
-            next_idx += 1;
-            if offset > 0 {
-                sql.push_str(&format!(" OFFSET ?{}", next_idx));
-                params.push(Box::new(offset as i64));
-            }
-        }
+                let mut sql = String::from(
+                    "SELECT id, flow_path, agent_name, messages, created_at, updated_at \
+                     FROM conversations",
+                );
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                let mut next_idx = 1usize;
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+                if let Some(fp) = flow_path {
+                    sql.push_str(&format!(" WHERE flow_path = ?{}", next_idx));
+                    params.push(Box::new(fp));
+                    next_idx += 1;
+                }
+                sql.push_str(" ORDER BY updated_at DESC");
+                if limit > 0 {
+                    sql.push_str(&format!(" LIMIT ?{}", next_idx));
+                    params.push(Box::new(limit as i64));
+                    next_idx += 1;
+                    if offset > 0 {
+                        sql.push_str(&format!(" OFFSET ?{}", next_idx));
+                        params.push(Box::new(offset as i64));
+                    }
+                }
 
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let messages_json: String = row.get(3)?;
-                let msgs: Vec<crate::llm::provider::ChatMessage> =
-                    serde_json::from_str(&messages_json).unwrap_or_default();
-                let turn_count = msgs.iter().filter(|m| m.role == "user").count();
-                Ok(ConversationSummary {
-                    id: row.get(0)?,
-                    flow_path: row.get(1)?,
-                    agent_name: row.get(2)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    turn_count,
-                })
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite prepare error: {}", e))
+                })?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+
+                let rows = stmt
+                    .query_map(param_refs.as_slice(), |row| {
+                        let messages_json: String = row.get(3)?;
+                        let msgs: Vec<crate::llm::provider::ChatMessage> =
+                            serde_json::from_str(&messages_json).unwrap_or_default();
+                        let turn_count = msgs.iter().filter(|m| m.role == "user").count();
+                        Ok(ConversationSummary {
+                            id: row.get(0)?,
+                            flow_path: row.get(1)?,
+                            agent_name: row.get(2)?,
+                            created_at: row.get(4)?,
+                            updated_at: row.get(5)?,
+                            turn_count,
+                        })
+                    })
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
+
+                let mut summaries = Vec::new();
+                for s in rows.flatten() {
+                    summaries.push(s);
+                }
+                Ok(summaries)
             })
-            .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
-
-        let mut summaries = Vec::new();
-        for s in rows.flatten() {
-            summaries.push(s);
-        }
-        Ok(summaries)
+            .await,
+        )
     }
 
     async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
 
-        let (sql, param): (String, Option<String>) = match flow_path {
-            Some(fp) => (
-                "SELECT COUNT(*) FROM conversations WHERE flow_path = ?1".into(),
-                Some(fp.to_string()),
-            ),
-            None => ("SELECT COUNT(*) FROM conversations".into(), None),
-        };
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        let count: i64 = match param {
-            Some(fp) => conn
-                .query_row(&sql, rusqlite::params![fp], |row| row.get(0))
-                .map_err(|e| IronCrewError::Validation(format!("SQLite count error: {}", e)))?,
-            None => conn
-                .query_row(&sql, [], |row| row.get(0))
-                .map_err(|e| IronCrewError::Validation(format!("SQLite count error: {}", e)))?,
-        };
-        Ok(count as u64)
+                let (sql, param): (String, Option<String>) = match flow_path {
+                    Some(fp) => (
+                        "SELECT COUNT(*) FROM conversations WHERE flow_path = ?1".into(),
+                        Some(fp),
+                    ),
+                    None => ("SELECT COUNT(*) FROM conversations".into(), None),
+                };
+
+                let count: i64 = match param {
+                    Some(fp) => conn
+                        .query_row(&sql, rusqlite::params![fp], |row| row.get(0))
+                        .map_err(|e| {
+                            IronCrewError::Validation(format!("SQLite count error: {}", e))
+                        })?,
+                    None => conn.query_row(&sql, [], |row| row.get(0)).map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite count error: {}", e))
+                    })?,
+                };
+                Ok(count as u64)
+            })
+            .await,
+        )
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let record = record.clone();
 
-        let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
-        })?;
-        let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
-        })?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        // See `save_conversation`: NULL-scoped legacy/global records need
-        // an explicit delete to preserve replace semantics on SQLite.
-        if record.flow_path.is_none() {
-            conn.execute(
-                "DELETE FROM dialogs WHERE id = ?1 AND flow_path IS NULL",
-                rusqlite::params![record.id],
-            )
-            .map_err(|e| {
-                IronCrewError::Validation(format!(
-                    "SQLite save_dialog_state delete-old-null-scope error: {}",
-                    e
-                ))
-            })?;
-        }
+                let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
+                    IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
+                })?;
+                let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
+                    IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
+                })?;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO dialogs \
-             (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                record.id,
-                record.flow_name,
-                record.flow_path,
-                agents_json,
-                record.starter,
-                transcript_json,
-                record.next_index as i64,
-                record.stopped as i64,
-                record.stop_reason,
-                record.created_at,
-                record.updated_at,
-            ],
+                // See `save_conversation`: NULL-scoped legacy/global records need
+                // an explicit delete to preserve replace semantics on SQLite.
+                if record.flow_path.is_none() {
+                    conn.execute(
+                        "DELETE FROM dialogs WHERE id = ?1 AND flow_path IS NULL",
+                        rusqlite::params![record.id],
+                    )
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!(
+                            "SQLite save_dialog_state delete-old-null-scope error: {}",
+                            e
+                        ))
+                    })?;
+                }
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO dialogs \
+                     (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        record.id,
+                        record.flow_name,
+                        record.flow_path,
+                        agents_json,
+                        record.starter,
+                        transcript_json,
+                        record.next_index as i64,
+                        record.stopped as i64,
+                        record.stop_reason,
+                        record.created_at,
+                        record.updated_at,
+                    ],
+                )
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite save_dialog_state error: {}", e))
+                })?;
+                Ok(())
+            })
+            .await,
         )
-        .map_err(|e| {
-            IronCrewError::Validation(format!("SQLite save_dialog_state error: {}", e))
-        })?;
-        Ok(())
     }
 
     async fn get_dialog_state(
@@ -742,97 +852,122 @@ impl StateStore for SqliteStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<DialogStateRecord>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
+        let id = id.to_string();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, flow_name, flow_path, agent_names, starter, transcript, next_index, \
-                 stopped, stop_reason, created_at, updated_at \
-                 FROM dialogs \
-                 WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
-            )
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        let row = stmt
-            .query_row(rusqlite::params![id, flow_path], |row| {
-                let agents_json: String = row.get(3)?;
-                let transcript_json: String = row.get(5)?;
-                Ok(DialogStateRecord {
-                    id: row.get(0)?,
-                    flow_name: row.get(1)?,
-                    flow_path: row.get(2)?,
-                    agent_names: serde_json::from_str(&agents_json).unwrap_or_default(),
-                    starter: row.get(4)?,
-                    transcript: serde_json::from_str(&transcript_json).unwrap_or_default(),
-                    next_index: row.get::<_, i64>(6)? as usize,
-                    stopped: row.get::<_, i64>(7)? != 0,
-                    stop_reason: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, flow_name, flow_path, agent_names, starter, transcript, next_index, \
+                         stopped, stop_reason, created_at, updated_at \
+                         FROM dialogs \
+                         WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
+                    )
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+
+                let row = stmt
+                    .query_row(rusqlite::params![id, flow_path], |row| {
+                        let agents_json: String = row.get(3)?;
+                        let transcript_json: String = row.get(5)?;
+                        Ok(DialogStateRecord {
+                            id: row.get(0)?,
+                            flow_name: row.get(1)?,
+                            flow_path: row.get(2)?,
+                            agent_names: serde_json::from_str(&agents_json).unwrap_or_default(),
+                            starter: row.get(4)?,
+                            transcript: serde_json::from_str(&transcript_json).unwrap_or_default(),
+                            next_index: row.get::<_, i64>(6)? as usize,
+                            stopped: row.get::<_, i64>(7)? != 0,
+                            stop_reason: row.get(8)?,
+                            created_at: row.get(9)?,
+                            updated_at: row.get(10)?,
+                        })
+                    })
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(IronCrewError::Validation(format!(
+                            "SQLite get_dialog_state error: {}",
+                            other
+                        ))),
+                    })?;
+                Ok(row)
             })
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(IronCrewError::Validation(format!(
-                    "SQLite get_dialog_state error: {}",
-                    other
-                ))),
-            })?;
-        Ok(row)
+            .await,
+        )
     }
 
     async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-        conn.execute(
-            "DELETE FROM dialogs WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
-            rusqlite::params![id, flow_path],
+        let conn = Arc::clone(&self.conn);
+        let flow_path = flow_path.map(|s| s.to_string());
+        let id = id.to_string();
+
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                conn.execute(
+                    "DELETE FROM dialogs WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
+                    rusqlite::params![id, flow_path],
+                )
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite delete_dialog_state error: {}", e))
+                })?;
+                Ok(())
+            })
+            .await,
         )
-        .map_err(|e| {
-            IronCrewError::Validation(format!("SQLite delete_dialog_state error: {}", e))
-        })?;
-        Ok(())
     }
 
     async fn save_audit_event(&self, event: &crate::engine::audit::AuditEvent) -> Result<String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let event = event.clone();
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let metadata_json = match &event.metadata {
-            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
-                IronCrewError::Validation(format!("Failed to serialize metadata: {}", e))
-            })?),
-            None => None,
-        };
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        conn.execute(
-            "INSERT INTO audit_events (id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                id,
-                event.timestamp,
-                event.action,
-                event.flow_path,
-                event.target,
-                event.actor,
-                event.source_ip,
-                if event.success { 1 } else { 0 },
-                event.status_code as i64,
-                metadata_json,
-            ],
+                let id = uuid::Uuid::new_v4().to_string();
+                let metadata_json = match &event.metadata {
+                    Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                        IronCrewError::Validation(format!("Failed to serialize metadata: {}", e))
+                    })?),
+                    None => None,
+                };
+
+                conn.execute(
+                    "INSERT INTO audit_events (id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        id,
+                        event.timestamp,
+                        event.action,
+                        event.flow_path,
+                        event.target,
+                        event.actor,
+                        event.source_ip,
+                        if event.success { 1 } else { 0 },
+                        event.status_code as i64,
+                        metadata_json,
+                    ],
+                )
+                .map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite insert audit event: {}", e))
+                })?;
+                tracing::debug!("Audit event saved: {}", id);
+                Ok(id)
+            })
+            .await,
         )
-        .map_err(|e| IronCrewError::Validation(format!("SQLite insert audit event: {}", e)))?;
-        tracing::debug!("Audit event saved: {}", id);
-        Ok(id)
     }
 
     async fn list_audit_events(
@@ -841,126 +976,85 @@ impl StateStore for SqliteStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let wc = store_sql::audit_where(filter, Dialect::Sqlite);
 
-        let mut sql = String::from(
-            "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata
-             FROM audit_events",
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        let mut clauses: Vec<&str> = Vec::new();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        if filter.flow_path.is_some() {
-            clauses.push("flow_path = ?");
-            params.push(Box::new(filter.flow_path.clone().unwrap()));
-        }
-        if filter.action.is_some() {
-            clauses.push("action = ?");
-            params.push(Box::new(filter.action.clone().unwrap()));
-        }
-        if filter.actor.is_some() {
-            clauses.push("actor = ?");
-            params.push(Box::new(filter.actor.clone().unwrap()));
-        }
-        if filter.since.is_some() {
-            clauses.push("timestamp >= ?");
-            params.push(Box::new(filter.since.clone().unwrap()));
-        }
-        if filter.until.is_some() {
-            clauses.push("timestamp < ?");
-            params.push(Box::new(filter.until.clone().unwrap()));
-        }
-        if let Some(s) = filter.success {
-            clauses.push("success = ?");
-            params.push(Box::new(if s { 1i64 } else { 0i64 }));
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
+                let mut sql = format!(
+                    "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata \
+                     FROM audit_events{}",
+                    wc.sql
+                );
+                sql.push_str(" ORDER BY timestamp DESC");
+                if limit > 0 {
+                    sql.push_str(&format!(" LIMIT {}", limit));
+                }
+                if offset > 0 {
+                    sql.push_str(&format!(" OFFSET {}", offset));
+                }
 
-        sql.push_str(" ORDER BY timestamp DESC");
-        if limit > 0 {
-            sql.push_str(&format!(" LIMIT {}", limit));
-        }
-        if offset > 0 {
-            sql.push_str(&format!(" OFFSET {}", offset));
-        }
+                let boxed = to_sql_params(wc.params);
+                let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| IronCrewError::Validation(format!("SQLite prepare: {}", e)))?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| &**b).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let metadata_json: Option<String> = row.get(9)?;
-                Ok(crate::engine::audit::AuditEvent {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    action: row.get(2)?,
-                    flow_path: row.get(3)?,
-                    target: row.get(4)?,
-                    actor: row.get(5)?,
-                    source_ip: row.get(6)?,
-                    success: row.get::<_, i64>(7)? != 0,
-                    status_code: row.get::<_, i64>(8)? as u16,
-                    metadata: metadata_json.and_then(|s| serde_json::from_str(&s).ok()),
-                })
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare: {}", e)))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(refs), |row| {
+                        let metadata_json: Option<String> = row.get(9)?;
+                        Ok(crate::engine::audit::AuditEvent {
+                            id: row.get(0)?,
+                            timestamp: row.get(1)?,
+                            action: row.get(2)?,
+                            flow_path: row.get(3)?,
+                            target: row.get(4)?,
+                            actor: row.get(5)?,
+                            source_ip: row.get(6)?,
+                            success: row.get::<_, i64>(7)? != 0,
+                            status_code: row.get::<_, i64>(8)? as u16,
+                            metadata: metadata_json.and_then(|s| serde_json::from_str(&s).ok()),
+                        })
+                    })
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite query: {}", e)))?;
+
+                let mut events = Vec::new();
+                for r in rows {
+                    events.push(
+                        r.map_err(|e| IronCrewError::Validation(format!("SQLite row: {}", e)))?,
+                    );
+                }
+                Ok(events)
             })
-            .map_err(|e| IronCrewError::Validation(format!("SQLite query: {}", e)))?;
-
-        let mut events = Vec::new();
-        for r in rows {
-            events.push(r.map_err(|e| IronCrewError::Validation(format!("SQLite row: {}", e)))?);
-        }
-        Ok(events)
+            .await,
+        )
     }
 
     async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+        let conn = Arc::clone(&self.conn);
+        let wc = store_sql::audit_where(filter, Dialect::Sqlite);
 
-        let mut sql = String::from("SELECT COUNT(*) FROM audit_events");
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        let mut clauses: Vec<&str> = Vec::new();
-        if filter.flow_path.is_some() {
-            clauses.push("flow_path = ?");
-            params.push(Box::new(filter.flow_path.clone().unwrap()));
-        }
-        if filter.action.is_some() {
-            clauses.push("action = ?");
-            params.push(Box::new(filter.action.clone().unwrap()));
-        }
-        if filter.actor.is_some() {
-            clauses.push("actor = ?");
-            params.push(Box::new(filter.actor.clone().unwrap()));
-        }
-        if filter.since.is_some() {
-            clauses.push("timestamp >= ?");
-            params.push(Box::new(filter.since.clone().unwrap()));
-        }
-        if filter.until.is_some() {
-            clauses.push("timestamp < ?");
-            params.push(Box::new(filter.until.clone().unwrap()));
-        }
-        if let Some(s) = filter.success {
-            clauses.push("success = ?");
-            params.push(Box::new(if s { 1i64 } else { 0i64 }));
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| &**b).collect();
-        let count: i64 = conn
-            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .map_err(|e| IronCrewError::Validation(format!("SQLite count: {}", e)))?;
-        Ok(count as u64)
+                let sql = format!("SELECT COUNT(*) FROM audit_events{}", wc.sql);
+                let boxed = to_sql_params(wc.params);
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
+
+                let count: i64 = conn
+                    .query_row(&sql, rusqlite::params_from_iter(refs), |row| row.get(0))
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite count: {}", e)))?;
+                Ok(count as u64)
+            })
+            .await,
+        )
     }
 }

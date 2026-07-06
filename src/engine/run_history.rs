@@ -179,7 +179,15 @@ fn dialog_flow_matches(record: &DialogStateRecord, flow_path: Option<&str>) -> b
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
+    /// The crew's `goal` text (human-readable). NOT a stable flow identifier —
+    /// use `flow` for scoping.
     pub flow_name: String,
+    /// Flow slug (the `{flow}` URL segment / project directory name) the run
+    /// was launched under. Used to scope run endpoints so one flow cannot read
+    /// or delete another's runs. Empty for pre-migration records and for CLI
+    /// runs that aren't launched under a named flow directory.
+    #[serde(default)]
+    pub flow: String,
     pub status: RunStatus,
     pub started_at: String,
     pub finished_at: String,
@@ -216,6 +224,28 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
+impl std::str::FromStr for RunStatus {
+    type Err = crate::utils::error::IronCrewError;
+
+    /// Inverse of `Display` — decodes the stored status string. Unknown values
+    /// are a data-integrity error rather than a silent default, so a corrupt
+    /// row surfaces instead of masquerading as a valid state. Single source of
+    /// truth shared by the SQLite and Postgres backends.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(RunStatus::Running),
+            "abandoned" => Ok(RunStatus::Abandoned),
+            "success" => Ok(RunStatus::Success),
+            "partial_failure" => Ok(RunStatus::PartialFailure),
+            "failed" => Ok(RunStatus::Failed),
+            other => Err(crate::utils::error::IronCrewError::Validation(format!(
+                "Unknown run status '{}' in stored record",
+                other
+            ))),
+        }
+    }
+}
+
 /// Lightweight run metadata — same as `RunRecord` without `task_results`.
 /// Used for paginated list views so clients don't pay to transfer every
 /// historical task output when they only want a summary table.
@@ -225,6 +255,9 @@ impl std::fmt::Display for RunStatus {
 pub struct RunSummary {
     pub run_id: String,
     pub flow_name: String,
+    /// Flow slug the run was launched under (see `RunRecord::flow`).
+    #[serde(default)]
+    pub flow: String,
     pub status: RunStatus,
     pub started_at: String,
     pub finished_at: String,
@@ -244,6 +277,7 @@ impl From<&RunRecord> for RunSummary {
         Self {
             run_id: record.run_id.clone(),
             flow_name: record.flow_name.clone(),
+            flow: record.flow.clone(),
             status: record.status.clone(),
             started_at: record.started_at.clone(),
             finished_at: record.finished_at.clone(),
@@ -261,6 +295,10 @@ impl From<&RunRecord> for RunSummary {
 /// "don't filter on this dimension".
 #[derive(Debug, Clone, Default)]
 pub struct ListRunsFilter {
+    /// Flow-slug scope — when `Some`, only runs launched under this flow are
+    /// returned. Set by the HTTP layer from the `{flow}` URL segment so a
+    /// flow's run list can't leak another flow's runs.
+    pub flow: Option<String>,
     /// Status filter — e.g. `"success"`, `"partial_failure"`, `"failed"`.
     pub status: Option<String>,
     /// Tag filter — matches runs that contain the given tag in their tags list.
@@ -269,9 +307,45 @@ pub struct ListRunsFilter {
     pub since: Option<String>,
 }
 
+/// Fields written when a run starts (`save_run_intent`). Passed as one value
+/// instead of a long positional argument list so call sites read as named
+/// fields and the set can grow without reshuffling every caller.
+#[derive(Debug, Clone, Default)]
+pub struct RunIntent {
+    /// Pre-chosen run id (e.g. allocated by the HTTP handler so SSE subscribers
+    /// can join mid-flight). `None` lets the store generate a UUID.
+    pub suggested_id: Option<String>,
+    /// Human-readable crew goal.
+    pub flow_name: String,
+    /// Flow slug the run is scoped to (see [`RunRecord::flow`]).
+    pub flow: String,
+    pub started_at: String,
+    pub agent_count: usize,
+    pub task_count: usize,
+    pub tags: Vec<String>,
+}
+
+/// Fields written when a run finishes (`update_run_completion`), transitioning a
+/// `Running` record to a terminal state. The run id stays a separate argument
+/// since it's the key, not part of the payload.
+#[derive(Debug, Clone)]
+pub struct RunCompletion {
+    pub status: RunStatus,
+    pub finished_at: String,
+    pub duration_ms: u64,
+    pub task_results: Vec<TaskResult>,
+    pub total_tokens: u32,
+    pub cached_tokens: u32,
+}
+
 /// Shared filter-check used by the JSON backend. Returns true if `record`
 /// matches every non-None field of `filter`.
 fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
+    if let Some(ref flow) = filter.flow
+        && record.flow != *flow
+    {
+        return false;
+    }
     if let Some(ref status) = filter.status
         && record.status.to_string() != *status
     {
@@ -337,29 +411,24 @@ impl JsonFileStore {
 
 #[async_trait]
 impl StateStore for JsonFileStore {
-    async fn save_run_intent(
-        &self,
-        suggested_id: Option<String>,
-        flow_name: &str,
-        started_at: &str,
-        agent_count: usize,
-        task_count: usize,
-        tags: &[String],
-    ) -> Result<String> {
-        let run_id = suggested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
+        let run_id = intent
+            .suggested_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let record = RunRecord {
             run_id: run_id.clone(),
-            flow_name: flow_name.to_string(),
+            flow_name: intent.flow_name,
+            flow: intent.flow,
             status: RunStatus::Running,
-            started_at: started_at.to_string(),
+            started_at: intent.started_at,
             finished_at: String::new(),
             duration_ms: 0,
             task_results: Vec::new(),
-            agent_count,
-            task_count,
+            agent_count: intent.agent_count,
+            task_count: intent.task_count,
             total_tokens: 0,
             cached_tokens: 0,
-            tags: tags.to_vec(),
+            tags: intent.tags,
         };
         let filename = format!("{}.json", record.run_id);
         let path = self.runs_dir.join(&filename);
@@ -371,16 +440,7 @@ impl StateStore for JsonFileStore {
         Ok(run_id)
     }
 
-    async fn update_run_completion(
-        &self,
-        run_id: &str,
-        status: RunStatus,
-        finished_at: &str,
-        duration_ms: u64,
-        task_results: Vec<crate::engine::task::TaskResult>,
-        total_tokens: u32,
-        cached_tokens: u32,
-    ) -> Result<()> {
+    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()> {
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
         if !path.exists() {
@@ -398,12 +458,12 @@ impl StateStore for JsonFileStore {
                 run_id, record.status
             )));
         }
-        record.status = status;
-        record.finished_at = finished_at.to_string();
-        record.duration_ms = duration_ms;
-        record.task_results = task_results;
-        record.total_tokens = total_tokens;
-        record.cached_tokens = cached_tokens;
+        record.status = completion.status;
+        record.finished_at = completion.finished_at;
+        record.duration_ms = completion.duration_ms;
+        record.task_results = completion.task_results;
+        record.total_tokens = completion.total_tokens;
+        record.cached_tokens = completion.cached_tokens;
         let json = serde_json::to_string_pretty(&record).map_err(|e| {
             IronCrewError::Validation(format!("Failed to serialize run completion: {}", e))
         })?;

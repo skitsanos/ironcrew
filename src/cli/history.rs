@@ -12,17 +12,14 @@ pub async fn cmd_runs(
     limit: usize,
     offset: usize,
 ) -> Result<()> {
-    // Load .env so store config (IRONCREW_STORE, DATABASE_URL, etc.) is available
-    dotenvy::dotenv().ok();
-    let env_file = project.join(".env");
-    if env_file.exists() {
-        dotenvy::from_path(&env_file).ok();
-    }
-
+    // Store config (IRONCREW_STORE, DATABASE_URL, …) comes from the environment;
+    // `.env` is loaded once in `main` before the runtime starts.
     let ironcrew_dir = project.join(".ironcrew");
     let store = create_store(ironcrew_dir).await?;
 
     let filter = ListRunsFilter {
+        // CLI history lists all runs in the project's local store; no flow scope.
+        flow: None,
         status: status_filter.map(|s| s.to_string()),
         tag: tag_filter.map(|s| s.to_string()),
         since: since_filter.map(|s| s.to_string()),
@@ -76,12 +73,7 @@ pub async fn cmd_runs(
 }
 
 pub async fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
-    dotenvy::dotenv().ok();
-    let env_file = project.join(".env");
-    if env_file.exists() {
-        dotenvy::from_path(&env_file).ok();
-    }
-
+    // `.env` is loaded once in `main` before the runtime starts.
     let ironcrew_dir = project.join(".ironcrew");
     let store = create_store(ironcrew_dir).await?;
     let record = store.get_run(run_id).await?;
@@ -129,12 +121,7 @@ pub async fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
 }
 
 pub async fn cmd_clean(project: &Path, keep: usize, all: bool) -> Result<()> {
-    dotenvy::dotenv().ok();
-    let env_file = project.join(".env");
-    if env_file.exists() {
-        dotenvy::from_path(&env_file).ok();
-    }
-
+    // `.env` is loaded once in `main` before the runtime starts.
     let ironcrew_dir = project.join(".ironcrew");
 
     if !ironcrew_dir.exists() {

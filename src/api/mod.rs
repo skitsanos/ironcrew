@@ -22,6 +22,9 @@ use crate::engine::store::StateStore;
 pub struct ActiveRun {
     pub eventbus: EventBus,
     pub abort_handle: tokio::task::AbortHandle,
+    /// Flow slug this run belongs to, so `abort_run` can reject a request that
+    /// targets another flow's run without a store round-trip.
+    pub flow: String,
 }
 
 /// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
@@ -39,6 +42,9 @@ pub struct AppState {
     /// Hard cap on `active_conversations.len()` — reads
     /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
     pub max_active_conversations: usize,
+    /// Hard cap on `active_runs.len()` — reads `IRONCREW_MAX_ACTIVE_RUNS`
+    /// once at boot. Backpressure against unbounded concurrent runs.
+    pub max_active_runs: usize,
     /// Server-wide persistence singleton. Bootstrapped once at
     /// `cmd_serve` startup and reused across every handler so Postgres
     /// migrations / table checks don't re-run per request, and so every
@@ -146,11 +152,6 @@ pub fn resolve_flow_path(state: &AppState, flow: &str) -> crate::utils::error::R
     }
 
     Ok(canonical)
-}
-
-/// Resolve the `.ironcrew` directory for a given flow (used by `create_store`).
-pub fn resolve_ironcrew_dir(state: &AppState, flow: &str) -> crate::utils::error::Result<PathBuf> {
-    Ok(resolve_flow_path(state, flow)?.join(".ironcrew"))
 }
 
 /// Build the router

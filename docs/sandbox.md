@@ -11,70 +11,51 @@ operators use to tune them.
 local key = env("OPENAI_API_KEY")
 ```
 
-Returns the env var's value, or `nil` if the var is unset **or
-blocked by the sandbox**.
+Returns the env var's value, or `nil` if the var is unset **or not
+allowed by the sandbox**.
 
-### Default blocklist
+### Fail-closed allowlist — `IRONCREW_ENV_ALLOWLIST`
 
-The following are blocked by default to prevent a crew script from
-exfiltrating server-side secrets:
-
-| Blocked | Why |
-|---|---|
-| Any name ending in `_API_KEY`, `_SECRET`, `_TOKEN`, `_PASSWORD` | Generic credential names |
-| `DATABASE_URL` | Postgres connection string with embedded credentials |
-| `IRONCREW_API_TOKEN` | Bearer token used by the REST API |
-| `IRONCREW_PG_TABLE_PREFIX` | Internal storage layout, not crew-relevant |
-
-A blocked `env()` call returns `nil` and emits a `tracing::warn!` so
-operators can detect and audit attempts.
-
-### Granting explicit access — `IRONCREW_ENV_ALLOWLIST`
-
-The default blocklist is conservative. To expose specific vars to
-your own crews (because you own the secret, your script needs it,
-and you trust the deployment), list them in `IRONCREW_ENV_ALLOWLIST`:
+`env()` is **deny-by-default**. A crew script can read *only* the
+environment variables whose exact names appear in
+`IRONCREW_ENV_ALLOWLIST`; every other name returns `nil` and emits a
+`tracing::warn!` so operators can detect and audit attempts.
 
 ```bash
-export IRONCREW_ENV_ALLOWLIST=AZURE_OPENAI_API_KEY,MY_DB_PASSWORD
+export IRONCREW_ENV_ALLOWLIST=APP_REGION,FEATURE_FLAGS,AZURE_OPENAI_API_KEY
 ```
 
 ```lua
 -- in crew.lua
-local azure_key = env("AZURE_OPENAI_API_KEY")  -- now returns the value
+local region = env("APP_REGION")           -- returns the value (allowlisted)
+local db = env("DATABASE_URL")             -- returns nil (not allowlisted)
 ```
 
 Semantics:
 
 - Comma-separated, exact names (case-insensitive).
-- The allowlist is checked **first** and wins over every block rule —
-  including the hardcoded defaults and the `*_API_KEY` suffix
-  patterns. This lets you grant precise per-var access without
-  disabling the generic patterns for the rest of the codebase.
 - Empty entries (`""` or `,,`) match nothing.
-- Defaults to empty when unset.
+- Defaults to empty when unset — meaning `env()` returns `nil` for
+  **everything** until you opt names in.
 
-### Extending the blocklist — `IRONCREW_ENV_BLOCKLIST`
+This posture replaces the earlier suffix denylist, which was
+fail-open: it blocked `*_API_KEY`/`*_SECRET`/`*_TOKEN`/`*_PASSWORD`
+but silently leaked credentials it didn't anticipate — e.g.
+`AWS_SECRET_ACCESS_KEY` (ends `_ACCESS_KEY`), `AWS_ACCESS_KEY_ID`,
+and `GOOGLE_APPLICATION_CREDENTIALS`. An allowlist is the only
+posture that can't be defeated by an unanticipated variable name.
 
-For project-specific secrets that don't match the generic suffixes,
-add them to the deny set:
-
-```bash
-export IRONCREW_ENV_BLOCKLIST=COMPANY_LICENSE,INTERNAL_WEBHOOK
-```
-
-Comma-separated, case-insensitive. **Additive** to the hardcoded
-defaults. Note that `IRONCREW_ENV_ALLOWLIST` overrides this — if a
-name appears in both, the allowlist wins.
+> **Migration note (breaking):** the previous `IRONCREW_ENV_BLOCKLIST`
+> variable and the built-in `*_API_KEY` suffix denylist are gone.
+> Crews that relied on reading non-secret vars by default must now
+> list those names in `IRONCREW_ENV_ALLOWLIST`.
 
 ### Resolution order
 
 ```
 env("X") →
-  1. Is X in IRONCREW_ENV_ALLOWLIST?            → return std::env::var(X)
-  2. Is X in DEFAULT_BLOCKED or matches a       → log warn, return nil
-     BLOCKED_SUFFIX or in IRONCREW_ENV_BLOCKLIST?
-  3. Otherwise                                   → return std::env::var(X)
+  1. Is X in IRONCREW_ENV_ALLOWLIST?  → return std::env::var(X)
+  2. Otherwise                         → log warn, return nil
 ```
 
 ## What else the sandbox hardens

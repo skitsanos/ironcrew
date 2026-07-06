@@ -11,23 +11,39 @@ use crate::lua::loader::ProjectLoader;
 use crate::lua::sandbox::create_crew_lua_with_lib_dirs;
 use crate::utils::error::{IronCrewError, Result};
 
-/// Load a project from a path (file or directory), handling .env loading.
-pub fn load_project(path: &Path) -> Result<ProjectLoader> {
-    // Load .env: check CWD first, then project directory
+/// Load `.env` files into the process environment.
+///
+/// Call this **exactly once, before the async runtime starts** (see `main`).
+/// `dotenvy` calls `std::env::set_var` internally, which is only sound while the
+/// process is single-threaded — calling it from a live request handler on the
+/// multithreaded runtime is undefined behavior (that is why `load_project` no
+/// longer touches the environment).
+///
+/// Loads the CWD `.env` first, then the project directory's `.env` if a project
+/// path is given. `dotenvy` never overrides a variable that is already set, so
+/// values already present in the process environment (or in the CWD `.env`) win
+/// over the project `.env`.
+pub fn load_dotenv(project_path: Option<&Path>) {
     dotenvy::dotenv().ok();
 
-    let project_dir = if path.is_file() {
-        path.parent().unwrap_or(Path::new("."))
-    } else {
-        path
-    };
-
-    // Project-level .env overrides CWD .env
-    let env_file = project_dir.join(".env");
-    if env_file.exists() {
-        dotenvy::from_path(&env_file).ok();
+    if let Some(path) = project_path {
+        let project_dir = if path.is_file() {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path
+        };
+        let env_file = project_dir.join(".env");
+        if env_file.exists() {
+            dotenvy::from_path(&env_file).ok();
+        }
     }
+}
 
+/// Load a project's structure from a path (file or directory).
+///
+/// Does **not** touch the environment — `.env` loading happens once at startup
+/// via [`load_dotenv`]. Safe to call from request handlers on the async runtime.
+pub fn load_project(path: &Path) -> Result<ProjectLoader> {
     if path.is_file() {
         ProjectLoader::from_file(path)
     } else {

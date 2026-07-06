@@ -24,14 +24,15 @@ async fn test_05_simulated_crash_reconciles_cleanly() {
 
     // Simulate a crashed run: write intent but NOT completion.
     let run_id = store
-        .save_run_intent(
-            Some("crashed-run".into()),
-            "demo-flow",
-            "2026-04-23T10:00:00Z",
-            2,
-            3,
-            &[],
-        )
+        .save_run_intent(ironcrew::engine::run_history::RunIntent {
+            suggested_id: Some("crashed-run".into()),
+            flow_name: "demo-flow".into(),
+            flow: "demo-flow".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: 2,
+            task_count: 3,
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(run_id, "crashed-run");
@@ -65,6 +66,7 @@ impl ironcrew::llm::provider::LlmProvider for StubProvider {
             reasoning: None,
             tool_calls: vec![],
             usage: None,
+            raw_blocks: None,
         })
     }
 
@@ -116,14 +118,15 @@ async fn test_04_full_lifecycle_writes_success_record() {
 
     // Write intent directly (mimics what crew:run() does in the two-phase path).
     let run_id = store
-        .save_run_intent(
-            None,
-            &crew.goal,
-            "2026-04-23T10:00:00Z",
-            crew.agents.len(),
-            crew.tasks.len(),
-            &[],
-        )
+        .save_run_intent(ironcrew::engine::run_history::RunIntent {
+            suggested_id: None,
+            flow_name: crew.goal.clone(),
+            flow: "demo-flow".into(),
+            started_at: "2026-04-23T10:00:00Z".into(),
+            agent_count: crew.agents.len(),
+            task_count: crew.tasks.len(),
+            ..Default::default()
+        })
         .await
         .unwrap();
 
@@ -144,12 +147,14 @@ async fn test_04_full_lifecycle_writes_success_record() {
     store
         .update_run_completion(
             &run_id,
-            record.status.clone(),
-            &run_end.to_rfc3339(),
-            total_ms,
-            record.task_results.clone(),
-            record.total_tokens,
-            record.cached_tokens,
+            ironcrew::engine::run_history::RunCompletion {
+                status: record.status.clone(),
+                finished_at: run_end.to_rfc3339(),
+                duration_ms: total_ms,
+                task_results: record.task_results.clone(),
+                total_tokens: record.total_tokens,
+                cached_tokens: record.cached_tokens,
+            },
         )
         .await
         .unwrap();
