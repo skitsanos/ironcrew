@@ -82,6 +82,31 @@ async fn test_template_render_with_conditional() {
     assert_eq!(result, "Active");
 }
 
+/// Regression guard for the tera 1.x -> 2.0 upgrade. Exercises the exact
+/// template shape used by `examples/http-api/crew.lua`: a `{% for %}` loop over
+/// an array of objects with field access plus the `truncate` filter called with
+/// an explicit `length=` argument. tera 2.0 dropped the *default* args on
+/// `truncate`, so this pins down that an explicit-length call still renders.
+#[tokio::test]
+async fn test_template_render_loop_with_truncate_filter() {
+    let tool = TemplateRenderTool::new();
+    let ctx = ToolCallContext::default();
+    let result = tool
+        .execute(
+            json!({
+                "template": "{% for post in posts %}{{ post.id }}. {{ post.title | truncate(length=5) }}\n{% endfor %}",
+                "data": {"posts": [
+                    {"id": 1, "title": "abcdefghij"},
+                    {"id": 2, "title": "hi"}
+                ]}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "1. abcde…\n2. hi\n");
+}
+
 #[tokio::test]
 async fn test_file_read_glob_basic() {
     let dir = tempfile::tempdir().unwrap();
