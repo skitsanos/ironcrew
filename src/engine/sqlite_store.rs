@@ -452,11 +452,12 @@ impl StateStore for SqliteStore {
                 }
 
                 let boxed = to_sql_params(wc.params);
-                let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
 
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite prepare error: {}", e))
+                })?;
 
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(refs), |row| {
@@ -509,7 +510,8 @@ impl StateStore for SqliteStore {
 
                 let sql = format!("SELECT COUNT(*) FROM runs{}", wc.sql);
                 let boxed = to_sql_params(wc.params);
-                let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
 
                 let count: i64 = conn
                     .query_row(&sql, rusqlite::params_from_iter(refs), |row| row.get(0))
@@ -535,7 +537,9 @@ impl StateStore for SqliteStore {
                         "DELETE FROM runs WHERE run_id = ?1",
                         rusqlite::params![run_id],
                     )
-                    .map_err(|e| IronCrewError::Validation(format!("SQLite delete error: {}", e)))?;
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite delete error: {}", e))
+                    })?;
 
                 if affected == 0 {
                     return Err(IronCrewError::Validation(format!(
@@ -717,9 +721,9 @@ impl StateStore for SqliteStore {
                     }
                 }
 
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    IronCrewError::Validation(format!("SQLite prepare error: {}", e))
+                })?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
 
@@ -1042,7 +1046,8 @@ impl StateStore for SqliteStore {
 
                 let sql = format!("SELECT COUNT(*) FROM audit_events{}", wc.sql);
                 let boxed = to_sql_params(wc.params);
-                let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+                let refs: Vec<&dyn rusqlite::types::ToSql> =
+                    boxed.iter().map(|b| b.as_ref()).collect();
 
                 let count: i64 = conn
                     .query_row(&sql, rusqlite::params_from_iter(refs), |row| row.get(0))

@@ -116,7 +116,13 @@ mod tests {
 
     #[test]
     fn blocks_private_and_internal_v4() {
-        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+        ] {
             assert!(check_ip(v4(ip)).is_err(), "expected {ip} to be blocked");
         }
     }

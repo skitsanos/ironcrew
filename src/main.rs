@@ -199,48 +199,52 @@ fn main() {
 
     let result = runtime.block_on(async {
         match cli.command {
-        Commands::Run {
-            path,
-            input,
-            json,
-            tag,
-        } => cli::commands::cmd_run(&path, input.as_deref(), json, tag).await,
-        Commands::Validate { path } => cli::commands::cmd_validate(&path),
-        Commands::List { path } => cli::commands::cmd_list(&path),
-        Commands::Init { name } => cli::commands::cmd_init(&name),
-        Commands::Nodes => cli::commands::cmd_nodes(),
-        Commands::Inspect { run_id, project } => cli::history::cmd_inspect(&project, &run_id).await,
-        Commands::Clean { project, keep, all } => {
-            cli::history::cmd_clean(&project, keep, all).await
-        }
-        Commands::Serve {
-            host,
-            port,
-            flows_dir,
-        } => cli::server::cmd_serve(&host, port, &flows_dir).await,
-        Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
-        Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
-        Commands::Export { path, output } => cli::commands::cmd_export(&path, output.as_deref()),
-        Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
-        Commands::Chat { path, agent, id } => cli::chat::cmd_chat(&path, agent, id).await,
-        Commands::Runs {
-            status,
-            tag,
-            since,
-            limit,
-            offset,
-            project,
-        } => {
-            cli::history::cmd_runs(
-                &project,
-                status.as_deref(),
-                tag.as_deref(),
-                since.as_deref(),
+            Commands::Run {
+                path,
+                input,
+                json,
+                tag,
+            } => cli::commands::cmd_run(&path, input.as_deref(), json, tag).await,
+            Commands::Validate { path } => cli::commands::cmd_validate(&path),
+            Commands::List { path } => cli::commands::cmd_list(&path),
+            Commands::Init { name } => cli::commands::cmd_init(&name),
+            Commands::Nodes => cli::commands::cmd_nodes(),
+            Commands::Inspect { run_id, project } => {
+                cli::history::cmd_inspect(&project, &run_id).await
+            }
+            Commands::Clean { project, keep, all } => {
+                cli::history::cmd_clean(&project, keep, all).await
+            }
+            Commands::Serve {
+                host,
+                port,
+                flows_dir,
+            } => cli::server::cmd_serve(&host, port, &flows_dir).await,
+            Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
+            Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
+            Commands::Export { path, output } => {
+                cli::commands::cmd_export(&path, output.as_deref())
+            }
+            Commands::Graph { path, output } => cli::graph::cmd_graph(&path, output.as_deref()),
+            Commands::Chat { path, agent, id } => cli::chat::cmd_chat(&path, agent, id).await,
+            Commands::Runs {
+                status,
+                tag,
+                since,
                 limit,
                 offset,
-            )
-            .await
-        }
+                project,
+            } => {
+                cli::history::cmd_runs(
+                    &project,
+                    status.as_deref(),
+                    tag.as_deref(),
+                    since.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await
+            }
         }
     });
 

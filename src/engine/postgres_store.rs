@@ -554,7 +554,10 @@ impl StateStore for PostgresStore {
         // SQLite backend. We NEVER select task_results — that's the whole
         // point of the summary view. LIMIT/OFFSET stay inline (trusted
         // integers) so the builder's `$N` numbering is left undisturbed.
-        let WhereClause { sql: where_sql, params } = store_sql::runs_where(filter, Dialect::Postgres);
+        let WhereClause {
+            sql: where_sql,
+            params,
+        } = store_sql::runs_where(filter, Dialect::Postgres);
         let mut sql = format!(
             "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
              agent_count, task_count, total_tokens, cached_tokens, tags::text \
@@ -581,7 +584,10 @@ impl StateStore for PostgresStore {
     }
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
-        let WhereClause { sql: where_sql, params } = store_sql::runs_where(filter, Dialect::Postgres);
+        let WhereClause {
+            sql: where_sql,
+            params,
+        } = store_sql::runs_where(filter, Dialect::Postgres);
         let sql = format!("SELECT COUNT(*) FROM {}{}", self.table_name, where_sql);
 
         let query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
@@ -951,7 +957,10 @@ impl StateStore for PostgresStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
-        let WhereClause { sql: where_sql, params } = store_sql::audit_where(filter, Dialect::Postgres);
+        let WhereClause {
+            sql: where_sql,
+            params,
+        } = store_sql::audit_where(filter, Dialect::Postgres);
         let mut sql = format!(
             "SELECT id, timestamp, action, flow_path, target, actor, source_ip, success, status_code, metadata::text
              FROM {}{}",
@@ -1004,8 +1013,14 @@ impl StateStore for PostgresStore {
     }
 
     async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
-        let WhereClause { sql: where_sql, params } = store_sql::audit_where(filter, Dialect::Postgres);
-        let sql = format!("SELECT COUNT(*) FROM {}{}", self.audit_events_table, where_sql);
+        let WhereClause {
+            sql: where_sql,
+            params,
+        } = store_sql::audit_where(filter, Dialect::Postgres);
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}{}",
+            self.audit_events_table, where_sql
+        );
 
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.to_string()));
         for p in &params {
