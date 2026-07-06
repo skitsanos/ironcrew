@@ -34,53 +34,33 @@ fn get_or_compile_regex(pattern: &str) -> mlua::Result<regex::Regex> {
 
 /// Register utility global functions available in all Lua sandboxes.
 pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
-    // env() — blocks sensitive variables by default.
+    // env() — fail-closed allowlist. Lua can read ONLY the environment
+    // variables whose exact names appear in IRONCREW_ENV_ALLOWLIST
+    // (comma-separated, case-insensitive). Every other name returns nil.
     //
-    // Two env vars tune the behavior at runtime:
-    //   * IRONCREW_ENV_ALLOWLIST — comma-separated exact names that bypass
-    //     ALL block rules (hardcoded defaults, suffix patterns, and the
-    //     custom blocklist). Use to expose specific secrets to your own
-    //     crews (e.g. `AZURE_OPENAI_API_KEY`).
-    //   * IRONCREW_ENV_BLOCKLIST — comma-separated names to ADD to the
-    //     deny set.
-    //
-    // The allowlist is checked first and wins over every block rule, so
-    // operators can grant precise per-var access without disabling the
-    // generic `*_API_KEY` etc. patterns for the rest of the codebase.
+    // This replaces the earlier suffix denylist, which was fail-open and
+    // silently leaked credentials it didn't anticipate — e.g.
+    // AWS_SECRET_ACCESS_KEY (ends `_ACCESS_KEY`, not `_API_KEY`),
+    // AWS_ACCESS_KEY_ID, GOOGLE_APPLICATION_CREDENTIALS, and anything ending
+    // `_KEY`/`_CREDENTIALS`. An allowlist matches the fail-closed posture of
+    // the rest of the sandbox: operators opt specific, non-secret vars in per
+    // deployment (e.g. `IRONCREW_ENV_ALLOWLIST=APP_REGION,FEATURE_FLAGS`).
     let env_fn = lua.create_function(|_, name: String| {
-        const DEFAULT_BLOCKED: &[&str] = &[
-            "DATABASE_URL",
-            "IRONCREW_API_TOKEN",
-            "IRONCREW_PG_TABLE_PREFIX",
-        ];
-        const BLOCKED_SUFFIXES: &[&str] = &["_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD"];
-
-        let upper = name.to_uppercase();
-
-        // 1. Allowlist wins — operator has explicitly opted in to this name.
         let allowlist = std::env::var("IRONCREW_ENV_ALLOWLIST").unwrap_or_default();
-        if allowlist
+        let allowed = allowlist
             .split(',')
             .map(|s| s.trim())
-            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(&name))
-        {
-            return Ok(std::env::var(&name).ok());
+            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(&name));
+
+        if allowed {
+            Ok(std::env::var(&name).ok())
+        } else {
+            tracing::warn!(
+                "Lua env('{}') blocked: name is not in IRONCREW_ENV_ALLOWLIST",
+                name
+            );
+            Ok(None)
         }
-
-        // 2. Otherwise apply the deny set: defaults + suffix patterns +
-        //    custom blocklist.
-        let custom_blocked = std::env::var("IRONCREW_ENV_BLOCKLIST").unwrap_or_default();
-        let custom: Vec<&str> = custom_blocked.split(',').map(|s| s.trim()).collect();
-
-        if DEFAULT_BLOCKED.contains(&upper.as_str())
-            || custom.iter().any(|b| b.eq_ignore_ascii_case(&name))
-            || BLOCKED_SUFFIXES.iter().any(|s| upper.ends_with(s))
-        {
-            tracing::warn!("Lua env() blocked access to '{}'", name);
-            return Ok(None);
-        }
-
-        Ok(std::env::var(&name).ok())
     })?;
     lua.globals().set("env", env_fn)?;
 
