@@ -56,6 +56,7 @@ pub async fn execute_foreach_task(
     max_concurrent: usize,
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
+    ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
 ) -> Result<TaskResult> {
     let item_var = task
         .foreach_as
@@ -164,6 +165,7 @@ pub async fn execute_foreach_task(
                     None,
                     before_task_hook,
                     after_task_hook,
+                    ask_human,
                 )
                 .await
             })
@@ -237,6 +239,7 @@ pub async fn execute_foreach_task(
                 None,
                 before_task_hook,
                 after_task_hook,
+                ask_human,
             )
             .await
             {

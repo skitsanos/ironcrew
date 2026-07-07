@@ -143,6 +143,10 @@ impl Tool for AgentAsTool {
             tool_registry: Some(augmented_registry),
             caller_agent: Some(self.agent.name.clone()),
             caller_scope: ctx.caller_scope.clone(),
+            // Delegated agents inherit the human-input transport, so a
+            // sub-agent can also pause to ask (depth-capped like the rest
+            // of the delegation machinery).
+            ask_human: ctx.ask_human.clone(),
         };
 
         // 5. Emit the opening bracket event.
