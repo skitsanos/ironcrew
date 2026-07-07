@@ -52,6 +52,8 @@ fn fixture(project_dir: &Path) -> (mlua::Lua, Arc<InputBridge>, EventBus) {
     lua.set_app_data(AskHumanContext {
         bridge: bridge.clone(),
         run_id: None, // store-status transitions are covered by store tests
+        store: None,
+        eventbus: None,
     });
 
     // Inject an EventBus the way the serve handler does, so we can assert

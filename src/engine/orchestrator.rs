@@ -367,6 +367,7 @@ pub async fn run_crew(
                     max_concurrent,
                     before_hook,
                     after_hook,
+                    crew.ask_human.as_ref(),
                 )
                 .await?;
 
@@ -670,6 +671,7 @@ pub async fn run_crew(
             let messagebus = crew.messagebus.clone();
             let before_hook = crew.before_task_hooks.get(&agent.name).cloned();
             let after_hook = crew.after_task_hooks.get(&agent.name).cloned();
+            let ask_human = crew.ask_human.clone();
 
             futures.push(async move {
                 let _permit = match sem {
@@ -690,6 +692,7 @@ pub async fn run_crew(
                     should_stream,
                     before_hook,
                     after_hook,
+                    ask_human,
                 )
                 .await
             });

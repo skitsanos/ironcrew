@@ -49,7 +49,7 @@ local results = crew:run()
 - **Reasoning/thinking support** — captures chain-of-thought from Anthropic, DeepSeek, Kimi, and OpenAI Responses API; streams dim to stderr and persists to run records
 - **Server-side tools** — built-in `web_search`, `code_execution`, `file_search`, `code_interpreter` via Anthropic and OpenAI Responses
 - **Structured output** — JSON Schema `response_format` for validated LLM responses
-- **9 built-in tools** — file I/O, HTTP, hashing, templates, schema validation
+- **10 built-in tools** — file I/O, HTTP, hashing, templates, schema validation, human-input (`ask_human`)
 - **Memory & MessageBus** — shared state and agent-to-agent communication
 - **Collaborative tasks** — multi-agent discussions with automatic synthesis
 - **REST API + SSE** — run crews via HTTP with real-time event streaming

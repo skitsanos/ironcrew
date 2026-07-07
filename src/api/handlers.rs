@@ -306,11 +306,14 @@ async fn execute_crew_from_path_with_events(
     lua.set_app_data(run_id.to_string());
 
     // Human-input transport for crew:ask_human() — carries the run_id so the
-    // method can flip the run between Running and WaitingForInput.
+    // method can flip the run between Running and WaitingForInput, plus the
+    // store + bus the agent-facing ask_human tool needs inside crew:run().
     if let Some(bridge) = input_bridge {
         lua.set_app_data(crate::engine::input_bridge::AskHumanContext {
             bridge,
             run_id: Some(run_id.to_string()),
+            store: shared_store.clone(),
+            eventbus: Some(eventbus.clone()),
         });
     }
 

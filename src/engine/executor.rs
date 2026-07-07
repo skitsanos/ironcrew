@@ -93,6 +93,8 @@ pub struct TaskExecutionContext<'a> {
     pub prompt_cache_retention: Option<String>,
     pub before_task_hook: Option<&'a [u8]>,
     pub after_task_hook: Option<&'a [u8]>,
+    /// Human-input transport for the agent-facing `ask_human` tool.
+    pub ask_human: Option<&'a crate::engine::input_bridge::AskHumanContext>,
 }
 
 impl<'a> TaskExecutionContext<'a> {
@@ -305,17 +307,24 @@ impl<'a> TaskExecutionContext<'a> {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                let tool_timeout = std::time::Duration::from_secs(
-                    std::env::var("IRONCREW_TOOL_TIMEOUT")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(60),
-                );
+                let tool_timeout = self
+                    .tool_registry
+                    .get(&tool_call.function.name)
+                    .and_then(|tool| tool.dispatch_timeout(&args))
+                    .unwrap_or_else(|| {
+                        std::time::Duration::from_secs(
+                            std::env::var("IRONCREW_TOOL_TIMEOUT")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(60),
+                        )
+                    });
 
                 let tool_ctx = ToolCallContext {
                     tool_registry: Some(self.tool_registry.clone()),
                     caller_agent: Some(self.agent.name.clone()),
                     caller_scope: Some(self.task.name.clone()),
+                    ask_human: self.ask_human.cloned(),
                     ..ToolCallContext::default()
                 };
                 let tool_result = match tokio::time::timeout(
@@ -372,6 +381,7 @@ pub async fn execute_task_standalone(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -393,6 +403,7 @@ pub async fn execute_task_standalone_with_hooks(
     prompt_cache_retention: Option<String>,
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
+    ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
 ) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
     let ctx = TaskExecutionContext {
         task,
@@ -409,6 +420,7 @@ pub async fn execute_task_standalone_with_hooks(
         prompt_cache_retention,
         before_task_hook,
         after_task_hook,
+        ask_human,
     };
     ctx.execute().await
 }

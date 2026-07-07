@@ -43,6 +43,10 @@ impl Runtime {
         tool_registry.register(Box::new(HashTool::new()));
         tool_registry.register(Box::new(TemplateRenderTool::new()));
         tool_registry.register(Box::new(ValidateSchemaTool::new()));
+        // Agent-facing human-input tool. Registered unconditionally (agents
+        // still opt in via their tools list); without a per-run bridge the
+        // tool fails with a clear "unavailable" message instead of hanging.
+        tool_registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new()));
 
         // Shell tool only registered when explicitly opted in via env var
         if std::env::var("IRONCREW_ALLOW_SHELL")
