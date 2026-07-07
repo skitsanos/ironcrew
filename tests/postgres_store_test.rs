@@ -383,3 +383,88 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     // The pre-migration legacy row is not visible under a real flow scope.
     assert_eq!(store.count_runs(&scoped).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn pg_update_run_status_waiting_round_trip() {
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_update_run_status_waiting_round_trip: IRONCREW_TEST_PG_URL unset");
+        return;
+    };
+    let prefix = "wfi_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+
+    store
+        .save_run_intent(intent("wfi-1", "demo", "2026-07-07T10:00:00Z", vec![]))
+        .await
+        .unwrap();
+
+    // Running -> WaitingForInput -> back (ask_human suspend/resume).
+    store
+        .update_run_status("wfi-1", RunStatus::WaitingForInput)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_run("wfi-1").await.unwrap().status,
+        RunStatus::WaitingForInput
+    );
+
+    // Completion is accepted while WaitingForInput.
+    store
+        .update_run_completion(
+            "wfi-1",
+            RunCompletion {
+                status: RunStatus::Failed,
+                finished_at: "2026-07-07T10:01:00Z".into(),
+                duration_ms: 60_000,
+                task_results: Vec::new(),
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Terminal records reject flips; unknown ids error.
+    assert!(
+        store
+            .update_run_status("wfi-1", RunStatus::Running)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .update_run_status("missing", RunStatus::Running)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn pg_reconcile_sweeps_waiting_for_input() {
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_reconcile_sweeps_waiting_for_input: IRONCREW_TEST_PG_URL unset");
+        return;
+    };
+    let prefix = "wfirec_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+
+    store
+        .save_run_intent(intent("wfi-2", "demo", "2026-07-07T10:00:00Z", vec![]))
+        .await
+        .unwrap();
+    store
+        .update_run_status("wfi-2", RunStatus::WaitingForInput)
+        .await
+        .unwrap();
+
+    let count = store
+        .reconcile_abandoned_runs("2026-07-07T11:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let r = store.get_run("wfi-2").await.unwrap();
+    assert_eq!(r.status, RunStatus::Abandoned);
+    assert_eq!(r.finished_at, "2026-07-07T11:00:00Z");
+}

@@ -266,7 +266,7 @@ ironcrew runs -p . --limit 20 --offset 40   # page 3
 | Flag           | Default | Description |
 |----------------|---------|-------------|
 | `-p, --project`| `.`     | Project path (locates `.ironcrew/runs/`) |
-| `-s, --status` | (all)   | Filter by status: `success`, `partial_failure`, `failed` |
+| `-s, --status` | (all)   | Filter by status: `success`, `partial_failure`, `failed`, `running`, `waiting_for_input`, `abandoned` |
 | `-t, --tag`    | (all)   | Filter by tag (exact match against the run's tag list) |
 | `--since`      | (all)   | Only include runs started at or after this RFC3339 timestamp |
 | `-l, --limit`  | `20`    | Maximum number of runs to return |

@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
-use crate::engine::run_history::{ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunSummary};
+use crate::engine::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary,
+};
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 
@@ -19,9 +21,18 @@ pub trait StateStore: Send + Sync {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
 
     /// Called when a run completes (success, partial failure, or hard
-    /// failure). Transitions a Running record to a terminal state.
-    /// Returns an error if the run_id doesn't exist or isn't Running.
+    /// failure). Transitions an in-flight record (Running or WaitingForInput)
+    /// to a terminal state. Returns an error if the run_id doesn't exist or
+    /// is already terminal.
     async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()>;
+
+    /// Flip an in-flight run between `Running` and `WaitingForInput` (both
+    /// directions — `crew:ask_human()` suspends and resumes). Narrow by
+    /// design: touches only the status column, never task_results or
+    /// finished_at. Returns an error if the run_id doesn't exist or is
+    /// already terminal, so a completed run can never be dragged back to an
+    /// in-flight state.
+    async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()>;
 
     /// Called once at ironcrew {run,serve} startup. Atomically flips
     /// every record whose status is Running to Abandoned, setting
