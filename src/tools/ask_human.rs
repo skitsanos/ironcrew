@@ -143,6 +143,7 @@ impl Tool for AskHumanTool {
                 prompt: prompt.clone(),
                 choices: choices.clone(),
                 timeout_s,
+                kind: "question".into(),
             });
         }
 
@@ -157,7 +158,7 @@ impl Tool for AskHumanTool {
 
         let outcome = ask
             .bridge
-            .ask(&question_id, &prompt, &choices, timeout_s)
+            .ask(&question_id, &prompt, &choices, timeout_s, "question")
             .await?;
 
         if let (Some(store), Some(run_id)) = (&store, &ask.run_id)

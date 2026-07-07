@@ -59,6 +59,9 @@ pub struct QuestionInfo {
     pub choices: Vec<String>,
     pub asked_at: String,
     pub timeout_s: u64,
+    /// `"question"` (ask_human) or `"approval"` (tool approval gate) — lets
+    /// UIs render an answer form vs allow/deny buttons off one field.
+    pub kind: String,
 }
 
 struct PendingQuestion {
@@ -148,15 +151,20 @@ impl InputBridge {
 
     /// Ask a question and suspend until it resolves. Emitting events and
     /// flipping the run status around this call is the caller's job.
+    /// `kind` is `"question"` or `"approval"` (see `QuestionInfo::kind`).
     pub async fn ask(
         &self,
         question_id: &str,
         prompt: &str,
         choices: &[String],
         timeout_s: u64,
+        kind: &str,
     ) -> Result<AskOutcome> {
         match self.mode {
-            BridgeMode::Http => self.ask_http(question_id, prompt, choices, timeout_s).await,
+            BridgeMode::Http => {
+                self.ask_http(question_id, prompt, choices, timeout_s, kind)
+                    .await
+            }
             BridgeMode::Tty => ask_tty(prompt, choices, timeout_s).await,
         }
     }
@@ -167,8 +175,9 @@ impl InputBridge {
         prompt: &str,
         choices: &[String],
         timeout_s: u64,
+        kind: &str,
     ) -> Result<AskOutcome> {
-        let rx = self.register(question_id, prompt, choices, timeout_s)?;
+        let rx = self.register(question_id, prompt, choices, timeout_s, kind)?;
 
         let outcome = tokio::select! {
             answer = rx => match answer {
@@ -197,6 +206,7 @@ impl InputBridge {
         prompt: &str,
         choices: &[String],
         timeout_s: u64,
+        kind: &str,
     ) -> Result<oneshot::Receiver<serde_json::Value>> {
         let mut map = self.pending.lock().expect("input bridge lock poisoned");
         if map.len() >= max_pending() {
@@ -215,6 +225,7 @@ impl InputBridge {
                     choices: choices.to_vec(),
                     asked_at: chrono::Utc::now().to_rfc3339(),
                     timeout_s,
+                    kind: kind.to_string(),
                 },
                 tx,
             },
@@ -289,8 +300,14 @@ mod tests {
         let b = std::sync::Arc::new(bridge());
         let b2 = b.clone();
         let ask = tokio::spawn(async move {
-            b2.ask("q1", "Proceed?", &["yes".into(), "no".into()], 30)
-                .await
+            b2.ask(
+                "q1",
+                "Proceed?",
+                &["yes".into(), "no".into()],
+                30,
+                "question",
+            )
+            .await
         });
 
         // Wait until the question is registered, then answer.
@@ -310,7 +327,10 @@ mod tests {
     #[tokio::test]
     async fn timeout_removes_question_and_rejects_late_answer() {
         let b = bridge();
-        let outcome = b.ask("q1", "Anyone there?", &[], 0).await.unwrap();
+        let outcome = b
+            .ask("q1", "Anyone there?", &[], 0, "question")
+            .await
+            .unwrap();
         assert!(matches!(outcome, AskOutcome::TimedOut));
         assert_eq!(b.pending_count(), 0);
         assert!(b.answer("q1", json!("too late")).is_err());
@@ -326,7 +346,7 @@ mod tests {
     async fn double_answer_second_writer_loses() {
         let b = std::sync::Arc::new(bridge());
         let b2 = b.clone();
-        let ask = tokio::spawn(async move { b2.ask("q1", "Pick", &[], 30).await });
+        let ask = tokio::spawn(async move { b2.ask("q1", "Pick", &[], 30, "question").await });
         while b.pending_count() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -346,14 +366,16 @@ mod tests {
         for i in 0..DEFAULT_MAX_PENDING {
             let b2 = b.clone();
             handles.push(tokio::spawn(async move {
-                let _ = b2.ask(&format!("q{}", i), "wait", &[], 30).await;
+                let _ = b2
+                    .ask(&format!("q{}", i), "wait", &[], 30, "question")
+                    .await;
             }));
         }
         while b.pending_count() < DEFAULT_MAX_PENDING {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         // One more trips the guard.
-        let err = b.ask("overflow", "one too many", &[], 30).await;
+        let err = b.ask("overflow", "one too many", &[], 30, "question").await;
         assert!(err.is_err());
         // Unblock the parked askers.
         for i in 0..DEFAULT_MAX_PENDING {
@@ -370,9 +392,11 @@ mod tests {
         // first must resume the right asker (spec §9.8).
         let b = std::sync::Arc::new(bridge());
         let b1 = b.clone();
-        let ask_a = tokio::spawn(async move { b1.ask("qa", "branch A", &[], 30).await });
+        let ask_a =
+            tokio::spawn(async move { b1.ask("qa", "branch A", &[], 30, "question").await });
         let b2 = b.clone();
-        let ask_b = tokio::spawn(async move { b2.ask("qb", "branch B", &[], 30).await });
+        let ask_b =
+            tokio::spawn(async move { b2.ask("qb", "branch B", &[], 30, "question").await });
 
         while b.pending_count() < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -397,7 +421,9 @@ mod tests {
             let b2 = b.clone();
             let id = id.to_string();
             tokio::spawn(async move {
-                let _ = b2.ask(&id, &format!("q #{}", i), &["x".into()], 30).await;
+                let _ = b2
+                    .ask(&id, &format!("q #{}", i), &["x".into()], 30, "question")
+                    .await;
             });
         }
         while b.pending_count() < 2 {

@@ -1,4 +1,5 @@
 pub mod agent_as_tool;
+pub mod approval;
 pub mod ask_human;
 pub mod file_read;
 pub mod file_read_glob;
