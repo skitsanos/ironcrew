@@ -118,7 +118,9 @@ async fn ask_human_returns_the_posted_answer() {
                 prompt,
                 choices,
                 timeout_s,
+                kind,
             } => {
+                assert_eq!(kind, "question");
                 assert_eq!(qid, &question_id);
                 assert_eq!(prompt, "Proceed with deploy?");
                 assert_eq!(choices.len(), 2);

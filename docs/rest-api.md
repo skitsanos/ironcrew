@@ -123,7 +123,8 @@ curl http://localhost:3000/flows/my-crew/questions/abc-123
       "prompt": "Deploy to production?",
       "choices": ["yes", "no", "staging only"],
       "asked_at": "2026-07-07T10:00:00Z",
-      "timeout_s": 600
+      "timeout_s": 600,
+      "kind": "question"
     }
   ]
 }
@@ -132,6 +133,14 @@ curl http://localhost:3000/flows/my-crew/questions/abc-123
 `status` is `"running"` with an empty array when nothing is pending. `404`
 when the run is not active under this flow — like `abort`, the endpoint is
 flow-scoped and never confirms that a run exists under a different flow.
+
+`kind` is `"question"` (from `crew:ask_human()` or the agent-facing
+`ask_human` tool) or `"approval"` (from a
+[tool approval gate](crews.md#approval-gates-require_approval)) — render an
+answer form for the first, allow/always/deny buttons for the second. For
+approvals, only the exact tokens `allow`/`yes`/`always` permit the call;
+anything else denies (free text is forwarded to the agent as the denial
+reason).
 
 ### Answer a question
 
@@ -210,7 +219,7 @@ full untruncated output.
 | `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended (either reached `max_turns` or a `should_stop` callback stopped it; `stop_reason` is present only when the callback stopped it) |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
-| `human_input_requested` | `question_id`, `prompt`, `choices`, `timeout_s`            | `crew:ask_human()` suspended the run on a question — render a form and POST to the [answer endpoint](#answer-a-question) |
+| `human_input_requested` | `question_id`, `prompt`, `choices`, `timeout_s`, `kind`    | The run suspended on a human question (`kind: "question"` from ask_human, `"approval"` from a tool approval gate) — render a form / allow-deny buttons and POST to the [answer endpoint](#answer-a-question) |
 | `human_input_received` | `question_id`, `outcome`                                    | The question resolved (`outcome`: `"answered"` or `"timeout"`). Never carries the answer content — answers may contain secrets |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
 | `run_complete`       | `run_id`, `status`, `duration_ms`, `total_tokens`             | Run finished (terminal event)                |
