@@ -665,6 +665,100 @@ delivered when each agent registers.
 
 ---
 
+## Human-in-the-Loop: `ask_human`
+
+`crew:ask_human(opts)` suspends the flow until a human answers — the mid-run
+counterpart to conversations (which are human-driven from the start). Use it
+for approval points, missing parameters, or any decision the flow shouldn't
+make on its own.
+
+```lua
+-- Free-form answer
+local region = crew:ask_human({ prompt = "Which region should this report cover?" })
+
+-- Constrained choice with timeout + fallback
+local decision = crew:ask_human({
+    prompt    = "Ready to publish. Proceed?",
+    choices   = { "publish", "hold" },
+    timeout_s = 300,
+    default   = "hold",
+})
+
+-- Structured answer: whatever JSON the caller posts comes back as a Lua value
+local params = crew:ask_human({ prompt = "Adjust thresholds (JSON object expected)" })
+print(params.max_items)
+```
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `prompt` | string | yes | Question shown to the human |
+| `choices` | array of strings | no | Advisory choice list, surfaced to UIs for rendering buttons. Not enforced — free-text answers are accepted; validate in Lua if you need strict values. |
+| `timeout_s` | integer | no | Per-question timeout. Default `IRONCREW_ASK_HUMAN_TIMEOUT` (600 s). |
+| `default` | any | no | Returned on timeout instead of raising an error |
+
+Returns the answer as a Lua value. On timeout **without** a `default`, raises
+`ask_human timed out after <n>s` — catch with `pcall` or let the task-retry
+machinery treat it like any other failure.
+
+### Where the answer comes from
+
+- **Server mode** (`ironcrew serve`): the run suspends, the SSE stream emits
+  `human_input_requested`, and the answer arrives via
+  [`POST /flows/{flow}/answer/{run_id}`](rest-api.md#answer-a-question). A UI
+  that missed the event lists pending questions with
+  `GET /flows/{flow}/questions/{run_id}`.
+- **CLI mode** (`ironcrew run`): the prompt (and numbered choices) print to
+  stderr and the answer is read from stdin. A bare number picks the matching
+  choice. Non-TTY stdin (piped, CI) resolves as an immediate timeout, so
+  unattended runs fall through to `default` or fail cleanly instead of
+  hanging — the same flow works attended and unattended.
+
+Parallel branches (`foreach_parallel`) may each ask concurrently; questions
+are answered independently by `question_id`, capped at
+`IRONCREW_ASK_HUMAN_MAX_PENDING` (default 16) per run.
+
+Note on run status: the persisted run record flips to `waiting_for_input`
+only when a run record exists at ask time (the record is created inside
+`crew:run()`). For the common pattern — asking in flow code before or between
+runs — the questions endpoint is the authoritative "waiting" signal.
+
+### Steering dialogs with ask_human
+
+Dialog callbacks are ordinary Lua, so a human can arbitrate an agent-to-agent
+dialog without any dedicated machinery:
+
+```lua
+local dialog = crew:dialog({
+    agents = { "optimist", "skeptic" },
+    max_turns = 12,
+    should_stop = function(last_turn, transcript)
+        -- Every 4 turns, let the human decide whether the debate continues.
+        -- should_stop is invoked via call_async, so the suspension works.
+        if #transcript % 4 == 0 then
+            local verdict = crew:ask_human({
+                prompt    = "Turn " .. last_turn.index .. ": continue the debate?",
+                choices   = { "continue", "stop" },
+                timeout_s = 120,
+                default   = "continue",
+            })
+            if verdict == "stop" then
+                return "stopped by human moderator"
+            end
+        end
+        return false
+    end,
+})
+```
+
+### Environment Variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `IRONCREW_ASK_HUMAN_TIMEOUT` | `600` | Default per-question timeout (seconds) when `timeout_s` is omitted |
+| `IRONCREW_ASK_HUMAN_MAX_PENDING` | `16` | Per-run cap on simultaneously pending questions |
+
+---
+
 ## Model Router
 
 The model router lets you assign different models to different execution phases
