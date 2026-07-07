@@ -117,12 +117,13 @@ pub(crate) async fn finalize_agent_tools(
     lua_crew: &LuaCrew,
 ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
     // 1. Snapshot everything we need off the crew under a short lock.
-    let (agents, default_model, max_tool_rounds) = {
+    let (agents, default_model, max_tool_rounds, require_approval) = {
         let crew_guard = lua_crew.crew.lock().await;
         (
             crew_guard.agents.clone(),
             crew_guard.provider_config.model.clone(),
             crew_guard.max_tool_rounds,
+            crew_guard.require_approval.clone(),
         )
     };
     let max_history = crate::lua::conversation::default_max_history();
@@ -220,6 +221,14 @@ pub(crate) async fn finalize_agent_tools(
         );
         registry.register_arc(Arc::new(tool));
     }
+
+    // Attach the approval policy (crew config ∪ IRONCREW_REQUIRE_APPROVAL)
+    // to the finalized registry. Every clone handed out from here —
+    // executor loops, dialogs, conversations, delegated sub-agents —
+    // shares the same policy and its "always" grant set.
+    registry.set_approval_policy(crate::tools::approval::ApprovalPolicy::from_rules(
+        &require_approval,
+    ));
 
     Ok(Arc::new(FinalizedAgentTools { registry }))
 }
@@ -417,6 +426,7 @@ impl UserData for LuaCrew {
                 prompt: prompt.clone(),
                 choices: choices.clone(),
                 timeout_s,
+                kind: "question".into(),
             });
 
             // Mark the run suspended. Idempotent under concurrent questions
@@ -438,7 +448,7 @@ impl UserData for LuaCrew {
 
             let outcome = ctx
                 .bridge
-                .ask(&question_id, &prompt, &choices, timeout_s)
+                .ask(&question_id, &prompt, &choices, timeout_s, "question")
                 .await
                 .map_err(mlua::Error::external)?;
 

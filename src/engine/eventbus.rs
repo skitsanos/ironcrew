@@ -192,6 +192,8 @@ pub enum CrewEvent {
         prompt: String,
         choices: Vec<String>,
         timeout_s: u64,
+        /// `"question"` (ask_human) or `"approval"` (tool approval gate).
+        kind: String,
     },
 
     /// Deliberately carries no answer content: answers may contain secrets,

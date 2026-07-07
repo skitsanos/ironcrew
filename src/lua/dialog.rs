@@ -766,8 +766,7 @@ impl AgentDialog {
 
         let tool_timeout = self
             .tool_registry
-            .get(&tool_call.function.name)
-            .and_then(|tool| tool.dispatch_timeout(&args))
+            .dispatch_timeout(&tool_call.function.name, &args)
             .unwrap_or_else(|| {
                 Duration::from_secs(
                     std::env::var("IRONCREW_TOOL_TIMEOUT")

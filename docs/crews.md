@@ -752,6 +752,49 @@ Two behaviors are specific to the agent path:
 Delegated agents (`agent__<name>`) inherit the transport, so a sub-agent can
 also pause to ask.
 
+### Approval gates (`require_approval`)
+
+Gate specific tools behind a human sign-off — sandboxing controls what tools
+*can* do, approval gates control what they *may* do per-invocation:
+
+```lua
+local crew = Crew.new({
+    goal = "quarterly close",
+    require_approval = { "http_request", "file_write", "agent__deployer", "mcp__git__*" },
+})
+```
+
+Entries are exact tool names or prefix globs (trailing `*`); `"*"` gates
+everything. Operators can enforce a policy without editing flows via
+`IRONCREW_REQUIRE_APPROVAL` (comma-separated, same syntax) — the two lists
+are unioned. Works from `config.lua` project defaults too.
+
+When a gated tool is called, the run suspends on an approval question
+(`kind: "approval"` on SSE and the questions endpoint; a prompt in CLI
+mode) showing the agent, the tool, and its **redacted** arguments
+(sensitive-looking keys like `authorization`/`token`/`api_key` are masked;
+the serialized form is capped at `IRONCREW_APPROVAL_ARGS_MAX_CHARS`,
+default 600):
+
+```
+[approval] Agent 'analyst' wants to call http_request({"method":"POST",...}). Allow?
+  1. allow    -- run this call
+  2. always   -- run it, and stop asking for this tool this flow execution
+  3. deny     -- refuse; the agent sees "denied by human operator"
+```
+
+**Fail closed:** timeout (`IRONCREW_APPROVAL_TIMEOUT`, default = the
+ask_human default), a missing approval channel, or any answer that isn't an
+exact allow token all **deny**. A free-text answer denies AND is forwarded
+to the model as the reason — "no, use the cached data instead" becomes
+agent steering.
+
+The policy rides the tool registry, so it automatically covers built-ins,
+MCP tools, custom Lua tools, and `agent__<name>` delegation (the delegation
+itself can be gated, and delegated sub-agents inherit the caller's policy
+and its "always" grants). `ask_human` itself is never gated. Human-wait
+time is excluded from task timeouts, same as ask_human.
+
 ### Steering dialogs with ask_human
 
 Dialog callbacks are ordinary Lua, so a human can arbitrate an agent-to-agent
