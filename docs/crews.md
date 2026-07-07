@@ -722,6 +722,36 @@ only when a run record exists at ask time (the record is created inside
 `crew:run()`). For the common pattern — asking in flow code before or between
 runs — the questions endpoint is the authoritative "waiting" signal.
 
+### Letting agents ask (the `ask_human` tool)
+
+`crew:ask_human()` is scripted by the flow author at fixed points. To let an
+**agent decide mid-reasoning** that it needs the human, give it the built-in
+[`ask_human` tool](tools.md#ask_human):
+
+```lua
+crew:add_agent({
+    name = "analyst",
+    goal = "analyze quarterly data",
+    tools = { "ask_human" },
+})
+```
+
+When the model calls the tool, the task suspends on the same per-run
+transport — same SSE events, same `questions`/`answer` endpoints, same
+terminal prompt in CLI mode. The human sees who's asking (`[analyst] …`).
+Two behaviors are specific to the agent path:
+
+- **Human-wait time is excluded from the task timeout.** A task suspended on
+  a question is observably waiting, not stuck, so `timeout_secs` doesn't
+  tick while a question is pending (`IRONCREW_MAX_RUN_LIFETIME` still bounds
+  the whole run).
+- **Timeouts return a soft result**, not an error: the model gets a
+  `[no answer]` message instructing it to proceed on its best judgment,
+  so it doesn't retry into another full wait.
+
+Delegated agents (`agent__<name>`) inherit the transport, so a sub-agent can
+also pause to ask.
+
 ### Steering dialogs with ask_human
 
 Dialog callbacks are ordinary Lua, so a human can arbitrate an agent-to-agent

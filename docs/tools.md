@@ -171,6 +171,43 @@ Validate a JSON string against a JSON Schema (Draft 7). Returns
 { "data": "{\"name\": \"Alice\"}", "schema": { "type": "object", "properties": { "name": { "type": "string" } } } }
 ```
 
+### ask_human
+
+Let an **agent** pause the run and ask the human operator a question
+mid-reasoning — the agent-facing counterpart to the flow-level
+[`crew:ask_human()`](crews.md#human-in-the-loop-ask_human) primitive. The
+agent's turn suspends on the same per-run transport: SSE emits
+`human_input_requested`, the answer arrives via the
+[`questions`/`answer` endpoints](rest-api.md#mid-run-questions-crewask_human)
+(server) or a terminal prompt (CLI).
+
+- **Parameters:** `question` (string, required), `choices` (array of
+  strings, optional), `timeout_s` (integer, optional, default 600)
+
+```lua
+{ "question": "Two conflicting revenue figures found — which source should I trust?", "choices": ["ERP export", "Finance spreadsheet"] }
+```
+
+The prompt shown to the human is prefixed with the asking agent's name
+(`[analyst] …`). On timeout the agent receives a soft `[no answer]` result
+telling it to proceed on its best judgment — not an error, so the model
+isn't tempted into a retry loop that parks the run again.
+
+**Timeouts:** the tool extends its own dispatch deadline past
+`IRONCREW_TOOL_TIMEOUT`, and **human-wait time does not count against the
+task's `timeout_secs`** — while a question is pending, the task clock is
+paused (the run-lifetime cap still bounds the whole run).
+
+Like every built-in, agents opt in explicitly:
+
+```lua
+crew:add_agent({
+    name = "analyst",
+    goal = "analyze quarterly data",
+    tools = { "ask_human" },
+})
+```
+
 ---
 
 ## Custom Lua Tools

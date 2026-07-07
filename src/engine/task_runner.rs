@@ -9,8 +9,53 @@ use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
+use crate::engine::input_bridge::AskHumanContext;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
+
+/// Race `fut` against a budget that only ticks while the run is NOT
+/// suspended on a human question. A task that lawfully pauses on the
+/// agent-facing `ask_human` tool is observably waiting, not stuck — so
+/// human-wait time is excluded from the task timeout instead of forcing
+/// flow authors to inflate `timeout_secs` by the worst-case answer delay.
+///
+/// Granularity note: the bridge is per-run, so while ANY question is
+/// pending the clock pauses for every task in the run. Coarse, but safe —
+/// the run-lifetime cap (`IRONCREW_MAX_RUN_LIFETIME`) still bounds the
+/// whole run.
+async fn timeout_excluding_human_wait<F, T>(
+    budget: std::time::Duration,
+    ask_human: Option<&AskHumanContext>,
+    fut: F,
+) -> std::result::Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    // No bridge in scope -> plain timeout, identical to the old behavior.
+    let Some(ask) = ask_human else {
+        return tokio::time::timeout(budget, fut).await;
+    };
+
+    tokio::pin!(fut);
+    let tick = std::time::Duration::from_millis(500);
+    let mut remaining = budget;
+    loop {
+        let slice = tick.min(remaining);
+        match tokio::time::timeout(slice, &mut fut).await {
+            Ok(v) => return Ok(v),
+            Err(elapsed) => {
+                // Only bill the slice against the budget when no human
+                // question is pending.
+                if ask.bridge.pending_count() == 0 {
+                    remaining = remaining.saturating_sub(slice);
+                    if remaining.is_zero() {
+                        return Err(elapsed);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Execute a single task with retry/timeout logic inside a spawned context.
 ///
@@ -29,6 +74,7 @@ pub async fn run_single_task(
     should_stream: bool,
     before_task_hook: Option<Vec<u8>>,
     after_task_hook: Option<Vec<u8>>,
+    ask_human: Option<AskHumanContext>,
 ) -> (
     String,
     String,
@@ -86,8 +132,9 @@ pub async fn run_single_task(
             None,
             before_task_hook.as_deref(),
             after_task_hook.as_deref(),
+            ask_human.as_ref(),
         );
-        match tokio::time::timeout(timeout_dur, result).await {
+        match timeout_excluding_human_wait(timeout_dur, ask_human.as_ref(), result).await {
             Ok(Ok((out, reas, usage))) => break (Ok(out), reas, usage),
             Ok(Err(e)) => {
                 if attempt >= max_retries {

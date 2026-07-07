@@ -1,4 +1,5 @@
 pub mod agent_as_tool;
+pub mod ask_human;
 pub mod file_read;
 pub mod file_read_glob;
 pub mod file_write;
@@ -54,6 +55,13 @@ pub struct ToolCallContext {
     /// events so sub-agent activity is attributable to the parent.
     /// Propagated unchanged through agent-as-tool nesting.
     pub caller_scope: Option<String>,
+
+    /// Human-input transport for the agent-facing `ask_human` tool.
+    /// `None` in contexts with no human to ask (admin paths, sub-flows
+    /// launched without a bridge) — the tool then fails with a clear
+    /// "unavailable" message instead of hanging. Propagated through
+    /// agent-as-tool nesting so delegated agents can also ask.
+    pub ask_human: Option<crate::engine::input_bridge::AskHumanContext>,
 }
 
 impl std::fmt::Debug for ToolCallContext {
@@ -77,5 +85,16 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> ToolSchema;
+
+    /// Per-call dispatch deadline override. `None` (the default) means the
+    /// caller applies the global `IRONCREW_TOOL_TIMEOUT`. Tools that
+    /// legitimately suspend for long periods (`ask_human` waiting on a
+    /// person) return their own bound derived from `args`, so the generic
+    /// timeout doesn't kill the wait.
+    fn dispatch_timeout(&self, args: &serde_json::Value) -> Option<std::time::Duration> {
+        let _ = args;
+        None
+    }
+
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCallContext) -> Result<String>;
 }

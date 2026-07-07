@@ -49,6 +49,10 @@ pub struct Crew {
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<String>,
     pub eventbus: EventBus,
+    /// Human-input transport for the agent-facing `ask_human` tool.
+    /// Injected by `crew:run()` from the per-run context (with the real
+    /// run id + store bound); `None` when no human is reachable.
+    pub ask_human: Option<crate::engine::input_bridge::AskHumanContext>,
     /// Lua bytecode for before_task hooks, keyed by agent name.
     pub before_task_hooks: HashMap<String, Vec<u8>>,
     /// Lua bytecode for after_task hooks, keyed by agent name.
@@ -71,6 +75,7 @@ impl Crew {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             eventbus: EventBus::default(),
+            ask_human: None,
             before_task_hooks: HashMap::new(),
             after_task_hooks: HashMap::new(),
         }

@@ -73,16 +73,26 @@ pub enum AskOutcome {
     TimedOut,
 }
 
-/// Per-run handle threaded into the Lua VM as app data so `crew:ask_human`
-/// can reach the bridge and, when the run is store-tracked, flip the run
-/// status around the suspension. Mirrors how the store singleton and
-/// EventBus are injected.
+/// Per-run handle for human-input suspension. Threaded into the Lua VM as
+/// app data (for the `crew:ask_human` flow primitive) and into
+/// `ToolCallContext.ask_human` (for the agent-facing `ask_human` tool).
+/// Carries everything a suspension point needs — bridge, run identity,
+/// telemetry, store — so exactly one optional value travels through the
+/// crew-run call chain instead of three.
 #[derive(Clone)]
 pub struct AskHumanContext {
     pub bridge: std::sync::Arc<InputBridge>,
     /// Persisted run id (`save_run_intent`) when this execution is tracked;
-    /// `None` for contexts without a run record.
+    /// `None` for contexts without a run record. `crew:run()` re-binds this
+    /// to the actual run id it allocates, so agent-initiated asks flip the
+    /// real record even in CLI mode.
     pub run_id: Option<String>,
+    /// Store for the best-effort `Running ↔ WaitingForInput` flips.
+    pub store: Option<std::sync::Arc<dyn crate::engine::store::StateStore>>,
+    /// Bus for `HumanInputRequested` / `HumanInputReceived`. The crew-run
+    /// executor's tool loop carries no bus of its own, so the tool relies
+    /// on this one.
+    pub eventbus: Option<crate::engine::eventbus::EventBus>,
 }
 
 pub struct InputBridge {

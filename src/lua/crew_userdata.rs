@@ -746,6 +746,23 @@ impl UserData for LuaCrew {
                 crew.eventbus = eventbus.clone();
             }
 
+            // Re-bind the human-input context with the REAL run id, the
+            // store, and the bus this run emits on — so the agent-facing
+            // ask_human tool flips the actual record and streams its events
+            // on the run's channel (works in CLI mode too, where the
+            // app-data context starts with run_id = None).
+            if let Some(ask) = lua
+                .app_data_ref::<crate::engine::input_bridge::AskHumanContext>()
+                .map(|c| c.clone())
+            {
+                crew.ask_human = Some(crate::engine::input_bridge::AskHumanContext {
+                    bridge: ask.bridge,
+                    run_id: Some(run_id.clone()),
+                    store: Some(store.clone()),
+                    eventbus: Some(crew.eventbus.clone()),
+                });
+            }
+
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
                 Some(p) => p.clone(),
                 None => this.runtime.provider.clone(),

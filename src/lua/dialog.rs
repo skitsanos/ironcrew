@@ -764,12 +764,18 @@ impl AgentDialog {
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-        let tool_timeout = Duration::from_secs(
-            std::env::var("IRONCREW_TOOL_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-        );
+        let tool_timeout = self
+            .tool_registry
+            .get(&tool_call.function.name)
+            .and_then(|tool| tool.dispatch_timeout(&args))
+            .unwrap_or_else(|| {
+                Duration::from_secs(
+                    std::env::var("IRONCREW_TOOL_TIMEOUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(60),
+                )
+            });
 
         // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
         // tools can see them on their sandbox VMs (needed for sandbox-level
@@ -783,6 +789,10 @@ impl AgentDialog {
             tool_registry: Some(self.tool_registry.clone()),
             caller_agent: Some(caller_agent.to_string()),
             caller_scope: Some(format!("{}:t{}", self.id, turn_idx)),
+            // Dialogs don't carry a human-input transport yet — human
+            // steering happens via should_stop/turn_selector callbacks
+            // (which run in flow scope and can call crew:ask_human).
+            ask_human: None,
         };
 
         let tool_result = match tokio::time::timeout(
