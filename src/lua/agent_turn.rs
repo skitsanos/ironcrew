@@ -154,7 +154,14 @@ pub async fn run_single_agent_turn(
             let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
                 .unwrap_or(serde_json::Value::Null);
 
-            let timeout = Duration::from_secs(tool_timeout_secs());
+            // A call may extend its own dispatch deadline (ask_human waits
+            // on a person; approval-gated tools wait for a sign-off);
+            // everything else gets the global timeout.
+            let timeout = ctx
+                .tool_registry
+                .as_ref()
+                .and_then(|reg| reg.dispatch_timeout(&tool_call.function.name, &args))
+                .unwrap_or_else(|| Duration::from_secs(tool_timeout_secs()));
             let (result_text, ok) = match &ctx.tool_registry {
                 Some(reg) => {
                     let dispatch = reg.execute(&tool_call.function.name, args, ctx);

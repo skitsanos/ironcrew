@@ -117,12 +117,13 @@ pub(crate) async fn finalize_agent_tools(
     lua_crew: &LuaCrew,
 ) -> std::result::Result<Arc<FinalizedAgentTools>, IronCrewError> {
     // 1. Snapshot everything we need off the crew under a short lock.
-    let (agents, default_model, max_tool_rounds) = {
+    let (agents, default_model, max_tool_rounds, require_approval) = {
         let crew_guard = lua_crew.crew.lock().await;
         (
             crew_guard.agents.clone(),
             crew_guard.provider_config.model.clone(),
             crew_guard.max_tool_rounds,
+            crew_guard.require_approval.clone(),
         )
     };
     let max_history = crate::lua::conversation::default_max_history();
@@ -220,6 +221,14 @@ pub(crate) async fn finalize_agent_tools(
         );
         registry.register_arc(Arc::new(tool));
     }
+
+    // Attach the approval policy (crew config ∪ IRONCREW_REQUIRE_APPROVAL)
+    // to the finalized registry. Every clone handed out from here —
+    // executor loops, dialogs, conversations, delegated sub-agents —
+    // shares the same policy and its "always" grant set.
+    registry.set_approval_policy(crate::tools::approval::ApprovalPolicy::from_rules(
+        &require_approval,
+    ));
 
     Ok(Arc::new(FinalizedAgentTools { registry }))
 }
@@ -371,6 +380,112 @@ impl UserData for LuaCrew {
                 table.set(i + 1, entry)?;
             }
             Ok(table)
+        });
+
+        // Human-in-the-loop: suspend the flow until a human answers (or the
+        // question times out). See docs/superpowers/specs/2026-07-07-ask-human-design.md.
+        methods.add_async_method("ask_human", |lua, this, opts: Table| async move {
+            let prompt: String = opts
+                .get("prompt")
+                .map_err(|_| mlua::Error::external("ask_human requires a 'prompt' string field"))?;
+            let choices: Vec<String> = match opts.get::<Option<Table>>("choices")? {
+                Some(t) => t
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<String>>>()?,
+                None => Vec::new(),
+            };
+            let timeout_s: u64 = opts
+                .get::<Option<u64>>("timeout_s")?
+                .unwrap_or_else(crate::engine::input_bridge::default_timeout_secs)
+                .max(1);
+            // Kept as a Lua value: on timeout it's returned as-is, so no
+            // JSON round-trip is needed for the fallback path.
+            let default_val: Value = opts.get("default")?;
+
+            let Some(ctx) = lua
+                .app_data_ref::<crate::engine::input_bridge::AskHumanContext>()
+                .map(|c| c.clone())
+            else {
+                return Err(mlua::Error::external(
+                    "ask_human is unavailable in this execution context (no input bridge)",
+                ));
+            };
+
+            // Prefer the API-injected EventBus so the question reaches the
+            // run's SSE channel; fall back to the crew's own bus.
+            let crew_bus = this.crew.lock().await.eventbus.clone();
+            let eventbus = lua
+                .app_data_ref::<EventBus>()
+                .map(|e| e.clone())
+                .unwrap_or(crew_bus);
+            let store = lua.app_data_ref::<Arc<dyn StateStore>>().map(|s| s.clone());
+
+            let question_id = uuid::Uuid::new_v4().to_string();
+            eventbus.emit(crate::engine::eventbus::CrewEvent::HumanInputRequested {
+                question_id: question_id.clone(),
+                prompt: prompt.clone(),
+                choices: choices.clone(),
+                timeout_s,
+                kind: "question".into(),
+            });
+
+            // Mark the run suspended. Idempotent under concurrent questions
+            // (both writers set the same value); a failed write is logged,
+            // not fatal — the question itself still works.
+            if let (Some(store), Some(run_id)) = (&store, &ctx.run_id)
+                && let Err(e) = store
+                    .update_run_status(
+                        run_id,
+                        crate::engine::run_history::RunStatus::WaitingForInput,
+                    )
+                    .await
+            {
+                // Debug, not warn: ask_human outside crew:run() has no run
+                // record yet — a normal pattern, not an operator problem. The
+                // questions endpoint is the authoritative waiting signal.
+                tracing::debug!("ask_human: run status not updated: {}", e);
+            }
+
+            let outcome = ctx
+                .bridge
+                .ask(&question_id, &prompt, &choices, timeout_s, "question")
+                .await
+                .map_err(mlua::Error::external)?;
+
+            // Restore Running only when no sibling question is still pending
+            // (parallel branches may each be waiting on their own answer).
+            if let (Some(store), Some(run_id)) = (&store, &ctx.run_id)
+                && ctx.bridge.pending_count() == 0
+                && let Err(e) = store
+                    .update_run_status(run_id, crate::engine::run_history::RunStatus::Running)
+                    .await
+            {
+                tracing::debug!("ask_human: run status not restored: {}", e);
+            }
+
+            match outcome {
+                crate::engine::input_bridge::AskOutcome::Answered(value) => {
+                    eventbus.emit(crate::engine::eventbus::CrewEvent::HumanInputReceived {
+                        question_id,
+                        outcome: "answered".into(),
+                    });
+                    json_value_to_lua(&lua, &value)
+                }
+                crate::engine::input_bridge::AskOutcome::TimedOut => {
+                    eventbus.emit(crate::engine::eventbus::CrewEvent::HumanInputReceived {
+                        question_id,
+                        outcome: "timeout".into(),
+                    });
+                    if default_val.is_nil() {
+                        Err(mlua::Error::external(format!(
+                            "ask_human timed out after {}s (no default provided)",
+                            timeout_s
+                        )))
+                    } else {
+                        Ok(default_val)
+                    }
+                }
+            }
         });
 
         // Memory methods
@@ -639,6 +754,23 @@ impl UserData for LuaCrew {
             // If an EventBus was injected via Lua app_data (from API handler), use it.
             if let Some(eventbus) = lua.app_data_ref::<EventBus>() {
                 crew.eventbus = eventbus.clone();
+            }
+
+            // Re-bind the human-input context with the REAL run id, the
+            // store, and the bus this run emits on — so the agent-facing
+            // ask_human tool flips the actual record and streams its events
+            // on the run's channel (works in CLI mode too, where the
+            // app-data context starts with run_id = None).
+            if let Some(ask) = lua
+                .app_data_ref::<crate::engine::input_bridge::AskHumanContext>()
+                .map(|c| c.clone())
+            {
+                crew.ask_human = Some(crate::engine::input_bridge::AskHumanContext {
+                    bridge: ask.bridge,
+                    run_id: Some(run_id.clone()),
+                    store: Some(store.clone()),
+                    eventbus: Some(crew.eventbus.clone()),
+                });
             }
 
             let provider: Arc<dyn LlmProvider> = match &this.custom_provider {

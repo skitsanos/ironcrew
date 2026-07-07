@@ -467,3 +467,93 @@ async fn sqlite_store_tag_filter_exact_match() {
     };
     assert_eq!(store.count_runs(&wildcard).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn sqlite_update_run_status_waiting_round_trip() {
+    let store = fresh_store();
+
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("wfi-1".into()),
+            flow_name: "demo".into(),
+            flow: "demo".into(),
+            started_at: "2026-07-07T10:00:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            tags: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Running -> WaitingForInput -> Running (ask_human suspend/resume).
+    store
+        .update_run_status("wfi-1", RunStatus::WaitingForInput)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_run("wfi-1").await.unwrap().status,
+        RunStatus::WaitingForInput
+    );
+
+    // Completion is accepted while WaitingForInput (a parallel branch may
+    // fail while another is suspended on a question).
+    store
+        .update_run_completion(
+            "wfi-1",
+            RunCompletion {
+                status: RunStatus::Failed,
+                finished_at: "2026-07-07T10:01:00Z".into(),
+                duration_ms: 60_000,
+                task_results: Vec::new(),
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Terminal records reject further status flips; unknown ids error.
+    assert!(
+        store
+            .update_run_status("wfi-1", RunStatus::Running)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .update_run_status("missing", RunStatus::Running)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_reconcile_sweeps_waiting_for_input() {
+    let store = fresh_store();
+
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("wfi-2".into()),
+            flow_name: "demo".into(),
+            flow: "demo".into(),
+            started_at: "2026-07-07T10:00:00Z".into(),
+            agent_count: 1,
+            task_count: 1,
+            tags: Vec::new(),
+        })
+        .await
+        .unwrap();
+    store
+        .update_run_status("wfi-2", RunStatus::WaitingForInput)
+        .await
+        .unwrap();
+
+    let count = store
+        .reconcile_abandoned_runs("2026-07-07T11:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let r = store.get_run("wfi-2").await.unwrap();
+    assert_eq!(r.status, RunStatus::Abandoned);
+    assert_eq!(r.finished_at, "2026-07-07T11:00:00Z");
+}

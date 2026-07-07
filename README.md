@@ -43,12 +43,14 @@ local results = crew:run()
 - **Lua scripting** — agents, tasks, tools, and orchestration defined in Lua
 - **Project defaults via `config.lua`** — set provider, model, limits, and routing once per project; `crew.lua` stays focused on workflow logic
 - **Conversation & Dialog modes** — stateful multi-turn chat with one agent (`crew:conversation({})`) or perspective-flipped multi-agent dialogs (`crew:dialog({})`) for two-agent debates or N-agent roundtables
+- **Mid-run Human-in-the-Loop** — `crew:ask_human({})` suspends a flow until a human answers (terminal prompt in CLI, `questions`/`answer` endpoints + SSE in server mode); timeouts with defaults keep unattended runs from hanging
+- **Tool approval gates** — `require_approval = {"http_request", "mcp__git__*"}` (or `IRONCREW_REQUIRE_APPROVAL`) pauses gated tool calls for a human allow/always/deny, with redacted args and fail-closed timeouts
 - **Parallel execution** — independent tasks run concurrently within topological phases
 - **Three provider types** — OpenAI Chat Completions, Anthropic native Messages API, OpenAI Responses API (also works with Gemini, Groq, Kimi, DeepSeek, xAI, Ollama via OpenAI compat)
 - **Reasoning/thinking support** — captures chain-of-thought from Anthropic, DeepSeek, Kimi, and OpenAI Responses API; streams dim to stderr and persists to run records
 - **Server-side tools** — built-in `web_search`, `code_execution`, `file_search`, `code_interpreter` via Anthropic and OpenAI Responses
 - **Structured output** — JSON Schema `response_format` for validated LLM responses
-- **9 built-in tools** — file I/O, HTTP, hashing, templates, schema validation
+- **10 built-in tools** — file I/O, HTTP, hashing, templates, schema validation, human-input (`ask_human`)
 - **Memory & MessageBus** — shared state and agent-to-agent communication
 - **Collaborative tasks** — multi-agent discussions with automatic synthesis
 - **REST API + SSE** — run crews via HTTP with real-time event streaming
@@ -119,7 +121,7 @@ The `.env.example` includes the `IRONCREW_ENV_ALLOWLIST` line each flow needs so
 its `env()` config resolves (see the Quick Start note above).
 
 
-**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `shared-modules` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `stock-debate` · `roundtable` · `moderator-dialog`
+**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `shared-modules` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `ask-human` · `stock-debate` · `roundtable` · `moderator-dialog`
 
 **Providers:** [`examples/providers/`](examples/providers/) contains 12 reference files covering every supported provider — OpenAI Chat, OpenAI Responses (basic, reasoning, web_search), Anthropic (basic, web_search, extended thinking), Gemini, Groq, Kimi K2.5, Kimi K2-thinking, and DeepSeek Reasoner.
 

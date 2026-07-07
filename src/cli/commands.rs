@@ -28,6 +28,21 @@ pub async fn cmd_run(
             });
     }
 
+    // Human-input transport for crew:ask_human(): CLI mode prompts on the
+    // terminal (stderr prompt, stdin answer). `run_id: None` — the run
+    // record is created inside crew:run() and terminal prompting doesn't
+    // need store status flips; non-TTY stdin resolves as immediate timeout.
+    lua.set_app_data(crate::engine::input_bridge::AskHumanContext {
+        bridge: std::sync::Arc::new(crate::engine::input_bridge::InputBridge::new(
+            crate::engine::input_bridge::BridgeMode::Tty,
+        )),
+        // crew:run() re-binds run_id/store/eventbus with the real values it
+        // allocates, so agent-initiated asks are fully wired even from here.
+        run_id: None,
+        store: None,
+        eventbus: None,
+    });
+
     // In --json mode, suppress Lua print() by marking via app_data
     if json_output {
         lua.set_app_data(JsonOutputMode);
@@ -131,15 +146,16 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
         "hash",
         "template_render",
         "validate_schema",
+        "ask_human",
     ]
     .into_iter()
     .map(String::from)
     .chain(tool_defs.iter().map(|t| t.name.clone()))
     .collect();
 
-    println!("Tools ({} built-in + {} custom):", 9, tool_defs.len());
+    println!("Tools ({} built-in + {} custom):", 10, tool_defs.len());
     println!(
-        "  Built-in: file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema"
+        "  Built-in: file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema, ask_human"
     );
     for tool in &tool_defs {
         println!(
@@ -326,6 +342,7 @@ pub fn cmd_nodes() -> Result<()> {
     registry.register(Box::new(
         crate::tools::validate_schema::ValidateSchemaTool::new(),
     ));
+    registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new()));
 
     println!("Built-in tools ({}):", registry.list().len());
     println!();
@@ -654,6 +671,7 @@ pub fn cmd_fmt(path: &Path) -> Result<()> {
         "hash",
         "template_render",
         "validate_schema",
+        "ask_human",
     ];
     println!(
         "  Tools ({} custom + {} built-in):",
@@ -761,7 +779,7 @@ pub fn cmd_list(path: &Path) -> Result<()> {
     println!();
 
     println!(
-        "Built-in tools (9): file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema"
+        "Built-in tools (10): file_read, file_read_glob, file_write, web_scrape, shell, http_request, hash, template_render, validate_schema, ask_human"
     );
     println!();
 

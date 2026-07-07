@@ -330,6 +330,9 @@ impl LuaConversationInner {
                         .clone()
                         .unwrap_or_else(|| self.id.clone()),
                 ),
+                // Propagate the human-input transport so an agent with the
+                // ask_human tool can suspend a conversation turn too.
+                ask_human: caller_ctx.ask_human.clone(),
             };
 
             let mut history = self.messages.lock().await;

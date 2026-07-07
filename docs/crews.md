@@ -665,6 +665,173 @@ delivered when each agent registers.
 
 ---
 
+## Human-in-the-Loop: `ask_human`
+
+`crew:ask_human(opts)` suspends the flow until a human answers — the mid-run
+counterpart to conversations (which are human-driven from the start). Use it
+for approval points, missing parameters, or any decision the flow shouldn't
+make on its own.
+
+```lua
+-- Free-form answer
+local region = crew:ask_human({ prompt = "Which region should this report cover?" })
+
+-- Constrained choice with timeout + fallback
+local decision = crew:ask_human({
+    prompt    = "Ready to publish. Proceed?",
+    choices   = { "publish", "hold" },
+    timeout_s = 300,
+    default   = "hold",
+})
+
+-- Structured answer: whatever JSON the caller posts comes back as a Lua value
+local params = crew:ask_human({ prompt = "Adjust thresholds (JSON object expected)" })
+print(params.max_items)
+```
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `prompt` | string | yes | Question shown to the human |
+| `choices` | array of strings | no | Advisory choice list, surfaced to UIs for rendering buttons. Not enforced — free-text answers are accepted; validate in Lua if you need strict values. |
+| `timeout_s` | integer | no | Per-question timeout. Default `IRONCREW_ASK_HUMAN_TIMEOUT` (600 s). |
+| `default` | any | no | Returned on timeout instead of raising an error |
+
+Returns the answer as a Lua value. On timeout **without** a `default`, raises
+`ask_human timed out after <n>s` — catch with `pcall` or let the task-retry
+machinery treat it like any other failure.
+
+### Where the answer comes from
+
+- **Server mode** (`ironcrew serve`): the run suspends, the SSE stream emits
+  `human_input_requested`, and the answer arrives via
+  [`POST /flows/{flow}/answer/{run_id}`](rest-api.md#answer-a-question). A UI
+  that missed the event lists pending questions with
+  `GET /flows/{flow}/questions/{run_id}`.
+- **CLI mode** (`ironcrew run`): the prompt (and numbered choices) print to
+  stderr and the answer is read from stdin. A bare number picks the matching
+  choice. Non-TTY stdin (piped, CI) resolves as an immediate timeout, so
+  unattended runs fall through to `default` or fail cleanly instead of
+  hanging — the same flow works attended and unattended.
+
+Parallel branches (`foreach_parallel`) may each ask concurrently; questions
+are answered independently by `question_id`, capped at
+`IRONCREW_ASK_HUMAN_MAX_PENDING` (default 16) per run.
+
+Note on run status: the persisted run record flips to `waiting_for_input`
+only when a run record exists at ask time (the record is created inside
+`crew:run()`). For the common pattern — asking in flow code before or between
+runs — the questions endpoint is the authoritative "waiting" signal.
+
+### Letting agents ask (the `ask_human` tool)
+
+`crew:ask_human()` is scripted by the flow author at fixed points. To let an
+**agent decide mid-reasoning** that it needs the human, give it the built-in
+[`ask_human` tool](tools.md#ask_human):
+
+```lua
+crew:add_agent({
+    name = "analyst",
+    goal = "analyze quarterly data",
+    tools = { "ask_human" },
+})
+```
+
+When the model calls the tool, the task suspends on the same per-run
+transport — same SSE events, same `questions`/`answer` endpoints, same
+terminal prompt in CLI mode. The human sees who's asking (`[analyst] …`).
+Two behaviors are specific to the agent path:
+
+- **Human-wait time is excluded from the task timeout.** A task suspended on
+  a question is observably waiting, not stuck, so `timeout_secs` doesn't
+  tick while a question is pending (`IRONCREW_MAX_RUN_LIFETIME` still bounds
+  the whole run).
+- **Timeouts return a soft result**, not an error: the model gets a
+  `[no answer]` message instructing it to proceed on its best judgment,
+  so it doesn't retry into another full wait.
+
+Delegated agents (`agent__<name>`) inherit the transport, so a sub-agent can
+also pause to ask.
+
+### Approval gates (`require_approval`)
+
+Gate specific tools behind a human sign-off — sandboxing controls what tools
+*can* do, approval gates control what they *may* do per-invocation:
+
+```lua
+local crew = Crew.new({
+    goal = "quarterly close",
+    require_approval = { "http_request", "file_write", "agent__deployer", "mcp__git__*" },
+})
+```
+
+Entries are exact tool names or prefix globs (trailing `*`); `"*"` gates
+everything. Operators can enforce a policy without editing flows via
+`IRONCREW_REQUIRE_APPROVAL` (comma-separated, same syntax) — the two lists
+are unioned. Works from `config.lua` project defaults too.
+
+When a gated tool is called, the run suspends on an approval question
+(`kind: "approval"` on SSE and the questions endpoint; a prompt in CLI
+mode) showing the agent, the tool, and its **redacted** arguments
+(sensitive-looking keys like `authorization`/`token`/`api_key` are masked;
+the serialized form is capped at `IRONCREW_APPROVAL_ARGS_MAX_CHARS`,
+default 600):
+
+```
+[approval] Agent 'analyst' wants to call http_request({"method":"POST",...}). Allow?
+  1. allow    -- run this call
+  2. always   -- run it, and stop asking for this tool this flow execution
+  3. deny     -- refuse; the agent sees "denied by human operator"
+```
+
+**Fail closed:** timeout (`IRONCREW_APPROVAL_TIMEOUT`, default = the
+ask_human default), a missing approval channel, or any answer that isn't an
+exact allow token all **deny**. A free-text answer denies AND is forwarded
+to the model as the reason — "no, use the cached data instead" becomes
+agent steering.
+
+The policy rides the tool registry, so it automatically covers built-ins,
+MCP tools, custom Lua tools, and `agent__<name>` delegation (the delegation
+itself can be gated, and delegated sub-agents inherit the caller's policy
+and its "always" grants). `ask_human` itself is never gated. Human-wait
+time is excluded from task timeouts, same as ask_human.
+
+### Steering dialogs with ask_human
+
+Dialog callbacks are ordinary Lua, so a human can arbitrate an agent-to-agent
+dialog without any dedicated machinery:
+
+```lua
+local dialog = crew:dialog({
+    agents = { "optimist", "skeptic" },
+    max_turns = 12,
+    should_stop = function(last_turn, transcript)
+        -- Every 4 turns, let the human decide whether the debate continues.
+        -- should_stop is invoked via call_async, so the suspension works.
+        if #transcript % 4 == 0 then
+            local verdict = crew:ask_human({
+                prompt    = "Turn " .. last_turn.index .. ": continue the debate?",
+                choices   = { "continue", "stop" },
+                timeout_s = 120,
+                default   = "continue",
+            })
+            if verdict == "stop" then
+                return "stopped by human moderator"
+            end
+        end
+        return false
+    end,
+})
+```
+
+### Environment Variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `IRONCREW_ASK_HUMAN_TIMEOUT` | `600` | Default per-question timeout (seconds) when `timeout_s` is omitted |
+| `IRONCREW_ASK_HUMAN_MAX_PENDING` | `16` | Per-run cap on simultaneously pending questions |
+
+---
+
 ## Model Router
 
 The model router lets you assign different models to different execution phases

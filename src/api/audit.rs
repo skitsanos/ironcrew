@@ -142,6 +142,13 @@ mod tests {
         ) -> Result<()> {
             unimplemented!()
         }
+        async fn update_run_status(
+            &self,
+            _: &str,
+            _: crate::engine::run_history::RunStatus,
+        ) -> Result<()> {
+            unimplemented!()
+        }
         async fn reconcile_abandoned_runs(&self, _: &str) -> Result<usize> {
             unimplemented!()
         }

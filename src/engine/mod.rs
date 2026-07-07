@@ -6,6 +6,7 @@ pub mod crew;
 pub mod eventbus;
 pub mod executor;
 pub mod foreach;
+pub mod input_bridge;
 pub mod interpolate;
 pub mod memory;
 pub mod messagebus;

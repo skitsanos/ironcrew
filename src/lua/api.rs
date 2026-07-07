@@ -379,6 +379,14 @@ pub fn register_crew_constructor(
         let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
         crew.stream = stream;
+        // Approval gates: tool names / prefix globs that need a human
+        // sign-off before executing. Merged with IRONCREW_REQUIRE_APPROVAL
+        // when the policy is attached at agent-tool finalization.
+        if let Ok(Some(list)) = table.get::<Option<Table>>("require_approval") {
+            crew.require_approval = list
+                .sequence_values::<String>()
+                .collect::<mlua::Result<Vec<String>>>()?;
+        }
         crew.model_router = model_router;
         crew.prompt_cache_key = prompt_cache_key;
         crew.prompt_cache_retention = prompt_cache_retention;
