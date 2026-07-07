@@ -185,6 +185,27 @@ pub enum CrewEvent {
     #[serde(rename = "memory_set")]
     MemorySet { key: String },
 
+    // ─── Human-in-the-loop (crew:ask_human) ─────────────────────────────────
+    #[serde(rename = "human_input_requested")]
+    HumanInputRequested {
+        question_id: String,
+        prompt: String,
+        choices: Vec<String>,
+        timeout_s: u64,
+        /// `"question"` (ask_human) or `"approval"` (tool approval gate).
+        kind: String,
+    },
+
+    /// Deliberately carries no answer content: answers may contain secrets,
+    /// and events land in the SSE replay buffer. The UI that answered
+    /// already has the value.
+    #[serde(rename = "human_input_received")]
+    HumanInputReceived {
+        question_id: String,
+        /// `"answered"` or `"timeout"`.
+        outcome: String,
+    },
+
     // ─── Logging ────────────────────────────────────────────────────────────
     #[serde(rename = "log")]
     Log { level: String, message: String },

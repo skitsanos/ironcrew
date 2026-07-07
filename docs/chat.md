@@ -10,6 +10,9 @@ Two surfaces share the underlying mechanism:
 - `POST /flows/{flow}/conversations/{id}/{start,messages,...}` — HTTP endpoints
   under the existing REST API.
 
+(For the *mid-run* counterpart — a flow that pauses itself to ask the human a
+question during execution — see [`crew:ask_human`](crews.md#human-in-the-loop-ask_human).)
+
 Both paths route through the same `LuaConversationInner` state, so a chat
 you start in the CLI can be continued later from the API and vice versa.
 

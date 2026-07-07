@@ -206,6 +206,10 @@ pub struct RunRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RunStatus {
     Running,
+    /// Suspended on `crew:ask_human()` — the flow coroutine is parked until a
+    /// human answers or the question times out. In-flight like `Running`: the
+    /// startup reconciler treats both as orphaned after a crash.
+    WaitingForInput,
     Abandoned,
     Success,
     PartialFailure,
@@ -216,6 +220,7 @@ impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunStatus::Running => write!(f, "running"),
+            RunStatus::WaitingForInput => write!(f, "waiting_for_input"),
             RunStatus::Abandoned => write!(f, "abandoned"),
             RunStatus::Success => write!(f, "success"),
             RunStatus::PartialFailure => write!(f, "partial_failure"),
@@ -234,6 +239,7 @@ impl std::str::FromStr for RunStatus {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "running" => Ok(RunStatus::Running),
+            "waiting_for_input" => Ok(RunStatus::WaitingForInput),
             "abandoned" => Ok(RunStatus::Abandoned),
             "success" => Ok(RunStatus::Success),
             "partial_failure" => Ok(RunStatus::PartialFailure),
@@ -452,9 +458,9 @@ impl StateStore for JsonFileStore {
         let data = std::fs::read_to_string(&path)?;
         let mut record: RunRecord = serde_json::from_str(&data)
             .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
-        if record.status != RunStatus::Running {
+        if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
             return Err(IronCrewError::Validation(format!(
-                "Run '{}' is not in Running state (status={})",
+                "Run '{}' is not in an in-flight state (status={})",
                 run_id, record.status
             )));
         }
@@ -472,6 +478,32 @@ impl StateStore for JsonFileStore {
         Ok(())
     }
 
+    async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()> {
+        let filename = format!("{}.json", run_id);
+        let path = self.runs_dir.join(&filename);
+        if !path.exists() {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found (update_run_status)",
+                run_id
+            )));
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let mut record: RunRecord = serde_json::from_str(&data)
+            .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
+        if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' is not in an in-flight state (status={})",
+                run_id, record.status
+            )));
+        }
+        record.status = status;
+        let json = serde_json::to_string_pretty(&record).map_err(|e| {
+            IronCrewError::Validation(format!("Failed to serialize run status: {}", e))
+        })?;
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
         let mut count: usize = 0;
         for entry in std::fs::read_dir(&self.runs_dir)? {
@@ -484,7 +516,7 @@ impl StateStore for JsonFileStore {
             let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
                 continue;
             };
-            if record.status != RunStatus::Running {
+            if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
                 continue;
             }
             record.status = RunStatus::Abandoned;

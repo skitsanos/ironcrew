@@ -489,7 +489,7 @@ impl StateStore for PostgresStore {
             "UPDATE {}
              SET status = $1, finished_at = $2, duration_ms = $3,
                  task_results = $4::jsonb, total_tokens = $5, cached_tokens = $6
-             WHERE run_id = $7 AND status = 'running'",
+             WHERE run_id = $7 AND status IN ('running', 'waiting_for_input')",
             self.table_name
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
@@ -506,7 +506,7 @@ impl StateStore for PostgresStore {
 
         if result.rows_affected() == 0 {
             return Err(IronCrewError::Validation(format!(
-                "Run '{}' not found or not in Running state",
+                "Run '{}' not found or not in an in-flight state",
                 run_id
             )));
         }
@@ -514,9 +514,34 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
+    async fn update_run_status(
+        &self,
+        run_id: &str,
+        status: crate::engine::run_history::RunStatus,
+    ) -> Result<()> {
+        let sql = format!(
+            "UPDATE {} SET status = $1
+             WHERE run_id = $2 AND status IN ('running', 'waiting_for_input')",
+            self.table_name
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .bind(status.to_string())
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IronCrewError::Validation(format!("PG update status: {}", e)))?;
+        if result.rows_affected() == 0 {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' not found or not in an in-flight state",
+                run_id
+            )));
+        }
+        Ok(())
+    }
+
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
         let sql = format!(
-            "UPDATE {} SET status = 'abandoned', finished_at = $1 WHERE status = 'running'",
+            "UPDATE {} SET status = 'abandoned', finished_at = $1 WHERE status IN ('running', 'waiting_for_input')",
             self.table_name
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))

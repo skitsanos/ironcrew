@@ -140,10 +140,17 @@ pub async fn run_flow(
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
 
+    // Per-run human-input transport: crew:ask_human() parks on this, the
+    // questions/answer endpoints reach it through ActiveRun.
+    let input_bridge = Arc::new(crate::engine::input_bridge::InputBridge::new(
+        crate::engine::input_bridge::BridgeMode::Http,
+    ));
+
     // Spawn the actual work as a child task — store its AbortHandle for cancellation
     let eventbus_inner = eventbus.clone();
     let run_id_for_work = run_id.clone();
     let store_for_work = state.store.clone();
+    let bridge_for_work = input_bridge.clone();
     let work_handle = tokio::spawn(async move {
         execute_crew_from_path_with_events(
             &flow_path,
@@ -151,6 +158,7 @@ pub async fn run_flow(
             &run_id_for_work,
             input.as_ref(),
             Some(store_for_work),
+            Some(bridge_for_work),
         )
         .await
     });
@@ -163,6 +171,7 @@ pub async fn run_flow(
             eventbus: eventbus.clone(),
             abort_handle,
             flow: flow_slug.clone(),
+            input_bridge,
         },
     );
 
@@ -282,6 +291,7 @@ async fn execute_crew_from_path_with_events(
     run_id: &str,
     input: Option<&serde_json::Value>,
     shared_store: Option<Arc<dyn crate::engine::store::StateStore>>,
+    input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
@@ -294,6 +304,18 @@ async fn execute_crew_from_path_with_events(
 
     // Store the run_id so LuaCrew::run() uses it for the RunRecord
     lua.set_app_data(run_id.to_string());
+
+    // Human-input transport for crew:ask_human() — carries the run_id so the
+    // method can flip the run between Running and WaitingForInput, plus the
+    // store + bus the agent-facing ask_human tool needs inside crew:run().
+    if let Some(bridge) = input_bridge {
+        lua.set_app_data(crate::engine::input_bridge::AskHumanContext {
+            bridge,
+            run_id: Some(run_id.to_string()),
+            store: shared_store.clone(),
+            eventbus: Some(eventbus.clone()),
+        });
+    }
 
     // Inject the server-wide store singleton so `LuaCrew` prefills its
     // OnceCell instead of bootstrapping a new Postgres pool per run.
@@ -497,6 +519,147 @@ pub async fn abort_run(
 }
 
 // ---------------------------------------------------------------------------
+// Human-in-the-loop: pending questions + answers (crew:ask_human)
+// ---------------------------------------------------------------------------
+
+/// `GET /flows/{flow}/questions/{run_id}` — pending `ask_human` questions for
+/// a live run. Lets a UI that missed the SSE `human_input_requested` event
+/// (or a poll-only client) recover state. Flow-scoped like `abort_run`.
+pub async fn list_questions(
+    State(state): State<Arc<AppState>>,
+    Path((flow, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
+        match resolve_flow_path(&state, &flow) {
+            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
+            Ok(p) => {
+                let flow_slug = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let active_runs = state.active_runs.read().await;
+                match active_runs.get(&run_id) {
+                    Some(active_run) if active_run.flow == flow_slug => {
+                        let questions = active_run.input_bridge.list();
+                        let status = if questions.is_empty() {
+                            "running"
+                        } else {
+                            "waiting_for_input"
+                        };
+                        Ok(Json(serde_json::json!({
+                            "run_id": run_id,
+                            "status": status,
+                            "questions": questions,
+                        })))
+                    }
+                    // Found but belongs to another flow → same 404 as
+                    // truly-missing (don't confirm existence across flows).
+                    _ => Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Run '{}' not found or already completed", run_id),
+                    )),
+                }
+            }
+        };
+
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
+    crate::api::audit::record(
+        &state.store,
+        "flow.run.questions_list",
+        Some(&flow),
+        Some(&run_id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        None,
+    )
+    .await;
+
+    result
+}
+
+#[derive(serde::Deserialize)]
+pub struct AnswerRequest {
+    pub question_id: String,
+    pub answer: serde_json::Value,
+}
+
+/// `POST /flows/{flow}/answer/{run_id}` — deliver a human answer to a pending
+/// `ask_human` question; the suspended flow coroutine resumes with the value.
+/// First writer wins; a repeat answer gets 404 (the question is gone). The
+/// audit record carries the question_id but never the answer body — answers
+/// may contain secrets.
+pub async fn answer_question(
+    State(state): State<Arc<AppState>>,
+    Path((flow, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<AnswerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let question_id = body.question_id.clone();
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
+        match resolve_flow_path(&state, &flow) {
+            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
+            Ok(p) => {
+                let flow_slug = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let active_runs = state.active_runs.read().await;
+                match active_runs.get(&run_id) {
+                    Some(active_run) if active_run.flow == flow_slug => {
+                        match active_run.input_bridge.answer(&question_id, body.answer) {
+                            Ok(()) => Ok(Json(serde_json::json!({
+                                "run_id": run_id,
+                                "question_id": question_id,
+                                "status": "delivered",
+                            }))),
+                            Err(_) => Err(error_response(
+                                StatusCode::NOT_FOUND,
+                                format!(
+                                    "Question '{}' not found or expired on run '{}'",
+                                    question_id, run_id
+                                ),
+                            )),
+                        }
+                    }
+                    _ => Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Run '{}' not found or already completed", run_id),
+                    )),
+                }
+            }
+        };
+
+    let (success, status_code) = match &result {
+        Ok(_) => (true, 200u16),
+        Err((sc, _)) => (false, sc.as_u16()),
+    };
+    crate::api::audit::record(
+        &state.store,
+        "flow.run.question_answer",
+        Some(&flow),
+        Some(&run_id),
+        &headers,
+        Some(addr),
+        success,
+        status_code,
+        Some(serde_json::json!({ "question_id": question_id })),
+    )
+    .await;
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // SSE event stream
 // ---------------------------------------------------------------------------
 
@@ -524,6 +687,8 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
         CrewEvent::DialogThinking { .. } => "dialog_thinking",
         CrewEvent::DialogCompleted { .. } => "dialog_completed",
         CrewEvent::MemorySet { .. } => "memory_set",
+        CrewEvent::HumanInputRequested { .. } => "human_input_requested",
+        CrewEvent::HumanInputReceived { .. } => "human_input_received",
         CrewEvent::Log { .. } => "log",
         CrewEvent::RunComplete { .. } => "run_complete",
     }

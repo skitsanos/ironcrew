@@ -103,7 +103,7 @@ ironcrew list .
 
 ### nodes
 
-List all 9 built-in tools with their descriptions.
+List all 10 built-in tools with their descriptions.
 
 ```
 ironcrew nodes
@@ -159,7 +159,7 @@ Performs static analysis on the project:
 |-------|-------------|
 | Syntax | Parses `crew.lua`, `agents/*.lua`, and `tools/*.lua` for Lua syntax errors |
 | Agent summary | Lists agents with their capabilities and tool references |
-| Tool summary | Lists custom tools alongside the 9 built-in tools |
+| Tool summary | Lists custom tools alongside the 10 built-in tools |
 | Unknown tools | Warns when an agent references a tool that is neither built-in nor in `tools/` |
 
 Since tasks are defined programmatically in `crew.lua` (via `crew:add_task()`),
@@ -266,7 +266,7 @@ ironcrew runs -p . --limit 20 --offset 40   # page 3
 | Flag           | Default | Description |
 |----------------|---------|-------------|
 | `-p, --project`| `.`     | Project path (locates `.ironcrew/runs/`) |
-| `-s, --status` | (all)   | Filter by status: `success`, `partial_failure`, `failed` |
+| `-s, --status` | (all)   | Filter by status: `success`, `partial_failure`, `failed`, `running`, `waiting_for_input`, `abandoned` |
 | `-t, --tag`    | (all)   | Filter by tag (exact match against the run's tag list) |
 | `--since`      | (all)   | Only include runs started at or after this RFC3339 timestamp |
 | `-l, --limit`  | `20`    | Maximum number of runs to return |

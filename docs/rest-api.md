@@ -34,6 +34,8 @@ scaling considerations, see [HTTP Scaling](http-scaling.md).
 | POST     | `/flows/{flow}/run`                                | Start a crew run (async)                            |
 | POST     | `/flows/{flow}/abort/{run_id}`                     | Abort a running crew                                |
 | GET      | `/flows/{flow}/events/{run_id}`                    | SSE event stream for a run                          |
+| GET      | `/flows/{flow}/questions/{run_id}`                 | Pending `ask_human` questions for a suspended run   |
+| POST     | `/flows/{flow}/answer/{run_id}`                    | Answer a pending `ask_human` question               |
 | GET      | `/flows/{flow}/runs`                               | List past runs for a flow                           |
 | GET      | `/flows/{flow}/runs/{id}`                          | Get a specific run record                           |
 | DELETE   | `/flows/{flow}/runs/{id}`                          | Delete a run record                                 |
@@ -97,6 +99,71 @@ A run can end with one of these statuses:
 - `timeout` — 30-minute lifetime exceeded
 - `aborted` — cancelled via this endpoint
 
+## Mid-Run Questions (`crew:ask_human`)
+
+When a flow calls [`crew:ask_human()`](crews.md#human-in-the-loop-ask_human),
+the run suspends until a human answers over these endpoints (or the question
+times out). The SSE stream carries a `human_input_requested` event the moment
+the question is asked, so a UI can render a form immediately; poll-only
+clients recover the same state from the questions endpoint.
+
+### List pending questions
+
+```bash
+curl http://localhost:3000/flows/my-crew/questions/abc-123
+```
+
+```json
+{
+  "run_id": "abc-123",
+  "status": "waiting_for_input",
+  "questions": [
+    {
+      "question_id": "9c1e…",
+      "prompt": "Deploy to production?",
+      "choices": ["yes", "no", "staging only"],
+      "asked_at": "2026-07-07T10:00:00Z",
+      "timeout_s": 600,
+      "kind": "question"
+    }
+  ]
+}
+```
+
+`status` is `"running"` with an empty array when nothing is pending. `404`
+when the run is not active under this flow — like `abort`, the endpoint is
+flow-scoped and never confirms that a run exists under a different flow.
+
+`kind` is `"question"` (from `crew:ask_human()` or the agent-facing
+`ask_human` tool) or `"approval"` (from a
+[tool approval gate](crews.md#approval-gates-require_approval)) — render an
+answer form for the first, allow/always/deny buttons for the second. For
+approvals, only the exact tokens `allow`/`yes`/`always` permit the call;
+anything else denies (free text is forwarded to the agent as the denial
+reason).
+
+### Answer a question
+
+```bash
+curl -X POST http://localhost:3000/flows/my-crew/answer/abc-123 \
+  -H 'Content-Type: application/json' \
+  -d '{"question_id": "9c1e…", "answer": "yes"}'
+# {"run_id":"abc-123","question_id":"9c1e…","status":"delivered"}
+```
+
+`answer` may be any JSON value — a string, number, or a whole object; the
+suspended flow receives it as a Lua value. First writer wins: a second answer
+to the same question gets `404` (the question is gone), never a silent
+overwrite. `choices` are advisory — the endpoint accepts free-form answers
+even when choices were offered; flows that need strict values validate in Lua.
+
+Both endpoints are recorded in the [audit log](#get-audit) (actions
+`flow.run.questions_list` / `flow.run.question_answer`). The audit record and
+the SSE events carry the `question_id` but **never the answer content** —
+answers may contain secrets.
+
+Aborting a suspended run works unchanged; its pending questions expire with it.
+
 ## SSE Event Stream
 
 `GET /flows/{flow}/events/{run_id}` returns a Server-Sent Events stream.
@@ -152,6 +219,8 @@ full untruncated output.
 | `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended (either reached `max_turns` or a `should_stop` callback stopped it; `stop_reason` is present only when the callback stopped it) |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
+| `human_input_requested` | `question_id`, `prompt`, `choices`, `timeout_s`, `kind`    | The run suspended on a human question (`kind: "question"` from ask_human, `"approval"` from a tool approval gate) — render a form / allow-deny buttons and POST to the [answer endpoint](#answer-a-question) |
+| `human_input_received` | `question_id`, `outcome`                                    | The question resolved (`outcome`: `"answered"` or `"timeout"`). Never carries the answer content — answers may contain secrets |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
 | `run_complete`       | `run_id`, `status`, `duration_ms`, `total_tokens`             | Run finished (terminal event)                |
 
@@ -244,7 +313,7 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
 
 | Param    | Type    | Description |
 |----------|---------|-------------|
-| `status` | string  | `success`, `partial_failure`, `failed` |
+| `status` | string  | `success`, `partial_failure`, `failed`, `running`, `waiting_for_input`, `abandoned` |
 | `tag`    | string  | Exact-match against the run's tag list |
 | `since`  | string  | RFC3339 timestamp; only runs at or after this time |
 | `limit`  | integer | Page size (default `IRONCREW_RUNS_DEFAULT_LIMIT`, capped at `IRONCREW_RUNS_MAX_LIMIT`, default 100) |
