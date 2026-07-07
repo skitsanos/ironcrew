@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::engine::eventbus::EventBus;
+use crate::engine::input_bridge::InputBridge;
 use crate::engine::store::StateStore;
 
 /// A running crew: its event bus and an abort handle to cancel it.
@@ -25,6 +26,10 @@ pub struct ActiveRun {
     /// Flow slug this run belongs to, so `abort_run` can reject a request that
     /// targets another flow's run without a store round-trip.
     pub flow: String,
+    /// Per-run human-input transport for `crew:ask_human()` — the questions
+    /// and answer endpoints reach the suspended flow through this. Dropped
+    /// with the entry, so pending oneshots die when the run is cleaned up.
+    pub input_bridge: Arc<InputBridge>,
 }
 
 /// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
@@ -171,6 +176,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/validate", get(validate_flow))
         .route("/flows/{flow}/agents", get(list_agents))
         .route("/flows/{flow}/events/{run_id}", get(flow_events))
+        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints
+        .route("/flows/{flow}/questions/{run_id}", get(list_questions))
+        .route("/flows/{flow}/answer/{run_id}", post(answer_question))
         // Phase-1 Human-in-the-Loop conversation endpoints
         .route(
             "/flows/{flow}/conversations",

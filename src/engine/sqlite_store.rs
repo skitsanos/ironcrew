@@ -312,7 +312,7 @@ impl StateStore for SqliteStore {
                         "UPDATE runs
                          SET status = ?1, finished_at = ?2, duration_ms = ?3,
                              task_results = ?4, total_tokens = ?5, cached_tokens = ?6
-                         WHERE run_id = ?7 AND status = 'running'",
+                         WHERE run_id = ?7 AND status IN ('running', 'waiting_for_input')",
                         rusqlite::params![
                             completion.status.to_string(),
                             completion.finished_at,
@@ -329,11 +329,46 @@ impl StateStore for SqliteStore {
 
                 if rows == 0 {
                     return Err(IronCrewError::Validation(format!(
-                        "Run '{}' not found or not in Running state",
+                        "Run '{}' not found or not in an in-flight state",
                         run_id
                     )));
                 }
                 tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
+                Ok(())
+            })
+            .await,
+        )
+    }
+
+    async fn update_run_status(
+        &self,
+        run_id: &str,
+        status: crate::engine::run_history::RunStatus,
+    ) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        let status = status.to_string();
+
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let rows = conn
+                    .execute(
+                        "UPDATE runs SET status = ?1
+                         WHERE run_id = ?2 AND status IN ('running', 'waiting_for_input')",
+                        rusqlite::params![status, run_id],
+                    )
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite update status: {}", e))
+                    })?;
+                if rows == 0 {
+                    return Err(IronCrewError::Validation(format!(
+                        "Run '{}' not found or not in an in-flight state",
+                        run_id
+                    )));
+                }
                 Ok(())
             })
             .await,
@@ -351,7 +386,7 @@ impl StateStore for SqliteStore {
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
                 let rows = conn
                     .execute(
-                        "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status = 'running'",
+                        "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status IN ('running', 'waiting_for_input')",
                         rusqlite::params![now],
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;

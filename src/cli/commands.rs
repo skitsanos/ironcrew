@@ -28,6 +28,17 @@ pub async fn cmd_run(
             });
     }
 
+    // Human-input transport for crew:ask_human(): CLI mode prompts on the
+    // terminal (stderr prompt, stdin answer). `run_id: None` — the run
+    // record is created inside crew:run() and terminal prompting doesn't
+    // need store status flips; non-TTY stdin resolves as immediate timeout.
+    lua.set_app_data(crate::engine::input_bridge::AskHumanContext {
+        bridge: std::sync::Arc::new(crate::engine::input_bridge::InputBridge::new(
+            crate::engine::input_bridge::BridgeMode::Tty,
+        )),
+        run_id: None,
+    });
+
     // In --json mode, suppress Lua print() by marking via app_data
     if json_output {
         lua.set_app_data(JsonOutputMode);
