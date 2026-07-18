@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
 use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
 
@@ -17,6 +18,82 @@ use super::{
     AppState, ErrorResponse, ListRunsQuery, ListRunsResponse, RunCrewResponse, TaskResultResponse,
     error_response, resolve_flow_path,
 };
+
+const HARD_API_MAX_TAGS: usize = 256;
+const HARD_API_MAX_TAG_BYTES: usize = 4 * 1024;
+const HARD_API_MAX_TAGS_BYTES: usize = 64 * 1024;
+
+fn validate_run_id(run_id: &str) -> Result<(), IronCrewError> {
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(IronCrewError::Validation(
+            "Invalid run identifier; expected 1-128 ASCII letters, digits, '.', '_' or '-'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_run_tags(input: Option<&serde_json::Value>) -> Result<Vec<String>, IronCrewError> {
+    let Some(tags_value) = input.and_then(|value| value.get("tags")) else {
+        return Ok(Vec::new());
+    };
+    let tags = tags_value.as_array().ok_or_else(|| {
+        IronCrewError::Validation("Input 'tags' must be an array of strings".into())
+    })?;
+    let max_tags = positive_bounded_env("IRONCREW_API_MAX_TAGS", 32, HARD_API_MAX_TAGS);
+    if tags.len() > max_tags {
+        return Err(IronCrewError::Validation(format!(
+            "Input has {} tags, exceeds IRONCREW_API_MAX_TAGS ({max_tags})",
+            tags.len()
+        )));
+    }
+
+    let max_tag_bytes =
+        positive_bounded_env("IRONCREW_API_MAX_TAG_BYTES", 256, HARD_API_MAX_TAG_BYTES);
+    let max_total_bytes = positive_bounded_env(
+        "IRONCREW_API_MAX_TAGS_BYTES",
+        4 * 1024,
+        HARD_API_MAX_TAGS_BYTES,
+    );
+    let mut total_bytes = 0usize;
+    let mut validated = Vec::with_capacity(tags.len());
+    let mut seen = std::collections::HashSet::with_capacity(tags.len());
+    for (index, value) in tags.iter().enumerate() {
+        let tag = value.as_str().ok_or_else(|| {
+            IronCrewError::Validation(format!("Input tags[{index}] must be a string"))
+        })?;
+        if tag.is_empty() || tag.trim() != tag || tag.chars().any(char::is_control) {
+            return Err(IronCrewError::Validation(format!(
+                "Input tags[{index}] must be non-empty and contain no padding or control characters"
+            )));
+        }
+        if tag.len() > max_tag_bytes {
+            return Err(IronCrewError::Validation(format!(
+                "Input tags[{index}] is {} bytes, exceeds IRONCREW_API_MAX_TAG_BYTES ({max_tag_bytes})",
+                tag.len()
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(tag.len())
+            .ok_or_else(|| IronCrewError::Validation("Input tag byte count overflowed".into()))?;
+        if total_bytes > max_total_bytes {
+            return Err(IronCrewError::Validation(format!(
+                "Input tags total {total_bytes} bytes, exceeds IRONCREW_API_MAX_TAGS_BYTES ({max_total_bytes})"
+            )));
+        }
+        if !seen.insert(tag) {
+            return Err(IronCrewError::Validation(format!(
+                "Input tags contains duplicate '{tag}'"
+            )));
+        }
+        validated.push(tag.to_string());
+    }
+    Ok(validated)
+}
 
 fn flow_status(err: &IronCrewError) -> StatusCode {
     if err.to_string().contains("not found") {
@@ -61,6 +138,269 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+/// Readiness probe: unlike the compatibility `/health` liveness endpoint,
+/// this verifies both the configured flows directory and the persistence
+/// backend before allowing the pod to receive traffic.
+pub async fn readiness(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state
+        .accepting_traffic
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "component": "shutdown",
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        );
+    }
+
+    if state
+        .terminal_persistence_failures
+        .load(std::sync::atomic::Ordering::Acquire)
+        > 0
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "component": "storage_finalization",
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        );
+    }
+
+    if !state
+        .store_maintenance_healthy
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "component": "storage_maintenance",
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        );
+    }
+
+    let mut cache = match state.readiness_cache.try_lock() {
+        Ok(cache) => cache,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "component": "readiness_check",
+                    "version": env!("CARGO_PKG_VERSION"),
+                })),
+            );
+        }
+    };
+    let cache_ttl = std::time::Duration::from_millis(positive_bounded_env(
+        "IRONCREW_READINESS_CACHE_MS",
+        1_000,
+        10_000,
+    ) as u64);
+    if let Some(snapshot) = *cache
+        && snapshot.checked_at.elapsed() < cache_ttl
+    {
+        let status = if snapshot.ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "status": if snapshot.ready { "ready" } else { "not_ready" },
+                "component": snapshot.component,
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        );
+    }
+
+    let snapshot = if let Err(error) = tokio::fs::read_dir(&state.flows_dir).await {
+        tracing::warn!(
+            path = %state.flows_dir.display(),
+            %error,
+            "Readiness check failed: flows directory is unavailable"
+        );
+        super::CachedReadiness {
+            checked_at: std::time::Instant::now(),
+            ready: false,
+            component: "flows",
+        }
+    } else if let Err(error) = state.store.health_check().await {
+        tracing::warn!(%error, "Readiness check failed: state store is unavailable");
+        super::CachedReadiness {
+            checked_at: std::time::Instant::now(),
+            ready: false,
+            component: "storage",
+        }
+    } else {
+        super::CachedReadiness {
+            checked_at: std::time::Instant::now(),
+            ready: true,
+            component: "storage",
+        }
+    };
+    *cache = Some(snapshot);
+
+    let status = if snapshot.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if snapshot.ready { "ready" } else { "not_ready" },
+            "component": snapshot.component,
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+}
+
+fn run_not_found(error: &IronCrewError, run_id: &str) -> bool {
+    matches!(
+        error,
+        IronCrewError::Validation(message)
+            if message == &format!("Run '{}' not found", run_id)
+    )
+}
+
+/// Persist one terminal transition for an HTTP-owned run. Normal crew runs
+/// have already completed their record inside `crew:run()`; in that case the
+/// store returns `AlreadyTerminal` and its winning status is preserved. If a
+/// task failed before Lua could create the intent, create a minimal fallback
+/// record only after confirming the run is genuinely absent.
+struct TerminalPersistence<'a> {
+    run_id: &'a str,
+    flow: &'a str,
+    started_at: &'a str,
+    tags: &'a [String],
+    status: RunStatus,
+    duration_ms: u64,
+    total_tokens: u32,
+}
+
+async fn persist_terminal_outcome(
+    store: &Arc<dyn crate::engine::store::StateStore>,
+    terminal: TerminalPersistence<'_>,
+) -> Result<RunStatus, IronCrewError> {
+    let completion = RunCompletion {
+        status: terminal.status.clone(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: terminal.duration_ms,
+        task_results: Vec::new(),
+        total_tokens: terminal.total_tokens,
+        cached_tokens: 0,
+    };
+
+    match store
+        .update_run_completion(terminal.run_id, completion.clone())
+        .await
+    {
+        Ok(RunTransition::Applied) => return Ok(terminal.status),
+        Ok(RunTransition::AlreadyTerminal(status)) => return Ok(status),
+        Err(update_error) => match store.get_run(terminal.run_id).await {
+            Ok(record) if record.status.is_terminal() => return Ok(record.status),
+            Ok(record) => {
+                return Err(IronCrewError::Validation(format!(
+                    "Failed to persist terminal outcome for run '{}': {}; durable status remains '{}'",
+                    terminal.run_id, update_error, record.status
+                )));
+            }
+            Err(get_error) if run_not_found(&get_error, terminal.run_id) => {}
+            Err(get_error) => {
+                return Err(IronCrewError::Validation(format!(
+                    "Could not verify run '{}' after terminal update failed (update: {}; read: {})",
+                    terminal.run_id, update_error, get_error
+                )));
+            }
+        },
+    }
+
+    let fallback = RunIntent {
+        suggested_id: Some(terminal.run_id.to_string()),
+        flow_name: terminal.flow.to_string(),
+        flow: terminal.flow.to_string(),
+        started_at: terminal.started_at.to_string(),
+        agent_count: 0,
+        task_count: 0,
+        tags: terminal.tags.to_vec(),
+    };
+    if let Err(error) = store.save_run_intent(fallback).await {
+        return Err(IronCrewError::Validation(format!(
+            "Failed to create fallback intent for terminal run '{}': {}",
+            terminal.run_id, error
+        )));
+    }
+
+    match store
+        .update_run_completion(terminal.run_id, completion)
+        .await
+    {
+        Ok(RunTransition::Applied) => Ok(terminal.status),
+        Ok(RunTransition::AlreadyTerminal(status)) => Ok(status),
+        Err(error) => Err(IronCrewError::Validation(format!(
+            "Failed to persist terminal outcome for fallback run '{}': {}",
+            terminal.run_id, error
+        ))),
+    }
+}
+
+struct WorkOutcome {
+    status: RunStatus,
+    duration_ms: u64,
+    total_tokens: u32,
+    error_message: Option<String>,
+}
+
+fn classify_work_result(
+    join_result: std::result::Result<
+        std::result::Result<RunCrewResponse, IronCrewError>,
+        tokio::task::JoinError,
+    >,
+    elapsed_ms: u64,
+) -> WorkOutcome {
+    match join_result {
+        Ok(Ok(response)) => WorkOutcome {
+            status: response
+                .status
+                .parse::<RunStatus>()
+                .ok()
+                .filter(RunStatus::is_terminal)
+                .unwrap_or(RunStatus::Success),
+            duration_ms: response.duration_ms,
+            total_tokens: response.total_tokens,
+            error_message: None,
+        },
+        Ok(Err(error)) => WorkOutcome {
+            status: RunStatus::Failed,
+            duration_ms: elapsed_ms,
+            total_tokens: 0,
+            error_message: Some(error.to_string()),
+        },
+        Err(join_error) if join_error.is_cancelled() => WorkOutcome {
+            status: RunStatus::Aborted,
+            duration_ms: elapsed_ms,
+            total_tokens: 0,
+            error_message: None,
+        },
+        Err(join_error) => WorkOutcome {
+            status: RunStatus::Failed,
+            duration_ms: elapsed_ms,
+            total_tokens: 0,
+            error_message: Some(format!("Task panicked: {join_error}")),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Flow execution
 // ---------------------------------------------------------------------------
@@ -77,16 +417,8 @@ pub async fn run_flow(
     // Extract tags up front so the audit metadata can be populated even
     // when flow resolution fails. Tags are user-controlled and bounded by
     // the audit recorder's metadata clamp.
-    let tags_for_audit: Vec<String> = input
-        .as_ref()
-        .and_then(|v| v.get("tags"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let tags_for_audit = validate_run_tags(input.as_ref())
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
 
     let flow_path = match resolve_flow_path(&state, &flow) {
         Ok(p) => p,
@@ -114,20 +446,32 @@ pub async fn run_flow(
         }
     };
 
-    // Backpressure: cap simultaneously-active runs so a request loop can't
-    // exhaust memory / LLM quota by spawning unbounded crew VMs. Mirrors the
-    // active-conversation cap. Checked after flow resolution so path-traversal
-    // still 404s; a rejected run returns 503 (no state mutated, not audited —
-    // same posture as the conversation cap).
-    if state.active_runs.read().await.len() >= state.max_active_runs {
+    if !state
+        .accepting_traffic
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Active run limit reached ({} runs). Raise IRONCREW_MAX_ACTIVE_RUNS or wait for in-flight runs to finish.",
-                state.max_active_runs
-            ),
+            "Server is shutting down".into(),
         ));
     }
+
+    // Reserve capacity atomically. A `len()` pre-check races concurrent HTTP
+    // requests and can oversubscribe the process before any run reaches the
+    // active map. The monitor owns this permit through terminal persistence.
+    let admission_permit = state
+        .run_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Active run limit reached ({} runs). Raise IRONCREW_MAX_ACTIVE_RUNS or wait for in-flight runs to finish.",
+                    state.max_active_runs
+                ),
+            )
+        })?;
 
     // Flow slug the run will be scoped by — the resolved directory's last
     // segment, matching what `crew:run()` stores in `RunRecord::flow`.
@@ -139,6 +483,8 @@ pub async fn run_flow(
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let eventbus = EventBus::new(256);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
 
     // Per-run human-input transport: crew:ask_human() parks on this, the
     // questions/answer endpoints reach it through ActiveRun.
@@ -146,114 +492,173 @@ pub async fn run_flow(
         crate::engine::input_bridge::BridgeMode::Http,
     ));
 
-    // Spawn the actual work as a child task — store its AbortHandle for cancellation
+    // Prepare the work task, then register it while holding the active-map
+    // write lock. Rechecking readiness under that lock closes the race where
+    // shutdown drains the map while a request is still being initialized.
     let eventbus_inner = eventbus.clone();
     let run_id_for_work = run_id.clone();
     let store_for_work = state.store.clone();
     let bridge_for_work = input_bridge.clone();
-    let work_handle = tokio::spawn(async move {
-        execute_crew_from_path_with_events(
-            &flow_path,
-            &eventbus_inner,
-            &run_id_for_work,
-            input.as_ref(),
-            Some(store_for_work),
-            Some(bridge_for_work),
-        )
-        .await
-    });
-    let abort_handle = work_handle.abort_handle();
+    let (work_handle, terminal_tx) = {
+        let mut active_runs = state.active_runs.write().await;
+        if !state
+            .accepting_traffic
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is shutting down".into(),
+            ));
+        }
 
-    // Store eventbus + abort handle for SSE subscribers and abort endpoint
-    state.active_runs.write().await.insert(
-        run_id.clone(),
-        super::ActiveRun {
-            eventbus: eventbus.clone(),
-            abort_handle,
-            flow: flow_slug.clone(),
-            input_bridge,
-        },
-    );
+        // Terminal entries are retained briefly so late SSE subscribers can
+        // recover the final event. Reclaim them before admitting new work so
+        // rapid completions can never make the event-bus map exceed the same
+        // bound used for active-run admission.
+        active_runs.retain(|_, active| !*active.terminal.borrow());
+        if active_runs.len() >= state.max_active_runs {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Active run registry is at capacity; retry shortly".into(),
+            ));
+        }
+
+        let work_handle = tokio::spawn(async move {
+            execute_crew_from_path_with_events(
+                &flow_path,
+                &eventbus_inner,
+                &run_id_for_work,
+                input.as_ref(),
+                Some(store_for_work),
+                Some(bridge_for_work),
+            )
+            .await
+        });
+        let abort_handle = work_handle.abort_handle();
+        let (terminal_tx, terminal_rx) = tokio::sync::watch::channel(false);
+
+        active_runs.insert(
+            run_id.clone(),
+            super::ActiveRun {
+                eventbus: eventbus.clone(),
+                abort_handle,
+                flow: flow_slug.clone(),
+                input_bridge,
+                terminal: terminal_rx,
+            },
+        );
+        (work_handle, terminal_tx)
+    };
 
     let run_id_clone = run_id.clone();
     let state_clone = state.clone();
     let flow_clone = flow.clone();
+    let flow_slug_for_monitor = flow_slug.clone();
+    let tags_for_terminal = tags_for_audit.clone();
 
-    // Monitor the work handle: emit RunComplete on finish, timeout, or abort
+    // Monitor the work handle. It is the single API-level finalizer for
+    // errors, cancellation, panic, timeout, and server shutdown. Store
+    // transitions are compare-and-set, so a normal `crew:run()` completion
+    // that wins first remains authoritative.
     tokio::spawn(async move {
-        let max_lifetime_secs: u64 = std::env::var("IRONCREW_MAX_RUN_LIFETIME")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30 * 60);
-        let max_lifetime = std::time::Duration::from_secs(max_lifetime_secs);
+        let max_lifetime = state_clone.max_run_lifetime;
         let mut work_handle = work_handle;
 
-        // Race the work against the timeout
-        tokio::select! {
+        let (requested_status, duration_ms, total_tokens, error_message) = tokio::select! {
             join_result = &mut work_handle => {
-                // Small delay to drain final events
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                match join_result {
-                    Ok(Ok(response)) => {
-                        eventbus.emit(CrewEvent::RunComplete {
-                            run_id: run_id_clone.clone(),
-                            status: response.status.clone(),
-                            duration_ms: response.duration_ms,
-                            total_tokens: response.total_tokens,
-                        });
-                    }
-                    Ok(Err(e)) => {
-                        eventbus.emit(CrewEvent::Log {
-                            level: "error".into(),
-                            message: e.to_string(),
-                        });
-                        eventbus.emit(CrewEvent::RunComplete {
-                            run_id: run_id_clone.clone(),
-                            status: "failed".into(),
-                            duration_ms: 0,
-                            total_tokens: 0,
-                        });
-                    }
-                    Err(join_err) if join_err.is_cancelled() => {
-                        // Aborted via the abort endpoint
-                        eventbus.emit(CrewEvent::RunComplete {
-                            run_id: run_id_clone.clone(),
-                            status: "aborted".into(),
-                            duration_ms: 0,
-                            total_tokens: 0,
-                        });
-                    }
-                    Err(join_err) => {
-                        eventbus.emit(CrewEvent::Log {
-                            level: "error".into(),
-                            message: format!("Task panicked: {}", join_err),
-                        });
-                        eventbus.emit(CrewEvent::RunComplete {
-                            run_id: run_id_clone.clone(),
-                            status: "failed".into(),
-                            duration_ms: 0,
-                            total_tokens: 0,
-                        });
-                    }
-                }
+                let outcome = classify_work_result(
+                    join_result,
+                    started.elapsed().as_millis() as u64,
+                );
+                (
+                    outcome.status,
+                    outcome.duration_ms,
+                    outcome.total_tokens,
+                    outcome.error_message,
+                )
             }
             _ = tokio::time::sleep(max_lifetime) => {
-                // Timeout: abort the work handle to cancel ongoing LLM calls
-                // and any sub-tasks awaiting inside the orchestrator.
                 work_handle.abort();
+                // Wait until cancellation has completed before touching the
+                // record, so Lua cannot race a later completion write.
+                let _ = work_handle.await;
                 tracing::warn!("Run {} timed out after {}s", run_id_clone, max_lifetime.as_secs());
-                eventbus.emit(CrewEvent::RunComplete {
-                    run_id: run_id_clone.clone(),
-                    status: "timeout".into(),
-                    duration_ms: max_lifetime.as_millis() as u64,
-                    total_tokens: 0,
-                });
+                (
+                    RunStatus::TimedOut,
+                    started.elapsed().as_millis() as u64,
+                    0,
+                    None,
+                )
             }
+        };
+
+        if let Some(message) = error_message {
+            eventbus.emit(CrewEvent::Log {
+                level: "error".into(),
+                message,
+            });
         }
 
-        // Clean up after a short delay to allow SSE clients to receive the final event
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let mut persistence_degraded = false;
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        let terminal_status = loop {
+            match persist_terminal_outcome(
+                &state_clone.store,
+                TerminalPersistence {
+                    run_id: &run_id_clone,
+                    flow: &flow_slug_for_monitor,
+                    started_at: &started_at,
+                    tags: &tags_for_terminal,
+                    status: requested_status.clone(),
+                    duration_ms,
+                    total_tokens,
+                },
+            )
+            .await
+            {
+                Ok(status) => {
+                    if persistence_degraded {
+                        state_clone
+                            .terminal_persistence_failures
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        tracing::info!(run_id = %run_id_clone, "Terminal persistence recovered");
+                    }
+                    break status;
+                }
+                Err(error) => {
+                    if !persistence_degraded {
+                        persistence_degraded = true;
+                        state_clone
+                            .terminal_persistence_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    tracing::error!(
+                        run_id = %run_id_clone,
+                        retry_ms = retry_delay.as_millis(),
+                        %error,
+                        "Terminal persistence failed; retaining admission permit and retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
+                }
+            }
+        };
+
+        eventbus.emit(CrewEvent::RunComplete {
+            run_id: run_id_clone.clone(),
+            status: terminal_status.to_string(),
+            duration_ms,
+            total_tokens,
+        });
+        let _ = terminal_tx.send(true);
+        drop(admission_permit);
+
+        // Keep the terminal bus for late SSE recovery. Admission prunes these
+        // tombstones early when capacity is needed, so retention is bounded by
+        // `max_active_runs` rather than completion rate.
+        tokio::time::sleep(run_sse_retention()).await;
         state_clone.active_runs.write().await.remove(&run_id_clone);
     });
 
@@ -326,14 +731,9 @@ async fn execute_crew_from_path_with_events(
     // Inject input as a global `input` table (from the HTTP request body)
     if let Some(input_value) = input {
         // Extract tags from input if present (e.g., {"tags": ["v2", "experiment"], ...})
-        if let Some(tags) = input_value.get("tags").and_then(|v| v.as_array()) {
-            let tag_strings: Vec<String> = tags
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if !tag_strings.is_empty() {
-                lua.set_app_data(tag_strings);
-            }
+        let tag_strings = validate_run_tags(Some(input_value))?;
+        if !tag_strings.is_empty() {
+            lua.set_app_data(tag_strings);
         }
 
         let lua_input = json_value_to_lua(&lua, input_value).map_err(IronCrewError::Lua)?;
@@ -346,9 +746,13 @@ async fn execute_crew_from_path_with_events(
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = std::fs::read_to_string(entrypoint)?;
+    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
-    let exec_err = lua.load(&script).exec_async().await.err();
+    let exec_err = {
+        let _execution =
+            crate::lua::limits::LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&script).exec_async().await.err()
+    };
 
     // Even if post-run Lua code failed (e.g., json_parse on skipped output),
     // the crew may have completed successfully. Check the run record first.
@@ -410,12 +814,16 @@ pub async fn execute_crew_from_path(
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = std::fs::read_to_string(entrypoint)?;
+    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(IronCrewError::Lua)?;
+    {
+        let _execution =
+            crate::lua::limits::LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&script)
+            .exec_async()
+            .await
+            .map_err(IronCrewError::Lua)?;
+    }
 
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
@@ -464,6 +872,8 @@ pub async fn abort_run(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_run_id(&run_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     // Scope to the flow in the URL: resolve it to the canonical slug and only
     // abort a run that belongs to it, so `DELETE /flows/A/runs/{id}` can't
     // cancel flow B's run.
@@ -531,6 +941,8 @@ pub async fn list_questions(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_run_id(&run_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
         match resolve_flow_path(&state, &flow) {
             Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
@@ -603,6 +1015,8 @@ pub async fn answer_question(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<AnswerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_run_id(&run_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let question_id = body.question_id.clone();
     let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
         match resolve_flow_path(&state, &flow) {
@@ -757,9 +1171,24 @@ pub async fn flow_events(
     Sse<impl futures::stream::Stream<Item = std::result::Result<Event, Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    // Validate flow exists
-    let _ = resolve_flow_path(&state, &flow)
+    validate_run_id(&run_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
+    let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let flow_slug = flow_path
+        .file_name()
+        .and_then(|segment| segment.to_str())
+        .unwrap_or("");
+
+    let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
+        error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "SSE connection limit reached ({})",
+                state.max_sse_connections
+            ),
+        )
+    })?;
 
     let active_runs = state.active_runs.read().await;
     let active_run = active_runs.get(&run_id).ok_or_else(|| {
@@ -768,10 +1197,16 @@ pub async fn flow_events(
             format!("Run '{}' not found or already completed", run_id),
         )
     })?;
+    if active_run.flow != flow_slug {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found or already completed", run_id),
+        ));
+    }
 
-    // Get replay buffer and live subscription
-    let replay = active_run.eventbus.replay().await;
-    let mut rx = active_run.eventbus.subscribe();
+    // Subscribe and snapshot under one EventBus critical section so an event
+    // cannot land in the replay/subscription gap.
+    let (replay, mut rx) = active_run.eventbus.subscribe_with_replay();
     drop(active_runs);
 
     // Optional output truncation (disabled by default)
@@ -781,6 +1216,7 @@ pub async fn flow_events(
         .filter(|&n| n > 0);
 
     let stream = async_stream::stream! {
+        let _sse_permit = sse_permit;
         // First: replay all past events for late subscribers
         for event in replay {
             let effective = maybe_truncate_event(&event, sse_max_chars);
@@ -828,30 +1264,62 @@ pub async fn flow_events(
 // Run history (per-flow)
 // ---------------------------------------------------------------------------
 
+fn positive_bounded_env(name: &str, default: usize, upper: usize) -> usize {
+    let fallback = default.min(upper);
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value.min(upper),
+            _ => {
+                tracing::warn!(
+                    variable = name,
+                    value = %raw,
+                    default = fallback,
+                    "Ignoring invalid resource-limit environment value"
+                );
+                fallback
+            }
+        },
+        Err(_) => fallback,
+    }
+}
+
 /// Cap on the number of simultaneously-active runs — reads
-/// `IRONCREW_MAX_ACTIVE_RUNS` once at boot (default 100).
+/// `IRONCREW_MAX_ACTIVE_RUNS` once at boot (default 4).
 pub fn max_active_runs() -> usize {
-    std::env::var("IRONCREW_MAX_ACTIVE_RUNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    positive_bounded_env("IRONCREW_MAX_ACTIVE_RUNS", 4, 1024)
+}
+
+/// Global cap for long-lived run and conversation SSE connections.
+pub fn max_sse_connections() -> usize {
+    positive_bounded_env("IRONCREW_MAX_SSE_CONNECTIONS", 16, 1024)
+}
+
+/// Maximum wall-clock lifetime for an HTTP run.
+pub fn max_run_lifetime() -> std::time::Duration {
+    std::time::Duration::from_secs(positive_bounded_env(
+        "IRONCREW_MAX_RUN_LIFETIME",
+        30 * 60,
+        24 * 60 * 60,
+    ) as u64)
+}
+
+/// How long a completed run's event bus remains available for a late SSE
+/// subscriber. Defaults to the established five-second recovery window.
+fn run_sse_retention() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        positive_bounded_env("IRONCREW_RUN_SSE_RETENTION_SECS", 5, 300) as u64,
+    )
 }
 
 /// Default page size for `GET /flows/{flow}/runs` — override with `IRONCREW_RUNS_DEFAULT_LIMIT`.
 fn runs_default_limit() -> usize {
-    std::env::var("IRONCREW_RUNS_DEFAULT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20)
+    positive_bounded_env("IRONCREW_RUNS_DEFAULT_LIMIT", 20, runs_max_limit())
 }
 
 /// Hard cap on page size — override with `IRONCREW_RUNS_MAX_LIMIT`.
 /// A client that asks for more than this gets silently clamped.
 fn runs_max_limit() -> usize {
-    std::env::var("IRONCREW_RUNS_MAX_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    positive_bounded_env("IRONCREW_RUNS_MAX_LIMIT", 100, 1000)
 }
 
 pub async fn list_runs(
@@ -905,6 +1373,8 @@ pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
 ) -> Result<Json<crate::engine::run_history::RunRecord>, (StatusCode, Json<ErrorResponse>)> {
+    validate_run_id(&id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let flow_path = resolve_flow_path(&state, &flow)
         .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
     let flow_slug = flow_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -933,6 +1403,8 @@ pub async fn delete_run(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_run_id(&id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> = async {
         let flow_path = resolve_flow_path(&state, &flow)
             .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
@@ -950,6 +1422,19 @@ pub async fn delete_run(
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Run '{}' not found", id),
+            ));
+        }
+
+        let active_in_memory = state
+            .active_runs
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|active| !*active.terminal.borrow());
+        if active_in_memory || record.status.is_in_flight() {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!("Run '{}' is still active and cannot be deleted", id),
             ));
         }
 
@@ -1015,7 +1500,7 @@ pub async fn validate_flow(
 
     // Check entrypoint syntax
     let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
-        if let Ok(script) = std::fs::read_to_string(ep) {
+        if let Ok(script) = crate::lua::source::read_lua_source(ep) {
             lua.load(&script).into_function().is_ok()
         } else {
             false
@@ -1118,7 +1603,14 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate_utf8;
+    use super::{
+        RunCrewResponse, TerminalPersistence, classify_work_result, persist_terminal_outcome,
+        truncate_utf8, validate_run_id, validate_run_tags,
+    };
+    use crate::engine::run_history::{JsonFileStore, RunStatus};
+    use crate::engine::store::StateStore;
+    use crate::utils::error::IronCrewError;
+    use std::sync::Arc;
 
     #[test]
     fn ascii_under_limit_returns_full() {
@@ -1160,6 +1652,77 @@ mod truncate_tests {
         }
         assert_eq!(truncate_utf8(s, 3), "你");
         assert_eq!(truncate_utf8(s, 6), "你好");
+    }
+
+    #[test]
+    fn run_ids_accept_only_bounded_ascii_identifiers() {
+        assert!(validate_run_id("run-1.test_value").is_ok());
+        assert!(validate_run_id("").is_err());
+        assert!(validate_run_id(&"a".repeat(129)).is_err());
+        assert!(validate_run_id("run/escape").is_err());
+        assert!(validate_run_id("rün").is_err());
+    }
+
+    #[test]
+    fn run_tags_are_strict_and_hard_bounded() {
+        let valid = serde_json::json!({"tags": ["release", "railway-pro"]});
+        assert_eq!(
+            validate_run_tags(Some(&valid)).unwrap(),
+            vec!["release", "railway-pro"]
+        );
+
+        assert!(validate_run_tags(Some(&serde_json::json!({"tags": "release"}))).is_err());
+        assert!(validate_run_tags(Some(&serde_json::json!({"tags": ["same", "same"]}))).is_err());
+        assert!(validate_run_tags(Some(&serde_json::json!({"tags": [1]}))).is_err());
+
+        let too_many = serde_json::json!({
+            "tags": (0..=super::HARD_API_MAX_TAGS)
+                .map(|index| format!("tag-{index}"))
+                .collect::<Vec<_>>()
+        });
+        assert!(validate_run_tags(Some(&too_many)).is_err());
+        let too_large = serde_json::json!({
+            "tags": ["x".repeat(super::HARD_API_MAX_TAG_BYTES + 1)]
+        });
+        assert!(validate_run_tags(Some(&too_large)).is_err());
+    }
+
+    #[tokio::test]
+    async fn panicked_work_is_persisted_as_failed() {
+        let handle: tokio::task::JoinHandle<std::result::Result<RunCrewResponse, IronCrewError>> =
+            tokio::spawn(async { panic!("intentional monitor test panic") });
+        let outcome = classify_work_result(handle.await, 42);
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert!(
+            outcome
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Task panicked"))
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn StateStore> =
+            Arc::new(JsonFileStore::new(temp.path().join(".ironcrew")).unwrap());
+        let status = persist_terminal_outcome(
+            &store,
+            TerminalPersistence {
+                run_id: "panic-run",
+                flow: "panic-flow",
+                started_at: "2026-07-18T00:00:00Z",
+                tags: &[],
+                status: outcome.status,
+                duration_ms: outcome.duration_ms,
+                total_tokens: outcome.total_tokens,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            store.get_run("panic-run").await.unwrap().status,
+            RunStatus::Failed
+        );
     }
 }
 

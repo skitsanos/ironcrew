@@ -13,7 +13,7 @@ local crew = Crew.new({
     base_url        = "https://api.openai.com/v1",  -- optional, overrides OPENAI_BASE_URL
     api_key         = env("OPENAI_API_KEY"),  -- optional, overrides OPENAI_API_KEY
     stream          = false,                  -- enable streaming output (default false)
-    max_concurrent  = 4,                      -- max parallel tasks (default: IRONCREW_DEFAULT_MAX_CONCURRENT or 10)
+    max_concurrent  = 4,                      -- max parallel tasks (default: IRONCREW_DEFAULT_MAX_CONCURRENT or 4)
     memory          = "ephemeral",            -- "ephemeral" (default) or "persistent"
     max_memory_items  = 500,                  -- eviction threshold (default 500)
     max_memory_tokens = 50000,                -- estimated token cap (default 50 000)
@@ -35,21 +35,21 @@ local crew = Crew.new({
 
 | Key                      | Type     | Default            | Description |
 |--------------------------|----------|--------------------|-------------|
-| `goal`                   | string   | *required*         | High-level objective shown in the system prompt |
-| `provider`               | string   | `"openai"`         | LLM provider: `"openai"`, `"anthropic"`, or `"openai-responses"` |
-| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking |
-| `server_tools`           | table    | `{}`               | (Anthropic/Responses) server-side tools: `{"web_search"}`, `{"code_execution"}`, `{"file_search"}`, `{"code_interpreter"}` |
-| `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task |
+| `goal`                   | string   | *required*         | Non-empty high-level objective shown in the system prompt; capped by `IRONCREW_CREW_GOAL_MAX_BYTES` (default 64 KiB) |
+| `provider`               | string   | `"openai"`         | LLM provider: `"openai"`, `"anthropic"`, or `"openai-responses"`; maximum 128 bytes |
+| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking; `1..=1000000` |
+| `server_tools`           | table    | `{}`               | (Anthropic/Responses) dense, duplicate-free server-side tool list; count capped by `IRONCREW_MAX_SERVER_TOOLS` |
+| `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task; `1..=100` |
 | `reasoning_effort`       | string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
 | `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` |
 | `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
-| `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results |
-| `model`                  | string   | `"gpt-4.1-mini"`    | Default model for task execution |
-| `base_url`               | string   | env `OPENAI_BASE_URL` | API endpoint (supports Gemini, Groq, etc.) |
-| `api_key`                | string   | env `OPENAI_API_KEY`  | API key; auto-resolved from provider-specific env vars |
+| `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results; `1..=1000` |
+| `model`                  | string   | `"gpt-4.1-mini"`    | Non-empty default model for task execution; maximum 1024 bytes |
+| `base_url`               | string   | env `OPENAI_BASE_URL` | HTTP(S) API endpoint, maximum 4096 bytes; embedded credentials are rejected |
+| `api_key`                | string   | env `OPENAI_API_KEY`  | API key, maximum 16 KiB; padding/control characters are rejected |
 | `stream`                 | bool     | `false`            | Stream LLM responses token-by-token |
-| `max_concurrent`         | number   | `10`               | Maximum tasks to run in parallel per phase. Overrides `IRONCREW_DEFAULT_MAX_CONCURRENT` env var |
+| `max_concurrent`         | number   | `4`                | Maximum tasks to run in parallel per phase. Overrides `IRONCREW_DEFAULT_MAX_CONCURRENT` env var |
 | `memory`                 | string   | `"ephemeral"`      | `"ephemeral"` or `"persistent"` |
 | `max_memory_items`       | number   | `500`              | Maximum items before LRU eviction |
 | `max_memory_tokens`      | number   | `50000`            | Estimated token budget for memory |
@@ -57,6 +57,18 @@ local crew = Crew.new({
 | `prompt_cache_retention` | string   | `nil`              | Cache retention hint (e.g. `"1h"`) |
 | `models`                 | table    | `{}`               | Model router mapping (purpose -> model) |
 | `mcp_servers`            | table    | `{}`               | External [MCP](#mcp-model-context-protocol-tool-servers) tool servers (stdio / HTTP) to connect on first `crew:run()` |
+
+---
+
+`max_memory_items` and `max_memory_tokens` must be positive and cannot exceed
+the operator policies `IRONCREW_MAX_MEMORY_ITEMS` (default 10000, hard 100000)
+and `IRONCREW_MAX_MEMORY_TOKENS` (default 1000000, hard 10000000). Provider
+configuration is also bounded: at most 16 `server_tools`, 32 vector-store IDs,
+and 64 `models` routes by default, with hard ceilings of 64, 256, and 256.
+Server-tool names, vector-store IDs, and model-route purposes are non-empty and
+capped at 4096 bytes; model-route values use the 1024-byte model-name cap.
+Lists must be dense arrays without duplicates. Invalid values fail crew
+construction rather than being silently ignored.
 
 ---
 
@@ -257,14 +269,15 @@ for a full walkthrough.
 
 **Gotchas:** IDs are restricted to alphanumerics plus `-`, `_`, `.` (1-128
 chars) to prevent path traversal and SQL oddness; violations fail loud at
-the Lua layer. Concurrency is last-write-wins — don't use the same id for
-simultaneous sessions without your own locking.
+the Lua layer. Saves carry an optimistic revision. If two processes resume the
+same `(flow_path, id)`, the first save wins and the stale process receives a
+conflict; reopen the session before retrying rather than replaying tool effects.
 
 **SSE events:** Conversations emit `conversation_started`, `conversation_turn`,
 and `conversation_thinking` events through the EventBus. REST API subscribers
 on `/flows/{flow}/events/{run_id}` see them in real time alongside task events.
 Each event includes a stable `conversation_id` so clients can group multiple
-conversations within a single run. See [REST API](rest-api.md#sse-events) for
+conversations within a single run. See [REST API](rest-api.md#sse-event-stream) for
 the full event schema.
 
 See [`examples/conversation/`](../examples/conversation/) for a basic example
@@ -294,11 +307,11 @@ for request/response shapes and a worked curl session.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Hard cap on simultaneously-active in-memory chat handles across the server. Breaches return `503` |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Hard cap on simultaneously-active in-memory chat handles across the server. Breaches return `503` |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS`   | `1800` | Idle timeout before an in-memory chat handle is evicted (its record stays on disk) |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20`  | Default page size for `GET /flows/{flow}/conversations` |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT`  | `100` | Hard cap on the `limit` query parameter for the same endpoint |
-| `IRONCREW_CONVERSATION_MAX_HISTORY` | `50`  | Default `max_history` for `crew:conversation({})` when not set explicitly. `0` = unbounded |
+| `IRONCREW_CONVERSATION_MAX_HISTORY` | `50`  | Default retained non-system messages for `crew:conversation({})`; explicit zero is rejected and the hard ceiling is 4096 |
 
 ---
 
@@ -353,9 +366,20 @@ local participants = debate:agents()       -- list of agent names
 debate:reset()                             -- clear transcript and rewind
 ```
 
-In SSE events and turn objects, `speaker` is always a positional letter
-(`"a"`, `"b"`, `"c"`, ..., up to `"z"`) and `agent` is always the agent name.
-Both fields are present so SSE consumers can use whichever is more useful.
+Dialog construction enforces bounded policy even when a flow supplies larger
+values:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Default retained turns; explicit zero is rejected, hard ceiling 4095 |
+| `IRONCREW_DIALOG_MAX_TURNS` | `1000` | Maximum accepted total turns; hard ceiling 10000 |
+| `IRONCREW_DIALOG_MAX_PARTICIPANTS` | `16` | Maximum accepted participant count; hard ceiling 64 |
+| `IRONCREW_CHAT_HISTORY_MAX_BYTES` | `33554432` | Shared estimated prompt/transcript byte budget; hard ceiling 256 MiB |
+
+In SSE events and turn objects, `speaker` is a positional label (`"a"` through
+`"z"`, then `"agent_26"`, `"agent_27"`, ...) and `agent` is always the agent
+name. Both fields are present so SSE consumers can use whichever is more
+useful.
 
 **How perspective-flipping works:**
 
@@ -550,6 +574,8 @@ JSON backend lays them out at `<dialogs_dir>/<flow>/<id>.json` (typically
 `.ironcrew/dialogs/<flow>/<id>.json`); SQL backends store the composite
 key in the `dialogs` table. Legacy flat records remain in
 `<dialogs_dir>/<id>.json` and are visible only to global/admin lookups.
+Dialog saves use the same revision conflict rule as conversations, so a stale
+pod cannot overwrite a newer transcript.
 The
 [`examples/cross-run-persistence/`](../examples/cross-run-persistence/)
 project demonstrates both a resumable conversation and a resumable dialog
@@ -559,7 +585,7 @@ in the same script.
 `dialog_thinking`, and `dialog_completed` events through the EventBus. REST API
 subscribers on `/flows/{flow}/events/{run_id}` see them in real time. Each
 event includes a stable `dialog_id` and `turn_index`. See
-[REST API](rest-api.md#sse-events) for the full event schema.
+[REST API](rest-api.md#sse-event-stream) for the full event schema.
 
 ---
 
@@ -602,7 +628,24 @@ local stats = crew:memory_stats() -- { total_items, total_tokens }
 | `"persistent"`| Survives across runs | `.ironcrew/memory.json` in the project directory |
 
 Persistent memory is loaded on crew creation and saved automatically after
-`crew:run()`. Expired items (TTL-based) are filtered out on load.
+`crew:run()`. Expired items (TTL-based) are filtered out on load. Saves are
+serialized, written to a mode-`0600` temporary file, synced, and atomically
+renamed so racing snapshots or a process interruption cannot expose a partial
+JSON file.
+
+Input and persistence budgets are independent from the LRU item/token policy:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `IRONCREW_MEMORY_MAX_KEY_BYTES` | `1024` | Key bytes |
+| `IRONCREW_MEMORY_MAX_VALUE_BYTES` | `1048576` | Serialized value bytes |
+| `IRONCREW_MEMORY_MAX_TAGS` | `32` | Tags per item |
+| `IRONCREW_MEMORY_MAX_TAG_BYTES` | `256` | Bytes per tag |
+| `IRONCREW_MEMORY_PERSIST_MAX_BYTES` | `16777216` | Loaded/saved snapshot bytes |
+| `IRONCREW_MEMORY_CONTEXT_MAX_BYTES` | `65536` | Memory context injected into one prompt |
+| `IRONCREW_MEMORY_QUERY_MAX_BYTES` | `16384` | Query bytes |
+
+Zero or invalid values fall back to these bounded defaults.
 
 ### Eviction
 
@@ -655,7 +698,12 @@ for _, msg in ipairs(history) do
 end
 ```
 
-History is capped at the last 500 messages.
+History defaults to the last 500 messages and 4 MiB. One message is truncated
+at 64 KiB; each agent queue defaults to 1000 messages/4 MiB, and broadcasts
+sent before registration default to 500 messages/4 MiB. Configure the count
+and byte policies with `IRONCREW_MESSAGEBUS_{MESSAGE_MAX_BYTES,QUEUE_DEPTH,QUEUE_MAX_BYTES,HISTORY_DEPTH,HISTORY_MAX_BYTES,PENDING_CAP,PENDING_MAX_BYTES}`.
+Only queue-depth and pending-count caps accept zero as disabled; byte caps and
+history depth remain bounded.
 
 ### Broadcast Delivery
 
@@ -695,6 +743,14 @@ print(params.max_items)
 | `choices` | array of strings | no | Advisory choice list, surfaced to UIs for rendering buttons. Not enforced — free-text answers are accepted; validate in Lua if you need strict values. |
 | `timeout_s` | integer | no | Per-question timeout. Default `IRONCREW_ASK_HUMAN_TIMEOUT` (600 s). |
 | `default` | any | no | Returned on timeout instead of raising an error |
+
+By default, one run may have 16 pending questions and the configured maximum
+timeout is 3600 seconds; prompts, aggregate choices, and serialized answers are each
+limited to 64 KiB; and a question may list at most 100 choices. These policies
+are controlled by `IRONCREW_ASK_HUMAN_MAX_PENDING`,
+`IRONCREW_ASK_HUMAN_MAX_TIMEOUT`, `IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES`,
+`IRONCREW_ASK_HUMAN_MAX_CHOICES`, `IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES`, and
+`IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES`.
 
 Returns the answer as a Lua value. On timeout **without** a `default`, raises
 `ask_human timed out after <n>s` — catch with `pcall` or let the task-retry
@@ -767,7 +823,9 @@ local crew = Crew.new({
 Entries are exact tool names or prefix globs (trailing `*`); `"*"` gates
 everything. Operators can enforce a policy without editing flows via
 `IRONCREW_REQUIRE_APPROVAL` (comma-separated, same syntax) — the two lists
-are unioned. Works from `config.lua` project defaults too.
+are unioned. Works from `config.lua` project defaults too. A crew accepts at
+most `IRONCREW_MAX_APPROVAL_PATTERNS` entries (default 128, hard ceiling 1024),
+and each non-empty pattern is capped at 512 bytes.
 
 When a gated tool is called, the run suspends on an approval question
 (`kind: "approval"` on SSE and the questions endpoint; a prompt in CLI
@@ -1076,7 +1134,7 @@ Constraints:
 
 | Variable | Default | Description |
 |---|---|---|
-| `IRONCREW_MCP_ALLOWED_COMMANDS` | (unset = allow all) | Comma-separated binary names allowed for stdio. E.g. `"uvx,npx"`. |
+| `IRONCREW_MCP_ALLOWED_COMMANDS` | (unset = allow all) | Comma-separated exact commands allowed for stdio. Present-but-empty refuses all commands. E.g. `"uvx,npx"`. |
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | `0` | Set to `1` to allow localhost/loopback HTTP URLs. |
 | `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` | `10` | Seconds to wait for the MCP handshake to complete. |
 | `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` (256 KB) | Maximum bytes returned per tool call. Oversized results are truncated with a `[truncated: N bytes omitted]` marker. |

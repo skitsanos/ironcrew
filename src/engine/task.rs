@@ -3,6 +3,26 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::utils::error::{IronCrewError, Result};
 
+const DEFAULT_MAX_TASK_RETRIES: u32 = 10;
+const HARD_MAX_TASK_RETRIES: u32 = 100;
+const DEFAULT_MAX_TASK_TIMEOUT_SECS: u64 = 86_400;
+const HARD_MAX_TASK_TIMEOUT_SECS: u64 = 86_400;
+const DEFAULT_MAX_RETRY_BACKOFF_SECS: f64 = 300.0;
+const HARD_MAX_RETRY_BACKOFF_SECS: f64 = 3_600.0;
+const DEFAULT_MAX_COLLABORATIVE_TURNS: usize = 100;
+const HARD_MAX_COLLABORATIVE_TURNS: usize = 1_000;
+
+fn env_limit<T>(name: &str, default: T, min: T, max: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value >= min && *value <= max)
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
@@ -66,9 +86,75 @@ pub struct TaskResult {
     pub reasoning: Option<String>,
 }
 
+fn validate_task_runtime_limits(task: &Task) -> Result<()> {
+    let max_retries = env_limit(
+        "IRONCREW_MAX_TASK_RETRIES",
+        DEFAULT_MAX_TASK_RETRIES,
+        0,
+        HARD_MAX_TASK_RETRIES,
+    );
+    if task.max_retries.is_some_and(|value| value > max_retries) {
+        return Err(IronCrewError::Validation(format!(
+            "Task '{}' max_retries exceeds IRONCREW_MAX_TASK_RETRIES ({})",
+            task.name, max_retries
+        )));
+    }
+
+    if let Some(backoff) = task.retry_backoff_secs {
+        let max_backoff = env_limit(
+            "IRONCREW_MAX_RETRY_BACKOFF_SECS",
+            DEFAULT_MAX_RETRY_BACKOFF_SECS,
+            f64::EPSILON,
+            HARD_MAX_RETRY_BACKOFF_SECS,
+        );
+        if !backoff.is_finite() || backoff <= 0.0 || backoff > max_backoff {
+            return Err(IronCrewError::Validation(format!(
+                "Task '{}' retry_backoff_secs must be finite, greater than 0, and at most {} seconds",
+                task.name, max_backoff
+            )));
+        }
+    }
+
+    if let Some(timeout) = task.timeout_secs {
+        let max_timeout = env_limit(
+            "IRONCREW_MAX_TASK_TIMEOUT_SECS",
+            DEFAULT_MAX_TASK_TIMEOUT_SECS,
+            1,
+            HARD_MAX_TASK_TIMEOUT_SECS,
+        );
+        if timeout == 0 || timeout > max_timeout {
+            return Err(IronCrewError::Validation(format!(
+                "Task '{}' timeout_secs must be between 1 and {}",
+                task.name, max_timeout
+            )));
+        }
+    }
+
+    if let Some(max_turns) = task.max_turns {
+        let turn_limit = env_limit(
+            "IRONCREW_MAX_COLLABORATIVE_TURNS",
+            DEFAULT_MAX_COLLABORATIVE_TURNS,
+            1,
+            HARD_MAX_COLLABORATIVE_TURNS,
+        );
+        if max_turns == 0 || max_turns > turn_limit {
+            return Err(IronCrewError::Validation(format!(
+                "Task '{}' max_turns must be between 1 and {}",
+                task.name, turn_limit
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate dependency references and detect cycles.
 pub fn validate_dependency_graph(tasks: &[Task]) -> Result<()> {
     validate_unique_task_names(tasks)?;
+
+    for task in tasks {
+        validate_task_runtime_limits(task)?;
+    }
 
     let task_names: HashSet<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
 
@@ -258,4 +344,31 @@ pub fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
     }
 
     sorted
+}
+
+#[cfg(test)]
+mod runtime_limit_tests {
+    use super::*;
+
+    fn task(name: &str) -> Task {
+        Task {
+            name: name.to_string(),
+            description: "test".to_string(),
+            ..Task::default()
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_retry_backoff() {
+        let mut candidate = task("unsafe-backoff");
+        candidate.retry_backoff_secs = Some(f64::NAN);
+        assert!(validate_dependency_graph(&[candidate]).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        let mut zero_timeout = task("zero-timeout");
+        zero_timeout.timeout_secs = Some(0);
+        assert!(validate_dependency_graph(&[zero_timeout]).is_err());
+    }
 }

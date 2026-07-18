@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: read # gh release download needs read access to release assets
+  id-token: write # keyless signing of the immutable pushed image digest
 
 env:
   IMAGE: skitsanos/ironcrew
@@ -56,9 +57,13 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Publishing image for tag $tag (version $version)"
 
-      # Pull the prebuilt binaries from that release and lay them out where
-      # docker/runtime.Dockerfile expects them: dist/linux/<arch>/ironcrew.
-      - name: Download release binaries
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # Pull the prebuilt binaries and their integrity metadata. Verify both
+      # the published SHA-256 and the keyless release-workflow signature before
+      # extracting any archive into the image build context.
+      - name: Download and verify release binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -66,7 +71,21 @@ jobs:
           gh release download "${{ steps.tag.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern 'ironcrew-linux-amd64.tar.gz' \
-            --pattern 'ironcrew-linux-arm64.tar.gz'
+            --pattern 'ironcrew-linux-amd64.tar.gz.sha256' \
+            --pattern 'ironcrew-linux-amd64.tar.gz.bundle' \
+            --pattern 'ironcrew-linux-arm64.tar.gz' \
+            --pattern 'ironcrew-linux-arm64.tar.gz.sha256' \
+            --pattern 'ironcrew-linux-arm64.tar.gz.bundle'
+          sha256sum --check ironcrew-linux-amd64.tar.gz.sha256
+          sha256sum --check ironcrew-linux-arm64.tar.gz.sha256
+          identity="https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ steps.tag.outputs.tag }}"
+          for arch in amd64 arm64; do
+            cosign verify-blob \
+              --bundle "ironcrew-linux-${arch}.tar.gz.bundle" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "ironcrew-linux-${arch}.tar.gz"
+          done
           tar xzf ironcrew-linux-amd64.tar.gz -C dist/linux/amd64
           tar xzf ironcrew-linux-arm64.tar.gz -C dist/linux/arm64
           test -x dist/linux/amd64/ironcrew
@@ -85,13 +104,20 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & push multi-arch image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/runtime.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          provenance: false
+          provenance: mode=max
+          sbom: true
           tags: |
             ${{ env.IMAGE }}:${{ steps.tag.outputs.version }}
             ${{ env.IMAGE }}:latest
+
+      - name: Sign pushed image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"

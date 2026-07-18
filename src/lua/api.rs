@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 use tokio::sync::Mutex;
 
 use crate::engine::agent::Agent;
@@ -20,6 +20,162 @@ use crate::utils::error::IronCrewError;
 
 #[cfg(feature = "mcp")]
 use crate::mcp::parse_mcp_config;
+
+const MAX_GOAL_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_NAME_BYTES: usize = 128;
+const MAX_MODEL_NAME_BYTES: usize = 1024;
+const MAX_BASE_URL_BYTES: usize = 4096;
+const MAX_API_KEY_BYTES: usize = 16 * 1024;
+const MAX_CONFIG_ITEM_BYTES: usize = 4096;
+const DEFAULT_MAX_MEMORY_ITEMS: usize = 10_000;
+const HARD_MAX_MEMORY_ITEMS: usize = 100_000;
+const DEFAULT_MAX_MEMORY_TOKENS: usize = 1_000_000;
+const HARD_MAX_MEMORY_TOKENS: usize = 10_000_000;
+const DEFAULT_MAX_SERVER_TOOLS: usize = 16;
+const HARD_MAX_SERVER_TOOLS: usize = 64;
+const DEFAULT_MAX_VECTOR_STORE_IDS: usize = 32;
+const HARD_MAX_VECTOR_STORE_IDS: usize = 256;
+const DEFAULT_MAX_MODEL_ROUTES: usize = 64;
+const HARD_MAX_MODEL_ROUTES: usize = 256;
+const MAX_WEB_SEARCH_USES: u32 = 100;
+const MAX_FILE_SEARCH_RESULTS: u32 = 1_000;
+const MAX_THINKING_BUDGET: u32 = 1_000_000;
+
+fn config_limit(name: &str, default: usize, hard_max: usize) -> LuaResult<usize> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw.parse::<usize>().map_err(|_| {
+                mlua::Error::external(IronCrewError::Validation(format!(
+                    "{name} must be an integer between 1 and {hard_max}"
+                )))
+            })?;
+            if value == 0 || value > hard_max {
+                return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                    "{name} must be between 1 and {hard_max}; got {value}"
+                ))));
+            }
+            Ok(value)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(mlua::Error::external(
+            IronCrewError::Validation(format!("{name} must contain valid UTF-8")),
+        )),
+    }
+}
+
+fn validate_config_string(field: &str, value: &str, max_bytes: usize) -> LuaResult<()> {
+    if value.trim().is_empty() {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Crew.new {field} must not be empty"
+        ))));
+    }
+    if value.len() > max_bytes {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Crew.new {field} is {} bytes, exceeds {max_bytes}",
+            value.len()
+        ))));
+    }
+    Ok(())
+}
+
+fn validate_api_key_value(value: &str) -> LuaResult<()> {
+    validate_config_string("api_key", value, MAX_API_KEY_BYTES)?;
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err(mlua::Error::external(IronCrewError::Validation(
+            "Crew.new api_key must not contain whitespace padding or control characters".into(),
+        )));
+    }
+    Ok(())
+}
+
+fn trusted_provider_key_env_name(base_url: &str) -> Option<&'static str> {
+    let parsed = reqwest::Url::parse(base_url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    match parsed.host_str()?.to_ascii_lowercase().as_str() {
+        "api.openai.com" => Some("OPENAI_API_KEY"),
+        "generativelanguage.googleapis.com" => Some("GEMINI_API_KEY"),
+        "api.groq.com" => Some("GROQ_API_KEY"),
+        "api.moonshot.ai" | "api.moonshot.cn" => Some("MOONSHOT_API_KEY"),
+        "api.deepseek.com" => Some("DEEPSEEK_API_KEY"),
+        "api.x.ai" => Some("XAI_API_KEY"),
+        "api.openrouter.ai" => Some("OPENROUTER_API_KEY"),
+        "api.anthropic.com" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
+fn resolve_custom_provider_key(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> LuaResult<Option<String>> {
+    let resolved = api_key.map(str::to_owned).or_else(|| {
+        base_url
+            .and_then(trusted_provider_key_env_name)
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty())
+    });
+    if base_url.is_some() && resolved.is_none() {
+        return Err(mlua::Error::external(IronCrewError::Validation(
+            "Crew.new with a non-canonical custom base_url requires an explicit api_key; process provider secrets are forwarded only to exact built-in HTTPS provider hosts".into(),
+        )));
+    }
+    Ok(resolved)
+}
+
+fn strict_string_list(
+    table: &Table,
+    field: &str,
+    max_items: usize,
+    max_item_bytes: usize,
+) -> LuaResult<Vec<String>> {
+    let len = table.raw_len();
+    if len > max_items {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Crew.new {field} has {len} entries, exceeds {max_items}"
+        ))));
+    }
+
+    // Reject map keys, sparse arrays, and trailing integer keys beyond
+    // raw_len instead of silently ignoring them through sequence_values().
+    let mut pair_count = 0usize;
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        pair_count = pair_count.saturating_add(1);
+        match key {
+            Value::Integer(index) if index >= 1 && (index as usize) <= len => {}
+            _ => {
+                return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                    "Crew.new {field} must be a dense array with integer keys starting at 1"
+                ))));
+            }
+        }
+    }
+    if pair_count != len {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Crew.new {field} must not contain gaps"
+        ))));
+    }
+
+    let mut values = Vec::with_capacity(len);
+    let mut seen = std::collections::HashSet::with_capacity(len);
+    for index in 1..=len {
+        let value = table.raw_get::<String>(index).map_err(|_| {
+            mlua::Error::external(IronCrewError::Validation(format!(
+                "Crew.new {field}[{index}] must be a string"
+            )))
+        })?;
+        validate_config_string(&format!("{field}[{index}]"), &value, max_item_bytes)?;
+        if !seen.insert(value.clone()) {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Crew.new {field} contains duplicate entry '{value}'"
+            ))));
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
 
 // Re-export everything that was previously defined here so that existing
 // import paths (`crate::lua::api::…`) continue to work unchanged.
@@ -125,17 +281,43 @@ pub fn register_crew_constructor(
         }
 
         let goal: String = table.get("goal")?;
-        let provider: String = table
-            .get::<String>("provider")
-            .unwrap_or_else(|_| "openai".into());
-        let model: String = table
-            .get::<String>("model")
-            .unwrap_or_else(|_| "gpt-4.1-mini".into());
-        let base_url: Option<String> = table.get("base_url").ok();
-        let api_key: Option<String> = table.get("api_key").ok();
-        let max_concurrent: Option<usize> =
-            table.get::<Option<usize>>("max_concurrent").ok().flatten();
+        let provider = table
+            .get::<Option<String>>("provider")?
+            .unwrap_or_else(|| "openai".into());
+        let model = table
+            .get::<Option<String>>("model")?
+            .unwrap_or_else(|| "gpt-4.1-mini".into());
+        let base_url: Option<String> = table.get("base_url")?;
+        let api_key: Option<String> = table.get("api_key")?;
+        let max_concurrent: Option<usize> = table.get("max_concurrent")?;
         let normalized_provider = provider.to_lowercase();
+
+        validate_config_string("goal", &goal, MAX_GOAL_BYTES)?;
+        validate_config_string("provider", &provider, MAX_PROVIDER_NAME_BYTES)?;
+        validate_config_string("model", &model, MAX_MODEL_NAME_BYTES)?;
+        if let Some(url) = base_url.as_deref() {
+            validate_config_string("base_url", url, MAX_BASE_URL_BYTES)?;
+            let parsed = reqwest::Url::parse(url).map_err(|error| {
+                mlua::Error::external(IronCrewError::Validation(format!(
+                    "Crew.new base_url must be a valid HTTP(S) URL: {error}"
+                )))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(mlua::Error::external(IronCrewError::Validation(
+                    "Crew.new base_url must use http or https".into(),
+                )));
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(mlua::Error::external(IronCrewError::Validation(
+                    "Crew.new base_url must not contain embedded credentials".into(),
+                )));
+            }
+        }
+        if let Some(key) = api_key.as_deref() {
+            validate_api_key_value(key)?;
+        }
+        let custom_provider_key =
+            resolve_custom_provider_key(base_url.as_deref(), api_key.as_deref())?;
 
         if !matches!(
             normalized_provider.as_str(),
@@ -151,9 +333,14 @@ pub fn register_crew_constructor(
         let custom_provider: Option<Arc<dyn LlmProvider>> =
             if normalized_provider == "anthropic" {
                 // Anthropic always creates a dedicated provider
-                let key = api_key
+                let key = custom_provider_key
                     .clone()
-                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .or_else(|| {
+                        base_url
+                            .is_none()
+                            .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                            .flatten()
+                    })
                     .filter(|k| !k.trim().is_empty())
                     .ok_or_else(|| {
                         mlua::Error::external(IronCrewError::Validation(
@@ -161,34 +348,53 @@ pub fn register_crew_constructor(
                                 .to_string(),
                         ))
                     })?;
+                validate_api_key_value(&key)?;
 
                 // Parse Anthropic-specific config
-                let thinking_budget: Option<u32> = table.get("thinking_budget").ok();
+                let thinking_budget: Option<u32> = table.get("thinking_budget")?;
+                if thinking_budget.is_some_and(|value| value == 0 || value > MAX_THINKING_BUDGET)
+                {
+                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                        "Crew.new thinking_budget must be between 1 and {MAX_THINKING_BUDGET}"
+                    ))));
+                }
 
-                let server_tools_list: Vec<String> = table
-                    .get::<mlua::Table>("server_tools")
-                    .map(|t| {
-                        t.sequence_values::<String>()
-                            .filter_map(|v| v.ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let max_server_tools = config_limit(
+                    "IRONCREW_MAX_SERVER_TOOLS",
+                    DEFAULT_MAX_SERVER_TOOLS,
+                    HARD_MAX_SERVER_TOOLS,
+                )?;
+                let server_tools_list = match table.get::<Option<Table>>("server_tools")? {
+                    Some(tools) => strict_string_list(
+                        &tools,
+                        "server_tools",
+                        max_server_tools,
+                        MAX_CONFIG_ITEM_BYTES,
+                    )?,
+                    None => Vec::new(),
+                };
 
-                let web_search_max_uses: Option<u32> = table.get("web_search_max_uses").ok();
+                let web_search_max_uses: Option<u32> = table.get("web_search_max_uses")?;
+                if web_search_max_uses
+                    .is_some_and(|value| value == 0 || value > MAX_WEB_SEARCH_USES)
+                {
+                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                        "Crew.new web_search_max_uses must be between 1 and {MAX_WEB_SEARCH_USES}"
+                    ))));
+                }
 
                 let server_tools: Vec<ServerTool> = server_tools_list
                     .iter()
-                    .filter_map(|name| match name.as_str() {
-                        "web_search" => Some(ServerTool::WebSearch {
+                    .map(|name| match name.as_str() {
+                        "web_search" => Ok(ServerTool::WebSearch {
                             max_uses: web_search_max_uses,
                         }),
-                        "code_execution" => Some(ServerTool::CodeExecution),
-                        other => {
-                            tracing::warn!("Unknown Anthropic server tool: '{}'", other);
-                            None
-                        }
+                        "code_execution" => Ok(ServerTool::CodeExecution),
+                        other => Err(mlua::Error::external(IronCrewError::Validation(format!(
+                            "Unknown Anthropic server tool '{other}'"
+                        )))),
                     })
-                    .collect();
+                    .collect::<LuaResult<Vec<_>>>()?;
 
                 let anthropic_config = AnthropicConfig {
                     thinking_budget,
@@ -202,17 +408,14 @@ pub fn register_crew_constructor(
                 )))
             } else if normalized_provider == "openai-responses" {
                 // OpenAI Responses API (also supports Azure, xAI/Grok, OpenRouter)
-                let key = api_key
+                let key = custom_provider_key
                     .clone()
                     .or_else(|| {
-                        if let Some(ref url) = base_url
-                            && url.contains("x.ai")
-                        {
-                            return std::env::var("XAI_API_KEY").ok();
-                        }
-                        None
+                        base_url
+                            .is_none()
+                            .then(|| std::env::var("OPENAI_API_KEY").ok())
+                            .flatten()
                     })
-                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                     .filter(|k| !k.trim().is_empty())
                     .ok_or_else(|| {
                         mlua::Error::external(IronCrewError::Validation(
@@ -220,52 +423,93 @@ pub fn register_crew_constructor(
                                 .to_string(),
                         ))
                     })?;
+                validate_api_key_value(&key)?;
 
                 // Parse Responses-specific config
-                let reasoning_effort: Option<String> = table.get("reasoning_effort").ok();
-                let reasoning_summary: Option<String> = table.get("reasoning_summary").ok();
+                let reasoning_effort: Option<String> = table.get("reasoning_effort")?;
+                let reasoning_summary: Option<String> = table.get("reasoning_summary")?;
+                if let Some(value) = reasoning_effort.as_deref() {
+                    validate_config_string(
+                        "reasoning_effort",
+                        value,
+                        MAX_CONFIG_ITEM_BYTES,
+                    )?;
+                }
+                if let Some(value) = reasoning_summary.as_deref() {
+                    validate_config_string(
+                        "reasoning_summary",
+                        value,
+                        MAX_CONFIG_ITEM_BYTES,
+                    )?;
+                }
 
-                let server_tools_list: Vec<String> = table
-                    .get::<mlua::Table>("server_tools")
-                    .map(|t| {
-                        t.sequence_values::<String>()
-                            .filter_map(|v| v.ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let max_server_tools = config_limit(
+                    "IRONCREW_MAX_SERVER_TOOLS",
+                    DEFAULT_MAX_SERVER_TOOLS,
+                    HARD_MAX_SERVER_TOOLS,
+                )?;
+                let server_tools_list = match table.get::<Option<Table>>("server_tools")? {
+                    Some(tools) => strict_string_list(
+                        &tools,
+                        "server_tools",
+                        max_server_tools,
+                        MAX_CONFIG_ITEM_BYTES,
+                    )?,
+                    None => Vec::new(),
+                };
 
-                let file_search_vector_store_ids: Vec<String> = table
-                    .get::<mlua::Table>("file_search_vector_store_ids")
-                    .map(|t| {
-                        t.sequence_values::<String>()
-                            .filter_map(|v| v.ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let max_vector_store_ids = config_limit(
+                    "IRONCREW_MAX_VECTOR_STORE_IDS",
+                    DEFAULT_MAX_VECTOR_STORE_IDS,
+                    HARD_MAX_VECTOR_STORE_IDS,
+                )?;
+                let file_search_vector_store_ids =
+                    match table.get::<Option<Table>>("file_search_vector_store_ids")? {
+                        Some(ids) => strict_string_list(
+                            &ids,
+                            "file_search_vector_store_ids",
+                            max_vector_store_ids,
+                            MAX_CONFIG_ITEM_BYTES,
+                        )?,
+                        None => Vec::new(),
+                    };
 
                 let file_search_max_results: Option<u32> =
-                    table.get("file_search_max_results").ok();
+                    table.get("file_search_max_results")?;
+                if file_search_max_results
+                    .is_some_and(|value| value == 0 || value > MAX_FILE_SEARCH_RESULTS)
+                {
+                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                        "Crew.new file_search_max_results must be between 1 and {MAX_FILE_SEARCH_RESULTS}"
+                    ))));
+                }
 
                 let web_search_context_size: Option<String> =
-                    table.get("web_search_context_size").ok();
+                    table.get("web_search_context_size")?;
+                if let Some(value) = web_search_context_size.as_deref() {
+                    validate_config_string(
+                        "web_search_context_size",
+                        value,
+                        MAX_CONFIG_ITEM_BYTES,
+                    )?;
+                }
 
                 let server_tools: Vec<ResponsesServerTool> = server_tools_list
                     .iter()
-                    .filter_map(|name| match name.as_str() {
-                        "web_search" => Some(ResponsesServerTool::WebSearch {
+                    .map(|name| match name.as_str() {
+                        "web_search" => Ok(ResponsesServerTool::WebSearch {
                             context_size: web_search_context_size.clone(),
                         }),
-                        "file_search" => Some(ResponsesServerTool::FileSearch {
+                        "file_search" => Ok(ResponsesServerTool::FileSearch {
                             vector_store_ids: file_search_vector_store_ids.clone(),
                             max_num_results: file_search_max_results,
                         }),
-                        "code_interpreter" => Some(ResponsesServerTool::CodeInterpreter),
-                        other => {
-                            tracing::warn!("Unknown Responses server tool: '{}'", other);
-                            None
-                        }
+                        "code_interpreter" => Ok(ResponsesServerTool::CodeInterpreter),
+                        other => Err(mlua::Error::external(IronCrewError::Validation(format!(
+                            "Unknown Responses server tool '{other}'"
+                        )))),
                     })
-                    .collect();
+                    .collect::<LuaResult<Vec<_>>>()?;
 
                 let responses_config = ResponsesConfig {
                     reasoning_effort,
@@ -280,47 +524,16 @@ pub fn register_crew_constructor(
                 )))
             } else if api_key.is_some() || base_url.is_some() {
                 // OpenAI with custom settings
-                // Resolve API key: explicit > provider-specific env var > OPENAI_API_KEY
-                let key = match api_key
-                    .clone()
-                    .or_else(|| {
-                        if let Some(ref url) = base_url {
-                            if url.contains("generativelanguage.googleapis.com")
-                                || url.contains("gemini")
-                            {
-                                return std::env::var("GEMINI_API_KEY").ok();
-                            }
-                            if url.contains("groq.com") {
-                                return std::env::var("GROQ_API_KEY").ok();
-                            }
-                            if url.contains("anthropic.com") {
-                                return std::env::var("ANTHROPIC_API_KEY").ok();
-                            }
-                            if url.contains("moonshot.ai") || url.contains("moonshot.cn") {
-                                return std::env::var("MOONSHOT_API_KEY").ok();
-                            }
-                            if url.contains("deepseek.com") {
-                                return std::env::var("DEEPSEEK_API_KEY").ok();
-                            }
-                            if url.contains("x.ai") {
-                                return std::env::var("XAI_API_KEY").ok();
-                            }
-                            if url.contains("openrouter.ai") {
-                                return std::env::var("OPENROUTER_API_KEY").ok();
-                            }
-                        }
-                        None
-                    })
-                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .filter(|k| !k.trim().is_empty())
-                {
-                    Some(key) => key,
-                    None => {
-                        return Err(mlua::Error::external(IronCrewError::Validation(
-                            "Crew with custom provider settings requires an api_key (set via env var or Crew.new config)".to_string(),
-                        )));
-                    }
-                };
+                // A custom endpoint can receive only the key explicitly paired
+                // with it in this Crew.new call. Never infer a process secret
+                // from attacker-controlled hostname text.
+                let key = custom_provider_key.clone().ok_or_else(|| {
+                    mlua::Error::external(IronCrewError::Validation(
+                        "Crew with custom provider settings requires an explicit api_key"
+                            .to_string(),
+                    ))
+                })?;
+                validate_api_key_value(&key)?;
                 let url = base_url.clone();
                 Some(Arc::new(OpenAiProvider::new(key, url)))
             } else {
@@ -334,22 +547,46 @@ pub fn register_crew_constructor(
             api_key,
         };
 
-        let memory_mode: String = table
-            .get::<String>("memory")
-            .unwrap_or_else(|_| "ephemeral".into());
+        let memory_mode = table
+            .get::<Option<String>>("memory")?
+            .unwrap_or_else(|| "ephemeral".into());
+        if !matches!(memory_mode.as_str(), "ephemeral" | "persistent") {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Crew.new memory must be 'ephemeral' or 'persistent', got '{memory_mode}'"
+            ))));
+        }
 
         let defaults = MemoryConfig::default();
+        let max_memory_items = config_limit(
+            "IRONCREW_MAX_MEMORY_ITEMS",
+            DEFAULT_MAX_MEMORY_ITEMS,
+            HARD_MAX_MEMORY_ITEMS,
+        )?;
+        let max_memory_tokens = config_limit(
+            "IRONCREW_MAX_MEMORY_TOKENS",
+            DEFAULT_MAX_MEMORY_TOKENS,
+            HARD_MAX_MEMORY_TOKENS,
+        )?;
+        let requested_memory_items: Option<usize> = table.get("max_memory_items")?;
+        let requested_memory_tokens: Option<usize> = table.get("max_memory_tokens")?;
+        if requested_memory_items.is_some_and(|value| value == 0 || value > max_memory_items) {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Crew.new max_memory_items must be between 1 and IRONCREW_MAX_MEMORY_ITEMS ({max_memory_items})"
+            ))));
+        }
+        if requested_memory_tokens.is_some_and(|value| value == 0 || value > max_memory_tokens) {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Crew.new max_memory_tokens must be between 1 and IRONCREW_MAX_MEMORY_TOKENS ({max_memory_tokens})"
+            ))));
+        }
         let memory_config = MemoryConfig {
-            max_items: table
-                .get::<Option<usize>>("max_memory_items")
-                .ok()
-                .flatten()
-                .or(defaults.max_items),
-            max_total_tokens: table
-                .get::<Option<usize>>("max_memory_tokens")
-                .ok()
-                .flatten()
-                .or(defaults.max_total_tokens),
+            max_items: requested_memory_items
+                .or_else(|| defaults.max_items.map(|value| value.min(max_memory_items))),
+            max_total_tokens: requested_memory_tokens.or_else(|| {
+                defaults
+                    .max_total_tokens
+                    .map(|value| value.min(max_memory_tokens))
+            }),
         };
 
         let memory = match memory_mode.as_str() {
@@ -358,23 +595,49 @@ pub fn register_crew_constructor(
                 MemoryStore::persistent_with_config(memory_path, memory_config)
                     .map_err(mlua::Error::external)?
             }
-            _ => MemoryStore::ephemeral_with_config(memory_config),
+            "ephemeral" => MemoryStore::ephemeral_with_config(memory_config),
+            _ => unreachable!("memory mode was validated above"),
         };
 
-        let stream: bool = table.get::<bool>("stream").unwrap_or(false);
+        let stream = table.get::<Option<bool>>("stream")?.unwrap_or(false);
 
         let model_router = if let Ok(models_table) = table.get::<mlua::Table>("models") {
+            let max_routes = config_limit(
+                "IRONCREW_MAX_MODEL_ROUTES",
+                DEFAULT_MAX_MODEL_ROUTES,
+                HARD_MAX_MODEL_ROUTES,
+            )?;
             let mut router = ModelRouter::new();
-            for (purpose, model_name) in models_table.pairs::<String, String>().flatten() {
+            let mut count = 0usize;
+            for pair in models_table.pairs::<String, String>() {
+                let (purpose, model_name) = pair?;
+                count = count.saturating_add(1);
+                if count > max_routes {
+                    return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                        "Crew.new models exceeds IRONCREW_MAX_MODEL_ROUTES ({max_routes})"
+                    ))));
+                }
+                validate_config_string("models purpose", &purpose, MAX_CONFIG_ITEM_BYTES)?;
+                validate_config_string("models value", &model_name, MAX_MODEL_NAME_BYTES)?;
                 router.set(&purpose, model_name);
             }
             router
+        } else if table.contains_key("models")? {
+            return Err(mlua::Error::external(IronCrewError::Validation(
+                "Crew.new models must be a table of string purpose-to-model entries".into(),
+            )));
         } else {
             ModelRouter::new()
         };
 
-        let prompt_cache_key: Option<String> = table.get("prompt_cache_key").ok();
-        let prompt_cache_retention: Option<String> = table.get("prompt_cache_retention").ok();
+        let prompt_cache_key: Option<String> = table.get("prompt_cache_key")?;
+        let prompt_cache_retention: Option<String> = table.get("prompt_cache_retention")?;
+        if let Some(value) = prompt_cache_key.as_deref() {
+            validate_config_string("prompt_cache_key", value, MAX_CONFIG_ITEM_BYTES)?;
+        }
+        if let Some(value) = prompt_cache_retention.as_deref() {
+            validate_config_string("prompt_cache_retention", value, MAX_CONFIG_ITEM_BYTES)?;
+        }
 
         let mut crew = Crew::new(goal, config, memory);
         crew.max_concurrent_tasks = max_concurrent;
@@ -383,24 +646,38 @@ pub fn register_crew_constructor(
         // sign-off before executing. Merged with IRONCREW_REQUIRE_APPROVAL
         // when the policy is attached at agent-tool finalization.
         if let Ok(Some(list)) = table.get::<Option<Table>>("require_approval") {
-            crew.require_approval = list
-                .sequence_values::<String>()
-                .collect::<mlua::Result<Vec<String>>>()?;
+            let max_patterns = config_limit(
+                "IRONCREW_MAX_APPROVAL_PATTERNS",
+                128,
+                1024,
+            )?;
+            crew.require_approval = strict_string_list(
+                &list,
+                "require_approval",
+                max_patterns,
+                512,
+            )?;
+        } else if table.contains_key("require_approval")? {
+            return Err(mlua::Error::external(IronCrewError::Validation(
+                "Crew.new require_approval must be an array of strings".into(),
+            )));
         }
         crew.model_router = model_router;
         crew.prompt_cache_key = prompt_cache_key;
         crew.prompt_cache_retention = prompt_cache_retention;
+        crew.validate_resource_limits()
+            .map_err(mlua::Error::external)?;
 
         // Auto-inject preloaded agents from agents/ directory
         for agent in agents.iter() {
-            crew.add_agent(agent.clone());
+            crew.add_agent(agent.clone()).map_err(mlua::Error::external)?;
         }
 
         // ── MCP config (feature-gated) ──────────────────────────────────
         #[cfg(feature = "mcp")]
-        let mcp_config = match table.get::<mlua::Table>("mcp_servers") {
-            Ok(mcp_table) => Some(parse_mcp_config(&mcp_table)?),
-            Err(_) => None,
+        let mcp_config = match table.get::<Option<Table>>("mcp_servers")? {
+            Some(mcp_table) => Some(parse_mcp_config(&mcp_table)?),
+            None => None,
         };
 
         // If the host (e.g. the HTTP server) has provided a shared store
@@ -444,4 +721,77 @@ pub fn register_crew_constructor(
     crew_table.set("new", new_fn)?;
     lua.globals().set("Crew", crew_table)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_custom_provider_key, strict_string_list, trusted_provider_key_env_name,
+        validate_api_key_value, validate_config_string,
+    };
+    use mlua::Lua;
+
+    #[test]
+    fn strict_string_list_rejects_sparse_mixed_and_duplicate_values() {
+        let lua = Lua::new();
+
+        let sparse = lua.create_table().unwrap();
+        sparse.raw_set(1, "one").unwrap();
+        sparse.raw_set(3, "three").unwrap();
+        assert!(strict_string_list(&sparse, "items", 8, 32).is_err());
+
+        let mixed = lua.create_table().unwrap();
+        mixed.raw_set(1, "one").unwrap();
+        mixed.set("extra", "two").unwrap();
+        assert!(strict_string_list(&mixed, "items", 8, 32).is_err());
+
+        let duplicate = lua.create_sequence_from(["one", "one"]).unwrap();
+        assert!(strict_string_list(&duplicate, "items", 8, 32).is_err());
+    }
+
+    #[test]
+    fn strict_string_list_preserves_valid_dense_order() {
+        let lua = Lua::new();
+        let table = lua.create_sequence_from(["one", "two"]).unwrap();
+        assert_eq!(
+            strict_string_list(&table, "items", 2, 8).unwrap(),
+            vec!["one", "two"]
+        );
+    }
+
+    #[test]
+    fn config_strings_and_api_keys_are_bounded() {
+        assert!(validate_config_string("goal", "", 10).is_err());
+        assert!(validate_config_string("goal", "eleven bytes", 10).is_err());
+        assert!(validate_config_string("goal", "valid", 10).is_ok());
+        assert!(validate_api_key_value(" padded").is_err());
+        assert!(validate_api_key_value("valid-key").is_ok());
+    }
+
+    #[test]
+    fn custom_provider_url_never_inherits_a_process_secret_for_untrusted_hosts() {
+        assert!(resolve_custom_provider_key(Some("https://attacker.example/v1"), None).is_err());
+        assert!(
+            resolve_custom_provider_key(
+                Some("https://attacker.example/v1"),
+                Some("caller-owned-key")
+            )
+            .is_ok()
+        );
+        assert!(resolve_custom_provider_key(None, None).is_ok());
+        assert_eq!(
+            trusted_provider_key_env_name(
+                "https://generativelanguage.googleapis.com/v1beta/openai"
+            ),
+            Some("GEMINI_API_KEY")
+        );
+        assert_eq!(
+            trusted_provider_key_env_name("https://api.openai.com.attacker.example/v1"),
+            None
+        );
+        assert_eq!(
+            trusted_provider_key_env_name("http://api.openai.com/v1"),
+            None
+        );
+    }
 }

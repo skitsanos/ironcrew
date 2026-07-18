@@ -14,9 +14,15 @@
 
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
 use ironcrew::engine::postgres_store::PostgresStore;
-use ironcrew::engine::run_history::{ListRunsFilter, RunCompletion, RunIntent, RunStatus};
-use ironcrew::engine::store::StateStore;
+use ironcrew::engine::run_history::{
+    ListRunsFilter, RunCompletion, RunIntent, RunStatus, RunTransition,
+};
+use ironcrew::engine::sessions::{ConversationRecord, DialogStateRecord};
+use ironcrew::engine::store::{RunLeaseConfig, StateStore};
 use ironcrew::engine::task::TaskResult;
+use ironcrew::llm::provider::ChatMessage;
+use ironcrew::lua::dialog::DialogTurn;
+use std::time::Duration;
 
 fn pg_url() -> Option<String> {
     std::env::var("IRONCREW_TEST_PG_URL")
@@ -48,6 +54,139 @@ fn intent(id: &str, flow: &str, started_at: &str, tags: Vec<String>) -> RunInten
         task_count: 1,
         tags,
     }
+}
+
+#[tokio::test]
+async fn pg_rejects_stale_session_snapshots() {
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_rejects_stale_session_snapshots: IRONCREW_TEST_PG_URL unset");
+        return;
+    };
+    let prefix = "session_cas_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+
+    let mut conversation = ConversationRecord {
+        id: "shared".into(),
+        flow_name: "chat".into(),
+        flow_path: Some("flow-a".into()),
+        agent_name: "assistant".into(),
+        messages: vec![ChatMessage::system("system")],
+        created_at: "2026-07-18T10:00:00Z".into(),
+        updated_at: "2026-07-18T10:00:00Z".into(),
+        revision: 0,
+    };
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    let stale_conversation = conversation.clone();
+    conversation.messages.push(ChatMessage::user("winner"));
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    assert!(matches!(
+        store.save_conversation(&stale_conversation).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_conversation(Some("flow-a"), "shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+
+    let mut dialog = DialogStateRecord {
+        id: "shared-dialog".into(),
+        flow_name: "dialog".into(),
+        flow_path: Some("flow-a".into()),
+        agent_names: vec!["alice".into(), "bob".into()],
+        starter: "start".into(),
+        transcript: vec![DialogTurn {
+            index: 0,
+            speaker_index: 0,
+            agent_name: "alice".into(),
+            content: "hello".into(),
+            reasoning: None,
+        }],
+        next_index: 1,
+        stopped: false,
+        stop_reason: None,
+        created_at: "2026-07-18T10:00:00Z".into(),
+        updated_at: "2026-07-18T10:00:00Z".into(),
+        revision: 0,
+    };
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    let stale_dialog = dialog.clone();
+    dialog.stopped = true;
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    assert!(matches!(
+        store.save_dialog_state(&stale_dialog).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_dialog_state(Some("flow-a"), "shared-dialog")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+}
+
+#[tokio::test]
+async fn pg_migrates_legacy_sessions_to_revision_guarded_updates() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_migrates_legacy_sessions_to_revision_guarded_updates: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "session_mig_";
+    reset(&url, prefix).await;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let legacy_schema = format!(
+        "CREATE TABLE {prefix}conversations (
+            id TEXT PRIMARY KEY, flow_name TEXT NOT NULL, agent_name TEXT NOT NULL,
+            messages JSONB NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+         );
+         CREATE TABLE {prefix}dialogs (
+            id TEXT PRIMARY KEY, flow_name TEXT NOT NULL, agent_names JSONB NOT NULL DEFAULT '[]',
+            starter TEXT NOT NULL, transcript JSONB NOT NULL DEFAULT '[]', next_index INTEGER NOT NULL,
+            stopped BOOLEAN NOT NULL DEFAULT FALSE, stop_reason TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         INSERT INTO {prefix}conversations
+            (id, flow_name, agent_name, messages, created_at, updated_at)
+            VALUES ('legacy-chat', 'chat', 'assistant', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+         INSERT INTO {prefix}dialogs
+            (id, flow_name, agent_names, starter, transcript, next_index, created_at, updated_at)
+            VALUES ('legacy-dialog', 'dialog', '[\"alice\",\"bob\"]', 'start', '[]', 0,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(legacy_schema))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let mut conversation = store
+        .get_conversation(None, "legacy-chat")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.revision, 0);
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    assert_eq!(conversation.revision, 1);
+
+    let mut dialog = store
+        .get_dialog_state(None, "legacy-dialog")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dialog.revision, 0);
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    assert_eq!(dialog.revision, 1);
 }
 
 #[tokio::test]
@@ -106,7 +245,7 @@ async fn pg_intent_completion_roundtrip() {
     assert_eq!(r.task_results.len(), 1);
     assert_eq!(r.total_tokens, 100);
 
-    // Double completion is rejected (record is no longer Running).
+    // A racing finalizer observes the winner without overwriting it.
     let again = store
         .update_run_completion(
             &run_id,
@@ -120,7 +259,55 @@ async fn pg_intent_completion_roundtrip() {
             },
         )
         .await;
-    assert!(again.is_err());
+    assert_eq!(
+        again.unwrap(),
+        RunTransition::AlreadyTerminal(RunStatus::Success)
+    );
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        RunStatus::Success
+    );
+}
+
+#[tokio::test]
+async fn pg_persists_abort_once() {
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_persists_abort_once: IRONCREW_TEST_PG_URL unset");
+        return;
+    };
+    let prefix = "abort_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    store
+        .save_run_intent(intent("abort-pg", "demo", "2026-07-18T10:00:00Z", vec![]))
+        .await
+        .unwrap();
+    let completion = RunCompletion {
+        status: RunStatus::Aborted,
+        finished_at: "2026-07-18T10:00:01Z".into(),
+        duration_ms: 1_000,
+        task_results: vec![],
+        total_tokens: 0,
+        cached_tokens: 0,
+    };
+    assert_eq!(
+        store
+            .update_run_completion("abort-pg", completion.clone())
+            .await
+            .unwrap(),
+        RunTransition::Applied
+    );
+    assert_eq!(
+        store
+            .update_run_completion("abort-pg", completion)
+            .await
+            .unwrap(),
+        RunTransition::AlreadyTerminal(RunStatus::Aborted)
+    );
+    assert_eq!(
+        store.get_run("abort-pg").await.unwrap().status,
+        RunStatus::Aborted
+    );
 }
 
 /// H2: runs scoped by flow slug on a real database.
@@ -231,7 +418,7 @@ async fn pg_reconcile_abandoned() {
         .unwrap();
 
     let n = store
-        .reconcile_abandoned_runs("2026-04-23T10:05:00Z")
+        .reconcile_abandoned_runs("9999-04-23T10:05:00Z")
         .await
         .unwrap();
     assert_eq!(n, 2);
@@ -241,13 +428,13 @@ async fn pg_reconcile_abandoned() {
     );
     assert_eq!(
         store.get_run("r1").await.unwrap().finished_at,
-        "2026-04-23T10:05:00Z"
+        "9999-04-23T10:05:00Z"
     );
 
     // Idempotent — nothing left in Running.
     assert_eq!(
         store
-            .reconcile_abandoned_runs("2026-04-23T10:06:00Z")
+            .reconcile_abandoned_runs("9999-04-23T10:06:00Z")
             .await
             .unwrap(),
         0
@@ -304,8 +491,8 @@ async fn pg_audit_roundtrip_and_filter() {
     assert!(!ev[0].success);
 }
 
-/// Exercises the additive migration: a pre-existing `runs` table WITHOUT the
-/// `flow` column must gain it on `PostgresStore::new`, and remain usable.
+/// Exercises additive migrations: a pre-existing `runs` table without flow or
+/// lease columns must gain them on `PostgresStore::new` and remain usable.
 #[tokio::test]
 async fn pg_migration_adds_flow_column_to_old_schema() {
     let Some(url) = pg_url() else {
@@ -369,10 +556,15 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     // run round-trips.
     let legacy = store.get_run("legacy-1").await.unwrap();
     assert_eq!(legacy.flow, "");
+    assert_eq!(legacy.owner_instance_id, "");
+    assert_eq!(legacy.lease_expires_at, "");
     store
         .save_run_intent(intent("new-1", "scoped", "2026-04-23T10:00:00Z", vec![]))
         .await
         .unwrap();
+    let new_run = store.get_run("new-1").await.unwrap();
+    assert!(!new_run.owner_instance_id.is_empty());
+    assert!(!new_run.lease_expires_at.is_empty());
     let scoped = ListRunsFilter {
         flow: Some("scoped".into()),
         ..Default::default()
@@ -460,11 +652,97 @@ async fn pg_reconcile_sweeps_waiting_for_input() {
         .unwrap();
 
     let count = store
-        .reconcile_abandoned_runs("2026-07-07T11:00:00Z")
+        .reconcile_abandoned_runs("9999-07-07T11:00:00Z")
         .await
         .unwrap();
     assert_eq!(count, 1);
     let r = store.get_run("wfi-2").await.unwrap();
     assert_eq!(r.status, RunStatus::Abandoned);
-    assert_eq!(r.finished_at, "2026-07-07T11:00:00Z");
+    assert_eq!(r.finished_at, "9999-07-07T11:00:00Z");
+}
+
+#[tokio::test]
+async fn pg_multi_instance_lease_prevents_live_run_sweep() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_multi_instance_lease_prevents_live_run_sweep: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "lease_";
+    reset(&url, prefix).await;
+    let owner_a = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let owner_b = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    owner_a.health_check().await.unwrap();
+
+    owner_a
+        .save_run_intent(intent("owned-run", "demo", "2026-07-18T10:00:00Z", vec![]))
+        .await
+        .unwrap();
+    assert_eq!(owner_a.heartbeat_owned_runs().await.unwrap(), 1);
+
+    let fresh = owner_a.get_run("owned-run").await.unwrap();
+    assert_eq!(fresh.owner_instance_id, "owner-a");
+    let deadline = chrono::DateTime::parse_from_rfc3339(&fresh.lease_expires_at).unwrap();
+    let before_deadline = (deadline - chrono::Duration::seconds(1)).to_rfc3339();
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&before_deadline)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        owner_b.get_run("owned-run").await.unwrap().status,
+        RunStatus::Running
+    );
+
+    let after_deadline = (deadline + chrono::Duration::seconds(1)).to_rfc3339();
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&after_deadline)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        owner_a.get_run("owned-run").await.unwrap().status,
+        RunStatus::Abandoned
+    );
+
+    let late_completion = owner_a
+        .update_run_completion(
+            "owned-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: (deadline + chrono::Duration::seconds(2)).to_rfc3339(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        late_completion,
+        RunTransition::AlreadyTerminal(RunStatus::Abandoned)
+    );
+    assert_eq!(
+        owner_a.get_run("owned-run").await.unwrap().status,
+        RunStatus::Abandoned
+    );
 }

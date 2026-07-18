@@ -11,6 +11,7 @@ use crate::lua::api::{
     agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files,
     register_agent_constructor, task_from_lua_table,
 };
+use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::sandbox::create_crew_lua;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -262,12 +263,15 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
 
-    let source = std::fs::read_to_string(entrypoint).map_err(IronCrewError::Io)?;
+    let source = crate::lua::source::read_lua_source(entrypoint)?;
 
     // First pass: try executing the full script. Errors are caught by
     // wrapping in pcall so the Lua VM stays alive.
     let wrapped = format!("local __ok, __err = pcall(function()\n{}\nend)\n", source);
-    match lua.load(&wrapped).exec() {
+    let first_pass = LuaExecutionGuard::begin(&lua)
+        .map_err(IronCrewError::Lua)
+        .and_then(|_execution| lua.load(&wrapped).exec().map_err(IronCrewError::Lua));
+    match first_pass {
         Ok(_) => {}
         Err(e) => {
             tracing::debug!("graph_extract: crew.lua execution stopped: {}", e);
@@ -300,7 +304,10 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
                     "{}\nlocal __ok, __err = pcall(function()\nlocal crew = {}\nend)\n",
                     locals, crew_portion
                 );
-                match lua.load(&fallback).exec() {
+                let fallback_pass = LuaExecutionGuard::begin(&lua)
+                    .map_err(IronCrewError::Lua)
+                    .and_then(|_execution| lua.load(&fallback).exec().map_err(IronCrewError::Lua));
+                match fallback_pass {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::debug!("graph_extract: fallback also stopped: {}", e);

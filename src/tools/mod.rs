@@ -7,6 +7,7 @@ pub mod file_write;
 pub mod hash;
 pub mod http_request;
 pub mod lua_tool;
+pub(crate) mod project_fs;
 pub mod registry;
 pub mod shell;
 pub mod template_render;

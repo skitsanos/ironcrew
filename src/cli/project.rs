@@ -7,6 +7,7 @@ use crate::lua::api::{
     load_agents_from_files, load_tool_defs_from_files, register_agent_constructor,
     register_crew_constructor, set_ironcrew_mode,
 };
+use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::loader::ProjectLoader;
 use crate::lua::sandbox::create_crew_lua_with_lib_dirs;
 use crate::utils::error::{IronCrewError, Result};
@@ -69,18 +70,20 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
     // Optionally load config.lua and store the resulting table as a Lua global.
     // Crew.new() will shallow-merge missing keys from this table at call time.
     if let Some(cfg_path) = loader.config_lua_path() {
-        let content = std::fs::read_to_string(&cfg_path).map_err(IronCrewError::Io)?;
-        let table: mlua::Table = lua
-            .load(&content)
-            .set_name(format!("config:{}", cfg_path.display()))
-            .eval()
-            .map_err(|e| {
-                IronCrewError::Validation(format!(
-                    "config.lua at {} must return a table: {}",
-                    cfg_path.display(),
-                    e
-                ))
-            })?;
+        let content = crate::lua::source::read_lua_source(&cfg_path)?;
+        let table: mlua::Table = {
+            let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+            lua.load(&content)
+                .set_name(format!("config:{}", cfg_path.display()))
+                .eval()
+                .map_err(|e| {
+                    IronCrewError::Validation(format!(
+                        "config.lua at {} must return a table: {}",
+                        cfg_path.display(),
+                        e
+                    ))
+                })?
+        };
         lua.globals()
             .set("__ironcrew_config_defaults", table)
             .map_err(IronCrewError::Lua)?;

@@ -20,7 +20,7 @@ An "active conversation" is a session handle currently held in the server's
 - a live Lua VM
 - a `LuaConversationInner` with message history
 - a per-session SSE `EventBus`
-- a per-session lock that serializes `POST /messages`
+- a per-session lock that rejects overlapping `POST /messages` with `409`
 - session metadata such as agent, timestamps, and flow id
 
 When a session is evicted for idleness, the in-memory handle is dropped, but
@@ -30,11 +30,16 @@ Related knobs:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Max live chat sessions kept in memory |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max live chat sessions kept in memory |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` | Idle time before a chat handle is evicted |
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Max retained conversation messages |
+| `IRONCREW_API_MESSAGE_MAX_BYTES` | `262144` | Max bytes in one HTTP chat message |
+| `IRONCREW_API_MAX_IMAGES_PER_CONVERSATION` | `16` | Max retained image references per conversation |
+| `IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION` | `33554432` | Max decoded image bytes retained per conversation |
+| `IRONCREW_LUA_MAX_MEMORY_BYTES` | `33554432` | Allocator cap for each live conversation VM |
 | `IRONCREW_MAX_EVENTS` | `1000` | Replay event count cap per event bus |
 | `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` | Replay event byte budget |
+| `IRONCREW_EVENT_MAX_BYTES` | `262144` | Individual live/replay event cap |
 
 ---
 
@@ -66,6 +71,7 @@ Cap replay aggressively in Cloud environments:
 ```bash
 IRONCREW_MAX_EVENTS=200
 IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
+IRONCREW_EVENT_MAX_BYTES=131072
 ```
 
 ### Large outputs
@@ -107,19 +113,32 @@ than the default `1800`.
 
 ## Recommended starting points
 
-These are conservative operational defaults, not hard limits.
+These are conservative, unbenchmarked starting points rather than capacity
+claims. Confirm peak RSS with your own prompts, images, tools, and provider
+responses before raising them.
 
 ### Small instance
 
 For `256 MiB` to `512 MiB` RAM:
 
 ```bash
-IRONCREW_MAX_ACTIVE_CONVERSATIONS=10
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=2
+IRONCREW_MAX_ACTIVE_RUNS=1
 IRONCREW_CHAT_SESSION_IDLE_SECS=300
 IRONCREW_CONVERSATION_MAX_HISTORY=20
+IRONCREW_CHAT_HISTORY_MAX_BYTES=4194304
+IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION=4194304
+IRONCREW_LUA_MAX_MEMORY_BYTES=16777216
+IRONCREW_PROVIDER_MAX_RESPONSE_BYTES=4194304
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=4194304
+IRONCREW_PROVIDER_MAX_OUTPUT_BYTES=2097152
 IRONCREW_MAX_EVENTS=100
 IRONCREW_EVENT_REPLAY_MAX_BYTES=524288
-IRONCREW_DEFAULT_MAX_CONCURRENT=2
+IRONCREW_EVENT_MAX_BYTES=65536
+IRONCREW_EVENT_CHANNEL_CAPACITY=8
+IRONCREW_MAX_SSE_CONNECTIONS=8
+IRONCREW_DEFAULT_MAX_CONCURRENT=1
+IRONCREW_MAX_CONCURRENT_TASKS=2
 ```
 
 ### Medium instance
@@ -127,12 +146,23 @@ IRONCREW_DEFAULT_MAX_CONCURRENT=2
 For `1 GiB` RAM:
 
 ```bash
-IRONCREW_MAX_ACTIVE_CONVERSATIONS=25
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
+IRONCREW_MAX_ACTIVE_RUNS=2
 IRONCREW_CHAT_SESSION_IDLE_SECS=600
-IRONCREW_CONVERSATION_MAX_HISTORY=30
+IRONCREW_CONVERSATION_MAX_HISTORY=20
+IRONCREW_CHAT_HISTORY_MAX_BYTES=8388608
+IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION=8388608
+IRONCREW_LUA_MAX_MEMORY_BYTES=25165824
+IRONCREW_PROVIDER_MAX_RESPONSE_BYTES=4194304
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=8388608
+IRONCREW_PROVIDER_MAX_OUTPUT_BYTES=4194304
 IRONCREW_MAX_EVENTS=200
 IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
-IRONCREW_DEFAULT_MAX_CONCURRENT=5
+IRONCREW_EVENT_MAX_BYTES=131072
+IRONCREW_EVENT_CHANNEL_CAPACITY=8
+IRONCREW_MAX_SSE_CONNECTIONS=16
+IRONCREW_DEFAULT_MAX_CONCURRENT=2
+IRONCREW_MAX_CONCURRENT_TASKS=4
 ```
 
 ### Large instance
@@ -140,16 +170,28 @@ IRONCREW_DEFAULT_MAX_CONCURRENT=5
 For `4 GiB+` RAM with controlled workloads:
 
 ```bash
-IRONCREW_MAX_ACTIVE_CONVERSATIONS=50
-IRONCREW_CHAT_SESSION_IDLE_SECS=900
-IRONCREW_CONVERSATION_MAX_HISTORY=50
-IRONCREW_MAX_EVENTS=500
-IRONCREW_EVENT_REPLAY_MAX_BYTES=4194304
-IRONCREW_DEFAULT_MAX_CONCURRENT=10
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=16
+IRONCREW_MAX_ACTIVE_RUNS=4
+IRONCREW_CHAT_SESSION_IDLE_SECS=600
+IRONCREW_CONVERSATION_MAX_HISTORY=32
+IRONCREW_CHAT_HISTORY_MAX_BYTES=16777216
+IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION=16777216
+IRONCREW_LUA_MAX_MEMORY_BYTES=33554432
+IRONCREW_PROVIDER_MAX_RESPONSE_BYTES=8388608
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=16777216
+IRONCREW_PROVIDER_MAX_OUTPUT_BYTES=8388608
+IRONCREW_MAX_EVENTS=250
+IRONCREW_EVENT_REPLAY_MAX_BYTES=2097152
+IRONCREW_EVENT_MAX_BYTES=131072
+IRONCREW_EVENT_CHANNEL_CAPACITY=16
+IRONCREW_MAX_SSE_CONNECTIONS=32
+IRONCREW_DEFAULT_MAX_CONCURRENT=4
+IRONCREW_MAX_CONCURRENT_TASKS=8
 ```
 
-I would not start at `100` active conversations unless you have already
-benchmarked your actual flows, prompts, tools, and providers.
+Do not treat the large profile as validated capacity. Raise it only after a
+Railway/OpenShift container soak demonstrates acceptable peak RSS and shutdown
+headroom; `100` resident conversations is not a safe starting point.
 
 ---
 
@@ -173,38 +215,43 @@ concurrency control in front of IronCrew.
 
 ---
 
-## Horizontal scaling
+## Deployment topology
 
-### Single instance
+### One HTTP instance (required today)
 
 Use this when:
 
-- traffic is modest
-- you can tolerate one process owning all active sessions
-- JSON or SQLite is sufficient
+- live runs, conversations, questions, cancellation, and SSE are handled by the
+  HTTP API
+- you need deterministic ownership during deploys and restarts
+- you can scale vertically and limit admission to fit one process
 
-This is the simplest deployment shape.
+This is the supported production shape. Use PostgreSQL for durable production
+records, but keep exactly one `serve` replica. On OpenShift/Kubernetes use
+`replicas: 1` with the `Recreate` strategy. On Railway keep `numReplicas: 1`
+and `overlapSeconds: 0` as configured in `railway.json`.
 
-### Multiple instances
+Railway Pro allows ample vertical headroom, but its account-wide resource
+ceiling is not a safe application setting. Set explicit service CPU/RAM limits,
+then raise IronCrew concurrency only from measured container workloads.
 
-Use PostgreSQL if you run more than one IronCrew instance.
+### Multiple HTTP instances (not yet supported)
 
-Important distinction:
+PostgreSQL shares persistent records and run leases, but these live control
+objects remain process-local:
 
-- persisted conversation state is shared through the store
-- active in-memory session handles are **not** shared across instances
+- active run handles and cancellation
+- pending human questions and answers
+- conversation Lua VMs and per-session locks
+- SSE broadcast/replay state
 
-That means a client that starts a conversation on instance A and sends the next
-message to instance B may hit a `404` for the active session even though the
-conversation exists in storage.
+Another replica can therefore return `404` for a live object that exists in the
+first process. Sticky sessions reduce routing mistakes but do not provide
+ownership transfer or failover, so they are not sufficient production safety.
 
-For production HTTP chat, you should choose one of these patterns:
-
-1. Sticky sessions at the load balancer
-2. External session router keyed by `(flow, conversation_id)`
-3. Future server-side resume-on-message behavior, if IronCrew adds it
-
-For now, sticky routing is the pragmatic choice.
+Do not configure an HPA or Railway replicas yet. Horizontal serving requires a
+distributed live-control design or deterministic resume-on-request semantics
+for every stateful endpoint.
 
 ### Storage backend guidance
 
@@ -212,7 +259,7 @@ For now, sticky routing is the pragmatic choice.
 |---|---|
 | JSON | Single instance only |
 | SQLite | Single instance only |
-| PostgreSQL | Required for multi-instance deployments |
+| PostgreSQL | Recommended for durable production storage; does not make the HTTP control plane horizontally scalable |
 
 ---
 
@@ -224,17 +271,19 @@ Recommendations:
 
 - disable or raise proxy read timeouts for SSE routes
 - avoid response buffering on SSE paths
-- keep sticky routing for chat-related endpoints
+- keep a single backend replica for stateful IronCrew endpoints
 - prefer HTTP/1.1 or verified HTTP/2 behavior for your proxy stack
 
 Common issues:
 
 - proxy closes idle SSE streams too early
 - buffering delays event delivery
-- reconnect lands on a different backend than the one holding the active handle
+- an accidentally configured second replica receives the reconnect and cannot
+  find the process-local handle
 
-If the client uses both `POST /messages` and `GET /events`, route both to the
-same backend instance.
+If a future deployment deliberately introduces more than one process, both
+`POST /messages` and `GET /events` must be routed to the owner; that routing
+mechanism does not exist in IronCrew today.
 
 ---
 
@@ -286,7 +335,8 @@ Response:
 
 - reduce internal concurrency
 - add external rate limiting
-- scale out behind a load balancer with PostgreSQL
+- reject excess work with conservative admission limits or scale the single
+  instance vertically after load testing
 
 ---
 
@@ -317,14 +367,23 @@ If you are deploying IronCrew HTTP chat in a cost-sensitive Cloud environment,
 start with:
 
 ```bash
-IRONCREW_MAX_ACTIVE_CONVERSATIONS=25
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
+IRONCREW_MAX_ACTIVE_RUNS=2
 IRONCREW_CHAT_SESSION_IDLE_SECS=600
-IRONCREW_CONVERSATION_MAX_HISTORY=30
+IRONCREW_CONVERSATION_MAX_HISTORY=20
+IRONCREW_CHAT_HISTORY_MAX_BYTES=8388608
+IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION=8388608
+IRONCREW_LUA_MAX_MEMORY_BYTES=25165824
+IRONCREW_PROVIDER_MAX_RESPONSE_BYTES=4194304
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=8388608
 IRONCREW_MAX_EVENTS=200
 IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
+IRONCREW_EVENT_CHANNEL_CAPACITY=8
+IRONCREW_MAX_SSE_CONNECTIONS=16
+IRONCREW_DEFAULT_MAX_CONCURRENT=2
 ```
 
 Then raise only after load testing your actual flows.
 
-The main rule is simple: do not treat the default of `100` as a guaranteed safe
+The main rule is simple: do not treat the default of `8` as a guaranteed safe
 production value. It is only a fallback default.

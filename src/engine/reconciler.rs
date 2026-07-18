@@ -1,12 +1,8 @@
-//! Stuck-run reconciliation on process startup.
+//! Lease-aware stuck-run reconciliation.
 //!
-//! Single-instance assumption: any RunRecord still marked `Running`
-//! when this function runs belongs to a prior process that crashed
-//! mid-run. Flips them all to `Abandoned` and logs a summary.
-//!
-//! Called from both `ironcrew run` (CLI) and `ironcrew serve` startup.
-//! In both cases it runs BEFORE the current invocation's own
-//! `save_run_intent`, so it can never sweep the in-flight record.
+//! Every in-flight run carries an owner instance id and a renewable deadline.
+//! Startup reconciliation abandons only expired (or legacy, unleased) rows, so
+//! a rolling deployment cannot sweep healthy work owned by another pod.
 
 use std::sync::Arc;
 
@@ -17,15 +13,19 @@ use crate::utils::error::Result;
 
 pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    let count = store.reconcile_abandoned_runs(&now).await?;
+    reconcile_stuck_runs_at(store, &now).await
+}
+
+pub async fn reconcile_stuck_runs_at(store: &Arc<dyn StateStore>, now: &str) -> Result<usize> {
+    let count = store.reconcile_abandoned_runs(now).await?;
 
     if count > 0 {
         tracing::warn!(
-            "Stuck-run reconciler: flipped {} Running → Abandoned (prior process crashed)",
+            "Stuck-run reconciler: marked {} expired run(s) Abandoned",
             count
         );
     } else {
-        tracing::debug!("Stuck-run reconciler: no orphaned runs");
+        tracing::debug!("Stuck-run reconciler: no expired runs");
     }
     Ok(count)
 }
@@ -56,7 +56,9 @@ mod tests {
             .unwrap();
 
         // First call: 1 record reconciled.
-        let first = reconcile_stuck_runs(&store).await.unwrap();
+        let first = reconcile_stuck_runs_at(&store, "9999-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(first, 1);
 
         // Record is now Abandoned.
@@ -65,7 +67,9 @@ mod tests {
         assert!(!r.finished_at.is_empty());
 
         // Second call: 0 — nothing to reconcile anymore.
-        let second = reconcile_stuck_runs(&store).await.unwrap();
+        let second = reconcile_stuck_runs_at(&store, "9999-01-01T00:00:01Z")
+            .await
+            .unwrap();
         assert_eq!(second, 0);
     }
 
@@ -94,7 +98,9 @@ mod tests {
             .unwrap();
 
         // A crashed process can no more resume a waiting run than a running one.
-        let count = reconcile_stuck_runs(&store).await.unwrap();
+        let count = reconcile_stuck_runs_at(&store, "9999-01-01T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(count, 1);
         let r = store.get_run("orphan-waiting").await.unwrap();
         assert_eq!(r.status, RunStatus::Abandoned);

@@ -74,8 +74,8 @@ fn extract_source_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> Option<St
         && let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok())
     {
         let first = xff.split(',').next().unwrap_or("").trim();
-        if !first.is_empty() {
-            return Some(first.to_string());
+        if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+            return Some(ip.to_string());
         }
     }
     addr.map(|a| a.ip().to_string())
@@ -98,7 +98,7 @@ fn clamp_metadata(value: serde_json::Value) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::engine::audit::{AuditEvent, AuditFilter};
-    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
+    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary, RunTransition};
     use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
     use crate::utils::error::{IronCrewError, Result};
     use async_trait::async_trait;
@@ -139,7 +139,7 @@ mod tests {
             &self,
             _: &str,
             _: crate::engine::run_history::RunCompletion,
-        ) -> Result<()> {
+        ) -> Result<RunTransition> {
             unimplemented!()
         }
         async fn update_run_status(
@@ -147,6 +147,18 @@ mod tests {
             _: &str,
             _: crate::engine::run_history::RunStatus,
         ) -> Result<()> {
+            unimplemented!()
+        }
+        fn instance_id(&self) -> &str {
+            "failing-test-store"
+        }
+        fn run_lease_ttl(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        async fn heartbeat_owned_runs(&self) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> Result<()> {
             unimplemented!()
         }
         async fn reconcile_abandoned_runs(&self, _: &str) -> Result<usize> {
@@ -169,7 +181,7 @@ mod tests {
         async fn delete_run(&self, _: &str) -> Result<()> {
             unimplemented!()
         }
-        async fn save_conversation(&self, _: &ConversationRecord) -> Result<()> {
+        async fn save_conversation(&self, _: &ConversationRecord) -> Result<u64> {
             unimplemented!()
         }
         async fn get_conversation(
@@ -193,7 +205,7 @@ mod tests {
         async fn count_conversations(&self, _: Option<&str>) -> Result<u64> {
             unimplemented!()
         }
-        async fn save_dialog_state(&self, _: &DialogStateRecord) -> Result<()> {
+        async fn save_dialog_state(&self, _: &DialogStateRecord) -> Result<u64> {
             unimplemented!()
         }
         async fn get_dialog_state(

@@ -29,6 +29,7 @@ fn sample_conversation(id: &str) -> ConversationRecord {
         ],
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: "2026-04-09T08:00:01Z".into(),
+        revision: 0,
     }
 }
 
@@ -60,6 +61,7 @@ fn sample_dialog(id: &str) -> DialogStateRecord {
         stop_reason: None,
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: "2026-04-09T08:00:02Z".into(),
+        revision: 0,
     }
 }
 
@@ -95,12 +97,12 @@ async fn conversation_missing_returns_none() {
 async fn conversation_save_is_upsert() {
     let (_dir, store) = fresh_store();
     let mut record = sample_conversation("upsert-chat");
-    store.save_conversation(&record).await.unwrap();
+    record.revision = store.save_conversation(&record).await.unwrap();
 
     // Modify and re-save under the same id
     record.messages.push(ChatMessage::user("Round 2"));
     record.updated_at = "2026-04-09T09:00:00Z".into();
-    store.save_conversation(&record).await.unwrap();
+    record.revision = store.save_conversation(&record).await.unwrap();
 
     let loaded = store
         .get_conversation(None, "upsert-chat")
@@ -109,6 +111,7 @@ async fn conversation_save_is_upsert() {
         .unwrap();
     assert_eq!(loaded.messages.len(), 4);
     assert_eq!(loaded.updated_at, "2026-04-09T09:00:00Z");
+    assert_eq!(loaded.revision, 2);
 }
 
 #[tokio::test]
@@ -191,7 +194,7 @@ async fn dialog_state_missing_returns_none() {
 async fn dialog_state_save_is_upsert() {
     let (_dir, store) = fresh_store();
     let mut record = sample_dialog("upsert-dialog");
-    store.save_dialog_state(&record).await.unwrap();
+    record.revision = store.save_dialog_state(&record).await.unwrap();
 
     // Simulate a new turn being appended and saved again
     record.transcript.push(DialogTurn {
@@ -203,7 +206,7 @@ async fn dialog_state_save_is_upsert() {
     });
     record.next_index = 3;
     record.updated_at = "2026-04-09T10:00:00Z".into();
-    store.save_dialog_state(&record).await.unwrap();
+    record.revision = store.save_dialog_state(&record).await.unwrap();
 
     let loaded = store
         .get_dialog_state(None, "upsert-dialog")
@@ -212,6 +215,32 @@ async fn dialog_state_save_is_upsert() {
         .unwrap();
     assert_eq!(loaded.transcript.len(), 3);
     assert_eq!(loaded.next_index, 3);
+    assert_eq!(loaded.revision, 2);
+}
+
+#[tokio::test]
+async fn stale_session_snapshots_are_rejected() {
+    let (_dir, store) = fresh_store();
+
+    let mut conversation = sample_conversation("conversation-cas");
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    let stale_conversation = conversation.clone();
+    conversation.messages.push(ChatMessage::user("winner"));
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    assert!(matches!(
+        store.save_conversation(&stale_conversation).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    let mut dialog = sample_dialog("dialog-cas");
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    let stale_dialog = dialog.clone();
+    dialog.next_index += 1;
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    assert!(matches!(
+        store.save_dialog_state(&stale_dialog).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
 }
 
 #[tokio::test]

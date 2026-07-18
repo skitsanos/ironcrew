@@ -38,6 +38,7 @@ use crate::utils::error::IronCrewError;
 
 use super::api::{register_agent_constructor, register_crew_constructor};
 use super::json::{json_value_to_lua, lua_table_to_json};
+use super::limits::LuaExecutionGuard;
 use super::parsers::load_agents_from_files;
 use super::sandbox::create_crew_lua_with_lib_dirs;
 
@@ -209,9 +210,11 @@ pub async fn invoke_subflow(
     }
 
     // ── Execute the sub-flow script ────────────────────────────────────────
-    let script = std::fs::read_to_string(&flow_path)
-        .map_err(|e| mlua::Error::external(IronCrewError::Io(e)))?;
-    let sub_result: Value = sub_lua.load(&script).eval_async().await?;
+    let script = crate::lua::source::read_lua_source(&flow_path).map_err(mlua::Error::external)?;
+    let sub_result: Value = {
+        let _execution = LuaExecutionGuard::begin(&sub_lua)?;
+        sub_lua.load(&script).eval_async().await?
+    };
 
     // ── Marshal the result back across VMs via JSON ───────────────────────
     let output = match ctx.output_key.clone() {

@@ -2,16 +2,17 @@
 //!
 //! Wraps `crew:conversation({...})` behind six endpoints under
 //! `/flows/{flow}/conversations`. Sessions are serialized per-id via a
-//! `tokio::sync::Mutex<()>` on the `ConversationHandle` — concurrent
-//! `POST /messages` calls for the same session queue rather than reject.
+//! `tokio::sync::Mutex<()>` on the `ConversationHandle`.
 //!
 //! Session creation is explicit: `POST /start` builds the session and
 //! stashes it in `AppState.active_conversations`. `POST /messages` against
-//! an unknown id returns 404 (never auto-creates).
+//! an unknown id returns 404 (never auto-creates). Overlapping mutations for
+//! the same session fail fast instead of retaining an unbounded request queue.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -22,7 +23,7 @@ use axum::{
 };
 use mlua::AnyUserData;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, broadcast};
 
 use super::{AppState, ErrorResponse, error_response, resolve_flow_path};
 use crate::engine::eventbus::{CrewEvent, EventBus};
@@ -46,12 +47,19 @@ pub struct ConversationHandle {
     pub conv: Arc<LuaConversationInner>,
     pub eventbus: EventBus,
     pub turn_lock: Mutex<()>,
+    /// Shutdown cancellation for an in-flight provider/tool turn. Dropping the
+    /// selected `run_turn` future invokes its rollback guards before the pod
+    /// releases this handle.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
     #[allow(dead_code)]
     pub flow_path: String,
     pub id: String,
     pub agent: String,
     pub created_at: String,
     pub last_touched: RwLock<Instant>,
+    /// Keeps one server-wide conversation admission slot occupied for the
+    /// full lifetime of this in-memory handle.
+    _admission_permit: OwnedSemaphorePermit,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,35 +68,127 @@ pub struct ConversationHandle {
 
 /// Default page size for `GET /flows/{flow}/conversations`.
 fn conversations_default_limit() -> usize {
-    std::env::var("IRONCREW_CONVERSATIONS_DEFAULT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20)
+    positive_bounded_env(
+        "IRONCREW_CONVERSATIONS_DEFAULT_LIMIT",
+        20,
+        conversations_max_limit(),
+    )
 }
 
 /// Hard cap on page size.
 fn conversations_max_limit() -> usize {
-    std::env::var("IRONCREW_CONVERSATIONS_MAX_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    positive_bounded_env("IRONCREW_CONVERSATIONS_MAX_LIMIT", 100, 1000)
 }
 
 /// Idle timeout after which a session handle is evicted from memory. The
 /// underlying record is kept in the store.
 pub fn chat_session_idle_secs() -> u64 {
-    std::env::var("IRONCREW_CHAT_SESSION_IDLE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1800)
+    positive_bounded_env("IRONCREW_CHAT_SESSION_IDLE_SECS", 1800, 7 * 24 * 60 * 60) as u64
 }
 
 /// Cap on the number of simultaneously-active chat sessions.
 pub fn max_active_conversations() -> usize {
-    std::env::var("IRONCREW_MAX_ACTIVE_CONVERSATIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    positive_bounded_env("IRONCREW_MAX_ACTIVE_CONVERSATIONS", 8, 1024)
+}
+
+fn max_conversation_turn_secs() -> u64 {
+    positive_bounded_env("IRONCREW_MAX_CONVERSATION_TURN_SECS", 300, 3600) as u64
+}
+
+fn positive_bounded_env(name: &str, default: usize, upper: usize) -> usize {
+    let fallback = default.min(upper);
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value.min(upper),
+            _ => {
+                tracing::warn!(
+                    variable = name,
+                    value = %raw,
+                    default = fallback,
+                    "Ignoring invalid resource-limit environment value"
+                );
+                fallback
+            }
+        },
+        Err(_) => fallback,
+    }
+}
+
+fn api_max_history() -> usize {
+    positive_bounded_env("IRONCREW_API_CONVERSATION_MAX_HISTORY", 50, 1000)
+}
+
+fn api_message_max_bytes() -> usize {
+    positive_bounded_env(
+        "IRONCREW_API_MESSAGE_MAX_BYTES",
+        256 * 1024,
+        4 * 1024 * 1024,
+    )
+}
+
+fn api_max_images_per_message() -> usize {
+    positive_bounded_env("IRONCREW_API_MAX_IMAGES_PER_MESSAGE", 4, 32)
+}
+
+fn api_max_images_per_conversation() -> usize {
+    positive_bounded_env("IRONCREW_API_MAX_IMAGES_PER_CONVERSATION", 16, 256)
+}
+
+fn api_max_image_bytes_per_message() -> usize {
+    positive_bounded_env(
+        "IRONCREW_API_MAX_IMAGE_BYTES_PER_MESSAGE",
+        20 * 1024 * 1024,
+        100 * 1024 * 1024,
+    )
+}
+
+fn api_max_image_bytes_per_conversation() -> usize {
+    positive_bounded_env(
+        "IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION",
+        32 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+}
+
+fn api_max_image_locator_bytes() -> usize {
+    positive_bounded_env("IRONCREW_API_MAX_IMAGE_LOCATOR_BYTES", 2048, 16 * 1024)
+}
+
+type ConversationKey = (String, String);
+type LifecycleLock = Mutex<()>;
+
+/// Per-conversation operation gates. Weak entries keep the registry bounded:
+/// once no request owns a gate, the next lookup prunes it. Serializing start,
+/// message, delete, and eviction gives each operation a clear linearization
+/// point without holding the global active-conversation map across LLM calls.
+static CONVERSATION_LIFECYCLES: OnceLock<StdMutex<HashMap<ConversationKey, Weak<LifecycleLock>>>> =
+    OnceLock::new();
+
+fn lifecycle_lock(key: &ConversationKey) -> Arc<LifecycleLock> {
+    let registry = CONVERSATION_LIFECYCLES.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(key.clone(), Arc::downgrade(&lock));
+    lock
+}
+
+fn decoded_base64_len(data: &str) -> usize {
+    let padding = data
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    data.len()
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_sub(padding)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +240,7 @@ pub struct HistoryResp {
     pub updated_at: String,
     pub messages: Vec<HistoryMessage>,
     pub turn_count: usize,
+    pub truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -183,6 +284,7 @@ pub struct ConversationEntry {
 
 fn map_err_to_response(e: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match e {
+        IronCrewError::Conflict(_) => StatusCode::CONFLICT,
         IronCrewError::Validation(_) => StatusCode::BAD_REQUEST,
         IronCrewError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -245,8 +347,36 @@ async fn start_conversation_inner(
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
+    if !state
+        .accepting_traffic
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is shutting down".into(),
+        ));
+    }
+
     let flow_slug = flow_segment(&flow_path_resolved);
     let key = (flow_slug.clone(), id.clone());
+    let lifecycle = lifecycle_lock(&key);
+    let _lifecycle_guard = lifecycle.try_lock().map_err(|_| {
+        error_response(
+            StatusCode::CONFLICT,
+            "Conversation is busy; retry after the active operation completes".into(),
+        )
+    })?;
+
+    let history_cap = api_max_history();
+    if req
+        .max_history
+        .is_some_and(|value| value == 0 || value > history_cap)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("`max_history` must be between 1 and {history_cap} for HTTP conversations"),
+        ));
+    }
 
     // Idempotent: if a handle exists, return its current metadata. This
     // path does NOT require `agent` in the body — clients can restart a
@@ -289,65 +419,90 @@ async fn start_conversation_inner(
     };
     let req = StartReq {
         agent: Some(agent_name),
-        max_history: req.max_history,
+        max_history: Some(req.max_history.unwrap_or(history_cap)),
     };
 
-    // Pre-check the cap BEFORE building the session — rejected starts must
-    // not create observable side effects (no Lua VM spin-up, no persisted
-    // bootstrap). The final cap re-check below closes the narrow TOCTOU
-    // window where another request might fill the slot between here and
-    // the insert.
-    {
-        let map = state.active_conversations.read().await;
-        if !map.contains_key(&key) && map.len() >= state.max_active_conversations {
-            return Err(error_response(
+    // Reserve a slot atomically before building the Lua VM. A plain
+    // `map.len()` check races concurrent starts; an owned semaphore permit
+    // cannot be oversubscribed and is released automatically with the handle.
+    let admission_permit = state
+        .conversation_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "Active conversation limit reached ({} sessions). Raise IRONCREW_MAX_ACTIVE_CONVERSATIONS or wait for idle eviction.",
                     state.max_active_conversations
                 ),
-            ));
-        }
-    }
+            )
+        })?;
 
     // Build a fresh session.
-    let (handle, created_at, turn_count) =
-        build_session(&state, &flow_path_resolved, &flow_slug, &id, &req).await?;
+    let (handle, created_at, turn_count) = build_session(
+        &state,
+        &flow_path_resolved,
+        &flow_slug,
+        &id,
+        &req,
+        admission_permit,
+    )
+    .await?;
     let events_url = format!("/flows/{}/conversations/{}/events", flow, id);
-    let agent = handle.agent.clone();
 
-    // Insert under write-lock with a final cap re-check (TOCTOU guard).
-    // If another request filled the last slot between the pre-check and
-    // here, reject — and critically, do NOT persist the handle's bootstrap.
-    {
+    // Establish durability before publishing the handle. If this request is
+    // cancelled during persistence, the candidate handle (and permit) drops;
+    // a successfully-written record is safely resumable on the next start.
+    handle.conv.persist().await.map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist conversation bootstrap: {error}"),
+        )
+    })?;
+
+    // Resolve a same-id creation race under the map lock. Only the winning
+    // handle is published and returned; the losing candidate is dropped,
+    // which also returns its unused admission permit. The lifecycle lock
+    // normally makes the occupied branch unreachable, but the map check keeps
+    // this invariant robust to future callers.
+    let (selected, inserted) = {
+        use std::collections::hash_map::Entry;
         let mut map = state.active_conversations.write().await;
-        if !map.contains_key(&key) && map.len() >= state.max_active_conversations {
+        if !state
+            .accepting_traffic
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "Active conversation limit reached ({} sessions). Raise IRONCREW_MAX_ACTIVE_CONVERSATIONS or wait for idle eviction.",
-                    state.max_active_conversations
-                ),
+                "Server is shutting down".into(),
             ));
         }
-        map.entry(key).or_insert_with(|| handle.clone());
-    }
+        match map.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(handle.clone());
+                (handle.clone(), true)
+            }
+            Entry::Occupied(entry) => (entry.get().clone(), false),
+        }
+    };
 
-    // Only now that the handle is successfully in the active map do we
-    // persist the bootstrap record. Rejected starts leave no trace in
-    // the store or in `/conversations` listings.
-    if let Err(e) = handle.conv.persist().await {
-        tracing::warn!(
-            conversation_id = %id,
-            error = %e,
-            "Failed to persist bootstrap conversation record on start"
-        );
+    if !inserted {
+        let selected_turn_count = selected.conv.turn_count().await;
+        return Ok(Json(StartResp {
+            conversation_id: selected.id.clone(),
+            flow,
+            agent: selected.agent.clone(),
+            created_at: selected.created_at.clone(),
+            turn_count: selected_turn_count,
+            events_url,
+        }));
     }
 
     Ok(Json(StartResp {
         conversation_id: id,
         flow,
-        agent,
+        agent: selected.agent.clone(),
         created_at,
         turn_count,
         events_url,
@@ -362,6 +517,7 @@ async fn build_session(
     flow_slug: &str,
     id: &str,
     req: &StartReq,
+    admission_permit: OwnedSemaphorePermit,
 ) -> Result<(Arc<ConversationHandle>, String, usize), (StatusCode, Json<ErrorResponse>)> {
     use crate::cli::project::{load_project, setup_crew_runtime};
 
@@ -388,13 +544,17 @@ async fn build_session(
             "No entrypoint found in flow".into(),
         )
     })?;
-    let script = std::fs::read_to_string(entrypoint)
-        .map_err(|e| map_err_to_response(&IronCrewError::Io(e)))?;
+    let script = crate::lua::source::read_lua_source(entrypoint)
+        .map_err(|error| map_err_to_response(&error))?;
 
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+    {
+        let _execution = crate::lua::limits::LuaExecutionGuard::begin(&lua)
+            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+        lua.load(&script)
+            .exec_async()
+            .await
+            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+    }
 
     // Pull the Crew userdata from the registry and call `conversation`.
     let crew_ud: AnyUserData = lua
@@ -424,11 +584,14 @@ async fn build_session(
         id = crate::cli::chat_lua_literal(id),
     );
 
-    let conv_ud: AnyUserData = lua
-        .load(&snippet)
-        .call_async::<AnyUserData>(crew_ud)
-        .await
-        .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+    let conv_ud: AnyUserData = {
+        let _execution = crate::lua::limits::LuaExecutionGuard::begin(&lua)
+            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+        lua.load(&snippet)
+            .call_async::<AnyUserData>(crew_ud)
+            .await
+            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?
+    };
 
     let conv: Arc<LuaConversationInner> = {
         let wrapper = conv_ud
@@ -444,16 +607,19 @@ async fn build_session(
     // Release the conv_ud borrow before moving `lua`.
     drop(conv_ud);
 
+    let (shutdown, _) = tokio::sync::watch::channel(false);
     let handle = Arc::new(ConversationHandle {
         _lua: Arc::new(std::sync::Mutex::new(Some(lua))),
         conv,
         eventbus,
         turn_lock: Mutex::new(()),
+        shutdown,
         flow_path: flow_slug.to_string(),
         id: id.to_string(),
         agent: agent.clone(),
         created_at: created_at.clone(),
         last_touched: RwLock::new(Instant::now()),
+        _admission_permit: admission_permit,
     });
 
     let _ = state; // silence unused when no-op
@@ -469,10 +635,29 @@ pub async fn post_message(
     Path((flow, id)): Path<(String, String)>,
     Json(req): Json<MessageReq>,
 ) -> Result<Json<MessageResp>, (StatusCode, Json<ErrorResponse>)> {
+    if !state
+        .accepting_traffic
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is shutting down".into(),
+        ));
+    }
     if req.content.trim().is_empty() {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "`content` is required".into(),
+        ));
+    }
+    let message_max_bytes = api_message_max_bytes();
+    if req.content.len() > message_max_bytes {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "`content` is {} bytes, exceeds IRONCREW_API_MESSAGE_MAX_BYTES ({message_max_bytes})",
+                req.content.len()
+            ),
         ));
     }
 
@@ -481,6 +666,8 @@ pub async fn post_message(
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
     let key = (flow_segment(&flow_path_resolved), id.clone());
+    let lifecycle = lifecycle_lock(&key);
+    let _lifecycle_guard = lifecycle.lock().await;
     let handle = {
         let map = state.active_conversations.read().await;
         map.get(&key).cloned().ok_or_else(|| {
@@ -491,18 +678,98 @@ pub async fn post_message(
         })?
     };
 
-    // Load images (if any) before acquiring the turn lock.
+    // The lifecycle gate prevents delete/eviction/recreation from crossing
+    // this turn. Fail fast if another path already owns the handle instead of
+    // retaining parsed requests in an unbounded same-session queue.
+    let _guard = handle.turn_lock.try_lock().map_err(|_| {
+        error_response(
+            StatusCode::CONFLICT,
+            "Conversation is busy; retry after the active operation completes".into(),
+        )
+    })?;
+    if !state
+        .accepting_traffic
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is shutting down".into(),
+        ));
+    }
+    let (history_image_count, history_image_bytes) = {
+        let history = handle.conv.messages.lock().await;
+        history
+            .iter()
+            .filter_map(|message| message.images.as_ref())
+            .flatten()
+            .fold((0usize, 0usize), |(count, bytes), image| {
+                (
+                    count.saturating_add(1),
+                    bytes.saturating_add(decoded_base64_len(&image.data)),
+                )
+            })
+    };
+
     let images: Option<Vec<crate::llm::provider::ImageInput>> = match req.images {
         Some(paths) if !paths.is_empty() => {
+            let max_per_message = api_max_images_per_message();
+            let max_per_conversation = api_max_images_per_conversation();
+            if paths.len() > max_per_message
+                || history_image_count.saturating_add(paths.len()) > max_per_conversation
+            {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "Image count exceeds limits ({max_per_message} per message, {max_per_conversation} per conversation)"
+                    ),
+                ));
+            }
+            let max_locator_bytes = api_max_image_locator_bytes();
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.is_empty() || path.len() > max_locator_bytes)
+            {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Image locator must be 1..={max_locator_bytes} bytes (received {})",
+                        path.len()
+                    ),
+                ));
+            }
+
+            let max_conversation_bytes = api_max_image_bytes_per_conversation();
+            let conversation_remaining = max_conversation_bytes.saturating_sub(history_image_bytes);
+            let mut remaining = api_max_image_bytes_per_message().min(conversation_remaining);
+            if remaining == 0 {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Conversation image-byte limit reached".into(),
+                ));
+            }
+
             // Use the shared client so image-URL fetches inherit the SSRF
             // redirect policy (a fresh Client would follow redirects to
             // private addresses unchecked).
             let client = crate::tools::http_request::SHARED_HTTP_CLIENT.clone();
-            let mut loaded = Vec::new();
+            let mut loaded = Vec::with_capacity(paths.len());
             for p in paths {
-                let img = crate::llm::image::load_image(&p, &flow_path_resolved, &client)
-                    .await
-                    .map_err(|e| map_err_to_response(&e))?;
+                let img = crate::llm::image::load_image_with_limit(
+                    &p,
+                    &flow_path_resolved,
+                    &client,
+                    remaining,
+                )
+                .await
+                .map_err(|e| map_err_to_response(&e))?;
+                let decoded_bytes = decoded_base64_len(&img.data);
+                if decoded_bytes > remaining {
+                    return Err(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Aggregate image-byte limit exceeded".into(),
+                    ));
+                }
+                remaining -= decoded_bytes;
                 loaded.push(img);
             }
             Some(loaded)
@@ -510,16 +777,34 @@ pub async fn post_message(
         _ => None,
     };
 
-    let _guard = handle.turn_lock.lock().await;
     {
         let mut t = handle.last_touched.write().await;
         *t = Instant::now();
     }
 
-    let (assistant, reasoning) = handle
-        .conv
-        .run_turn(&req.content, images)
-        .await
+    let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
+    let mut shutdown = handle.shutdown.subscribe();
+    let turn = tokio::time::timeout(turn_timeout, handle.conv.run_turn(&req.content, images));
+    let turn_result = tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopping| *stopping) => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation turn cancelled during server shutdown".into(),
+            ));
+        }
+        result = turn => result,
+    };
+    let (assistant, reasoning) = turn_result
+        .map_err(|_| {
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Conversation turn exceeded IRONCREW_MAX_CONVERSATION_TURN_SECS ({})",
+                    turn_timeout.as_secs()
+                ),
+            )
+        })?
         .map_err(|e| map_err_to_response(&e))?;
 
     let turn_count = handle.conv.turn_count().await;
@@ -561,9 +846,13 @@ pub async fn get_history(
 
     let turn_count = record.messages.iter().filter(|m| m.role == "user").count();
 
+    let max_messages = api_max_history();
+    let start = record.messages.len().saturating_sub(max_messages);
+    let truncated = start > 0;
     let messages: Vec<HistoryMessage> = record
         .messages
         .iter()
+        .skip(start)
         .map(|m| HistoryMessage {
             role: m.role.clone(),
             content: m.content.clone(),
@@ -579,6 +868,7 @@ pub async fn get_history(
         updated_at: record.updated_at,
         messages,
         turn_count,
+        truncated,
     }))
 }
 
@@ -621,6 +911,15 @@ pub async fn conversation_events(
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
     let key = (flow_segment(&flow_path_resolved), id.clone());
+    let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
+        error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "SSE connection limit reached ({})",
+                state.max_sse_connections
+            ),
+        )
+    })?;
     let handle = {
         let map = state.active_conversations.read().await;
         map.get(&key).cloned().ok_or_else(|| {
@@ -631,10 +930,10 @@ pub async fn conversation_events(
         })?
     };
 
-    let replay = handle.eventbus.replay().await;
-    let mut rx = handle.eventbus.subscribe();
+    let (replay, mut rx) = handle.eventbus.subscribe_with_replay();
 
     let stream = async_stream::stream! {
+        let _sse_permit = sse_permit;
         for event in replay {
             if !is_conversation_event(&event) {
                 continue;
@@ -711,14 +1010,28 @@ pub async fn delete_conversation(
 
         let flow_slug = flow_segment(&flow_path_resolved);
         let key = (flow_slug.clone(), id.clone());
+        let lifecycle = lifecycle_lock(&key);
+        let _lifecycle_guard = lifecycle.lock().await;
 
-        // Drop the in-memory handle first.
-        {
+        // Wait for an in-flight turn before deleting its durable record. All
+        // same-id operations honor the lifecycle gate, so no cloned stale
+        // handle can autosave after this deletion or race a recreated handle.
+        let handle = state.active_conversations.read().await.get(&key).cloned();
+        let _turn_guard = match handle.as_ref() {
+            Some(handle) => Some(handle.turn_lock.lock().await),
+            None => None,
+        };
+        if let Some(handle) = handle.as_ref() {
             let mut map = state.active_conversations.write().await;
-            map.remove(&key);
+            if map
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+            {
+                map.remove(&key);
+            }
         }
 
-        // Then remove the persisted record, scoped to this flow so a delete
+        // Remove the persisted record, scoped to this flow so a delete
         // can never touch another flow's session with the same id.
         state
             .store
@@ -826,13 +1139,13 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
         let now = Instant::now();
 
         // Phase 1 — collect expired keys under read lock.
-        let expired: Vec<(String, String)> = {
+        let expired: Vec<(ConversationKey, Arc<ConversationHandle>)> = {
             let map = state.active_conversations.read().await;
             let mut out = Vec::new();
             for (key, handle) in map.iter() {
                 let last = *handle.last_touched.read().await;
-                if now.duration_since(last) >= idle_cutoff {
-                    out.push(key.clone());
+                if now.saturating_duration_since(last) >= idle_cutoff {
+                    out.push((key.clone(), handle.clone()));
                 }
             }
             out
@@ -842,23 +1155,45 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
             continue;
         }
 
-        // Phase 2 — evict under write lock.
-        {
+        // Phase 2 — serialize against same-id start/message/delete, wait for a
+        // current turn, and re-check both identity and idle time. This avoids
+        // evicting a freshly touched handle or deleting a newly recreated one.
+        let mut evicted = 0usize;
+        for (key, observed) in expired {
+            let lifecycle = lifecycle_lock(&key);
+            let _lifecycle_guard = lifecycle.lock().await;
+            let _turn_guard = observed.turn_lock.lock().await;
+
+            let is_current = state
+                .active_conversations
+                .read()
+                .await
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &observed));
+            let last = *observed.last_touched.read().await;
+            if !is_current || Instant::now().saturating_duration_since(last) < idle_cutoff {
+                continue;
+            }
+
+            if let Err(error) = observed.conv.persist().await {
+                tracing::warn!(
+                    conversation_id = %observed.id,
+                    %error,
+                    "Failed to persist conversation during idle eviction; retaining handle for retry"
+                );
+                continue;
+            }
             let mut map = state.active_conversations.write().await;
-            for key in &expired {
-                if let Some(handle) = map.remove(key) {
-                    // Best-effort final persist — drop the final lock via
-                    // spawn so we don't block the eviction scan.
-                    let conv = handle.conv.clone();
-                    tokio::spawn(async move {
-                        let _ = conv.persist().await;
-                    });
-                }
+            if map
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &observed))
+            {
+                map.remove(&key);
+                evicted += 1;
             }
         }
-        tracing::info!(
-            evicted = expired.len(),
-            "Evicted idle chat conversation handles"
-        );
+        if evicted > 0 {
+            tracing::info!(evicted, "Evicted idle chat conversation handles");
+        }
     }
 }

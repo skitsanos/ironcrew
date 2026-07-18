@@ -27,6 +27,10 @@ pub struct ConversationRecord {
     pub messages: Vec<ChatMessage>,
     pub created_at: String,
     pub updated_at: String,
+    /// Optimistic-concurrency revision. Zero denotes a record that has not
+    /// yet been written (or a legacy row awaiting its first guarded update).
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// Lightweight conversation metadata — same as `ConversationRecord` without
@@ -82,6 +86,9 @@ pub struct DialogStateRecord {
     pub stop_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Optimistic-concurrency revision; see `ConversationRecord::revision`.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// Validate a user-provided session ID.

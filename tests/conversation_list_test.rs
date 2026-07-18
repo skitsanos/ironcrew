@@ -34,6 +34,7 @@ fn conv(
         messages,
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: updated_at.into(),
+        revision: 0,
     }
 }
 

@@ -15,12 +15,28 @@ pub struct WebScrapeTool {
 
 impl WebScrapeTool {
     pub fn new(allowed_domains: Option<Vec<String>>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("IronCrew/0.1")
-            .redirect(crate::utils::network::ssrf_redirect_policy())
-            .build()
-            .expect("Failed to build HTTP client");
+        let redirect_domains = allowed_domains.clone();
+        let client = crate::utils::network::secure_client_builder(
+            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
+        )
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects (max 10)".to_string());
+            }
+            if let Err(reason) =
+                crate::utils::network::validate_url_not_private(attempt.url().as_str())
+            {
+                return attempt.error(reason);
+            }
+            if !Self::is_domain_allowed_for(redirect_domains.as_deref(), attempt.url().as_str()) {
+                return attempt.error("redirect target is not in the allowed domain list");
+            }
+            attempt.follow()
+        }))
+        .timeout(Duration::from_secs(30))
+        .user_agent("IronCrew/0.1")
+        .build()
+        .expect("Failed to build HTTP client");
 
         Self {
             client,
@@ -29,7 +45,11 @@ impl WebScrapeTool {
     }
 
     fn is_domain_allowed(&self, url: &str) -> bool {
-        let Some(ref domains) = self.allowed_domains else {
+        Self::is_domain_allowed_for(self.allowed_domains.as_deref(), url)
+    }
+
+    fn is_domain_allowed_for(domains: Option<&[String]>, url: &str) -> bool {
+        let Some(domains) = domains else {
             return true;
         };
 
@@ -41,9 +61,14 @@ impl WebScrapeTool {
             return false;
         };
 
-        domains.iter().any(|d| {
-            if d.starts_with("*.") {
-                host.ends_with(&d[1..]) || host == &d[2..]
+        let host = host.to_ascii_lowercase();
+        domains.iter().any(|domain| {
+            let d = domain.to_ascii_lowercase();
+            if let Some(apex) = d.strip_prefix("*.") {
+                host == apex
+                    || host
+                        .strip_suffix(apex)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
             } else {
                 host == d
             }
@@ -114,43 +139,17 @@ impl Tool for WebScrapeTool {
         // Cap HTML bytes BEFORE parsing into the DOM. Very large HTML
         // documents can cause quadratic parser behavior and consume
         // disproportionate RAM during DOM construction.
-        let max_html_bytes: usize = std::env::var("IRONCREW_WEB_SCRAPE_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2 * 1024 * 1024); // 2 MB default
-
-        if let Some(len) = resp.content_length()
-            && len as usize > max_html_bytes
-        {
-            return Err(IronCrewError::ToolExecution {
-                tool: "web_scrape".into(),
-                message: format!(
-                    "HTML response too large: {} bytes (limit: {} bytes)",
-                    len, max_html_bytes
-                ),
-            });
-        }
-
-        // Stream with byte cap (handles chunked responses with no header).
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-        let mut html_bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| IronCrewError::ToolExecution {
-                tool: "web_scrape".into(),
-                message: format!("Failed to read response: {}", e),
-            })?;
-            if html_bytes.len() + chunk.len() > max_html_bytes {
-                return Err(IronCrewError::ToolExecution {
+        let max_html_bytes = crate::utils::http::byte_limit_from_env(
+            "IRONCREW_WEB_SCRAPE_MAX_BYTES",
+            crate::utils::http::DEFAULT_WEB_SCRAPE_BYTES,
+        );
+        let html_bytes =
+            crate::utils::http::read_response_bytes(resp, max_html_bytes, "web scrape response")
+                .await
+                .map_err(|error| IronCrewError::ToolExecution {
                     tool: "web_scrape".into(),
-                    message: format!(
-                        "HTML response exceeded max size of {} bytes while streaming",
-                        max_html_bytes
-                    ),
-                });
-            }
-            html_bytes.extend_from_slice(&chunk);
-        }
+                    message: error.to_string(),
+                })?;
         let html = String::from_utf8_lossy(&html_bytes).into_owned();
 
         let document = Html::parse_document(&html);

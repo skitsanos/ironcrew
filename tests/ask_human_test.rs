@@ -77,7 +77,7 @@ const CREW_NEW: &str = r#"
 async fn ask_human_returns_the_posted_answer() {
     let dir = tempfile::tempdir().unwrap();
     let (lua, bridge, eventbus) = fixture(dir.path());
-    let mut events = eventbus.subscribe();
+    let (_, mut events) = eventbus.subscribe_with_replay();
 
     let script = format!(
         r#"{CREW_NEW}

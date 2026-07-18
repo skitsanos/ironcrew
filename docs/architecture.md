@@ -142,7 +142,7 @@ Within each phase, standard tasks run concurrently using `FuturesUnordered`. Thi
 
 A Tokio semaphore always limits how many tasks execute at once. The limit is
 resolved as: crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env var
-> default of 10.
+> default of 4.
 
 ```lua
 local crew = Crew.new({
@@ -357,7 +357,9 @@ Run records are persisted via a pluggable `StateStore` trait:
 
 - **JSON files** (default) — individual `.json` files in `.ironcrew/runs/`
 - **SQLite** — single database file at `.ironcrew/ironcrew.db`
-- **PostgreSQL** — shared state for multi-instance cloud deployments, with JSONB columns for native SQL queries
+- **PostgreSQL** — durable cloud records and restart recovery, with JSONB
+  columns for native SQL queries. It does not distribute the process-local HTTP
+  control plane, so `ironcrew serve` remains a one-replica deployment
 
 Set `IRONCREW_STORE` to `sqlite` or `postgres` to switch backends. See
 [Storage](storage.md) for full configuration and [CLI Reference](cli.md) for

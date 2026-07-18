@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ironcrew::engine::reconciler::reconcile_stuck_runs;
+use ironcrew::engine::reconciler::reconcile_stuck_runs_at;
 use ironcrew::engine::run_history::{JsonFileStore, RunStatus};
 use ironcrew::engine::store::StateStore;
 
@@ -42,7 +42,9 @@ async fn test_05_simulated_crash_reconciles_cleanly() {
     assert_eq!(before.finished_at, "");
 
     // Run the reconciler (as if a new process is booting).
-    let reconciled = reconcile_stuck_runs(&store).await.unwrap();
+    let reconciled = reconcile_stuck_runs_at(&store, "9999-01-01T00:00:00Z")
+        .await
+        .unwrap();
     assert_eq!(reconciled, 1);
 
     let after = store.get_run("crashed-run").await.unwrap();

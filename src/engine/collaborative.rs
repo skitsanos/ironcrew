@@ -3,9 +3,110 @@ use std::sync::Arc;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::interpolate::prompt_char_limit;
 use crate::engine::task::{TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
 use crate::utils::error::{IronCrewError, Result};
+
+const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const HARD_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_TURN_MAX_BYTES: usize = 1024 * 1024;
+const HARD_TURN_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_PARTICIPANT_TURNS: usize = 64;
+const HARD_MAX_PARTICIPANT_TURNS: usize = 512;
+
+fn bounded_env(name: &str, default: usize, hard_max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(hard_max))
+        .unwrap_or(default)
+}
+
+struct Transcript {
+    entries: Vec<String>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Transcript {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, task_name: &str, label: &str, value: &str) -> Result<()> {
+        let separator = usize::from(!self.entries.is_empty()) * 2;
+        let next = self
+            .bytes
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(label.len()))
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or_else(|| IronCrewError::Task {
+                task: task_name.to_string(),
+                message: "collaboration transcript size overflowed".into(),
+            })?;
+        if next > self.max_bytes {
+            return Err(IronCrewError::Task {
+                task: task_name.to_string(),
+                message: format!(
+                    "collaboration transcript exceeds IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES ({})",
+                    self.max_bytes
+                ),
+            });
+        }
+        let mut entry = String::with_capacity(label.len().saturating_add(value.len()));
+        entry.push_str(label);
+        entry.push_str(value);
+        self.entries.push(entry);
+        self.bytes = next;
+        Ok(())
+    }
+}
+
+fn push_chars(output: &mut String, value: &str, chars: &mut usize, max_chars: usize) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if *chars >= max_chars {
+        return true;
+    }
+    let remaining = max_chars - *chars;
+    let mut included = 0usize;
+    let mut boundary = value.len();
+    let mut truncated = false;
+    for (byte_index, _) in value.char_indices() {
+        if included == remaining {
+            boundary = byte_index;
+            truncated = true;
+            break;
+        }
+        included += 1;
+    }
+    output.push_str(&value[..boundary]);
+    *chars += included.min(remaining);
+    truncated
+}
+
+fn build_bounded_prompt(prefix: &str, transcript: &Transcript, max_chars: usize) -> (String, bool) {
+    let mut output = String::with_capacity(max_chars.min(16 * 1024));
+    let mut chars = 0usize;
+    let mut truncated = push_chars(&mut output, prefix, &mut chars, max_chars);
+    for entry in &transcript.entries {
+        if truncated {
+            break;
+        }
+        if !output.is_empty() {
+            truncated |= push_chars(&mut output, "\n\n", &mut chars, max_chars);
+        }
+        truncated |= push_chars(&mut output, entry, &mut chars, max_chars);
+    }
+    (output, truncated)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_collaborative_task(
@@ -26,20 +127,49 @@ pub async fn execute_collaborative_task(
         ));
     }
 
+    let max_participant_turns = bounded_env(
+        "IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS",
+        DEFAULT_MAX_PARTICIPANT_TURNS,
+        HARD_MAX_PARTICIPANT_TURNS,
+    );
+    let requested_turns = agents
+        .len()
+        .checked_mul(max_turns)
+        .ok_or_else(|| IronCrewError::Validation("collaboration turn count overflowed".into()))?;
+    if requested_turns > max_participant_turns {
+        return Err(IronCrewError::Validation(format!(
+            "collaboration requests {requested_turns} participant-turns, exceeding IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS ({max_participant_turns})"
+        )));
+    }
+
+    let transcript_limit = bounded_env(
+        "IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES",
+        DEFAULT_TRANSCRIPT_MAX_BYTES,
+        HARD_TRANSCRIPT_MAX_BYTES,
+    );
+    let turn_limit = bounded_env(
+        "IRONCREW_COLLABORATION_MAX_TURN_BYTES",
+        DEFAULT_TURN_MAX_BYTES,
+        HARD_TURN_MAX_BYTES,
+    )
+    .min(transcript_limit);
+    let prompt_limit = prompt_char_limit();
+
     let mut total_usage = TaskTokenUsage::default();
 
     // Build conversation history shared across all agents
-    let mut conversation: Vec<String> = Vec::new();
-    conversation.push(format!("Task: {}", task_description));
+    let mut conversation = Transcript::new(transcript_limit);
+    conversation.push(task_name, "Task: ", task_description)?;
 
     if !memory_context.is_empty() {
-        conversation.push(format!("Context:\n{}", memory_context));
+        conversation.push(task_name, "Context:\n", memory_context)?;
     }
 
     // Add dependency results as context
     for (name, result) in completed_results {
         if result.success {
-            conversation.push(format!("Result from '{}': {}", name, result.output));
+            let label = format!("Result from '{name}': ");
+            conversation.push(task_name, &label, &result.output)?;
         }
     }
 
@@ -56,20 +186,24 @@ pub async fn execute_collaborative_task(
 
             let mut messages = vec![ChatMessage::system(&system_prompt)];
 
-            // Add the conversation so far
-            let conversation_text = conversation.join("\n\n");
-            let user_prompt = if turn == 0 && conversation.len() <= 1 {
-                format!(
-                    "{}\n\nYou are starting the discussion. Share your initial thoughts.",
-                    conversation_text
-                )
+            // Build directly into the provider prompt budget. The instruction
+            // comes first so transcript truncation cannot remove it.
+            let instruction = if turn == 0 && conversation.entries.len() <= 1 {
+                "You are starting the discussion. Share your initial thoughts.\n\nDiscussion:\n"
             } else {
-                format!(
-                    "{}\n\nIt's your turn. Respond to the discussion, adding your perspective.",
-                    conversation_text
-                )
+                "It's your turn. Respond to the discussion, adding your perspective.\n\nDiscussion:\n"
             };
+            let (user_prompt, prompt_truncated) =
+                build_bounded_prompt(instruction, &conversation, prompt_limit);
+            if prompt_truncated {
+                tracing::warn!(
+                    task = task_name,
+                    max_chars = prompt_limit,
+                    "Collaborative provider prompt was truncated"
+                );
+            }
             messages.push(ChatMessage::user(&user_prompt));
+            validate_chat_history(&messages, 1, chat_history_max_bytes(), true)?;
 
             let agent_model = agent.model.clone().unwrap_or_else(|| model.to_string());
 
@@ -91,8 +225,19 @@ pub async fn execute_collaborative_task(
                 total_usage.cached_tokens += usage.cached_tokens;
             }
             let content = response.content.unwrap_or_default();
+            if content.len() > turn_limit {
+                return Err(IronCrewError::Task {
+                    task: task_name.to_string(),
+                    message: format!(
+                        "collaboration turn from '{}' is {} bytes, exceeding IRONCREW_COLLABORATION_MAX_TURN_BYTES ({turn_limit})",
+                        agent.name,
+                        content.len()
+                    ),
+                });
+            }
 
-            conversation.push(format!("[{}]: {}", agent.name, content));
+            let label = format!("[{}]: ", agent.name);
+            conversation.push(task_name, &label, &content)?;
 
             eventbus.emit(CrewEvent::CollaborationTurn {
                 task: task_name.to_string(),
@@ -115,15 +260,23 @@ pub async fn execute_collaborative_task(
         "You are {}. Synthesize the collaborative discussion into a final, cohesive response.",
         synth_agent.name
     );
-    let conversation_text = conversation.join("\n\n");
+    let (synthesis_prompt, synthesis_truncated) = build_bounded_prompt(
+        "Provide a final synthesized response that combines the best insights from all participants.\n\nFull discussion:\n",
+        &conversation,
+        prompt_limit,
+    );
+    if synthesis_truncated {
+        tracing::warn!(
+            task = task_name,
+            max_chars = prompt_limit,
+            "Collaborative synthesis prompt was truncated"
+        );
+    }
 
     let request = ChatRequest {
         messages: vec![
             ChatMessage::system(&system_prompt),
-            ChatMessage::user(&format!(
-                "Here is the full discussion:\n\n{}\n\nProvide a final synthesized response that combines the best insights from all participants.",
-                conversation_text
-            )),
+            ChatMessage::user(&synthesis_prompt),
         ],
         model: synth_agent
             .model
@@ -135,6 +288,8 @@ pub async fn execute_collaborative_task(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     };
+
+    validate_chat_history(&request.messages, 1, chat_history_max_bytes(), true)?;
 
     let response = provider.chat(request).await?;
     if let Some(usage) = &response.usage {
@@ -148,4 +303,31 @@ pub async fn execute_collaborative_task(
         .content
         .map(|c| (c, if has_usage { Some(total_usage) } else { None }))
         .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_rejects_growth_before_allocating_an_oversized_entry() {
+        let mut transcript = Transcript::new(32);
+        transcript.push("task", "Task: ", "small").unwrap();
+        let error = transcript
+            .push("task", "[agent]: ", &"x".repeat(64))
+            .expect_err("oversized turn must fail");
+        assert!(error.to_string().contains("transcript exceeds"));
+        assert_eq!(transcript.entries.len(), 1);
+        assert!(transcript.bytes <= 32);
+    }
+
+    #[test]
+    fn prompt_builder_stops_at_character_budget_without_splitting_utf8() {
+        let mut transcript = Transcript::new(1024);
+        transcript.push("task", "", &"é".repeat(100)).unwrap();
+        let (prompt, truncated) = build_bounded_prompt("", &transcript, 17);
+        assert!(truncated);
+        assert_eq!(prompt.chars().count(), 17);
+        assert_eq!(prompt.len(), 34);
+    }
 }

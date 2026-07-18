@@ -1,28 +1,317 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
+use crate::engine::sessions::{
+    ConversationRecord, ConversationSummary, DialogStateRecord, validate_session_id,
+};
 use crate::engine::task::TaskResult;
 use crate::utils::error::{IronCrewError, Result};
 
 use super::store::StateStore;
 
-/// Sanitize an arbitrary flow label so it's safe to use as a filename
-/// component. Keeps alphanumerics and `-_.`; replaces the rest with `_`.
-/// The input flow_path is already validated at crate entry points, but
-/// we defensively sanitize here too.
-fn sanitize_flow_component(flow_path: &str) -> String {
-    flow_path
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+type JsonRunLockRegistry = Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>;
+static JSON_RUN_LOCKS: OnceLock<JsonRunLockRegistry> = OnceLock::new();
+
+const DEFAULT_JSON_RECORD_MAX_BYTES: usize = 64 * 1024 * 1024;
+const HARD_JSON_RECORD_MAX_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_JSON_SCAN_MAX_ENTRIES: usize = 10_000;
+const HARD_JSON_SCAN_MAX_ENTRIES: usize = 100_000;
+
+fn json_record_max_bytes() -> usize {
+    match std::env::var("IRONCREW_JSON_STORE_RECORD_MAX_BYTES") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .map(|value| value.min(HARD_JSON_RECORD_MAX_BYTES))
+            .unwrap_or(DEFAULT_JSON_RECORD_MAX_BYTES),
+        Err(_) => DEFAULT_JSON_RECORD_MAX_BYTES,
+    }
+}
+
+fn json_scan_max_entries() -> usize {
+    match std::env::var("IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .map(|value| value.min(HARD_JSON_SCAN_MAX_ENTRIES))
+            .unwrap_or(DEFAULT_JSON_SCAN_MAX_ENTRIES),
+        Err(_) => DEFAULT_JSON_SCAN_MAX_ENTRIES,
+    }
+}
+
+fn consume_scan_entry(scanned: &mut usize) -> Result<()> {
+    *scanned = scanned.saturating_add(1);
+    let limit = json_scan_max_entries();
+    if *scanned > limit {
+        return Err(IronCrewError::Validation(format!(
+            "JSON store scan exceeds IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES ({limit}); use PostgreSQL for larger stores"
+        )));
+    }
+    Ok(())
+}
+
+fn read_json_record(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IronCrewError::Validation(format!(
+            "JSON store path '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    let max_bytes = json_record_max_bytes();
+    if metadata.len() > max_bytes as u64 {
+        return Err(IronCrewError::Validation(format!(
+            "JSON store record '{}' is {} bytes, exceeds IRONCREW_JSON_STORE_RECORD_MAX_BYTES ({max_bytes})",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(IronCrewError::Validation(format!(
+            "JSON store record '{}' grew beyond IRONCREW_JSON_STORE_RECORD_MAX_BYTES ({max_bytes}) while reading",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "JSON store record '{}' is not valid UTF-8: {error}",
+            path.display()
+        ))
+    })
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("serialized JSON exceeds {} bytes", self.max_bytes),
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_json_record<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>> {
+    let max_bytes = json_record_max_bytes();
+    let mut output = BoundedJsonBuffer {
+        bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
+        max_bytes,
+    };
+    serde_json::to_writer_pretty(&mut output, value).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Failed to serialize {label} within IRONCREW_JSON_STORE_RECORD_MAX_BYTES ({max_bytes}): {error}"
+        ))
+    })?;
+    Ok(output.bytes)
+}
+
+fn write_serialized_record_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<()> {
+    let bytes = serialize_json_record(value, label)?;
+    let parent = path.parent().ok_or_else(|| {
+        IronCrewError::Validation(format!(
+            "JSON record path '{}' has no parent",
+            path.display()
+        ))
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("record"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_serialized_record_create_new<T: Serialize>(
+    path: &Path,
+    value: &T,
+    label: &str,
+) -> Result<()> {
+    let bytes = serialize_json_record(value, label)?;
+    let parent = path.parent().ok_or_else(|| {
+        IronCrewError::Validation(format!(
+            "JSON record path '{}' has no parent",
+            path.display()
+        ))
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("record"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Same-directory hard-link publication is atomic and never replaces
+        // an existing run id. The temporary name is removed after the link is
+        // durable; both names refer to the same fully-written inode meanwhile.
+        std::fs::hard_link(&temporary, path)?;
+        std::fs::remove_file(&temporary)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Store handles are constructed independently by the CLI heartbeat and Lua
+/// runtime. Share one process-local lock per runs directory so their
+/// read-modify-write cycles cannot resurrect a record that another handle just
+/// terminalized.
+fn shared_json_run_lock(runs_dir: &Path) -> Arc<Mutex<()>> {
+    let key = std::fs::canonicalize(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
+    let registry = JSON_RUN_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+/// Encode a flow label into one collision-resistant filename component.
+///
+/// Ordinary ASCII flow names retain their pre-hardening on-disk layout. Every
+/// other UTF-8 byte is percent encoded, including `%`, so names such as `a+b`
+/// and `a?b` can no longer collapse into the same JSON-store directory. Very
+/// long encodings use a reserved, content-addressed form to remain below
+/// filesystem component limits; a literal leading `%` is itself encoded and
+/// therefore cannot collide with that namespace.
+fn encode_flow_component(flow_path: &str) -> String {
+    use std::fmt::Write as _;
+
+    if flow_path.is_empty() {
+        return "%E".to_string();
+    }
+    if matches!(flow_path, "." | "..") {
+        return flow_path.replace('.', "%2E");
+    }
+
+    let mut encoded = String::with_capacity(flow_path.len());
+    for byte in flow_path.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.') {
+            encoded.push(char::from(*byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+
+    if encoded.len() <= 240 {
+        encoded
+    } else {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(flow_path.as_bytes());
+        let mut hashed = String::with_capacity(66);
+        hashed.push_str("%H");
+        for byte in digest {
+            write!(&mut hashed, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        hashed
+    }
+}
+
+fn validate_run_id(run_id: &str) -> Result<()> {
+    if run_id.is_empty() || run_id.len() > 128 {
+        return Err(IronCrewError::Validation(
+            "run id must contain between 1 and 128 ASCII characters".into(),
+        ));
+    }
+    if !run_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(IronCrewError::Validation(
+            "run id contains an invalid character".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod path_component_tests {
+    use super::{encode_flow_component, validate_run_id};
+
+    #[test]
+    fn ordinary_flow_names_keep_their_existing_component() {
+        assert_eq!(encode_flow_component("chat-http.v2"), "chat-http.v2");
+    }
+
+    #[test]
+    fn unusual_flow_names_do_not_collapse_or_escape() {
+        let plus = encode_flow_component("a+b");
+        let question = encode_flow_component("a?b");
+        assert_ne!(plus, question);
+        assert_eq!(plus, "a%2Bb");
+        assert_eq!(question, "a%3Fb");
+        assert_eq!(encode_flow_component("."), "%2E");
+        assert_eq!(encode_flow_component(".."), "%2E%2E");
+        assert_eq!(encode_flow_component(""), "%E");
+    }
+
+    #[test]
+    fn run_ids_are_safe_filename_components() {
+        assert!(validate_run_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_run_id("../outside").is_err());
+        assert!(validate_run_id("").is_err());
+    }
 }
 
 /// Resolve the on-disk JSON path for a conversation record. When
@@ -32,7 +321,7 @@ fn sanitize_flow_component(flow_path: &str) -> String {
 fn conversation_file_path(conversations_dir: &Path, flow_path: Option<&str>, id: &str) -> PathBuf {
     match flow_path {
         Some(flow) => {
-            let flow_dir = conversations_dir.join(sanitize_flow_component(flow));
+            let flow_dir = conversations_dir.join(encode_flow_component(flow));
             let _ = std::fs::create_dir_all(&flow_dir);
             flow_dir.join(format!("{}.json", id))
         }
@@ -46,7 +335,7 @@ fn load_conversation_file(path: &Path, id: &str) -> Result<Option<ConversationRe
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read_to_string(path)?;
+    let data = read_json_record(path)?;
     let record: ConversationRecord = serde_json::from_str(&data).map_err(|e| {
         IronCrewError::Validation(format!("Failed to parse conversation '{}': {}", id, e))
     })?;
@@ -65,6 +354,7 @@ fn walk_conversation_records(
     if !conversations_dir.exists() {
         return Ok(());
     }
+    let mut scanned = 0usize;
     for entry in std::fs::read_dir(conversations_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -76,6 +366,7 @@ fn walk_conversation_records(
                 if sub_path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
+                consume_scan_entry(&mut scanned)?;
                 if let Some(record) = read_record_for_walk(&sub_path)
                     && flow_filter_matches(&record, flow_path)
                 {
@@ -84,6 +375,7 @@ fn walk_conversation_records(
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
             // Legacy flat record.
+            consume_scan_entry(&mut scanned)?;
             if let Some(record) = read_record_for_walk(&path)
                 && flow_filter_matches(&record, flow_path)
             {
@@ -95,7 +387,7 @@ fn walk_conversation_records(
 }
 
 fn read_record_for_walk(path: &Path) -> Option<ConversationRecord> {
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = read_json_record(path).ok()?;
     serde_json::from_str::<ConversationRecord>(&data).ok()
 }
 
@@ -111,7 +403,7 @@ fn flow_filter_matches(record: &ConversationRecord, flow_path: Option<&str>) -> 
 fn dialog_file_path(dialogs_dir: &Path, flow_path: Option<&str>, id: &str) -> PathBuf {
     match flow_path {
         Some(flow) => {
-            let flow_dir = dialogs_dir.join(sanitize_flow_component(flow));
+            let flow_dir = dialogs_dir.join(encode_flow_component(flow));
             let _ = std::fs::create_dir_all(&flow_dir);
             flow_dir.join(format!("{}.json", id))
         }
@@ -123,7 +415,7 @@ fn load_dialog_file(path: &Path, id: &str) -> Result<Option<DialogStateRecord>> 
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read_to_string(path)?;
+    let data = read_json_record(path)?;
     let record: DialogStateRecord = serde_json::from_str(&data).map_err(|e| {
         IronCrewError::Validation(format!("Failed to parse dialog state '{}': {}", id, e))
     })?;
@@ -138,6 +430,7 @@ fn walk_dialog_records(
     if !dialogs_dir.exists() {
         return Ok(());
     }
+    let mut scanned = 0usize;
     for entry in std::fs::read_dir(dialogs_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -148,24 +441,27 @@ fn walk_dialog_records(
                 if sub_path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
+                consume_scan_entry(&mut scanned)?;
                 if let Some(record) = read_dialog_for_walk(&sub_path)
                     && dialog_flow_matches(&record, flow_path)
                 {
                     visit(record);
                 }
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("json")
-            && let Some(record) = read_dialog_for_walk(&path)
-            && dialog_flow_matches(&record, flow_path)
-        {
-            visit(record);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            consume_scan_entry(&mut scanned)?;
+            if let Some(record) = read_dialog_for_walk(&path)
+                && dialog_flow_matches(&record, flow_path)
+            {
+                visit(record);
+            }
         }
     }
     Ok(())
 }
 
 fn read_dialog_for_walk(path: &Path) -> Option<DialogStateRecord> {
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = read_json_record(path).ok()?;
     serde_json::from_str::<DialogStateRecord>(&data).ok()
 }
 
@@ -201,6 +497,14 @@ pub struct RunRecord {
     pub cached_tokens: u32,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Runtime instance that currently owns this in-flight run. Empty for
+    /// records written before leases were introduced.
+    #[serde(default)]
+    pub owner_instance_id: String,
+    /// RFC3339 deadline renewed by the owner heartbeat. Empty for legacy
+    /// records, which the reconciler treats as unleased and therefore stale.
+    #[serde(default)]
+    pub lease_expires_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -211,6 +515,8 @@ pub enum RunStatus {
     /// startup reconciler treats both as orphaned after a crash.
     WaitingForInput,
     Abandoned,
+    Aborted,
+    TimedOut,
     Success,
     PartialFailure,
     Failed,
@@ -222,6 +528,8 @@ impl std::fmt::Display for RunStatus {
             RunStatus::Running => write!(f, "running"),
             RunStatus::WaitingForInput => write!(f, "waiting_for_input"),
             RunStatus::Abandoned => write!(f, "abandoned"),
+            RunStatus::Aborted => write!(f, "aborted"),
+            RunStatus::TimedOut => write!(f, "timed_out"),
             RunStatus::Success => write!(f, "success"),
             RunStatus::PartialFailure => write!(f, "partial_failure"),
             RunStatus::Failed => write!(f, "failed"),
@@ -241,6 +549,8 @@ impl std::str::FromStr for RunStatus {
             "running" => Ok(RunStatus::Running),
             "waiting_for_input" => Ok(RunStatus::WaitingForInput),
             "abandoned" => Ok(RunStatus::Abandoned),
+            "aborted" => Ok(RunStatus::Aborted),
+            "timed_out" => Ok(RunStatus::TimedOut),
             "success" => Ok(RunStatus::Success),
             "partial_failure" => Ok(RunStatus::PartialFailure),
             "failed" => Ok(RunStatus::Failed),
@@ -249,6 +559,16 @@ impl std::str::FromStr for RunStatus {
                 other
             ))),
         }
+    }
+}
+
+impl RunStatus {
+    pub fn is_in_flight(&self) -> bool {
+        matches!(self, Self::Running | Self::WaitingForInput)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !self.is_in_flight()
     }
 }
 
@@ -344,6 +664,40 @@ pub struct RunCompletion {
     pub cached_tokens: u32,
 }
 
+/// Result of an atomic terminal transition. A second finalizer can observe
+/// the winner without rewriting its status or payload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunTransition {
+    Applied,
+    AlreadyTerminal(RunStatus),
+}
+
+impl RunCompletion {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.status.is_terminal() {
+            return Err(IronCrewError::Validation(format!(
+                "Run completion status must be terminal, got '{}'",
+                self.status
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn write_run_record_atomic(path: &Path, record: &RunRecord) -> Result<()> {
+    write_serialized_record_atomic(path, record, "run record")
+}
+
+fn lease_is_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if lease_expires_at.is_empty() {
+        return true;
+    }
+    chrono::DateTime::parse_from_rfc3339(lease_expires_at)
+        .map(|deadline| deadline <= now)
+        // Invalid legacy/corrupt leases must not make an in-flight row immortal.
+        .unwrap_or(true)
+}
+
 /// Shared filter-check used by the JSON backend. Returns true if `record`
 /// matches every non-None field of `filter`.
 fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
@@ -380,6 +734,8 @@ pub struct JsonFileStore {
     conversations_dir: PathBuf,
     dialogs_dir: PathBuf,
     audit_events_dir: PathBuf,
+    lease: super::store::RunLeaseConfig,
+    run_lock: Arc<Mutex<()>>,
 }
 
 impl JsonFileStore {
@@ -387,6 +743,13 @@ impl JsonFileStore {
     /// directory. The directory — and the four subdirectories it contains
     /// — are created with `create_dir_all` if they don't already exist.
     pub fn new(ironcrew_dir: PathBuf) -> Result<Self> {
+        Self::new_with_lease_config(ironcrew_dir, super::store::RunLeaseConfig::from_env()?)
+    }
+
+    pub fn new_with_lease_config(
+        ironcrew_dir: PathBuf,
+        lease: super::store::RunLeaseConfig,
+    ) -> Result<Self> {
         let runs_dir = ironcrew_dir.join("runs");
         let conversations_dir = ironcrew_dir.join("conversations");
         let dialogs_dir = ironcrew_dir.join("dialogs");
@@ -406,11 +769,14 @@ impl JsonFileStore {
             }
         }
 
+        let run_lock = shared_json_run_lock(&runs_dir);
         Ok(Self {
             runs_dir,
             conversations_dir,
             dialogs_dir,
             audit_events_dir,
+            lease,
+            run_lock,
         })
     }
 }
@@ -418,6 +784,13 @@ impl JsonFileStore {
 #[async_trait]
 impl StateStore for JsonFileStore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
+        if let Some(run_id) = intent.suggested_id.as_deref() {
+            validate_run_id(run_id)?;
+        }
+        let _guard = self
+            .run_lock
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let run_id = intent
             .suggested_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -435,18 +808,34 @@ impl StateStore for JsonFileStore {
             total_tokens: 0,
             cached_tokens: 0,
             tags: intent.tags,
+            owner_instance_id: self.lease.instance_id().to_string(),
+            lease_expires_at: self.lease.deadline_now(),
         };
         let filename = format!("{}.json", record.run_id);
         let path = self.runs_dir.join(&filename);
-        let json = serde_json::to_string_pretty(&record).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize run intent: {}", e))
+        write_serialized_record_create_new(&path, &record, "run intent").map_err(|error| {
+            if matches!(&error, IronCrewError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                IronCrewError::Validation(format!("Run '{}' already exists", run_id))
+            } else {
+                error
+            }
         })?;
-        std::fs::write(&path, json)?;
         tracing::debug!("Run intent saved: {} -> {}", run_id, path.display());
         Ok(run_id)
     }
 
-    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()> {
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        completion: RunCompletion,
+    ) -> Result<RunTransition> {
+        validate_run_id(run_id)?;
+        completion.validate()?;
+        let _guard = self
+            .run_lock
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
         if !path.exists() {
@@ -455,13 +844,18 @@ impl StateStore for JsonFileStore {
                 run_id
             )));
         }
-        let data = std::fs::read_to_string(&path)?;
+        let data = read_json_record(&path)?;
         let mut record: RunRecord = serde_json::from_str(&data)
             .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
-        if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
+        if record.status.is_terminal() {
+            return Ok(RunTransition::AlreadyTerminal(record.status));
+        }
+        if record.owner_instance_id != self.lease.instance_id() {
             return Err(IronCrewError::Validation(format!(
-                "Run '{}' is not in an in-flight state (status={})",
-                run_id, record.status
+                "Run '{}' is owned by instance '{}', not '{}'",
+                run_id,
+                record.owner_instance_id,
+                self.lease.instance_id()
             )));
         }
         record.status = completion.status;
@@ -470,15 +864,24 @@ impl StateStore for JsonFileStore {
         record.task_results = completion.task_results;
         record.total_tokens = completion.total_tokens;
         record.cached_tokens = completion.cached_tokens;
-        let json = serde_json::to_string_pretty(&record).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize run completion: {}", e))
-        })?;
-        std::fs::write(&path, json)?;
+        record.lease_expires_at.clear();
+        write_run_record_atomic(&path, &record)?;
         tracing::info!("Run completion saved: {} ({})", run_id, record.status);
-        Ok(())
+        Ok(RunTransition::Applied)
     }
 
     async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()> {
+        validate_run_id(run_id)?;
+        if !status.is_in_flight() {
+            return Err(IronCrewError::Validation(format!(
+                "update_run_status requires an in-flight status, got '{}'",
+                status
+            )));
+        }
+        let _guard = self
+            .run_lock
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
         if !path.exists() {
@@ -487,50 +890,124 @@ impl StateStore for JsonFileStore {
                 run_id
             )));
         }
-        let data = std::fs::read_to_string(&path)?;
+        let data = read_json_record(&path)?;
         let mut record: RunRecord = serde_json::from_str(&data)
             .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
-        if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
+        if !record.status.is_in_flight() {
             return Err(IronCrewError::Validation(format!(
                 "Run '{}' is not in an in-flight state (status={})",
                 run_id, record.status
             )));
         }
+        if record.owner_instance_id != self.lease.instance_id() {
+            return Err(IronCrewError::Validation(format!(
+                "Run '{}' is owned by instance '{}', not '{}'",
+                run_id,
+                record.owner_instance_id,
+                self.lease.instance_id()
+            )));
+        }
         record.status = status;
-        let json = serde_json::to_string_pretty(&record).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize run status: {}", e))
-        })?;
-        std::fs::write(&path, json)?;
+        write_run_record_atomic(&path, &record)?;
         Ok(())
     }
 
+    fn instance_id(&self) -> &str {
+        self.lease.instance_id()
+    }
+
+    fn run_lease_ttl(&self) -> std::time::Duration {
+        self.lease.ttl()
+    }
+
+    async fn heartbeat_owned_runs(&self) -> Result<usize> {
+        let _guard = self
+            .run_lock
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
+        let deadline = self.lease.deadline_now();
+        let mut count = 0;
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&self.runs_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
+            let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
+                continue;
+            };
+            if !record.status.is_in_flight() || record.owner_instance_id != self.lease.instance_id()
+            {
+                continue;
+            }
+            record.lease_expires_at.clone_from(&deadline);
+            write_run_record_atomic(&path, &record)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        let path = self
+            .runs_dir
+            .join(format!(".health-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            file.write_all(b"ok")?;
+            drop(file);
+            std::fs::remove_file(&path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        result
+    }
+
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let now_parsed = chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|e| {
+                IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
+            })?
+            .with_timezone(&chrono::Utc);
+        let _guard = self
+            .run_lock
+            .lock()
+            .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let mut count: usize = 0;
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)?;
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
             let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
                 continue;
             };
-            if record.status != RunStatus::Running && record.status != RunStatus::WaitingForInput {
+            if !record.status.is_in_flight()
+                || !lease_is_expired(&record.lease_expires_at, now_parsed)
+            {
                 continue;
             }
             record.status = RunStatus::Abandoned;
             record.finished_at = now.to_string();
-            let json = serde_json::to_string_pretty(&record).map_err(|e| {
-                IronCrewError::Validation(format!("Failed to serialize reconciled run: {}", e))
-            })?;
-            std::fs::write(&path, json)?;
+            record.lease_expires_at.clear();
+            write_run_record_atomic(&path, &record)?;
             count += 1;
         }
         Ok(count)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
+        validate_run_id(run_id)?;
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
         if !path.exists() {
@@ -539,7 +1016,7 @@ impl StateStore for JsonFileStore {
                 run_id
             )));
         }
-        let data = std::fs::read_to_string(&path)?;
+        let data = read_json_record(&path)?;
         let record: RunRecord = serde_json::from_str(&data)
             .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
         Ok(record)
@@ -556,13 +1033,15 @@ impl StateStore for JsonFileStore {
         // memory as soon as possible. The winning optimization here would be
         // a sidecar index file — out of scope for this tier.
         let mut summaries = Vec::new();
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)?;
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
             let Ok(record) = serde_json::from_str::<RunRecord>(&data) else {
                 continue;
             };
@@ -587,13 +1066,15 @@ impl StateStore for JsonFileStore {
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
         let mut count: u64 = 0;
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)?;
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
             if let Ok(record) = serde_json::from_str::<RunRecord>(&data)
                 && filter_matches(&record, filter)
             {
@@ -604,6 +1085,7 @@ impl StateStore for JsonFileStore {
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
+        validate_run_id(run_id)?;
         let filename = format!("{}.json", run_id);
         let path = self.runs_dir.join(&filename);
         if !path.exists() {
@@ -621,7 +1103,11 @@ impl StateStore for JsonFileStore {
     // `get_*` returns Ok(None) when the file is missing so the caller can
     // tell "first time this id is used" apart from real I/O errors.
 
-    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
+        validate_session_id(&record.id)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
         // Scope the on-disk filename by flow to prevent two flows sharing
         // the same `id` from clobbering each other. Legacy records
         // (flow_path = None) keep the old `<id>.json` layout.
@@ -630,12 +1116,25 @@ impl StateStore for JsonFileStore {
             record.flow_path.as_deref(),
             &record.id,
         );
-        let json = serde_json::to_string_pretty(record).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize conversation: {}", e))
-        })?;
-        std::fs::write(&path, json)?;
+        let current = load_conversation_file(&path, &record.id)?;
+        let current_revision = current.as_ref().map(|saved| saved.revision).unwrap_or(0);
+        if current.is_some() && current_revision != record.revision
+            || current.is_none() && record.revision != 0
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' changed since revision {}; reopen it before saving",
+                record.id, record.revision
+            )));
+        }
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| IronCrewError::Validation("Conversation revision overflow".into()))?;
+        let mut to_write = record.clone();
+        to_write.revision = next_revision;
+        write_serialized_record_atomic(&path, &to_write, "conversation")?;
         tracing::debug!("Conversation saved: {} -> {}", record.id, path.display());
-        Ok(())
+        Ok(next_revision)
     }
 
     async fn get_conversation(
@@ -643,6 +1142,7 @@ impl StateStore for JsonFileStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<ConversationRecord>> {
+        validate_session_id(id)?;
         match flow_path {
             Some(requested) => {
                 // Scoped read — only look at the flow's own subdirectory.
@@ -672,6 +1172,7 @@ impl StateStore for JsonFileStore {
     }
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        validate_session_id(id)?;
         let path = conversation_file_path(&self.conversations_dir, flow_path, id);
         if !path.exists() {
             return Ok(());
@@ -718,16 +1219,33 @@ impl StateStore for JsonFileStore {
         Ok(count)
     }
 
-    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
+        validate_session_id(&record.id)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
         // Scope on-disk filename by flow — mirrors the conversation layout.
         // Legacy records with `flow_path = None` stay at `<id>.json`.
         let path = dialog_file_path(&self.dialogs_dir, record.flow_path.as_deref(), &record.id);
-        let json = serde_json::to_string_pretty(record).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize dialog state: {}", e))
-        })?;
-        std::fs::write(&path, json)?;
+        let current = load_dialog_file(&path, &record.id)?;
+        let current_revision = current.as_ref().map(|saved| saved.revision).unwrap_or(0);
+        if current.is_some() && current_revision != record.revision
+            || current.is_none() && record.revision != 0
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Dialog '{}' changed since revision {}; reopen it before saving",
+                record.id, record.revision
+            )));
+        }
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| IronCrewError::Validation("Dialog revision overflow".into()))?;
+        let mut to_write = record.clone();
+        to_write.revision = next_revision;
+        write_serialized_record_atomic(&path, &to_write, "dialog state")?;
         tracing::debug!("Dialog state saved: {} -> {}", record.id, path.display());
-        Ok(())
+        Ok(next_revision)
     }
 
     async fn get_dialog_state(
@@ -735,6 +1253,7 @@ impl StateStore for JsonFileStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<DialogStateRecord>> {
+        validate_session_id(id)?;
         match flow_path {
             Some(requested) => {
                 let path = dialog_file_path(&self.dialogs_dir, Some(requested), id);
@@ -761,6 +1280,7 @@ impl StateStore for JsonFileStore {
     }
 
     async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        validate_session_id(id)?;
         let path = dialog_file_path(&self.dialogs_dir, flow_path, id);
         if !path.exists() {
             return Ok(());
@@ -788,10 +1308,7 @@ impl StateStore for JsonFileStore {
         let mut to_write = event.clone();
         to_write.id = id.clone();
 
-        let json = serde_json::to_string_pretty(&to_write).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize audit event: {}", e))
-        })?;
-        std::fs::write(&path, json)?;
+        write_serialized_record_atomic(&path, &to_write, "audit event")?;
         tracing::debug!("Audit event saved: {} -> {}", id, path.display());
         Ok(id)
     }
@@ -803,13 +1320,15 @@ impl StateStore for JsonFileStore {
         offset: usize,
     ) -> Result<Vec<crate::engine::audit::AuditEvent>> {
         let mut events: Vec<crate::engine::audit::AuditEvent> = Vec::new();
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.audit_events_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)?;
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
             let Ok(event) = serde_json::from_str::<crate::engine::audit::AuditEvent>(&data) else {
                 continue;
             };
@@ -831,13 +1350,15 @@ impl StateStore for JsonFileStore {
 
     async fn count_audit_events(&self, filter: &crate::engine::audit::AuditFilter) -> Result<u64> {
         let mut count: u64 = 0;
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.audit_events_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let data = std::fs::read_to_string(&path)?;
+            consume_scan_entry(&mut scanned)?;
+            let data = read_json_record(&path)?;
             if let Ok(event) = serde_json::from_str::<crate::engine::audit::AuditEvent>(&data)
                 && filter.matches(&event)
             {

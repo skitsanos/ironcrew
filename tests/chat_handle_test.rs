@@ -44,6 +44,7 @@ async fn restart_after_eviction_rehydrates_from_store() {
         ],
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: "2026-04-09T08:00:01Z".into(),
+        revision: 0,
     };
     store.save_conversation(&record).await.unwrap();
 
@@ -119,6 +120,7 @@ async fn capped_out_start_must_not_leak_persisted_record() {
         messages: vec![ChatMessage::system("sys")],
         created_at: "2026-04-18T00:00:00Z".into(),
         updated_at: "2026-04-18T00:00:00Z".into(),
+        revision: 0,
     };
     store.save_conversation(&accepted).await.unwrap();
     let listed_after = store

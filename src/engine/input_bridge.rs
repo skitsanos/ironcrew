@@ -26,19 +26,53 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// Default cap on simultaneously pending questions per run — a runaway
 /// `foreach_parallel` guard, not a workflow limit.
 const DEFAULT_MAX_PENDING: usize = 16;
+const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3_600;
+const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_CHOICES: usize = 100;
+const DEFAULT_MAX_CHOICES_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_ANSWER_BYTES: usize = 64 * 1024;
+const HARD_MAX_TIMEOUT_SECS: u64 = 86_400;
+const HARD_MAX_PENDING: usize = 256;
+const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const HARD_MAX_CHOICES: usize = 1_000;
+const HARD_MAX_CHOICES_BYTES: usize = 1024 * 1024;
+const HARD_MAX_ANSWER_BYTES: usize = 1024 * 1024;
+
+fn positive_env_limit<T>(name: &str, default: T, hard_max: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + From<u8> + Copy,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<T>().ok())
+        .filter(|value| *value > T::from(0))
+        .filter(|value| *value <= hard_max)
+        .unwrap_or(default)
+}
 
 pub fn default_timeout_secs() -> u64 {
-    std::env::var("IRONCREW_ASK_HUMAN_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+    positive_env_limit(
+        "IRONCREW_ASK_HUMAN_TIMEOUT",
+        DEFAULT_TIMEOUT_SECS,
+        HARD_MAX_TIMEOUT_SECS,
+    )
+    .min(max_timeout_secs())
+}
+
+fn max_timeout_secs() -> u64 {
+    positive_env_limit(
+        "IRONCREW_ASK_HUMAN_MAX_TIMEOUT",
+        DEFAULT_MAX_TIMEOUT_SECS,
+        HARD_MAX_TIMEOUT_SECS,
+    )
 }
 
 fn max_pending() -> usize {
-    std::env::var("IRONCREW_ASK_HUMAN_MAX_PENDING")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_PENDING)
+    positive_env_limit(
+        "IRONCREW_ASK_HUMAN_MAX_PENDING",
+        DEFAULT_MAX_PENDING,
+        HARD_MAX_PENDING,
+    )
 }
 
 /// Where answers come from. Decided once per process entrypoint.
@@ -131,6 +165,31 @@ impl InputBridge {
     /// question is removed before the send, so a concurrent second answer
     /// sees "unknown or expired" instead of silently overwriting.
     pub fn answer(&self, question_id: &str, value: serde_json::Value) -> Result<()> {
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(buffer.len());
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = Counter(0);
+        serde_json::to_writer(&mut counter, &value).map_err(|error| {
+            IronCrewError::Validation(format!("Invalid question answer: {error}"))
+        })?;
+        let max_answer = positive_env_limit(
+            "IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES",
+            DEFAULT_MAX_ANSWER_BYTES,
+            HARD_MAX_ANSWER_BYTES,
+        );
+        if counter.0 > max_answer {
+            return Err(IronCrewError::Validation(format!(
+                "Question answer exceeds IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES ({max_answer})"
+            )));
+        }
         let q = self
             .pending
             .lock()
@@ -160,6 +219,45 @@ impl InputBridge {
         timeout_s: u64,
         kind: &str,
     ) -> Result<AskOutcome> {
+        let max_timeout = max_timeout_secs();
+        if timeout_s == 0 || timeout_s > max_timeout {
+            return Err(IronCrewError::Validation(format!(
+                "ask_human timeout must be between 1 and {max_timeout} seconds"
+            )));
+        }
+        let max_prompt = positive_env_limit(
+            "IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES",
+            DEFAULT_MAX_PROMPT_BYTES,
+            HARD_MAX_PROMPT_BYTES,
+        );
+        if prompt.len() > max_prompt {
+            return Err(IronCrewError::Validation(format!(
+                "ask_human prompt exceeds IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES ({max_prompt})"
+            )));
+        }
+        let max_choices = positive_env_limit(
+            "IRONCREW_ASK_HUMAN_MAX_CHOICES",
+            DEFAULT_MAX_CHOICES,
+            HARD_MAX_CHOICES,
+        );
+        if choices.len() > max_choices {
+            return Err(IronCrewError::Validation(format!(
+                "ask_human choices exceed IRONCREW_ASK_HUMAN_MAX_CHOICES ({max_choices})"
+            )));
+        }
+        let max_choice_bytes = positive_env_limit(
+            "IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES",
+            DEFAULT_MAX_CHOICES_BYTES,
+            HARD_MAX_CHOICES_BYTES,
+        );
+        let choice_bytes = choices
+            .iter()
+            .try_fold(0usize, |total, choice| total.checked_add(choice.len()));
+        if choice_bytes.is_none_or(|total| total > max_choice_bytes) {
+            return Err(IronCrewError::Validation(format!(
+                "ask_human choices exceed IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES ({max_choice_bytes})"
+            )));
+        }
         match self.mode {
             BridgeMode::Http => {
                 self.ask_http(question_id, prompt, choices, timeout_s, kind)
@@ -208,7 +306,26 @@ impl InputBridge {
         timeout_s: u64,
         kind: &str,
     ) -> Result<oneshot::Receiver<serde_json::Value>> {
+        if question_id.is_empty()
+            || question_id.len() > 128
+            || question_id.chars().any(char::is_control)
+        {
+            return Err(IronCrewError::Validation(
+                "Question id must be 1-128 printable characters".into(),
+            ));
+        }
+        if !matches!(kind, "question" | "approval") {
+            return Err(IronCrewError::Validation(
+                "Question kind must be 'question' or 'approval'".into(),
+            ));
+        }
         let mut map = self.pending.lock().expect("input bridge lock poisoned");
+        if map.contains_key(question_id) {
+            return Err(IronCrewError::Validation(format!(
+                "Question '{}' is already pending",
+                question_id
+            )));
+        }
         if map.len() >= max_pending() {
             return Err(IronCrewError::Validation(format!(
                 "Too many pending questions ({}); raise IRONCREW_ASK_HUMAN_MAX_PENDING if intentional",
@@ -325,15 +442,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_removes_question_and_rejects_late_answer() {
+    async fn zero_timeout_is_rejected_without_registering_question() {
         let b = bridge();
-        let outcome = b
-            .ask("q1", "Anyone there?", &[], 0, "question")
-            .await
-            .unwrap();
-        assert!(matches!(outcome, AskOutcome::TimedOut));
+        let outcome = b.ask("q1", "Anyone there?", &[], 0, "question").await;
+        assert!(outcome.is_err());
         assert_eq!(b.pending_count(), 0);
         assert!(b.answer("q1", json!("too late")).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_prompt_and_choices_are_rejected() {
+        let b = bridge();
+        let prompt = "x".repeat(DEFAULT_MAX_PROMPT_BYTES + 1);
+        assert!(b.ask("q1", &prompt, &[], 30, "question").await.is_err());
+
+        let choices = vec!["x".to_string(); DEFAULT_MAX_CHOICES + 1];
+        assert!(b.ask("q2", "Pick", &choices, 30, "question").await.is_err());
     }
 
     #[tokio::test]
