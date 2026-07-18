@@ -16,29 +16,34 @@ use std::sync::Arc;
 use mlua::{Table, UserData, UserDataMethods, Value};
 use tokio::sync::Mutex;
 
+use super::agent_turn::ActiveTurnGuard;
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::sessions::{ConversationRecord, validate_session_id};
 use crate::engine::store::StateStore;
-use crate::llm::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk};
+use crate::llm::provider::{
+    ChatMessage, ChatRequest, ChatResponse, DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
+    HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider, StreamChunk, append_text_bounded,
+    chat_history_max_bytes, enforce_conversation_history_limits, max_reasoning_bytes,
+    validate_chat_history,
+};
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
 /// Resolve the default max_history cap when no explicit Lua-side value is
-/// provided. Honors `IRONCREW_CONVERSATION_MAX_HISTORY` (0 → unbounded),
-/// falling back to a safe 50-message cap. Shared with non-conversation
+/// provided. Honors a positive `IRONCREW_CONVERSATION_MAX_HISTORY` up to the
+/// process hard ceiling, falling back to a safe 50-message cap. Shared with non-conversation
 /// consumers (e.g. `AgentAsTool` finalization) so they apply the same
 /// policy as the user-facing `crew:conversation()` path.
 pub(crate) fn default_max_history() -> Option<usize> {
     let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    match env_default {
-        Some(0) => None, // env var explicitly disables the cap
-        Some(n) => Some(n),
-        None => Some(50), // safe default
-    }
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(HARD_CHAT_HISTORY_MAX_MESSAGES))
+        .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
+    Some(env_default)
 }
 
 /// Shared inner state of a conversation. All methods live here so that
@@ -81,6 +86,9 @@ pub struct LuaConversationInner {
     /// Optional cap on the number of stored messages (excluding system prompt).
     pub max_history: Option<usize>,
 
+    /// Aggregate estimated footprint cap for the complete message history.
+    pub history_max_bytes: usize,
+
     /// Whether to stream responses to stderr.
     pub stream: bool,
 
@@ -112,6 +120,10 @@ pub struct LuaConversationInner {
     /// RFC3339 timestamp of the original creation (loaded from the store on
     /// resume, or set at construction for fresh sessions).
     pub created_at: String,
+
+    /// Revision expected by the next durable save. Held across persistence so
+    /// overlapping save calls cannot reuse the same optimistic revision.
+    pub revision: Mutex<u64>,
 }
 
 impl LuaConversationInner {
@@ -142,6 +154,16 @@ impl LuaConversationInner {
         http_client: reqwest::Client,
     ) -> Result<Self, IronCrewError> {
         let now = chrono::Utc::now().to_rfc3339();
+        let max_history = match max_history {
+            Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
+            Some(value) => {
+                return Err(IronCrewError::Validation(format!(
+                    "max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {value}"
+                )));
+            }
+            None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
+        };
+        let history_max_bytes = chat_history_max_bytes();
 
         // Resolve the id and decide whether the session is persistent.
         let (id, persistent) = match id {
@@ -156,11 +178,20 @@ impl LuaConversationInner {
         // the persisted messages instead of the bootstrap seed.
         let mut messages = vec![ChatMessage::system(&system_prompt)];
         let mut created_at = now.clone();
+        let mut revision = 0;
 
         if persistent
             && let Some(ref store) = store
             && let Some(record) = store.get_conversation(flow_path.as_deref(), &id).await?
         {
+            validate_chat_history(&record.messages, max_history, history_max_bytes, true).map_err(
+                |error| {
+                    IronCrewError::Validation(format!(
+                        "Conversation '{id}' has invalid persisted history: {error}"
+                    ))
+                },
+            )?;
+            revision = record.revision;
             messages = record.messages;
             created_at = record.created_at;
             tracing::info!(
@@ -169,6 +200,8 @@ impl LuaConversationInner {
                 messages.len()
             );
         }
+
+        validate_chat_history(&messages, max_history, history_max_bytes, true)?;
 
         eventbus.emit(CrewEvent::ConversationStarted {
             conversation_id: id.clone(),
@@ -184,7 +217,8 @@ impl LuaConversationInner {
             model,
             system_prompt,
             messages: Mutex::new(messages),
-            max_history,
+            max_history: Some(max_history),
+            history_max_bytes,
             stream,
             max_tool_rounds,
             eventbus,
@@ -193,6 +227,7 @@ impl LuaConversationInner {
             flow_path,
             autosave,
             created_at,
+            revision: Mutex::new(revision),
             project_dir,
             http_client,
         })
@@ -207,7 +242,15 @@ impl LuaConversationInner {
         if !self.persistent {
             return Ok(());
         }
+        let mut revision = self.revision.lock().await;
         let messages = self.messages.lock().await.clone();
+        validate_chat_history(
+            &messages,
+            self.max_history
+                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
+            self.history_max_bytes,
+            true,
+        )?;
         let record = ConversationRecord {
             id: self.id.clone(),
             flow_name: self.flow_name.clone(),
@@ -216,8 +259,10 @@ impl LuaConversationInner {
             messages,
             created_at: self.created_at.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
+            revision: *revision,
         };
-        store.save_conversation(&record).await
+        *revision = store.save_conversation(&record).await?;
+        Ok(())
     }
 
     /// Reset history — clear all messages, keep the system prompt.
@@ -282,25 +327,49 @@ impl LuaConversationInner {
         images: Option<Vec<crate::llm::provider::ImageInput>>,
         caller_ctx: &ToolCallContext,
     ) -> Result<(String, Option<String>), IronCrewError> {
-        // 1. Append the user message to history.
-        {
-            let mut history = self.messages.lock().await;
-            if let Some(imgs) = images {
-                history.push(ChatMessage::user_with_images(user_message, imgs));
-            } else {
-                history.push(ChatMessage::user(user_message));
-            }
-            self.enforce_history_cap(&mut history);
-        }
-
         let has_tools = !self.agent.tools.is_empty();
+        let helper_ctx = ToolCallContext {
+            store: caller_ctx.store.clone().or_else(|| self.store.clone()),
+            eventbus: Some(
+                caller_ctx
+                    .eventbus
+                    .clone()
+                    .unwrap_or_else(|| self.eventbus.clone()),
+            ),
+            depth: caller_ctx.depth,
+            tool_registry: Some(
+                caller_ctx
+                    .tool_registry
+                    .clone()
+                    .unwrap_or_else(|| self.tool_registry.clone()),
+            ),
+            caller_agent: Some(self.agent.name.clone()),
+            caller_scope: Some(
+                caller_ctx
+                    .caller_scope
+                    .clone()
+                    .unwrap_or_else(|| self.id.clone()),
+            ),
+            ask_human: caller_ctx.ask_human.clone(),
+        };
+
+        // Acquire the history lock before publishing the active user message,
+        // then retain it until a cancellation-aware guard owns that turn. This
+        // closes the timeout window where an appended user message could
+        // otherwise survive without a provider response.
+        let mut history = self.messages.lock().await;
+        if let Some(imgs) = images {
+            history.push(ChatMessage::user_with_images(user_message, imgs));
+        } else {
+            history.push(ChatMessage::user(user_message));
+        }
 
         // 2. Streaming special case — preserve the original stream+no-tools
         //    path. The headless helper does not support streaming (Task 6
         //    scope), so when the caller opted into streaming and the agent
         //    has no tools, we keep the original inline branch.
         let (content, reasoning) = if self.stream && !has_tools {
-            self.run_turn_streaming_no_tools().await?
+            self.run_turn_streaming_no_tools(&mut history).await?
         } else {
             // 3. Non-streaming (or tools-present) path: delegate to the
             //    shared helper under the history lock. The lock is held
@@ -308,34 +377,6 @@ impl LuaConversationInner {
             //    has a single writer per turn, and releasing it mid-turn
             //    would let a concurrent caller interleave user messages.
             //    `tokio::sync::Mutex` is await-safe so this is fine.
-            let helper_ctx = ToolCallContext {
-                store: caller_ctx.store.clone().or_else(|| self.store.clone()),
-                eventbus: Some(
-                    caller_ctx
-                        .eventbus
-                        .clone()
-                        .unwrap_or_else(|| self.eventbus.clone()),
-                ),
-                depth: caller_ctx.depth,
-                tool_registry: Some(
-                    caller_ctx
-                        .tool_registry
-                        .clone()
-                        .unwrap_or_else(|| self.tool_registry.clone()),
-                ),
-                caller_agent: Some(self.agent.name.clone()),
-                caller_scope: Some(
-                    caller_ctx
-                        .caller_scope
-                        .clone()
-                        .unwrap_or_else(|| self.id.clone()),
-                ),
-                // Propagate the human-input transport so an agent with the
-                // ask_human tool can suspend a conversation turn too.
-                ask_human: caller_ctx.ask_human.clone(),
-            };
-
-            let mut history = self.messages.lock().await;
             crate::lua::agent_turn::run_single_agent_turn(
                 &self.agent,
                 &self.provider,
@@ -347,6 +388,14 @@ impl LuaConversationInner {
             )
             .await?
         };
+        drop(history);
+
+        // Persist before emitting success events. A persistence error is now
+        // visible to the request and cannot be mistaken for a durably committed
+        // turn by an SSE subscriber.
+        if self.autosave && self.persistent {
+            self.persist().await?;
+        }
 
         // 4. Compute turn index and emit conversation lifecycle events.
         //    `turn_index` is 0-based: the number of user messages already
@@ -377,15 +426,6 @@ impl LuaConversationInner {
             });
         }
 
-        // 5. Autosave after each successful turn (no-op for sessions
-        //    without a store or with autosave disabled).
-        if self.autosave
-            && self.persistent
-            && let Err(e) = self.persist().await
-        {
-            tracing::warn!("Autosave failed for conversation '{}': {}", self.id, e);
-        }
-
         Ok((content, reasoning))
     }
 
@@ -396,11 +436,12 @@ impl LuaConversationInner {
     /// Tool-call rounds are not supported here by design — the shared
     /// helper owns that path and does not stream. Callers must check
     /// `has_tools` before dispatching to this method.
-    async fn run_turn_streaming_no_tools(&self) -> Result<(String, Option<String>), IronCrewError> {
-        let messages_snapshot: Vec<ChatMessage> = {
-            let history = self.messages.lock().await;
-            history.clone()
-        };
+    async fn run_turn_streaming_no_tools(
+        &self,
+        history: &mut Vec<ChatMessage>,
+    ) -> Result<(String, Option<String>), IronCrewError> {
+        let mut active_turn = ActiveTurnGuard::new(history);
+        let messages_snapshot: Vec<ChatMessage> = active_turn.clone();
 
         let request = ChatRequest {
             messages: messages_snapshot,
@@ -418,13 +459,29 @@ impl LuaConversationInner {
             .content
             .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
 
-        {
-            let mut history = self.messages.lock().await;
-            history.push(ChatMessage::assistant(Some(content.clone()), None));
-            self.enforce_history_cap(&mut history);
-        }
+        active_turn.push(ChatMessage::assistant(Some(content.clone()), None));
+        enforce_conversation_history_limits(
+            &mut active_turn,
+            self.max_history
+                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
+            self.history_max_bytes,
+        )?;
+        active_turn.commit();
 
-        Ok((content, response.reasoning))
+        let reasoning = response.reasoning.map(|reasoning| {
+            let limit = max_reasoning_bytes();
+            let mut bounded = String::new();
+            if append_text_bounded(&mut bounded, &reasoning, limit) {
+                tracing::warn!(
+                    conversation = %self.id,
+                    limit,
+                    "Reasoning text was truncated to the configured byte limit"
+                );
+            }
+            bounded
+        });
+
+        Ok((content, reasoning))
     }
 
     /// Stream a request to stderr (with dim reasoning) and return the response.
@@ -457,22 +514,6 @@ impl LuaConversationInner {
         let result = self.provider.chat_stream(request, tx).await;
         print_handle.await.ok();
         result
-    }
-
-    /// Trim history if it exceeds the configured cap. Always preserves the
-    /// system message at index 0.
-    fn enforce_history_cap(&self, history: &mut Vec<ChatMessage>) {
-        let Some(cap) = self.max_history else {
-            return;
-        };
-        // +1 for the system message we always keep
-        let limit = cap + 1;
-        if history.len() <= limit {
-            return;
-        }
-        // Drain the oldest non-system messages
-        let excess = history.len() - limit;
-        history.drain(1..1 + excess);
     }
 
     /// Delete the persisted record (if any) for this session. Flow-scoped
@@ -710,15 +751,16 @@ pub async fn build_conversation(
         .unwrap_or_else(|| format!("You are {}. Your goal: {}", agent.name, agent.goal));
 
     // max_history resolution order:
-    //   1. Explicit value in the Lua table (including 0 → unbounded)
+    //   1. Explicit positive value in the Lua table
     //   2. IRONCREW_CONVERSATION_MAX_HISTORY env var
     //   3. Safe default of 50 messages
-    //
-    // A value of 0 is treated as an explicit opt-in to unbounded history,
-    // for backward compatibility with v2.3.x users who relied on unbounded.
     let max_history: Option<usize> = match table.get::<usize>("max_history") {
-        Ok(0) => None, // explicit unbounded opt-in
-        Ok(n) => Some(n),
+        Ok(n) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&n) => Some(n),
+        Ok(n) => {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Conversation max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {n}"
+            ))));
+        }
         Err(_) => default_max_history(),
     };
 

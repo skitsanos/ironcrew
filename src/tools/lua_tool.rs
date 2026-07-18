@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 use super::{Tool, ToolCallContext};
 use crate::engine::runtime::Runtime;
 use crate::llm::provider::ToolSchema;
-use crate::lua::sandbox::create_tool_lua_with_base_dir;
+use crate::lua::limits::LuaExecutionGuard;
+use crate::lua::sandbox::create_tool_lua_with_fs_roots;
 use crate::lua::subflow::SubflowDepth;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -15,7 +16,8 @@ pub struct LuaScriptTool {
     pub description: String,
     pub parameters: serde_json::Value,
     pub source: String,
-    pub base_dir: Option<PathBuf>,
+    pub read_base_dir: Option<PathBuf>,
+    pub write_base_dir: Option<PathBuf>,
     /// Weak ref to the owning `Runtime`. Populated by `Runtime::set_self_ref`
     /// after the `Arc<Runtime>` is constructed so sub-flows can re-enter the
     /// same tool registry without a reference cycle.
@@ -31,14 +33,16 @@ impl LuaScriptTool {
         description: String,
         parameters: serde_json::Value,
         source: String,
-        base_dir: Option<PathBuf>,
+        read_base_dir: Option<PathBuf>,
+        write_base_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             tool_name,
             description,
             parameters,
             source,
-            base_dir,
+            read_base_dir,
+            write_base_dir,
             runtime: Mutex::new(None),
             project_dir_arc: Mutex::new(None),
         }
@@ -81,7 +85,8 @@ impl Tool for LuaScriptTool {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCallContext) -> Result<String> {
         let lua =
-            create_tool_lua_with_base_dir(self.base_dir.clone()).map_err(IronCrewError::Lua)?;
+            create_tool_lua_with_fs_roots(self.read_base_dir.clone(), self.write_base_dir.clone())
+                .map_err(IronCrewError::Lua)?;
 
         // Seed app-data on the sandbox VM so sandbox-level primitives (like
         // `run_flow`) can reach the runtime + project dir + current subflow
@@ -105,6 +110,10 @@ impl Tool for LuaScriptTool {
         if let Some(ref store) = ctx.store {
             lua.set_app_data(store.clone());
         }
+
+        // Loading the definition executes its top-level Lua, so the same
+        // budget must cover both definition evaluation and the tool call.
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
 
         // Load the tool definition
         let table: mlua::Table = lua.load(&self.source).eval().map_err(IronCrewError::Lua)?;

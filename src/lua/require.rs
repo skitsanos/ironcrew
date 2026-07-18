@@ -86,7 +86,7 @@ pub fn install_require(lua: &Lua, roots: Vec<PathBuf>) -> LuaResult<()> {
 
         let path = resolve_module_path(&roots, &relpath)
             .ok_or_else(|| mlua::Error::external(format!("module '{name}' not found in _lib")))?;
-        let source = std::fs::read_to_string(&path).map_err(mlua::Error::external)?;
+        let source = crate::lua::source::read_lua_source(&path).map_err(mlua::Error::external)?;
 
         loading.set(name.as_str(), true)?;
         let outcome = lua

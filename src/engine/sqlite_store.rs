@@ -1,18 +1,20 @@
 use async_trait::async_trait;
 use rusqlite::Connection;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::run_history::{
-    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary,
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
 };
 use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
-use super::store::StateStore;
+use super::store::{RunLeaseConfig, StateStore};
 use super::store_sql::{self, Dialect, SqlParam};
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    lease: RunLeaseConfig,
 }
 
 /// Map the shared `SqlParam` values to boxed `rusqlite::ToSql` trait objects so
@@ -30,8 +32,22 @@ fn to_sql_params(params: Vec<SqlParam>) -> Vec<Box<dyn rusqlite::types::ToSql>> 
         .collect()
 }
 
+fn decode_stored_json<T: DeserializeOwned>(raw: &str, column: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 impl SqliteStore {
     pub fn new(db_path: PathBuf) -> Result<Self> {
+        Self::new_with_lease_config(db_path, RunLeaseConfig::from_env()?)
+    }
+
+    pub fn new_with_lease_config(db_path: PathBuf, lease: RunLeaseConfig) -> Result<Self> {
         let conn = Connection::open(&db_path).map_err(|e| {
             IronCrewError::Validation(format!("Failed to open SQLite database: {}", e))
         })?;
@@ -55,6 +71,8 @@ impl SqliteStore {
                 total_tokens INTEGER DEFAULT 0,
                 cached_tokens INTEGER DEFAULT 0,
                 tags TEXT DEFAULT '[]',
+                owner_instance_id TEXT NOT NULL DEFAULT '',
+                lease_expires_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
@@ -64,7 +82,8 @@ impl SqliteStore {
                 agent_name TEXT NOT NULL,
                 messages TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS dialogs (
@@ -77,7 +96,8 @@ impl SqliteStore {
                 stopped INTEGER NOT NULL DEFAULT 0,
                 stop_reason TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -105,6 +125,8 @@ impl SqliteStore {
         for sql in [
             "ALTER TABLE conversations ADD COLUMN flow_path TEXT",
             "ALTER TABLE dialogs ADD COLUMN flow_path TEXT",
+            "ALTER TABLE conversations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = conn.execute(sql, []) {
                 let msg = e.to_string();
@@ -118,6 +140,7 @@ impl SqliteStore {
         // history). Detected via PRAGMA so we only ALTER when absent — mirrors
         // `migrate_sessions_to_composite_unique`'s "check first" style.
         migrate_runs_add_flow(&conn)?;
+        migrate_runs_add_lease_columns(&conn)?;
 
         // Enforce the documented `(flow_path, id)` uniqueness on sessions.
         // Older schemas had `id TEXT PRIMARY KEY`, which meant a save from
@@ -135,6 +158,7 @@ impl SqliteStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            lease,
         })
     }
 }
@@ -160,6 +184,44 @@ fn migrate_runs_add_flow(conn: &rusqlite::Connection) -> Result<()> {
         .map_err(|e| IronCrewError::Validation(format!("SQLite runs add flow column: {}", e)))?;
         tracing::info!("SQLite runs table migrated: added `flow` column");
     }
+    Ok(())
+}
+
+/// Add run ownership columns to databases created before lease-based
+/// reconciliation. Empty values intentionally identify legacy in-flight rows;
+/// they are reconciled once instead of being attributed to the new process.
+fn migrate_runs_add_lease_columns(conn: &rusqlite::Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(runs)")
+        .map_err(|e| IronCrewError::Validation(format!("SQLite pragma prepare: {}", e)))?;
+    let columns: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| IronCrewError::Validation(format!("SQLite pragma query: {}", e)))?
+        .filter_map(|column| column.ok())
+        .collect();
+    drop(stmt);
+
+    for (column, sql) in [
+        (
+            "owner_instance_id",
+            "ALTER TABLE runs ADD COLUMN owner_instance_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "lease_expires_at",
+            "ALTER TABLE runs ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        if !columns.contains(column) {
+            conn.execute(sql, []).map_err(|e| {
+                IronCrewError::Validation(format!("SQLite runs add {} column: {}", column, e))
+            })?;
+        }
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_active_lease ON runs (status, lease_expires_at)",
+        [],
+    )
+    .map_err(|e| IronCrewError::Validation(format!("SQLite lease index: {}", e)))?;
     Ok(())
 }
 
@@ -189,11 +251,12 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
              messages    TEXT NOT NULL,
              created_at  TEXT NOT NULL,
              updated_at  TEXT NOT NULL,
+             revision    INTEGER NOT NULL DEFAULT 0,
              UNIQUE (flow_path, id)
          );
          INSERT OR IGNORE INTO conversations_new
-             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at)
-             SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at
+             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision)
+             SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision
              FROM conversations;
          DROP TABLE conversations;
          ALTER TABLE conversations_new RENAME TO conversations;
@@ -220,13 +283,14 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
              stop_reason TEXT,
              created_at  TEXT NOT NULL,
              updated_at  TEXT NOT NULL,
+             revision    INTEGER NOT NULL DEFAULT 0,
              UNIQUE (flow_path, id)
          );
          INSERT OR IGNORE INTO dialogs_new
              (id, flow_name, flow_path, agent_names, starter, transcript,
-              next_index, stopped, stop_reason, created_at, updated_at)
+              next_index, stopped, stop_reason, created_at, updated_at, revision)
              SELECT id, flow_name, flow_path, agent_names, starter, transcript,
-                    next_index, stopped, stop_reason, created_at, updated_at
+                    next_index, stopped, stop_reason, created_at, updated_at, revision
              FROM dialogs;
          DROP TABLE dialogs;
          ALTER TABLE dialogs_new RENAME TO dialogs;
@@ -256,6 +320,8 @@ fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError
 impl StateStore for SqliteStore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
         let conn = Arc::clone(&self.conn);
+        let owner_instance_id = self.lease.instance_id().to_string();
+        let lease_expires_at = self.lease.deadline_now();
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
@@ -270,8 +336,8 @@ impl StateStore for SqliteStore {
                 })?;
 
                 conn.execute(
-                    "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags)
-                     VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, 0, 0, ?7)",
+                    "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
+                     VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, 0, 0, ?7, ?8, ?9)",
                     rusqlite::params![
                         run_id,
                         intent.flow_name,
@@ -280,6 +346,8 @@ impl StateStore for SqliteStore {
                         intent.agent_count as i64,
                         intent.task_count as i64,
                         tags_json,
+                        owner_instance_id,
+                        lease_expires_at,
                     ],
                 )
                 .map_err(|e| IronCrewError::Validation(format!("SQLite insert intent: {}", e)))?;
@@ -290,9 +358,15 @@ impl StateStore for SqliteStore {
         )
     }
 
-    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()> {
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        completion: RunCompletion,
+    ) -> Result<RunTransition> {
+        completion.validate()?;
         let conn = Arc::clone(&self.conn);
         let run_id = run_id.to_string();
+        let owner_instance_id = self.lease.instance_id().to_string();
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
@@ -311,8 +385,10 @@ impl StateStore for SqliteStore {
                     .execute(
                         "UPDATE runs
                          SET status = ?1, finished_at = ?2, duration_ms = ?3,
-                             task_results = ?4, total_tokens = ?5, cached_tokens = ?6
-                         WHERE run_id = ?7 AND status IN ('running', 'waiting_for_input')",
+                             task_results = ?4, total_tokens = ?5, cached_tokens = ?6,
+                             lease_expires_at = ''
+                         WHERE run_id = ?7 AND status IN ('running', 'waiting_for_input')
+                           AND owner_instance_id = ?8",
                         rusqlite::params![
                             completion.status.to_string(),
                             completion.finished_at,
@@ -321,6 +397,7 @@ impl StateStore for SqliteStore {
                             completion.total_tokens as i64,
                             completion.cached_tokens as i64,
                             run_id,
+                            owner_instance_id,
                         ],
                     )
                     .map_err(|e| {
@@ -328,13 +405,30 @@ impl StateStore for SqliteStore {
                     })?;
 
                 if rows == 0 {
-                    return Err(IronCrewError::Validation(format!(
-                        "Run '{}' not found or not in an in-flight state",
-                        run_id
-                    )));
+                    let state = conn.query_row(
+                        "SELECT status, owner_instance_id FROM runs WHERE run_id = ?1",
+                        rusqlite::params![run_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    );
+                    return match state {
+                        Ok((status, _)) if status.parse::<RunStatus>()?.is_terminal() => {
+                            Ok(RunTransition::AlreadyTerminal(status.parse()?))
+                        }
+                        Ok((_, owner)) => Err(IronCrewError::Validation(format!(
+                            "Run '{}' is owned by instance '{}', not '{}'",
+                            run_id, owner, owner_instance_id
+                        ))),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => Err(
+                            IronCrewError::Validation(format!("Run '{}' not found", run_id)),
+                        ),
+                        Err(e) => Err(IronCrewError::Validation(format!(
+                            "SQLite completion state query: {}",
+                            e
+                        ))),
+                    };
                 }
                 tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
-                Ok(())
+                Ok(RunTransition::Applied)
             })
             .await,
         )
@@ -345,9 +439,16 @@ impl StateStore for SqliteStore {
         run_id: &str,
         status: crate::engine::run_history::RunStatus,
     ) -> Result<()> {
+        if !status.is_in_flight() {
+            return Err(IronCrewError::Validation(format!(
+                "update_run_status requires an in-flight status, got '{}'",
+                status
+            )));
+        }
         let conn = Arc::clone(&self.conn);
         let run_id = run_id.to_string();
         let status = status.to_string();
+        let owner_instance_id = self.lease.instance_id().to_string();
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
@@ -357,8 +458,9 @@ impl StateStore for SqliteStore {
                 let rows = conn
                     .execute(
                         "UPDATE runs SET status = ?1
-                         WHERE run_id = ?2 AND status IN ('running', 'waiting_for_input')",
-                        rusqlite::params![status, run_id],
+                         WHERE run_id = ?2 AND status IN ('running', 'waiting_for_input')
+                           AND owner_instance_id = ?3",
+                        rusqlite::params![status, run_id, owner_instance_id],
                     )
                     .map_err(|e| {
                         IronCrewError::Validation(format!("SQLite update status: {}", e))
@@ -375,7 +477,65 @@ impl StateStore for SqliteStore {
         )
     }
 
+    fn instance_id(&self) -> &str {
+        self.lease.instance_id()
+    }
+
+    fn run_lease_ttl(&self) -> std::time::Duration {
+        self.lease.ttl()
+    }
+
+    async fn heartbeat_owned_runs(&self) -> Result<usize> {
+        let conn = Arc::clone(&self.conn);
+        let owner_instance_id = self.lease.instance_id().to_string();
+        let lease_expires_at = self.lease.deadline_now();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                conn.execute(
+                    "UPDATE runs SET lease_expires_at = ?1
+                     WHERE owner_instance_id = ?2
+                       AND status IN ('running', 'waiting_for_input')",
+                    rusqlite::params![lease_expires_at, owner_instance_id],
+                )
+                .map_err(|e| IronCrewError::Validation(format!("SQLite heartbeat: {}", e)))
+            })
+            .await,
+        )
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn
+                    .lock()
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let value: i64 = conn
+                    .query_row("SELECT 1", [], |row| row.get(0))
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!("SQLite health check: {}", e))
+                    })?;
+                if value != 1 {
+                    return Err(IronCrewError::Validation(
+                        "SQLite health check returned an unexpected value".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .await,
+        )
+    }
+
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
+        let normalized_now = chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|e| {
+                IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
+            })?
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339();
         let conn = Arc::clone(&self.conn);
         let now = now.to_string();
 
@@ -386,8 +546,11 @@ impl StateStore for SqliteStore {
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
                 let rows = conn
                     .execute(
-                        "UPDATE runs SET status = 'abandoned', finished_at = ?1 WHERE status IN ('running', 'waiting_for_input')",
-                        rusqlite::params![now],
+                        "UPDATE runs
+                         SET status = 'abandoned', finished_at = ?1, lease_expires_at = ''
+                         WHERE status IN ('running', 'waiting_for_input')
+                           AND (lease_expires_at = '' OR lease_expires_at <= ?2)",
+                        rusqlite::params![now, normalized_now],
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;
                 Ok(rows)
@@ -408,7 +571,7 @@ impl StateStore for SqliteStore {
 
                 let mut stmt = conn
                     .prepare(
-                        "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags FROM runs WHERE run_id = ?1",
+                        "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at FROM runs WHERE run_id = ?1",
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
 
@@ -428,13 +591,14 @@ impl StateStore for SqliteStore {
                                 started_at: row.get(4)?,
                                 finished_at: row.get(5)?,
                                 duration_ms: row.get::<_, i64>(6)? as u64,
-                                task_results: serde_json::from_str(&task_results_json)
-                                    .unwrap_or_default(),
+                                task_results: decode_stored_json(&task_results_json, 7)?,
                                 agent_count: row.get::<_, i64>(8)? as usize,
                                 task_count: row.get::<_, i64>(9)? as usize,
                                 total_tokens: row.get::<_, i64>(10)? as u32,
                                 cached_tokens: row.get::<_, i64>(11)? as u32,
-                                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                                tags: decode_stored_json(&tags_json, 12)?,
+                                owner_instance_id: row.get(13)?,
+                                lease_expires_at: row.get(14)?,
                             },
                             status_str,
                         ))
@@ -512,7 +676,7 @@ impl StateStore for SqliteStore {
                                 task_count: row.get::<_, i64>(8)? as usize,
                                 total_tokens: row.get::<_, i64>(9)? as u32,
                                 cached_tokens: row.get::<_, i64>(10)? as u32,
-                                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                                tags: decode_stored_json(&tags_json, 11)?,
                             },
                             status_str,
                         ))
@@ -590,54 +754,116 @@ impl StateStore for SqliteStore {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
-    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()> {
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
         let conn = Arc::clone(&self.conn);
         let record = record.clone();
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| IronCrewError::Validation("Conversation revision overflow".into()))?;
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!(
+                            "SQLite save_conversation transaction error: {e}"
+                        ))
+                    })?;
 
                 let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
                     IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
                 })?;
-
-                // SQLite's `UNIQUE(flow_path, id)` does not consider `NULL`
-                // values equal, so legacy/global records need an explicit
-                // delete-first step to preserve the store's upsert contract.
-                if record.flow_path.is_none() {
-                    conn.execute(
-                        "DELETE FROM conversations WHERE id = ?1 AND flow_path IS NULL",
-                        rusqlite::params![record.id],
-                    )
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "SQLite save_conversation delete-old-null-scope error: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                conn.execute(
-                    "INSERT OR REPLACE INTO conversations \
-                     (id, flow_name, flow_path, agent_name, messages, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        record.id,
-                        record.flow_name,
-                        record.flow_path,
-                        record.agent_name,
-                        messages_json,
-                        record.created_at,
-                        record.updated_at,
-                    ],
-                )
-                .map_err(|e| {
-                    IronCrewError::Validation(format!("SQLite save_conversation error: {}", e))
+                let current_revision = match tx.query_row(
+                    "SELECT revision FROM conversations WHERE id = ?1 AND flow_path IS ?2",
+                    rusqlite::params![&record.id, &record.flow_path],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => {
+                        return Err(IronCrewError::Validation(format!(
+                            "SQLite save_conversation revision read error: {error}"
+                        )));
+                    }
+                };
+                let expected_revision = i64::try_from(record.revision).map_err(|_| {
+                    IronCrewError::Validation("Conversation revision is out of range".into())
                 })?;
-                Ok(())
+                let next_revision_i64 = i64::try_from(next_revision).map_err(|_| {
+                    IronCrewError::Validation("Conversation revision is out of range".into())
+                })?;
+                match current_revision {
+                    None if record.revision == 0 => {
+                        tx.execute(
+                            "INSERT INTO conversations \
+                             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![
+                                &record.id,
+                                &record.flow_name,
+                                &record.flow_path,
+                                &record.agent_name,
+                                &messages_json,
+                                &record.created_at,
+                                &record.updated_at,
+                                next_revision_i64,
+                            ],
+                        )
+                        .map_err(|e| {
+                            IronCrewError::Validation(format!(
+                                "SQLite save_conversation insert error: {e}"
+                            ))
+                        })?;
+                    }
+                    Some(current) if current == expected_revision => {
+                        let affected = tx
+                            .execute(
+                                "UPDATE conversations SET \
+                                 flow_name = ?3, agent_name = ?4, messages = ?5, \
+                                 created_at = ?6, updated_at = ?7, revision = ?8 \
+                                 WHERE id = ?1 AND flow_path IS ?2 AND revision = ?9",
+                                rusqlite::params![
+                                    &record.id,
+                                    &record.flow_path,
+                                    &record.flow_name,
+                                    &record.agent_name,
+                                    &messages_json,
+                                    &record.created_at,
+                                    &record.updated_at,
+                                    next_revision_i64,
+                                    expected_revision,
+                                ],
+                            )
+                            .map_err(|e| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite save_conversation update error: {e}"
+                                ))
+                            })?;
+                        if affected != 1 {
+                            return Err(IronCrewError::Conflict(format!(
+                                "Conversation '{}' changed since revision {}; reopen it before saving",
+                                record.id, record.revision
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Conversation '{}' changed since revision {}; reopen it before saving",
+                            record.id, record.revision
+                        )));
+                    }
+                }
+                tx.commit().map_err(|e| {
+                    IronCrewError::Validation(format!(
+                        "SQLite save_conversation commit error: {e}"
+                    ))
+                })?;
+                Ok(next_revision)
             })
             .await,
         )
@@ -662,7 +888,7 @@ impl StateStore for SqliteStore {
                 // match. The SQL guards prevent cross-flow reads on the same id.
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at \
+                        "SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision \
                          FROM conversations \
                          WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
                     )
@@ -676,9 +902,12 @@ impl StateStore for SqliteStore {
                             flow_name: row.get(1)?,
                             flow_path: row.get(2)?,
                             agent_name: row.get(3)?,
-                            messages: serde_json::from_str(&messages_json).unwrap_or_default(),
+                            messages: decode_stored_json(&messages_json, 4)?,
                             created_at: row.get(5)?,
                             updated_at: row.get(6)?,
+                            revision: u64::try_from(row.get::<_, i64>(7)?).map_err(|_| {
+                                rusqlite::Error::IntegralValueOutOfRange(7, i64::MIN)
+                            })?,
                         })
                     })
                     .map(Some)
@@ -734,8 +963,11 @@ impl StateStore for SqliteStore {
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
 
                 let mut sql = String::from(
-                    "SELECT id, flow_path, agent_name, messages, created_at, updated_at \
-                     FROM conversations",
+                    "SELECT c.id, c.flow_path, c.agent_name, \
+                            (SELECT COUNT(*) FROM json_each(c.messages) AS message \
+                             WHERE json_extract(message.value, '$.role') = 'user') AS turn_count, \
+                            c.created_at, c.updated_at \
+                     FROM conversations AS c",
                 );
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                 let mut next_idx = 1usize;
@@ -764,17 +996,13 @@ impl StateStore for SqliteStore {
 
                 let rows = stmt
                     .query_map(param_refs.as_slice(), |row| {
-                        let messages_json: String = row.get(3)?;
-                        let msgs: Vec<crate::llm::provider::ChatMessage> =
-                            serde_json::from_str(&messages_json).unwrap_or_default();
-                        let turn_count = msgs.iter().filter(|m| m.role == "user").count();
                         Ok(ConversationSummary {
                             id: row.get(0)?,
                             flow_path: row.get(1)?,
                             agent_name: row.get(2)?,
                             created_at: row.get(4)?,
                             updated_at: row.get(5)?,
-                            turn_count,
+                            turn_count: row.get::<_, i64>(3)? as usize,
                         })
                     })
                     .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
@@ -823,15 +1051,26 @@ impl StateStore for SqliteStore {
         )
     }
 
-    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()> {
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
         let conn = Arc::clone(&self.conn);
         let record = record.clone();
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| IronCrewError::Validation("Dialog revision overflow".into()))?;
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| {
+                        IronCrewError::Validation(format!(
+                            "SQLite save_dialog_state transaction error: {e}"
+                        ))
+                    })?;
 
                 let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
                     IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
@@ -840,43 +1079,102 @@ impl StateStore for SqliteStore {
                     IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
                 })?;
 
-                // See `save_conversation`: NULL-scoped legacy/global records need
-                // an explicit delete to preserve replace semantics on SQLite.
-                if record.flow_path.is_none() {
-                    conn.execute(
-                        "DELETE FROM dialogs WHERE id = ?1 AND flow_path IS NULL",
-                        rusqlite::params![record.id],
-                    )
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "SQLite save_dialog_state delete-old-null-scope error: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                conn.execute(
-                    "INSERT OR REPLACE INTO dialogs \
-                     (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                    rusqlite::params![
-                        record.id,
-                        record.flow_name,
-                        record.flow_path,
-                        agents_json,
-                        record.starter,
-                        transcript_json,
-                        record.next_index as i64,
-                        record.stopped as i64,
-                        record.stop_reason,
-                        record.created_at,
-                        record.updated_at,
-                    ],
-                )
-                .map_err(|e| {
-                    IronCrewError::Validation(format!("SQLite save_dialog_state error: {}", e))
+                let current_revision = match tx.query_row(
+                    "SELECT revision FROM dialogs WHERE id = ?1 AND flow_path IS ?2",
+                    rusqlite::params![&record.id, &record.flow_path],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => {
+                        return Err(IronCrewError::Validation(format!(
+                            "SQLite save_dialog_state revision read error: {error}"
+                        )));
+                    }
+                };
+                let expected_revision = i64::try_from(record.revision).map_err(|_| {
+                    IronCrewError::Validation("Dialog revision is out of range".into())
                 })?;
-                Ok(())
+                let next_revision_i64 = i64::try_from(next_revision).map_err(|_| {
+                    IronCrewError::Validation("Dialog revision is out of range".into())
+                })?;
+                match current_revision {
+                    None if record.revision == 0 => {
+                        tx.execute(
+                            "INSERT INTO dialogs \
+                             (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            rusqlite::params![
+                                &record.id,
+                                &record.flow_name,
+                                &record.flow_path,
+                                &agents_json,
+                                &record.starter,
+                                &transcript_json,
+                                record.next_index as i64,
+                                record.stopped as i64,
+                                &record.stop_reason,
+                                &record.created_at,
+                                &record.updated_at,
+                                next_revision_i64,
+                            ],
+                        )
+                        .map_err(|e| {
+                            IronCrewError::Validation(format!(
+                                "SQLite save_dialog_state insert error: {e}"
+                            ))
+                        })?;
+                    }
+                    Some(current) if current == expected_revision => {
+                        let affected = tx
+                            .execute(
+                                "UPDATE dialogs SET \
+                                 flow_name = ?3, agent_names = ?4, starter = ?5, \
+                                 transcript = ?6, next_index = ?7, stopped = ?8, \
+                                 stop_reason = ?9, created_at = ?10, updated_at = ?11, \
+                                 revision = ?12 \
+                                 WHERE id = ?1 AND flow_path IS ?2 AND revision = ?13",
+                                rusqlite::params![
+                                    &record.id,
+                                    &record.flow_path,
+                                    &record.flow_name,
+                                    &agents_json,
+                                    &record.starter,
+                                    &transcript_json,
+                                    record.next_index as i64,
+                                    record.stopped as i64,
+                                    &record.stop_reason,
+                                    &record.created_at,
+                                    &record.updated_at,
+                                    next_revision_i64,
+                                    expected_revision,
+                                ],
+                            )
+                            .map_err(|e| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite save_dialog_state update error: {e}"
+                                ))
+                            })?;
+                        if affected != 1 {
+                            return Err(IronCrewError::Conflict(format!(
+                                "Dialog '{}' changed since revision {}; reopen it before saving",
+                                record.id, record.revision
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Dialog '{}' changed since revision {}; reopen it before saving",
+                            record.id, record.revision
+                        )));
+                    }
+                }
+                tx.commit().map_err(|e| {
+                    IronCrewError::Validation(format!(
+                        "SQLite save_dialog_state commit error: {e}"
+                    ))
+                })?;
+                Ok(next_revision)
             })
             .await,
         )
@@ -900,7 +1198,7 @@ impl StateStore for SqliteStore {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, flow_name, flow_path, agent_names, starter, transcript, next_index, \
-                         stopped, stop_reason, created_at, updated_at \
+                         stopped, stop_reason, created_at, updated_at, revision \
                          FROM dialogs \
                          WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
                     )
@@ -914,14 +1212,17 @@ impl StateStore for SqliteStore {
                             id: row.get(0)?,
                             flow_name: row.get(1)?,
                             flow_path: row.get(2)?,
-                            agent_names: serde_json::from_str(&agents_json).unwrap_or_default(),
+                            agent_names: decode_stored_json(&agents_json, 3)?,
                             starter: row.get(4)?,
-                            transcript: serde_json::from_str(&transcript_json).unwrap_or_default(),
+                            transcript: decode_stored_json(&transcript_json, 5)?,
                             next_index: row.get::<_, i64>(6)? as usize,
                             stopped: row.get::<_, i64>(7)? != 0,
                             stop_reason: row.get(8)?,
                             created_at: row.get(9)?,
                             updated_at: row.get(10)?,
+                            revision: u64::try_from(row.get::<_, i64>(11)?).map_err(|_| {
+                                rusqlite::Error::IntegralValueOutOfRange(11, i64::MIN)
+                            })?,
                         })
                     })
                     .map(Some)
@@ -1052,7 +1353,10 @@ impl StateStore for SqliteStore {
                             source_ip: row.get(6)?,
                             success: row.get::<_, i64>(7)? != 0,
                             status_code: row.get::<_, i64>(8)? as u16,
-                            metadata: metadata_json.and_then(|s| serde_json::from_str(&s).ok()),
+                            metadata: metadata_json
+                                .as_deref()
+                                .map(|raw| decode_stored_json(raw, 9))
+                                .transpose()?,
                         })
                     })
                     .map_err(|e| IronCrewError::Validation(format!("SQLite query: {}", e)))?;

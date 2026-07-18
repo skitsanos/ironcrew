@@ -4,7 +4,6 @@
 -- Reasoning should stream dim to stderr and be persisted to the run record.
 -- Requires: DEEPSEEK_API_KEY
 
--- API key is auto-resolved from DEEPSEEK_API_KEY env var based on base_url.
 local crew = Crew.new({
     goal = "Verify DeepSeek reasoning_content parsing",
     provider = "openai",

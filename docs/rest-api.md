@@ -77,6 +77,13 @@ Response:
 The `run_id` is consistent across the initial response, SSE events, and the
 persisted run record. Use the `events_url` to subscribe to real-time progress.
 
+An optional top-level `tags` array is attached to the run record. It accepts
+unique, non-empty, trimmed strings without control characters. The defaults
+are at most 32 tags, 256 bytes per tag, and 4096 aggregate tag bytes; operators
+can lower those policies with `IRONCREW_API_MAX_TAGS`,
+`IRONCREW_API_MAX_TAG_BYTES`, and `IRONCREW_API_MAX_TAGS_BYTES` (hard ceilings
+256, 4096 bytes, and 65536 bytes respectively).
+
 Each run has a maximum lifetime (default: 30 minutes). If execution exceeds this
 limit, the run is aborted and a `run_complete` event is emitted with `status: "timeout"`.
 Configure via `IRONCREW_MAX_RUN_LIFETIME` env var (seconds).
@@ -313,7 +320,7 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
 
 | Param    | Type    | Description |
 |----------|---------|-------------|
-| `status` | string  | `success`, `partial_failure`, `failed`, `running`, `waiting_for_input`, `abandoned` |
+| `status` | string  | `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `running`, `waiting_for_input`, `abandoned` |
 | `tag`    | string  | Exact-match against the run's tag list |
 | `since`  | string  | RFC3339 timestamp; only runs at or after this time |
 | `limit`  | integer | Page size (default `IRONCREW_RUNS_DEFAULT_LIMIT`, capped at `IRONCREW_RUNS_MAX_LIMIT`, default 100) |
@@ -435,8 +442,14 @@ used by `ironcrew chat`.
 | GET    | `/flows/{flow}/conversations`                       | Paginated list (filtered by flow)   |
 
 `POST /messages` against an unknown id returns `404` — sessions never
-auto-create. The hard cap on simultaneously-active sessions is
-`IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default 100); breaches return `503`.
+auto-create. Only one mutating operation may be active for a conversation;
+an overlapping message returns `409 Conflict` so the server does not retain
+an unbounded per-session request queue. Clients should retry with bounded
+backoff after the current turn completes. The hard cap on simultaneously-active sessions is
+`IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default 8); breaches return `503`.
+Text and image inputs are independently bounded; see the
+[chat environment table](chat.md#environment-variables) for the exact defaults
+and hard ceilings.
 
 See [docs/chat.md](chat.md) for the full reference, request/response
 shapes, and a worked curl session.
@@ -524,26 +537,30 @@ always reflects the binary you are actually running.
 ## Authentication
 
 Set `IRONCREW_API_TOKEN` to require Bearer token authentication on all endpoints
-except `/health`:
+except the public health routes. Public/non-loopback binds require a token by
+default, along with an explicit `IRONCREW_STORE`; the server refuses to start
+otherwise. A configured token must be valid UTF-8, 32–4096 bytes, contain no
+whitespace/control characters, and an empty or malformed value fails startup:
 
 ```bash
-IRONCREW_API_TOKEN=my-secret-token ironcrew serve --flows-dir ./flows
+IRONCREW_API_TOKEN=replace-with-a-random-32-byte-token ironcrew serve --flows-dir ./flows
 ```
 
 Callers must include the token in the `Authorization` header:
 
 ```bash
-curl -H "Authorization: Bearer my-secret-token" \
+curl -H "Authorization: Bearer replace-with-a-random-32-byte-token" \
   http://localhost:3000/flows/simple/run -X POST
 ```
 
 | Scenario | Result |
 |----------|--------|
-| `IRONCREW_API_TOKEN` not set | All requests pass (no auth) |
+| Token absent on a loopback bind | All requests pass (local development only) |
+| Token absent on a public bind | Startup fails unless `IRONCREW_ALLOW_UNAUTHENTICATED=true` is explicitly set |
 | Token set, no header | `401 {"error":"Missing Authorization header"}` |
 | Token set, wrong token | `401 {"error":"Invalid token"}` |
 | Token set, correct token | Request proceeds normally |
-| `/health` endpoint | Always public, no token needed |
+| `/health`, `/health/live`, `/health/ready` | Always public, no token needed |
 
 Authentication priority (for future extensibility):
 1. `IRONCREW_API_TOKEN` — static token, checked locally (highest priority)
@@ -571,12 +588,14 @@ Allowed methods: GET, POST, DELETE, OPTIONS. Allowed headers: `Authorization`, `
 
 ## Request Size Limits
 
-The server enforces a maximum request body size (default 10MB). Override with
+The server enforces a maximum request body size (default 10 MiB). Override with
 `IRONCREW_MAX_BODY_SIZE` (in bytes):
 
 ```bash
-IRONCREW_MAX_BODY_SIZE=52428800  # 50MB
+IRONCREW_MAX_BODY_SIZE=8388608  # 8 MiB
 ```
+
+Values must be positive and cannot exceed 64 MiB.
 
 ## Error Responses
 
@@ -588,10 +607,11 @@ or server structure. Full error details are logged server-side.
 The server handles `SIGTERM` and `Ctrl+C` for graceful shutdown. On receipt of
 the signal, IronCrew:
 
-1. Stops accepting new connections via Axum's graceful-shutdown hook.
-2. **Actively drops** every entry in `active_conversations` and **aborts**
-   every task in `active_runs` so that open SSE streams close cleanly
-   instead of hanging until the client times out.
+1. Marks readiness unavailable, stops accepting new work, and enters Axum's
+   graceful-shutdown path.
+2. Aborts every active run, waits for its monitor to persist an `aborted`
+   terminal record and emit the terminal event, then drops run and conversation
+   event buses so SSE streams close cleanly.
 3. Waits out a short post-serve drain window to let background cleanup tasks
    (e.g. MCP child-process reapers) finish.
 
@@ -614,13 +634,16 @@ docker build -t ironcrew .
 docker run -p 3000:3000 \
   --env-file .env \
   -e IRONCREW_CORS_ORIGINS=https://app.example.com \
-  -e IRONCREW_API_TOKEN=your-secret-token \
-  -v ./flows:/app/flows \
-  ironcrew serve --host 0.0.0.0 --port 3000 --flows-dir /app/flows
+  -e IRONCREW_API_TOKEN=replace-with-a-random-32-byte-token \
+  -v ./flows:/flows:ro \
+  ironcrew
 ```
 
-The Dockerfile uses a multi-stage build: Rust compilation in `rust:latest`,
-then a minimal `debian:13-slim` runtime with only `ca-certificates`.
+The Dockerfile uses a reproducible multi-stage build: Rust `1.96.0` with
+`cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
+certificates. The image runs as numeric non-root UID `10001` (group `0`) and
+provides `ironcrew serve --flows-dir /flows` as its default command.
 
-When running in Docker, bind to `0.0.0.0` (not the default `127.0.0.1`) so the
-port mapping works correctly.
+The image sets `IRONCREW_HOST=0.0.0.0`, so the published port is reachable
+without an extra bind flag. A host-built binary still defaults to `127.0.0.1`
+unless `PORT`, `IRONCREW_HOST`, or `--host` selects another address.

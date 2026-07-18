@@ -17,6 +17,9 @@ pub enum IronCrewError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

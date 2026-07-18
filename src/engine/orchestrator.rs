@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,6 +20,150 @@ use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
+
+const DEFAULT_MAX_CONCURRENT_TASKS: usize = 32;
+const HARD_MAX_CONCURRENT_TASKS: usize = 256;
+const DEFAULT_TASK_RESULT_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const HARD_TASK_RESULT_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_TASK_RESULT_MAX_REASONING_BYTES: usize = 4 * 1024 * 1024;
+const HARD_TASK_RESULT_MAX_REASONING_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_RUN_RESULTS_MAX_BYTES: usize = 32 * 1024 * 1024;
+// The JSON store defaults to 64 MiB per record. Keep at least 16 MiB for the
+// RunRecord envelope, tags, goal, and JSON escaping/metadata overhead.
+const HARD_RUN_RESULTS_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+fn configured_byte_limit(name: &str, default: usize, hard_max: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw.parse::<usize>().map_err(|_| {
+                IronCrewError::Validation(format!(
+                    "{name} must be an integer between 1 and {hard_max}"
+                ))
+            })?;
+            if value == 0 || value > hard_max {
+                return Err(IronCrewError::Validation(format!(
+                    "{name} must be between 1 and {hard_max}; got {value}"
+                )));
+            }
+            Ok(value)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(IronCrewError::Validation(format!(
+            "{name} must contain valid UTF-8"
+        ))),
+    }
+}
+
+#[derive(Debug)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("serialized TaskResult size overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_result_bytes(result: &TaskResult) -> Result<usize> {
+    let mut writer = CountingWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, result).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Failed to size task result '{}': {error}",
+            result.task
+        ))
+    })?;
+    Ok(writer.bytes)
+}
+
+/// Tracks the serialized bytes retained in the run result map. This is the
+/// representation ultimately persisted, so the aggregate ceiling protects
+/// both process RSS and the 64 MiB JSON-store record budget.
+struct RetainedResultBudget {
+    max_output_bytes: usize,
+    max_reasoning_bytes: usize,
+    max_total_bytes: usize,
+    total_bytes: usize,
+}
+
+impl RetainedResultBudget {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            max_output_bytes: configured_byte_limit(
+                "IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES",
+                DEFAULT_TASK_RESULT_MAX_OUTPUT_BYTES,
+                HARD_TASK_RESULT_MAX_OUTPUT_BYTES,
+            )?,
+            max_reasoning_bytes: configured_byte_limit(
+                "IRONCREW_TASK_RESULT_MAX_REASONING_BYTES",
+                DEFAULT_TASK_RESULT_MAX_REASONING_BYTES,
+                HARD_TASK_RESULT_MAX_REASONING_BYTES,
+            )?,
+            max_total_bytes: configured_byte_limit(
+                "IRONCREW_RUN_RESULTS_MAX_BYTES",
+                DEFAULT_RUN_RESULTS_MAX_BYTES,
+                HARD_RUN_RESULTS_MAX_BYTES,
+            )?,
+            total_bytes: 0,
+        })
+    }
+
+    fn insert(
+        &mut self,
+        results: &mut HashMap<String, TaskResult>,
+        key: String,
+        result: TaskResult,
+    ) -> Result<()> {
+        if result.output.len() > self.max_output_bytes {
+            return Err(IronCrewError::Validation(format!(
+                "Task '{}' output is {} bytes, exceeds IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES ({})",
+                result.task,
+                result.output.len(),
+                self.max_output_bytes
+            )));
+        }
+        if let Some(reasoning) = result.reasoning.as_ref()
+            && reasoning.len() > self.max_reasoning_bytes
+        {
+            return Err(IronCrewError::Validation(format!(
+                "Task '{}' reasoning is {} bytes, exceeds IRONCREW_TASK_RESULT_MAX_REASONING_BYTES ({})",
+                result.task,
+                reasoning.len(),
+                self.max_reasoning_bytes
+            )));
+        }
+
+        let result_bytes = serialized_result_bytes(&result)?;
+        let replaced_bytes = results
+            .get(&key)
+            .map(serialized_result_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let new_total = self
+            .total_bytes
+            .saturating_sub(replaced_bytes)
+            .checked_add(result_bytes)
+            .ok_or_else(|| IronCrewError::Validation("Run result byte count overflowed".into()))?;
+        if new_total > self.max_total_bytes {
+            return Err(IronCrewError::Validation(format!(
+                "Retaining task '{}' would grow serialized run results to {} bytes, exceeding IRONCREW_RUN_RESULTS_MAX_BYTES ({})",
+                result.task, new_total, self.max_total_bytes
+            )));
+        }
+
+        results.insert(key, result);
+        self.total_bytes = new_total;
+        Ok(())
+    }
+}
 
 /// Resolve the model to use for a task, following the priority chain:
 /// 1. Agent's model override
@@ -51,8 +196,9 @@ fn filter_eligible_tasks<'a>(
     error_handler_names: &HashSet<&str>,
     failed_tasks: &mut HashSet<String>,
     results: &mut HashMap<String, TaskResult>,
+    result_budget: &mut RetainedResultBudget,
     crew: &Crew,
-) -> Vec<&'a Task> {
+) -> Result<Vec<&'a Task>> {
     let mut eligible = Vec::new();
 
     for task in phase {
@@ -78,7 +224,7 @@ fn filter_eligible_tasks<'a>(
                 reasoning: None,
             };
             failed_tasks.insert(task.name.clone());
-            results.insert(task.name.clone(), result);
+            result_budget.insert(results, task.name.clone(), result)?;
             tracing::warn!(
                 "Skipping task '{}': dependency '{}' failed",
                 task.name,
@@ -105,7 +251,7 @@ fn filter_eligible_tasks<'a>(
                     token_usage: None,
                     reasoning: None,
                 };
-                results.insert(task.name.clone(), result);
+                result_budget.insert(results, task.name.clone(), result)?;
                 tracing::info!(
                     "Skipping task '{}': condition '{}' is false",
                     task.name,
@@ -118,7 +264,7 @@ fn filter_eligible_tasks<'a>(
         eligible.push(*task);
     }
 
-    eligible
+    Ok(eligible)
 }
 
 /// The result type from each concurrent task future.
@@ -132,101 +278,104 @@ type TaskFutureResult = (
     Option<String>,
 );
 
-/// Process the results from concurrent task futures, handling success, failure, and error recovery.
-async fn process_phase_results(
-    phase_results: Vec<TaskFutureResult>,
+/// Process one completed concurrent task future immediately. Avoid retaining a
+/// second phase-sized vector of outputs while all results are already complete.
+async fn process_phase_result(
+    phase_result: TaskFutureResult,
     crew: &Crew,
     provider: &Arc<dyn LlmProvider>,
     tool_registry: &ToolRegistry,
     results: &mut HashMap<String, TaskResult>,
+    result_budget: &mut RetainedResultBudget,
     failed_tasks: &mut HashSet<String>,
 ) -> Result<()> {
-    for (task_name, agent_name, output, duration_ms, token_usage, reasoning) in phase_results {
-        match output {
-            Ok(out) => {
-                // Emit TaskThinking event if reasoning was captured
-                if let Some(ref r) = reasoning {
-                    crew.eventbus.emit(CrewEvent::TaskThinking {
-                        task: task_name.clone(),
-                        agent: agent_name.clone(),
-                        content: r.clone(),
-                    });
-                }
-                crew.eventbus.emit(CrewEvent::TaskCompleted {
+    let (task_name, agent_name, output, duration_ms, token_usage, reasoning) = phase_result;
+    match output {
+        Ok(out) => {
+            let result = TaskResult {
+                task: task_name.clone(),
+                agent: agent_name.clone(),
+                output: out,
+                success: true,
+                duration_ms,
+                token_usage,
+                reasoning,
+            };
+            result_budget.insert(results, task_name.clone(), result)?;
+            let retained = results
+                .get(&task_name)
+                .expect("result was inserted immediately above");
+            if let Some(ref reasoning) = retained.reasoning {
+                crew.eventbus.emit(CrewEvent::TaskThinking {
                     task: task_name.clone(),
                     agent: agent_name.clone(),
-                    duration_ms,
-                    success: true,
-                    output: out.clone(),
-                    token_usage: token_usage.as_ref().map(|u| TokenUsageSummary {
-                        prompt_tokens: u.prompt_tokens,
-                        completion_tokens: u.completion_tokens,
-                        total_tokens: u.total_tokens,
-                        cached_tokens: u.cached_tokens,
-                    }),
+                    content: reasoning.clone(),
                 });
-                let result = TaskResult {
-                    task: task_name.clone(),
-                    agent: agent_name,
-                    output: out,
-                    success: true,
-                    duration_ms,
-                    token_usage,
-                    reasoning,
-                };
-                tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
-                results.insert(task_name, result);
             }
-            Err(e) => {
-                let error_msg = e.to_string();
+            crew.eventbus.emit(CrewEvent::TaskCompleted {
+                task: task_name.clone(),
+                agent: agent_name,
+                duration_ms,
+                success: true,
+                output: retained.output.clone(),
+                token_usage: retained.token_usage.as_ref().map(|u| TokenUsageSummary {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                    cached_tokens: u.cached_tokens,
+                }),
+            });
+            tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
 
-                // Check if this task has an on_error handler
-                let task_def = crew.tasks.iter().find(|t| t.name == task_name);
-                if let Some(task_def) = task_def
-                    && task_def.on_error.is_some()
-                    && let Some((mut recovered, handler_result)) = handle_task_error(
-                        task_def,
-                        &agent_name,
-                        &error_msg,
-                        &crew.tasks,
-                        &crew.agents,
-                        provider.clone(),
-                        tool_registry,
-                        results,
-                        &crew.memory,
-                        &crew.provider_config.model,
-                        crew.max_tool_rounds,
-                    )
-                    .await
-                {
-                    recovered.duration_ms = duration_ms;
-                    results.insert(task_name, recovered);
-                    if let Some(hr) = handler_result {
-                        results.insert(hr.task.clone(), hr);
-                    }
-                    continue;
+            // Check if this task has an on_error handler
+            let task_def = crew.tasks.iter().find(|t| t.name == task_name);
+            if let Some(task_def) = task_def
+                && task_def.on_error.is_some()
+                && let Some((mut recovered, handler_result)) = handle_task_error(
+                    task_def,
+                    &agent_name,
+                    &error_msg,
+                    &crew.tasks,
+                    &crew.agents,
+                    provider.clone(),
+                    tool_registry,
+                    results,
+                    &crew.memory,
+                    &crew.provider_config.model,
+                    crew.max_tool_rounds,
+                )
+                .await
+            {
+                recovered.duration_ms = duration_ms;
+                result_budget.insert(results, task_name, recovered)?;
+                if let Some(hr) = handler_result {
+                    result_budget.insert(results, hr.task.clone(), hr)?;
                 }
-
-                // Original failure path (no handler or handler failed)
-                crew.eventbus.emit(CrewEvent::TaskFailed {
-                    task: task_name.clone(),
-                    agent: agent_name.clone(),
-                    error: error_msg.clone(),
-                    duration_ms,
-                });
-                let result = TaskResult {
-                    task: task_name.clone(),
-                    agent: agent_name,
-                    output: error_msg,
-                    success: false,
-                    duration_ms,
-                    token_usage: None,
-                    reasoning: None,
-                };
-                tracing::error!("Task '{}' failed: {}", task_name, e);
-                failed_tasks.insert(task_name.clone());
-                results.insert(task_name, result);
+                return Ok(());
             }
+
+            // Original failure path (no handler or handler failed)
+            crew.eventbus.emit(CrewEvent::TaskFailed {
+                task: task_name.clone(),
+                agent: agent_name.clone(),
+                error: error_msg.clone(),
+                duration_ms,
+            });
+            let result = TaskResult {
+                task: task_name.clone(),
+                agent: agent_name,
+                output: error_msg,
+                success: false,
+                duration_ms,
+                token_usage: None,
+                reasoning: None,
+            };
+            tracing::error!("Task '{}' failed: {}", task_name, e);
+            failed_tasks.insert(task_name.clone());
+            result_budget.insert(results, task_name, result)?;
         }
     }
 
@@ -238,6 +387,7 @@ pub async fn run_crew(
     provider: Arc<dyn LlmProvider>,
     tool_registry: &ToolRegistry,
 ) -> Result<Vec<TaskResult>> {
+    crew.validate_resource_limits()?;
     if crew.agents.is_empty() {
         return Err(IronCrewError::Validation("No agents in crew".into()));
     }
@@ -263,6 +413,7 @@ pub async fn run_crew(
     let phases = topological_phases(&crew.tasks);
 
     let mut results: HashMap<String, TaskResult> = HashMap::new();
+    let mut result_budget = RetainedResultBudget::from_env()?;
     let mut failed_tasks: HashSet<String> = HashSet::new();
     // Track task names already persisted to memory, so we only write each once
     // across phases (previously the loop re-wrote every successful result every phase).
@@ -275,13 +426,24 @@ pub async fn run_crew(
         .filter_map(|t| t.on_error.as_deref())
         .collect();
 
-    // Concurrency limit: crew config > env var > default (10)
+    // Concurrency limit: crew config > env var > conservative default (4)
     let max_concurrent = crew.max_concurrent_tasks.unwrap_or_else(|| {
         std::env::var("IRONCREW_DEFAULT_MAX_CONCURRENT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10)
+            .filter(|value| *value > 0 && *value <= HARD_MAX_CONCURRENT_TASKS)
+            .unwrap_or(4)
     });
+    let hard_concurrency_limit = std::env::var("IRONCREW_MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0 && *value <= HARD_MAX_CONCURRENT_TASKS)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS);
+    if max_concurrent == 0 || max_concurrent > hard_concurrency_limit {
+        return Err(IronCrewError::Validation(format!(
+            "Crew max_concurrent must be between 1 and IRONCREW_MAX_CONCURRENT_TASKS ({hard_concurrency_limit})"
+        )));
+    }
     let semaphore = Some(Arc::new(tokio::sync::Semaphore::new(max_concurrent)));
 
     // Build a flat ordering of task names for final result ordering
@@ -296,8 +458,9 @@ pub async fn run_crew(
             &error_handler_names,
             &mut failed_tasks,
             &mut results,
+            &mut result_budget,
             crew,
-        );
+        )?;
 
         if phase_tasks.is_empty() {
             continue;
@@ -404,7 +567,7 @@ pub async fn run_crew(
                     });
                 }
 
-                results.insert(task.name.clone(), foreach_result);
+                result_budget.insert(&mut results, task.name.clone(), foreach_result)?;
                 continue; // Don't go through normal spawn path
             } else if task.task_type.as_deref() == Some("collaborative")
                 && task.collaborative_agents.len() >= 2
@@ -486,7 +649,8 @@ pub async fn run_crew(
                             task.name,
                             duration_ms
                         );
-                        results.insert(
+                        result_budget.insert(
+                            &mut results,
                             task.name.clone(),
                             TaskResult {
                                 task: task.name.clone(),
@@ -497,7 +661,7 @@ pub async fn run_crew(
                                 token_usage: collab_usage,
                                 reasoning: None,
                             },
-                        );
+                        )?;
                     }
                     Err(e) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -554,7 +718,8 @@ pub async fn run_crew(
                                 .await
                                 {
                                     Ok((output, handler_reasoning, handler_usage)) => {
-                                        results.insert(
+                                        result_budget.insert(
+                                            &mut results,
                                             task.name.clone(),
                                             TaskResult {
                                                 task: task.name.clone(),
@@ -568,8 +733,9 @@ pub async fn run_crew(
                                                 token_usage: None,
                                                 reasoning: None,
                                             },
-                                        );
-                                        results.insert(
+                                        )?;
+                                        result_budget.insert(
+                                            &mut results,
                                             error_handler_name.clone(),
                                             TaskResult {
                                                 task: error_handler_name.clone(),
@@ -581,7 +747,7 @@ pub async fn run_crew(
                                                 token_usage: handler_usage,
                                                 reasoning: handler_reasoning,
                                             },
-                                        );
+                                        )?;
                                         continue;
                                     }
                                     Err(handler_err) => {
@@ -603,7 +769,8 @@ pub async fn run_crew(
                         });
                         tracing::error!("Collaborative task '{}' failed: {}", task.name, e);
                         failed_tasks.insert(task.name.clone());
-                        results.insert(
+                        result_budget.insert(
+                            &mut results,
                             task.name.clone(),
                             TaskResult {
                                 task: task.name.clone(),
@@ -614,7 +781,7 @@ pub async fn run_crew(
                                 token_usage: None,
                                 reasoning: None,
                             },
-                        );
+                        )?;
                     }
                 }
             } else {
@@ -698,20 +865,20 @@ pub async fn run_crew(
             });
         }
 
-        // Collect all results from concurrent futures
-        let mut phase_results = Vec::new();
+        // Process each completion immediately so a phase does not retain all
+        // completed outputs in both FuturesUnordered and a second Vec.
         while let Some(result) = futures.next().await {
-            phase_results.push(result);
+            process_phase_result(
+                result,
+                crew,
+                &provider,
+                tool_registry,
+                &mut results,
+                &mut result_budget,
+                &mut failed_tasks,
+            )
+            .await?;
         }
-        process_phase_results(
-            phase_results,
-            crew,
-            &provider,
-            tool_registry,
-            &mut results,
-            &mut failed_tasks,
-        )
-        .await?;
 
         // Store successful task results in memory. Only persist each task
         // once across all phases — previously this loop iterated the whole
@@ -723,7 +890,9 @@ pub async fn run_crew(
                     "agent": result.agent,
                     "duration_ms": result.duration_ms,
                 });
-                crew.memory.set(format!("task:{}", task_name), value).await;
+                crew.memory
+                    .set(format!("task:{}", task_name), value)
+                    .await?;
             }
         }
     }
@@ -736,7 +905,8 @@ pub async fn run_crew(
         .collect();
     for handler_name in &all_error_handler_names {
         if !results.contains_key(handler_name) {
-            results.insert(
+            result_budget.insert(
+                &mut results,
                 handler_name.clone(),
                 TaskResult {
                     task: handler_name.clone(),
@@ -747,7 +917,7 @@ pub async fn run_crew(
                     token_usage: None,
                     reasoning: None,
                 },
-            );
+            )?;
         }
     }
 
@@ -769,4 +939,89 @@ pub async fn run_crew(
         .iter()
         .filter_map(|name| results.remove(*name))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetainedResultBudget, serialized_result_bytes};
+    use crate::engine::task::TaskResult;
+    use std::collections::HashMap;
+
+    fn result(task: &str, output: &str, reasoning: Option<&str>) -> TaskResult {
+        TaskResult {
+            task: task.into(),
+            agent: "agent".into(),
+            output: output.into(),
+            success: true,
+            duration_ms: 1,
+            token_usage: None,
+            reasoning: reasoning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn retained_result_budget_rejects_large_output_and_reasoning() {
+        let mut results = HashMap::new();
+        let mut budget = RetainedResultBudget {
+            max_output_bytes: 3,
+            max_reasoning_bytes: 2,
+            max_total_bytes: 1024,
+            total_bytes: 0,
+        };
+
+        let output_error = budget
+            .insert(&mut results, "one".into(), result("one", "four", None))
+            .unwrap_err()
+            .to_string();
+        assert!(output_error.contains("IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES"));
+        assert!(results.is_empty());
+
+        let reasoning_error = budget
+            .insert(
+                &mut results,
+                "one".into(),
+                result("one", "ok", Some("long")),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reasoning_error.contains("IRONCREW_TASK_RESULT_MAX_REASONING_BYTES"));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn retained_result_budget_counts_serialized_bytes_and_replacements() {
+        let first = result("one", "line\nwith escaping", None);
+        let first_bytes = serialized_result_bytes(&first).unwrap();
+        let replacement = result("one", "x", None);
+        let replacement_bytes = serialized_result_bytes(&replacement).unwrap();
+        let second = result("two", "y", None);
+        let second_bytes = serialized_result_bytes(&second).unwrap();
+        let mut results = HashMap::new();
+        let mut budget = RetainedResultBudget {
+            max_output_bytes: 1024,
+            max_reasoning_bytes: 1024,
+            max_total_bytes: first_bytes - 1,
+            total_bytes: 0,
+        };
+
+        budget
+            .insert(&mut results, "one".into(), first)
+            .unwrap_err();
+        assert!(results.is_empty());
+
+        budget.max_total_bytes = replacement_bytes + second_bytes;
+        budget
+            .insert(&mut results, "one".into(), replacement)
+            .unwrap();
+        budget.insert(&mut results, "two".into(), second).unwrap();
+        assert_eq!(budget.total_bytes, replacement_bytes + second_bytes);
+
+        let larger_replacement = result("one", "this no longer fits", None);
+        let error = budget
+            .insert(&mut results, "one".into(), larger_replacement)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IRONCREW_RUN_RESULTS_MAX_BYTES"));
+        assert_eq!(results["one"].output, "x");
+    }
 }

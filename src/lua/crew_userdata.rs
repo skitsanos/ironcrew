@@ -242,6 +242,10 @@ impl UserData for LuaCrew {
 
             let mut crew = this.crew.lock().await;
 
+            // Validate uniqueness/count before mutating hook maps so a
+            // rejected agent leaves the existing crew unchanged.
+            crew.add_agent(agent).map_err(mlua::Error::external)?;
+
             // Extract before_task hook if present and store as bytecode
             if let Ok(func) = table.get::<mlua::Function>("before_task") {
                 let bytecode = func.dump(false);
@@ -254,13 +258,16 @@ impl UserData for LuaCrew {
                 crew.after_task_hooks.insert(agent_name.clone(), bytecode);
             }
 
-            crew.add_agent(agent);
             Ok(())
         });
 
         methods.add_async_method("add_task", |_, this, table: Table| async move {
             let task = task_from_lua_table(&table)?;
-            this.crew.lock().await.add_task(task);
+            this.crew
+                .lock()
+                .await
+                .add_task(task)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
 
@@ -269,7 +276,11 @@ impl UserData for LuaCrew {
             |_, this, (condition, table): (String, Table)| async move {
                 let mut task = task_from_lua_table(&table)?;
                 task.condition = Some(condition);
-                this.crew.lock().await.add_task(task);
+                this.crew
+                    .lock()
+                    .await
+                    .add_task(task)
+                    .map_err(mlua::Error::external)?;
                 Ok(())
             },
         );
@@ -314,7 +325,11 @@ impl UserData for LuaCrew {
                     "foreach task requires 'foreach' field specifying the source key".into(),
                 )));
             }
-            this.crew.lock().await.add_task(task);
+            this.crew
+                .lock()
+                .await
+                .add_task(task)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
 
@@ -332,7 +347,11 @@ impl UserData for LuaCrew {
                     )));
                 }
 
-                this.crew.lock().await.add_task(task);
+                this.crew
+                    .lock()
+                    .await
+                    .add_task(task)
+                    .map_err(mlua::Error::external)?;
                 Ok(())
             },
         );
@@ -493,7 +512,13 @@ impl UserData for LuaCrew {
             "memory_set",
             |_, this, (key, value): (String, Value)| async move {
                 let json_value = lua_value_to_json(value)?;
-                this.crew.lock().await.memory.set(key, json_value).await;
+                this.crew
+                    .lock()
+                    .await
+                    .memory
+                    .set(key, json_value)
+                    .await
+                    .map_err(mlua::Error::external)?;
                 Ok(())
             },
         );
@@ -516,7 +541,8 @@ impl UserData for LuaCrew {
                     .await
                     .memory
                     .set_with_options(key, json_value, tags, ttl_ms)
-                    .await;
+                    .await
+                    .map_err(mlua::Error::external)?;
                 Ok(())
             },
         );
@@ -804,7 +830,11 @@ impl UserData for LuaCrew {
                                 status: record.status.clone(),
                                 finished_at: run_end.to_rfc3339(),
                                 duration_ms: total_ms,
-                                task_results: record.task_results.clone(),
+                                // `create_run_record` already cloned the results so the
+                                // originals remain available for the Lua return value.
+                                // Transfer that owned copy into persistence instead of
+                                // deep-cloning every TaskResult a second time.
+                                task_results: std::mem::take(&mut record.task_results),
                                 total_tokens: record.total_tokens,
                                 cached_tokens: record.cached_tokens,
                             },

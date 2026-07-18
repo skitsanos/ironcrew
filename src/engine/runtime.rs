@@ -19,6 +19,7 @@ pub struct Runtime {
     pub tool_registry: ToolRegistry,
     pub provider: Arc<dyn LlmProvider>,
     project_dir: Option<PathBuf>,
+    write_dir: Option<PathBuf>,
     /// Strong `Arc`s to every registered `LuaScriptTool`. Kept in parallel
     /// with the trait-object registry so `set_self_ref` can hand each tool
     /// its weak runtime reference without `Any`-downcasting.
@@ -34,10 +35,14 @@ impl Runtime {
         let mut tool_registry = ToolRegistry::new();
 
         let base_dir = project_dir.map(|p| p.to_path_buf());
+        let write_base_dir = std::env::var_os("IRONCREW_FILE_WRITE_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| base_dir.clone());
 
         tool_registry.register(Box::new(FileReadTool::new(base_dir.clone())));
         tool_registry.register(Box::new(FileReadGlobTool::new(base_dir.clone())));
-        tool_registry.register(Box::new(FileWriteTool::new(base_dir.clone(), None)));
+        tool_registry.register(Box::new(FileWriteTool::new(write_base_dir.clone(), None)));
         tool_registry.register(Box::new(WebScrapeTool::new(None)));
         tool_registry.register(Box::new(HttpRequestTool::new()));
         tool_registry.register(Box::new(HashTool::new()));
@@ -63,6 +68,7 @@ impl Runtime {
             tool_registry,
             provider: Arc::from(provider),
             project_dir: base_dir,
+            write_dir: write_base_dir,
             lua_tools: Vec::new(),
             self_ref: OnceLock::new(),
         }
@@ -80,7 +86,7 @@ impl Runtime {
         tool_defs: Vec<crate::lua::api::LuaToolDef>,
     ) -> Result<()> {
         for def in tool_defs {
-            let source = std::fs::read_to_string(&def.source_path).map_err(|err| {
+            let source = crate::lua::source::read_lua_source(&def.source_path).map_err(|err| {
                 IronCrewError::Validation(format!(
                     "Failed to read Lua tool source '{}': {}",
                     def.name, err
@@ -92,6 +98,7 @@ impl Runtime {
                 def.parameters,
                 source,
                 self.project_dir.clone(),
+                self.write_dir.clone(),
             ));
             let as_tool: Arc<dyn crate::tools::Tool> = lua_tool.clone();
             self.tool_registry.register_arc(as_tool);

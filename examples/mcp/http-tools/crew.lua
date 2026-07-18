@@ -33,6 +33,7 @@ crew:add_agent({
 })
 
 crew:add_task({
+    name            = "call_increment",
     description     = "Call the increment tool on the MCP server and report what it returned.",
     agent           = "api_agent",
     expected_output = "The result of calling the increment tool.",

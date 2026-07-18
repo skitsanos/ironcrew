@@ -2,18 +2,24 @@
 
 How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**, **Railway**, and similar platforms. This doc covers graceful shutdown, resource limits, security posture, and platform-specific recipes.
 
-IronCrew is a single statically-linked Rust binary. It runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a one-shot job.
+IronCrew is distributed as a single Rust executable. The default Linux release
+and container image use the GNU target and are dynamically linked against
+glibc; the Debian runtime image supplies that runtime environment. IronCrew
+runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a
+one-shot job.
 
-For HTTP-specific capacity planning, active conversation sizing, SSE tuning, and
-horizontal scaling advice, see [HTTP Scaling](http-scaling.md).
+For HTTP-specific capacity planning, active conversation sizing, SSE tuning,
+and the current single-replica constraint, see [HTTP Scaling](http-scaling.md).
 
 ---
 
 ## Binary profile
 
-- Single static binary (no shared libraries to bundle).
+- Single application executable; default Linux artifacts require a compatible glibc runtime.
 - Release build strips symbols and enables LTO — typical size is 15–25 MB.
-- Base image for containers: `gcr.io/distroless/cc-debian12` (or `scratch` if you link musl).
+- Source and release container images use `debian:13-slim` plus CA certificates.
+- The image defaults to numeric UID `10001` and group `0`; writable directories are group-writable so OpenShift can substitute its namespace-assigned UID.
+- The image has a runnable `CMD` (`ironcrew serve --flows-dir /flows`) and listens on port `3000` unless an environment port overrides it.
 - No systemd, no daemonization — runs in the foreground; logs to stderr.
 
 ---
@@ -23,25 +29,27 @@ horizontal scaling advice, see [HTTP Scaling](http-scaling.md).
 IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cleanly:
 
 1. Signal received → server stops accepting new HTTP requests and starts the hard-deadline clock (`IRONCREW_SHUTDOWN_TIMEOUT_SECS`).
-2. All entries in `active_conversations` are actively dropped. Dropping a chat session closes its per-session `EventBus`, so SSE subscribers on `/conversations/{id}/events` unblock and their streams terminate.
-3. All entries in `active_runs` are aborted via their `abort_handle` and then dropped, which closes the run's `EventBus` and unblocks any SSE subscriber on `/events/{run_id}`.
-4. Axum's `with_graceful_shutdown` lets remaining in-flight non-SSE requests finish.
-5. Per-request `LuaCrew` instances drop → MCP managers call `shutdown_blocking()` which spawns async cleanup tasks for each stdio child / HTTP connection.
-6. If Axum graceful shutdown takes longer than `IRONCREW_SHUTDOWN_TIMEOUT_SECS`, the server exits anyway (logs a warning).
-7. A post-serve drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) gives the Drop-spawned MCP cleanup tasks a moment before the Tokio runtime tears down.
+2. Readiness is disabled immediately, so `/health/ready` returns `503` while teardown proceeds.
+3. Active run work is aborted. Each run monitor persists an `aborted` terminal state and emits its terminal event; shutdown waits for that acknowledgement before dropping the run handle/EventBus.
+4. All entries in `active_conversations` are dropped. Dropping a chat session closes its per-session `EventBus`, so SSE subscribers on `/conversations/{id}/events` unblock and their streams terminate.
+5. Axum's `with_graceful_shutdown` lets remaining in-flight non-SSE requests finish.
+6. Per-request `LuaCrew` instances drop → MCP managers call `shutdown_blocking()` which spawns async cleanup tasks for each stdio child / HTTP connection.
+7. If Axum graceful shutdown takes longer than `IRONCREW_SHUTDOWN_TIMEOUT_SECS`, the server exits anyway (logs a warning).
+8. A post-serve drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) gives the Drop-spawned MCP cleanup tasks a moment before the Tokio runtime tears down.
 
 ### Shutdown tunables
 
 | Variable | Default | Description |
 |---|---|---|
-| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard deadline, in seconds, counted from the moment SIGTERM/SIGINT arrives. If Axum graceful shutdown exceeds it, the process exits anyway. Drop this to `~7` on platforms with 10-second grace windows (e.g. Railway). |
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard deadline, in seconds, counted from the moment SIGTERM/SIGINT arrives. If Axum graceful shutdown exceeds it, the process exits anyway. Keep it below the platform's configured termination grace. |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | `1000` | Milliseconds to wait after Axum returns, so Drop-spawned shutdown tasks can complete. Set to `0` to skip (children will be killed when the runtime drops). |
 
-**Tune this value** to fit your platform's grace period:
+**Tune these values** to fit your platform's grace period:
 
 - **Kubernetes `terminationGracePeriodSeconds: 30`** (default) → leave `IRONCREW_SHUTDOWN_DRAIN_MS=1000`. Plenty of headroom.
 - **Tight grace periods (≤ 10 s)** → `IRONCREW_SHUTDOWN_DRAIN_MS=500`.
 - **Heavy MCP stdio usage** (many long-lived child processes per request) → bump to `2000–3000` to ensure every `uvx` / `npx` child exits cleanly.
+- **Railway** → the platform default draining time is zero. The checked-in `railway.json` explicitly grants 30 seconds, so use a shutdown timeout below that value.
 
 ### Pod termination sequence (Kubernetes)
 
@@ -52,11 +60,12 @@ IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cl
        │                      │── stop accepting new requests
        │                      │── start hard-deadline clock
        │                      │       (IRONCREW_SHUTDOWN_TIMEOUT_SECS)
-       │                      │── drop active_conversations
-       │                      │       → closes chat EventBuses
+       │                      │── fail readiness (/health/ready → 503)
+       │                      │── abort active_runs
+       │                      │       → persist aborted terminal states
+       │                      │       → emit terminal events and await monitors
+       │                      │── drop run + conversation EventBuses
        │                      │       → SSE subscribers unblock
-       │                      │── abort active_runs, drop their EventBuses
-       │                      │       → SSE subscribers on /events/{id} unblock
        │                      │── axum graceful-shutdown: finish
        │                      │       remaining non-SSE in-flight requests
        │                      │── drop LuaCrews, shutdown MCP clients
@@ -80,24 +89,32 @@ Production deployments should set these at minimum:
 
 | Variable | Recommended | Why |
 |---|---|---|
-| `IRONCREW_API_TOKEN` | strong random string (32+ bytes) | Protects `/flows/*` endpoints. `/health` stays public. |
+| `IRONCREW_API_TOKEN` | strong random string (32+ bytes) | Protects `/flows/*` endpoints. Health endpoints stay public. |
+| `IRONCREW_ALLOW_UNAUTHENTICATED` | **unset** | Public binds fail closed without a token. This explicit override is for isolated development only. |
 | `IRONCREW_CORS_ORIGINS` | explicit domain list | Default is **deny-all**. Set `https://app.example.com` (comma-separated for multiple). Avoid `*`. |
 | `IRONCREW_ALLOW_SHELL` | **unset** | Leaving shell disabled prevents agents from running arbitrary commands. Only enable in sandboxed workloads. |
-| `IRONCREW_ALLOW_PRIVATE_IPS` | **unset** | Keep SSRF protection on. Default blocks RFC1918, loopback, link-local in `http_request` and Lua `http.*`. |
-| `IRONCREW_MCP_ALLOWED_COMMANDS` | comma-separated allowlist | If using MCP stdio, whitelist only the binaries you trust (e.g. `uvx,npx`). Unset = allow all. |
+| `IRONCREW_ALLOW_PRIVATE_IPS` | **unset** | Keep SSRF protection on. Protected HTTP clients check DNS answers, actual connection addresses, and redirects, and ignore environment proxies. |
+| `IRONCREW_MCP_ALLOWED_COMMANDS` | comma-separated allowlist | If using MCP stdio, whitelist only exact commands you trust (e.g. `uvx,npx`). Unset = development allow-all; present-but-empty refuses all. |
+| `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` | `__disabled__` or exact hosts | HTTP MCP frames are not bounded before rmcp decodes them. Keep disabled in production unless every exact host is operator-trusted. Public binds require this policy. |
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | **unset** | Only enable if MCP servers run as sidecars. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
-| `IRONCREW_MAX_RESPONSE_SIZE` | `52428800` (50 MB) | Caps `http_request` tool responses. |
-| `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist: Lua `env()` reads **only** these exact names; every other var returns `nil`. Opt in the specific vars a crew needs (e.g. `APP_REGION,AZURE_OPENAI_API_KEY`). See [docs/sandbox.md](sandbox.md). |
+| `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
+| `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist shared by Lua `env()` and `${env.NAME}` interpolation. Opt in only the exact vars a crew needs. See [docs/sandbox.md](sandbox.md). |
 | `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
 | `IRONCREW_AUDIT_MAX_LIMIT` | `500` | Hard cap on `GET /audit?limit=`. |
+
+Protected outbound clients deliberately ignore `HTTP_PROXY`, `HTTPS_PROXY`,
+and related environment proxy settings because proxy routing would bypass the
+connect-time address policy. Railway/OpenShift deployments must allow direct
+egress to provider/tool destinations; a mandatory egress proxy is not currently
+a supported transport path.
 
 ### Secrets handling
 
 - **Never** bake API keys into the container image.
 - Mount them as environment variables via `Secret` (Kubernetes), `Environment Variables` (Railway), or equivalent.
-- IronCrew's Lua `env()` is fail-closed: it reads only the exact names in `IRONCREW_ENV_ALLOWLIST` and returns `nil` for everything else, so secrets are unreadable from crew scripts unless explicitly opted in.
+- Lua `env()` and `${env.NAME}` interpolation share the fail-closed `IRONCREW_ENV_ALLOWLIST`, so process secrets are unreadable unless explicitly opted in.
 - MCP stdio children do **not** inherit the parent environment by default — only `PATH`, `HOME`, `USER`, `LANG`, `LC_*`. Secrets are therefore isolated from spawned MCP servers unless you explicitly list them in `env = {...}` or set `inherit_env = true`.
 
 ---
@@ -108,60 +125,147 @@ Production deployments should set these at minimum:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `IRONCREW_MAX_PROMPT_CHARS` | `100000` | Caps prompt size per task. |
-| `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) | Request body cap. |
-| `IRONCREW_MAX_RESPONSE_SIZE` | `52428800` (50 MB) | HTTP tool response cap. |
-| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | `10485760` | Cap on `web_scrape` HTML download. |
-| `IRONCREW_FILE_READ_MAX_BYTES` | `10485760` | Cap on single `file_read` result. |
-| `IRONCREW_GLOB_MAX_FILES` | `500` | Per-call limit for `file_read_glob`. |
-| `IRONCREW_GLOB_MAX_BYTES` | `52428800` | Aggregate limit for `file_read_glob`. |
+| `IRONCREW_MAX_PROMPT_CHARS` | `102400` characters | Caps prompt size per task. |
+| `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MiB) | Request body cap (hard ceiling 64 MiB). |
+| `IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES` | `65536` (64 KiB) | Outbound `http_request` header budget (hard ceiling 1 MiB). |
+| `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
+| `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |
+| `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Final serialized `http_request` result cap. |
+| `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Non-streaming model response cap. |
+| `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | `33554432` (32 MiB) | Raw model SSE stream cap. |
+| `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Accumulated model output/reasoning cap. |
+| `IRONCREW_CHAT_HISTORY_MAX_BYTES` | `33554432` (32 MiB) | Aggregate in-memory provider history cap (hard ceiling 256 MiB). |
+| `IRONCREW_MAX_REASONING_BYTES` | `1048576` (1 MiB) | Reasoning retained during one provider tool loop (hard ceiling 16 MiB). |
+| `IRONCREW_MAX_IMAGE_BYTES` | `20971520` (20 MiB) | Per-image local/remote input cap. |
+| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | `2097152` (2 MiB) | Cap on `web_scrape` HTML download. |
+| `IRONCREW_FILE_READ_MAX_BYTES` | `10485760` | Cap on single `file_read` result (hard ceiling 256 MiB). |
+| `IRONCREW_FILE_WRITE_MAX_BYTES` | `10485760` | Cap on single `file_write` input (hard ceiling 256 MiB). |
+| `IRONCREW_GLOB_MAX_FILES` | `500` | Per-call file limit for `file_read_glob` (hard ceiling 10000). |
+| `IRONCREW_GLOB_MAX_BYTES` | `52428800` | Aggregate file-content limit for `file_read_glob` (hard ceiling 256 MiB). |
+| `IRONCREW_GLOB_MAX_OUTPUT_BYTES` | `67108864` | Final serialized glob-result cap (hard ceiling 256 MiB). |
+| `IRONCREW_FOREACH_MAX_ITEMS` | `100` | Maximum fan-out items in one task. |
+| `IRONCREW_FOREACH_MAX_OUTPUT_BYTES` | `8388608` (8 MiB) | Aggregate serialized foreach result cap. |
+| `IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES` | `8388608` (8 MiB) | Per-task output retained in the run result map (hard ceiling 32 MiB). |
+| `IRONCREW_TASK_RESULT_MAX_REASONING_BYTES` | `4194304` (4 MiB) | Per-task reasoning retained in the run result map (hard ceiling 16 MiB). |
+| `IRONCREW_RUN_RESULTS_MAX_BYTES` | `33554432` (32 MiB) | Aggregate serialized task results retained for one run (hard ceiling 48 MiB). |
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | `1048576` | Shell stdout/stderr cap. |
 | `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` | Cap on each MCP tool result. |
-| `IRONCREW_DEFAULT_MAX_CONCURRENT` | `10` | Default semaphore for `foreach_parallel`. |
+| `IRONCREW_DEFAULT_MAX_CONCURRENT` | `4` | Default task semaphore per execution phase; also bounds `foreach_parallel` fan-out unless the crew overrides `max_concurrent`. |
+| `IRONCREW_MAX_CONCURRENT_TASKS` | `32` | Process policy ceiling for any crew's task semaphore. |
+| `IRONCREW_MAX_AGENTS` | `64` | Maximum agents registered in one crew. |
+| `IRONCREW_MAX_TASKS` | `256` | Maximum tasks registered in one crew. |
+| `IRONCREW_CREW_GOAL_MAX_BYTES` | `65536` | Maximum crew-goal bytes (hard ceiling 1 MiB). |
+| `IRONCREW_MAX_APPROVAL_PATTERNS` | `128` | Maximum crew approval patterns (hard ceiling 1024). |
+| `IRONCREW_MAX_MEMORY_ITEMS` | `10000` | Policy ceiling for a crew's memory item setting (hard ceiling 100000). |
+| `IRONCREW_MAX_MEMORY_TOKENS` | `1000000` | Policy ceiling for a crew's estimated memory tokens (hard ceiling 10000000). |
+| `IRONCREW_MAX_SERVER_TOOLS` | `16` | Maximum provider-hosted tools per crew (hard ceiling 64). |
+| `IRONCREW_MAX_VECTOR_STORE_IDS` | `32` | Maximum Responses vector-store IDs per crew (hard ceiling 256). |
+| `IRONCREW_MAX_MODEL_ROUTES` | `64` | Maximum purpose-to-model routes per crew (hard ceiling 256). |
+| `IRONCREW_LUA_MAX_MEMORY_BYTES` | `33554432` (32 MiB) | Allocator cap for each live Lua VM. |
+| `IRONCREW_LUA_MAX_INSTRUCTIONS` | `50000000` | Per-top-level-execution instruction budget. |
+| `IRONCREW_LUA_MAX_EXECUTION_SECONDS` | `1800` | Per-top-level-execution wall-clock budget. |
 | `IRONCREW_MAX_EVENTS` | `1000` | SSE replay buffer size per run. |
 | `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` (4 MB) | SSE replay byte budget per run. |
+| `IRONCREW_EVENT_MAX_BYTES` | `262144` (256 KiB) | Maximum serialized size of one live/replay event. |
+| `IRONCREW_EVENT_CHANNEL_CAPACITY` | `32` | Live broadcast-ring entry cap per EventBus; automatically reduced to fit the replay byte budget. |
+| `IRONCREW_MAX_SSE_CONNECTIONS` | `16` | Process-wide admission cap for long-lived run and conversation SSE connections. |
 | `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | `1000` | Max pending messages per agent. |
+| `IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES` | `65536` | Cap on one inter-agent message. |
+| `IRONCREW_MESSAGEBUS_QUEUE_MAX_BYTES` | `4194304` (4 MiB) | Byte cap on each agent queue. |
 | `IRONCREW_MAX_RUN_LIFETIME` | `1800` (30 min) | Hard per-run timeout. Lower for short flows. |
-| `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many turns. |
-| `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns. |
-| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `100` | Max simultaneous live chat sessions (HTTP + CLI). Exceeding returns 503. |
-| `IRONCREW_MAX_ACTIVE_RUNS` | `100` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
+| `IRONCREW_MAX_CONVERSATION_TURN_SECS` | `300` | Whole provider/tool deadline for one conversation message. |
+| `IRONCREW_READINESS_CACHE_MS` | `1000` | Coalesces public storage-aware readiness checks to protect the DB pool. |
+| `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many non-system messages (hard ceiling 4096; zero is rejected). |
+| `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns (hard ceiling 4095). |
+| `IRONCREW_DIALOG_MAX_TURNS` | `1000` | Maximum accepted total turns in one dialog (hard ceiling 10000). |
+| `IRONCREW_DIALOG_MAX_PARTICIPANTS` | `16` | Maximum accepted participants in one dialog (hard ceiling 64). |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
+| `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
+| `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | `8388608` (8 MiB) | Aggregate retained transcript for one collaborative task (hard ceiling 32 MiB). |
+| `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | `1048576` (1 MiB) | Maximum one collaborative provider response may add (hard ceiling 8 MiB). |
+| `IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS` | `64` | Maximum participants multiplied by turns (hard ceiling 512). |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` (30 min) | Idle window after which a chat handle is evicted from memory. |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/conversations`. |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the conversation list endpoint. |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | `20` | Default page size for `GET /flows/{flow}/runs`. |
 | `IRONCREW_RUNS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the run list endpoint. |
 | `IRONCREW_MAX_FLOW_DEPTH` | `5` | Maximum recursion depth for `run_flow` sub-flow invocation. Raise only if you have intentional deep nesting. |
-| `IRONCREW_TOOL_TIMEOUT` | `60` | Seconds to wait before a single tool call is cancelled. |
+| `IRONCREW_TOOL_TIMEOUT` | `60` | Seconds to wait before a single tool call is cancelled (hard ceiling 3600; invalid or zero uses 60). |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | _off_ | If set, truncates per-event SSE output text at N characters. Unset leaves events unlimited. |
 
 The conversation-related defaults above are only generic fallbacks. For Cloud
 deployments, especially when using HTTP chat and SSE, size them intentionally
-using the guidance in [HTTP Scaling](http-scaling.md).
+using the guidance in [HTTP Scaling](http-scaling.md). The complete list,
+including API image/message, memory, ask-human, schema, MCP, and database
+ceilings, is in [CLI environment variables](cli.md#environment-variables).
 
 ### Recommended baselines
 
 **Small pod (256 MB / 0.25 CPU):**
 ```bash
+IRONCREW_MAX_ACTIVE_RUNS=1
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=2
+IRONCREW_CHAT_SESSION_IDLE_SECS=300
+IRONCREW_LUA_MAX_MEMORY_BYTES=16777216
+IRONCREW_CHAT_HISTORY_MAX_BYTES=4194304
+IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION=4194304
 IRONCREW_MAX_PROMPT_CHARS=30000
-IRONCREW_MAX_BODY_SIZE=2097152      # 2 MB
-IRONCREW_MAX_RESPONSE_SIZE=10485760 # 10 MB
-IRONCREW_DEFAULT_MAX_CONCURRENT=3
-IRONCREW_MAX_EVENTS=200
+IRONCREW_MAX_BODY_SIZE=2097152
+IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES=32768
+IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES=2097152
+IRONCREW_HTTP_MAX_RESPONSE_BYTES=2097152
+IRONCREW_PROVIDER_MAX_OUTPUT_BYTES=4194304
+IRONCREW_PROVIDER_MAX_RESPONSE_BYTES=4194304
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=4194304
+IRONCREW_MAX_IMAGE_BYTES=2097152
+IRONCREW_DEFAULT_MAX_CONCURRENT=2
+IRONCREW_MAX_CONCURRENT_TASKS=2
+IRONCREW_CREW_GOAL_MAX_BYTES=32768
+IRONCREW_MAX_APPROVAL_PATTERNS=32
+IRONCREW_MAX_MEMORY_ITEMS=1000
+IRONCREW_MAX_MEMORY_TOKENS=100000
+IRONCREW_MAX_SERVER_TOOLS=8
+IRONCREW_MAX_VECTOR_STORE_IDS=8
+IRONCREW_MAX_MODEL_ROUTES=16
+IRONCREW_FOREACH_MAX_ITEMS=25
+IRONCREW_FOREACH_MAX_OUTPUT_BYTES=2097152
+IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES=2097152
+IRONCREW_TASK_RESULT_MAX_REASONING_BYTES=1048576
+IRONCREW_RUN_RESULTS_MAX_BYTES=8388608
+IRONCREW_MAX_EVENTS=100
+IRONCREW_EVENT_REPLAY_MAX_BYTES=524288
+IRONCREW_EVENT_MAX_BYTES=131072
+IRONCREW_EVENT_CHANNEL_CAPACITY=4
+IRONCREW_MAX_SSE_CONNECTIONS=8
 ```
 
-**Medium pod (1 GB / 1 CPU):** defaults are fine.
+**Medium pod (1 GiB / 1 CPU):** the checked-in OpenShift manifest is a
+conservative, unbenchmarked baseline: 2 active runs, 4 resident conversations,
+concurrency 2 with a hard ceiling of 4, 24 MiB per Lua VM, bounded
+history/images/network/provider output, and a PostgreSQL pool of 2. Keep these
+settings until a workload-specific Linux/container soak test demonstrates
+headroom.
 
-**Large pod (4 GB / 4 CPU):**
+**Large pod (4 GB / 4 CPU, after load testing):**
 ```bash
-IRONCREW_DEFAULT_MAX_CONCURRENT=40
-IRONCREW_MAX_EVENTS=5000
+IRONCREW_MAX_ACTIVE_RUNS=4
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=16
+IRONCREW_DEFAULT_MAX_CONCURRENT=4
+IRONCREW_MAX_EVENTS=250
+IRONCREW_EVENT_REPLAY_MAX_BYTES=2097152
+IRONCREW_EVENT_CHANNEL_CAPACITY=16
+IRONCREW_MAX_SSE_CONNECTIONS=32
 ```
+
+Do not infer safe application limits from the Railway Pro account ceiling. Pro
+permits substantially larger aggregate resources, but IronCrew should still
+have explicit per-service CPU/RAM limits and conservative application caps.
 
 ### Rate limiting
 
 - `IRONCREW_RATE_LIMIT_MS` — per-provider minimum interval between LLM calls (milliseconds). Use to stay within provider-side quotas.
-- Combine with `IRONCREW_DEFAULT_MAX_CONCURRENT` to cap parallelism globally.
+- `IRONCREW_DEFAULT_MAX_CONCURRENT` limits task parallelism inside each crew run; it is not a process-wide provider limit.
+- `IRONCREW_MAX_ACTIVE_RUNS` and `IRONCREW_MAX_ACTIVE_CONVERSATIONS` are process-wide admission limits for the HTTP server.
 
 ---
 
@@ -173,21 +277,39 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 |---|---|---|
 | JSON files | single-pod deployments with mounted PVC | `IRONCREW_STORE=json` (default) |
 | SQLite | single-pod or small team, self-contained | `IRONCREW_STORE=sqlite`, `IRONCREW_STORE_PATH=/data/ironcrew.db` |
-| PostgreSQL | multi-pod, horizontally scaled | `IRONCREW_STORE=postgres`, `DATABASE_URL=postgres://...` |
+| PostgreSQL | durable production storage and safe restart recovery | `IRONCREW_STORE=postgres`, `DATABASE_URL=postgres://...` |
 
-**Kubernetes:** use PostgreSQL if you have `replicas > 1`. JSON/SQLite require a `ReadWriteOnce` PVC, which prevents horizontal scaling.
+**Kubernetes/OpenShift:** use PostgreSQL for production durability, but keep
+`replicas: 1`. PostgreSQL shares records; it does not distribute the live
+`active_runs`, conversation, question, cancellation, or SSE control planes.
+JSON/SQLite remain single-process backends and require a writable persistent
+volume if their records must survive replacement.
 
 **Railway:** the built-in PostgreSQL add-on is the simplest path. Add it and Railway sets `DATABASE_URL` automatically.
 
-**Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once at `cmd_serve` startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run exactly once at boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
+### One live HTTP executor
+
+Until distributed live control is implemented, run exactly one `serve`
+replica. This restriction applies even with PostgreSQL. A second process cannot
+serve or cancel another process's live run/conversation, and routing affinity
+does not make lifecycle ownership distributed. Use one-shot `ironcrew run`
+workers only when their workload and store ownership are intentionally
+separated from the HTTP service.
+
+**Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once per process startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run once during each process boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
 
 ### Postgres-specific
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | — | PostgreSQL 15+ DSN. Required. |
-| `IRONCREW_PG_TABLE_PREFIX` | empty | Prefix for shared databases (e.g. `tenant1_`). Alphanumeric + underscore only. |
-| `IRONCREW_DB_POOL_SIZE` | `10` | Connection pool size. Raise for concurrent load. |
+| `IRONCREW_PG_TABLE_PREFIX` | empty | Prefix for shared databases (e.g. `tenant1_`), max 37 lowercase ASCII alphanumeric/underscore bytes. |
+| `IRONCREW_DB_POOL_SIZE` | `10` | Connection pool size (range 1–128). Raise only for measured concurrent load. |
+| `IRONCREW_DB_CONNECT_RETRIES` | `10` | Connection retries after the initial attempt (range 0–100). |
+| `IRONCREW_DB_CONNECT_BACKOFF_MS` | `1000` | Base delay for exponential connection-retry backoff, in milliseconds (range 1–30000). |
+| `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
+| `IRONCREW_INSTANCE_ID` | generated per process | Optional stable runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry used before another process may reconcile an unfinished run. Range: 1–86400. |
 
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage
 features used by the runtime and the intended deployment target of
@@ -208,12 +330,19 @@ IRONCREW_LOG=ironcrew=debug    # debug ironcrew-only
 IRONCREW_LOG=debug,hyper=info  # broad debug, suppress hyper
 ```
 
-### Health check
+### Health endpoints
 
-`GET /health` returns `200 OK` with `{"status": "ok", "version": "…"}`. Public, no auth. Use for:
-- Kubernetes `livenessProbe` and `readinessProbe`
-- Railway automatic health checks
-- Load balancer target group health checks
+All health endpoints are public and require no API token:
+
+| Endpoint | Meaning | Use |
+|---|---|---|
+| `GET /health/live` | Process is alive and the HTTP runtime can answer. It does not probe providers or storage. | Kubernetes/OpenShift liveness. |
+| `GET /health/ready` | Process is ready to accept traffic and the configured persistence store responds. Returns `503` when storage is unavailable. | Startup/readiness probes and Railway deployment healthcheck. |
+| `GET /health` | Backwards-compatible lightweight liveness response. | Existing monitors only; do not use as a storage-aware readiness gate. |
+
+Provider APIs are intentionally excluded from readiness: a provider outage
+should fail requests cleanly, not continuously restart or withdraw the whole
+service.
 
 ### Metrics
 
@@ -223,7 +352,11 @@ Not built-in today. Structured tracing output can be scraped via Loki/Promtail o
 
 ## Kubernetes recipe
 
-### Minimal Deployment
+### Single-executor Deployment
+
+Use one replica and `Recreate`. Kubernetes documents that `Recreate` kills the
+existing pod before creating the replacement during a Deployment upgrade. Do
+not add an HPA until IronCrew has a distributed live-control plane.
 
 ```yaml
 apiVersion: apps/v1
@@ -231,17 +364,20 @@ kind: Deployment
 metadata:
   name: ironcrew
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: ironcrew }
   template:
     metadata:
       labels: { app: ironcrew }
     spec:
-      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: your-registry/ironcrew:2.13.0
+        image: docker.io/skitsanos/ironcrew:2.22.0
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080
@@ -260,18 +396,32 @@ spec:
           value: "https://app.example.com"
         - name: IRONCREW_MAX_RUN_LIFETIME
           value: "300"
+        - name: IRONCREW_MAX_ACTIVE_RUNS
+          value: "2"
+        - name: IRONCREW_MAX_ACTIVE_CONVERSATIONS
+          value: "4"
+        - name: IRONCREW_FILE_WRITE_ROOT
+          value: "/tmp/ironcrew-outputs"
+        - name: IRONCREW_DEFAULT_MAX_CONCURRENT
+          value: "2"
         - name: IRONCREW_SHUTDOWN_DRAIN_MS
-          value: "1500"
+          value: "1000"
         - name: IRONCREW_MCP_ALLOWED_COMMANDS
-          value: "uvx,npx"
+          value: "__disabled__"
+        - name: IRONCREW_MCP_ALLOWED_HTTP_HOSTS
+          value: "__disabled__"
         resources:
-          requests: { cpu: "200m", memory: "256Mi" }
-          limits:   { cpu: "2",    memory: "1Gi"  }
+          requests: { cpu: "250m", memory: "256Mi" }
+          limits:   { cpu: "1",    memory: "1Gi"  }
+        startupProbe:
+          httpGet: { path: /health/ready, port: 8080 }
+          periodSeconds: 5
+          failureThreshold: 60
         readinessProbe:
-          httpGet: { path: /health, port: 8080 }
+          httpGet: { path: /health/ready, port: 8080 }
           periodSeconds: 5
         livenessProbe:
-          httpGet: { path: /health, port: 8080 }
+          httpGet: { path: /health/live, port: 8080 }
           periodSeconds: 15
         volumeMounts:
         - name: flows
@@ -289,70 +439,76 @@ spec:
   ports: [{ port: 80, targetPort: 8080 }]
 ```
 
+The startup window above is five minutes, which covers the default exponential
+PostgreSQL connection retries. Startup probes prevent liveness/readiness checks
+from interfering during that window; readiness then removes a pod from Service
+traffic during a later storage outage without killing it.
+
 ### Flows as ConfigMap
 
 For small flow sets, mount `crew.lua` / `config.lua` via ConfigMap. For larger sets, bake them into a separate image layer or pull from object storage at startup.
 
-### HPA
-
-```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata: { name: ironcrew }
-spec:
-  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: ironcrew }
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-  - type: Resource
-    resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
-```
-
-Note: each replica holds its own `active_runs` map. SSE subscribers must stick to the replica running their flow. Configure session affinity on the Service (`sessionAffinity: ClientIP`) or use the `/runs/{id}` polling API instead of SSE.
+Do not configure session affinity as a substitute for this restriction. Affinity
+can improve routing but cannot transfer run ownership, pending questions,
+abort handles, or SSE replay state between processes.
 
 ---
 
 ## OpenShift specifics
 
-OpenShift adds a few constraints on top of upstream Kubernetes:
+The checked-in [`deploy/openshift.yaml`](../deploy/openshift.yaml) is the
+production baseline. It deliberately uses:
+
+- one replica with Deployment strategy `Recreate`
+- `/health/ready` for startup and readiness, and `/health/live` for liveness
+- a five-minute startup budget for PostgreSQL initialization/retries
+- `restricted-v2`-compatible security settings: arbitrary non-root UID, no
+  privilege escalation, all capabilities dropped, runtime-default seccomp, and
+  a read-only root filesystem
+- `emptyDir` mounted at `/tmp`, with flows mounted read-only from the
+  `ironcrew-flows` ConfigMap
+- PostgreSQL credentials and API tokens from the externally created
+  `ironcrew-secrets` Secret
+- stdio MCP disabled by a non-matching command allowlist until the operator
+  replaces it with the exact trusted binaries installed in the image
+
+Apply it only after replacing the image tag, example CORS origin, ConfigMap,
+and Secret names:
+
+```bash
+oc apply -f deploy/openshift.yaml
+```
 
 ### Restricted SCC and non-root
 
-OpenShift's default `restricted-v2` SCC forces containers to run as a non-root UID assigned per-namespace. Ensure your container image:
+OpenShift's default `restricted-v2` SCC uses a namespace-specific UID range.
+Do not hard-code `runAsUser` in the workload manifest; the assigned UID is not
+predictable across projects. The shipped image has a numeric non-root default
+for ordinary Docker runtimes, while its writable directories are owned by
+group `0` with group permissions matching the owner so OpenShift can substitute
+an arbitrary UID safely.
 
-- Does **not** `USER root` or rely on root-owned paths.
-- Writes only to `/tmp` or mounted `emptyDir`/PVC volumes.
-- Does not bind to ports < 1024.
+- Keep writes in `/tmp` or an explicitly mounted PVC/`emptyDir`.
+- Do not bind to ports below 1024.
+- Do not grant a broader SCC just to run IronCrew.
+- Leave `runAsNonRoot`, `allowPrivilegeEscalation: false`, dropped capabilities,
+  and `RuntimeDefault` seccomp in place.
 
-The default port `8080` is fine. IronCrew does not require root at runtime.
+Port `8080` in the manifest is non-privileged. IronCrew requires no root
+privileges at runtime.
 
-Example distroless-based Dockerfile:
+### Flow and memory writes
 
-```dockerfile
-FROM rust:1.86 AS build
-WORKDIR /src
-COPY . .
-RUN cargo build --release
-
-FROM gcr.io/distroless/cc-debian12
-COPY --from=build /src/target/release/ironcrew /usr/local/bin/ironcrew
-USER 1000
-ENTRYPOINT ["/usr/local/bin/ironcrew"]
-```
+The baseline mounts flows read-only. Flows that use IronCrew's file-backed crew
+memory need a separate writable volume at the relevant flow path; PostgreSQL
+run/session storage does not replace that memory file. Do not make the whole
+container root filesystem writable to accommodate one flow.
 
 ### Routes instead of Ingress
 
-OpenShift uses `Route` objects for external traffic. Create one pointing at the `ironcrew` Service; TLS is terminated at the router.
-
-```yaml
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata: { name: ironcrew }
-spec:
-  to: { kind: Service, name: ironcrew }
-  port: { targetPort: 8080 }
-  tls: { termination: edge }
-```
+The checked-in manifest includes a `Route` pointing at the `ironcrew` Service,
+with edge TLS termination and HTTP-to-HTTPS redirect. Replace or remove it when
+the cluster uses a different ingress policy.
 
 ### Secrets
 
@@ -364,13 +520,31 @@ OpenShift `Secret` objects work the same as Kubernetes ones. For stricter enviro
 
 Railway has no Kubernetes manifests — everything is a service, an environment variable, or a config file in the repo.
 
-### 1. Create a service from the GitHub repo
+### 1. Deploy the checked-in configuration
 
-- **Build command:** `cargo build --release`
-- **Start command:** `./target/release/ironcrew serve --host 0.0.0.0 --port $PORT --flows-dir ./flows`
-- **Root directory:** repo root
+Connect the repository at its root. [`railway.json`](../railway.json) selects the
+root Dockerfile and configures:
 
-Or use a Dockerfile-based build (recommended — faster cold starts).
+- exactly one replica
+- `/health/ready` as the deployment healthcheck, with a 300-second timeout
+- no additional old/new deployment overlap
+- a 30-second SIGTERM draining window
+- restart policy `ALWAYS`
+
+Do not override the image command unless the flows live elsewhere. The image
+starts `ironcrew serve --flows-dir /flows` itself.
+
+The base image creates `/flows` but intentionally does not bundle a production
+flow. Before deploying, either add `COPY --chown=10001:0 flows/ /flows/` to a
+service-specific image or mount and initialize a Railway volume at `/flows`.
+An empty directory is storage-readable, so `/health/ready` can succeed even
+when no deployable flow has been supplied; call
+`GET /flows/{expected-flow}/validate` during rollout.
+
+IronCrew natively reads Railway's injected `PORT`: CLI `--port` wins first,
+then `IRONCREW_PORT`, then `PORT`, then `3000`. When `PORT` is present and no
+host override is supplied, the server binds `0.0.0.0`. Invalid environment port
+values fail startup instead of silently binding a different port.
 
 ### 2. Environment variables
 
@@ -381,80 +555,142 @@ IRONCREW_LOG=info
 IRONCREW_API_TOKEN=<generated token>
 IRONCREW_CORS_ORIGINS=https://your-frontend.example.com
 IRONCREW_MAX_RUN_LIFETIME=300
-IRONCREW_SHUTDOWN_DRAIN_MS=1500
-IRONCREW_STORE=postgres       # if you added Postgres
+IRONCREW_MAX_ACTIVE_RUNS=2
+IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
+IRONCREW_CHAT_SESSION_IDLE_SECS=600
+IRONCREW_DEFAULT_MAX_CONCURRENT=2
+IRONCREW_MAX_CONCURRENT_TASKS=4
+IRONCREW_CREW_GOAL_MAX_BYTES=65536
+IRONCREW_MAX_APPROVAL_PATTERNS=64
+IRONCREW_MAX_MEMORY_ITEMS=2000
+IRONCREW_MAX_MEMORY_TOKENS=200000
+IRONCREW_MAX_SERVER_TOOLS=8
+IRONCREW_MAX_VECTOR_STORE_IDS=16
+IRONCREW_MAX_MODEL_ROUTES=32
+IRONCREW_LUA_MAX_MEMORY_BYTES=25165824
+IRONCREW_LUA_MAX_EXECUTION_SECONDS=900
+IRONCREW_MAX_BODY_SIZE=8388608
+IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES=65536
+IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES=4194304
+IRONCREW_HTTP_MAX_RESPONSE_BYTES=4194304
+IRONCREW_HTTP_MAX_OUTPUT_BYTES=8388608
+IRONCREW_PROVIDER_MAX_OUTPUT_BYTES=4194304
+IRONCREW_PROVIDER_MAX_STREAM_BYTES=8388608
+IRONCREW_CHAT_HISTORY_MAX_BYTES=8388608
+IRONCREW_MAX_REASONING_BYTES=524288
+IRONCREW_MAX_IMAGE_BYTES=5242880
+IRONCREW_FOREACH_MAX_ITEMS=50
+IRONCREW_FOREACH_MAX_OUTPUT_BYTES=4194304
+IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES=4194304
+IRONCREW_TASK_RESULT_MAX_REASONING_BYTES=2097152
+IRONCREW_RUN_RESULTS_MAX_BYTES=16777216
+IRONCREW_MAX_EVENTS=200
+IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
+IRONCREW_EVENT_MAX_BYTES=131072
+IRONCREW_EVENT_CHANNEL_CAPACITY=8
+IRONCREW_MAX_SSE_CONNECTIONS=16
+IRONCREW_DB_POOL_SIZE=2
+IRONCREW_SHUTDOWN_TIMEOUT_SECS=25
+IRONCREW_SHUTDOWN_DRAIN_MS=1000
+IRONCREW_INSTANCE_ID=${{RAILWAY_REPLICA_ID}}
+IRONCREW_STORE=postgres
+IRONCREW_FILE_WRITE_ROOT=/data/outputs
+IRONCREW_MCP_ALLOWED_COMMANDS=__disabled__
+IRONCREW_MCP_ALLOWED_HTTP_HOSTS=__disabled__
 OPENAI_API_KEY=sk-...
 ```
 
 Railway's Postgres add-on auto-injects `DATABASE_URL`.
 
+Railway Pro provides a much higher account resource ceiling than the smaller
+plans, but that ceiling includes replica multiplication and is not a sizing
+recommendation for this service. Start with an explicit per-service allocation
+around 1 vCPU/1 GiB and the conservative caps above (the checked-in OpenShift
+manifest contains the fuller set). Raise CPU/RAM and application caps only
+after a representative container soak test. Keep `numReplicas: 1`; Pro plan
+headroom does not authorize horizontal serving while live control is
+process-local.
+
+Replica CPU and memory limits are dashboard state rather than fields in the
+current `railway.json` schema. In **Service Settings > Deploy > Replica
+Limits**, set and verify approximately **1 vCPU / 1 GiB per replica** for the
+initial deployment. Do not assume that checking in `railway.json` applied this
+cost and OOM guard. Railway documents the control in its
+[cost-control guide](https://docs.railway.com/pricing/cost-control#replica-limits).
+
 ### 3. Health check
 
-Railway auto-detects `/health` if you set **Health Check Path** to `/health` in the service settings. Unhealthy services are not routed traffic.
+The checked-in healthcheck path is `/health/ready`. Railway waits for HTTP 200
+before making a new deployment active, and uses the injected `PORT` for that
+request. Railway healthchecks are deployment gates, **not continuous runtime
+monitoring**; use an external monitor for ongoing availability.
 
 ### 4. SIGTERM grace
 
-Railway sends `SIGTERM` on deploys and scales. Its grace period is **10 seconds** — keep:
+Railway's default draining time is zero seconds. `railway.json` explicitly sets
+30 seconds between SIGTERM and SIGKILL, so keep IronCrew's own deadline inside
+that window:
 
 ```
-IRONCREW_MAX_RUN_LIFETIME=60        # fast runs
-IRONCREW_SHUTDOWN_TIMEOUT_SECS=7    # fits inside Railway's 10s grace
-IRONCREW_SHUTDOWN_DRAIN_MS=500
+IRONCREW_SHUTDOWN_TIMEOUT_SECS=25
+IRONCREW_SHUTDOWN_DRAIN_MS=1000
 ```
 
-Longer-running crews should run via Railway **Cron** jobs (one-shot `ironcrew run`) rather than the `serve` service.
+`overlapSeconds: 0` prevents extra overlap after the candidate becomes active;
+it does not authorize horizontal replicas. Keep the service replica count at
+one until live run/conversation control is distributed.
 
 ### 5. Volumes
 
-Railway volumes persist between deploys but do **not** survive region migrations. For production, use the Postgres backend instead of JSON/SQLite.
+For the HTTP service, use Railway PostgreSQL instead of JSON/SQLite. If a flow
+uses file-backed crew memory, mount and back up a volume for that specific
+writable path; run/session PostgreSQL storage does not persist the separate
+memory file.
 
 ---
 
 ## Building container images
 
-### Dockerfile (multi-stage, distroless)
+### Source Dockerfile
 
-```dockerfile
-FROM rust:1.86 AS build
-WORKDIR /src
-# Cache dependencies
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN cargo build --release --locked
+The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.96.0` builder that
+matches `Cargo.toml`'s minimum supported Rust version, builds with
+`cargo build --release --locked`, and copies the executable into
+`debian:13-slim`. The runtime is intentionally glibc-based and dynamically
+linked; it is not distroless, musl, or `scratch`.
 
-FROM gcr.io/distroless/cc-debian12
-COPY --from=build /src/target/release/ironcrew /usr/local/bin/ironcrew
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/ironcrew"]
-CMD ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
-```
+The runtime stage:
 
-Image size ≈ 40 MB.
+- installs only CA certificates
+- runs as numeric non-root UID `10001`, group `0`
+- remains compatible with an OpenShift-assigned arbitrary UID
+- exposes the local/container default port `3000`
+- supplies a runnable server `CMD`
 
-### Alternative: musl static
-
-```dockerfile
-FROM rust:1.86-alpine AS build
-RUN apk add --no-cache musl-dev
-WORKDIR /src
-COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
-
-FROM scratch
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/ironcrew /ironcrew
-EXPOSE 8080
-ENTRYPOINT ["/ironcrew"]
-```
-
-Image size ≈ 20 MB, but you lose glibc-only TLS backends. Use rustls (default in IronCrew's `reqwest` stack).
+Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
+with GNU/Linux artifacts built by the release workflow using Rust `1.96.0` and
+`--locked`. It has the same Debian, permissions, user, environment, and command
+contract as the source image.
 
 ### Excluding MCP
 
-If you don't need MCP support, build with `--no-default-features`. This drops `rmcp` and shrinks the binary by ~2 MB:
+If you don't need MCP or PostgreSQL, build with `--no-default-features`. If you
+still need PostgreSQL, re-enable it explicitly:
 
 ```
-RUN cargo build --release --no-default-features --features postgres
+RUN cargo build --release --locked --no-default-features --features postgres
 ```
+
+### Official platform references
+
+- [Railway config as code](https://docs.railway.com/config-as-code/reference)
+- [Railway healthchecks](https://docs.railway.com/deployments/healthchecks)
+- [Railway deployment teardown](https://docs.railway.com/deployments/deployment-teardown)
+- [Railway plan resource ceilings](https://docs.railway.com/pricing/plans)
+- [Railway-provided variables](https://docs.railway.com/variables/reference)
+- [Kubernetes Deployment strategies](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Kubernetes startup, readiness, and liveness probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [OpenShift `restricted-v2` SCC behavior](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/authentication_and_authorization/managing-pod-security-policies)
 
 ---
 
@@ -468,8 +704,11 @@ RUN cargo build --release --no-default-features --features postgres
 ### MCP stdio children orphaned after SIGKILL
 - `terminationGracePeriodSeconds` was too short. Raise it so IronCrew's drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) fits comfortably.
 
-### `/health` passes but real traffic 500s
-- Health check is intentionally lightweight and does not probe LLM providers or the database. Add application-level monitoring for those.
+### `/health/live` passes but readiness is 503
+- The process is alive but its configured store is unavailable. Inspect PostgreSQL connectivity and the readiness response/logs. Provider APIs are not part of readiness.
+
+### Railway deployment passes but later becomes unhealthy
+- Railway's healthcheck is a deployment-time gate, not continuous monitoring. Add an external uptime monitor against `/health/ready`.
 
 ### CORS blocks legitimate frontend
 - Set `IRONCREW_CORS_ORIGINS` explicitly — default is deny-all. Never use `*` in production.
@@ -485,11 +724,17 @@ RUN cargo build --release --no-default-features --features postgres
 - [ ] `IRONCREW_CORS_ORIGINS` restricted to your frontend domains
 - [ ] `IRONCREW_ALLOW_SHELL` unset (unless sandboxed)
 - [ ] `IRONCREW_MCP_ALLOWED_COMMANDS` whitelist set (if using MCP stdio)
-- [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (shorter than `terminationGracePeriodSeconds`)
-- [ ] `IRONCREW_SHUTDOWN_DRAIN_MS` fits within grace period
-- [ ] PostgreSQL configured for multi-replica deployments
+- [ ] `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` is `__disabled__` or lists only exact operator-trusted hosts
+- [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (active runs are aborted on SIGTERM, so this limit is independent of termination grace)
+- [ ] `IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s` fits within platform termination grace
+- [ ] Exactly one HTTP replica configured (`numReplicas: 1` or `replicas: 1`)
+- [ ] Replacement strategy does not intentionally overlap active executors (`Recreate` on OpenShift; Railway overlap set to zero)
+- [ ] Railway replica limits explicitly set and verified in the dashboard (start around 1 vCPU / 1 GiB)
+- [ ] PostgreSQL configured for production durability
 - [ ] Secrets mounted from `Secret` / vault, not baked into image
-- [ ] Readiness + liveness probes hitting `/health`
+- [ ] Startup/readiness probes hit `/health/ready`; liveness hits `/health/live`
 - [ ] Resource `requests` and `limits` set on the container
+- [ ] Production image reference replaced with the signed release digest (`image@sha256:...`), not a mutable tag
+- [ ] Container runs non-root with no privilege escalation and dropped capabilities
 - [ ] TLS terminated at ingress / router / load balancer
 - [ ] Log level set to `info` or lower (never `debug` in prod)

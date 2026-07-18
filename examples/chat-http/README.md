@@ -28,7 +28,7 @@ examples/chat-http/
 
 ```sh
 export OPENAI_API_KEY=sk-...
-export IRONCREW_API_TOKEN=dev-token   # required to exercise the API
+export IRONCREW_API_TOKEN=ironcrew-local-development-token-0001 # 32+ bytes
 
 ironcrew serve --flows-dir examples --host 127.0.0.1 --port 3000
 ```
@@ -84,7 +84,7 @@ curl -sX DELETE http://127.0.0.1:3000/flows/chat-http/conversations/demo \
 | Variable                                 | Default | Purpose                                         |
 | ---------------------------------------- | ------- | ----------------------------------------------- |
 | `IRONCREW_API_TOKEN`                     | —       | Bearer token required for the protected routes  |
-| `IRONCREW_MAX_ACTIVE_CONVERSATIONS`      | 100     | Simultaneous in-memory session cap              |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS`      | 8       | Simultaneous in-memory session cap              |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS`        | 1800    | Idle eviction threshold                         |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT`   | 20      | Default page size for list                      |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT`       | 100     | Hard cap on `?limit=` parameter                 |

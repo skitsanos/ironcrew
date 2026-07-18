@@ -20,6 +20,7 @@ fn record(id: &str, flow_path: &str) -> ConversationRecord {
         messages: vec![ChatMessage::system("sys")],
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
+        revision: 0,
     }
 }
 
@@ -150,6 +151,7 @@ fn dialog_record(id: &str, flow_path: &str) -> DialogStateRecord {
         stop_reason: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
+        revision: 0,
     }
 }
 
@@ -356,7 +358,7 @@ async fn sqlite_legacy_records_invisible_to_scoped_queries() {
     // Legacy record with flow_path = None (pre-migration data).
     let mut legacy_conv = record("legacy", "flow-a");
     legacy_conv.flow_path = None;
-    store.save_conversation(&legacy_conv).await.unwrap();
+    legacy_conv.revision = store.save_conversation(&legacy_conv).await.unwrap();
 
     let mut legacy_dlg = dialog_record("legacy-dlg", "flow-a");
     legacy_dlg.flow_path = None;
@@ -402,7 +404,7 @@ async fn sqlite_null_scoped_saves_remain_true_upserts() {
     let mut legacy_conv = record("legacy-upsert", "flow-a");
     legacy_conv.flow_path = None;
     legacy_conv.updated_at = "2026-01-01T00:00:00Z".into();
-    store.save_conversation(&legacy_conv).await.unwrap();
+    legacy_conv.revision = store.save_conversation(&legacy_conv).await.unwrap();
     legacy_conv.updated_at = "2026-01-01T00:00:05Z".into();
     store.save_conversation(&legacy_conv).await.unwrap();
 
@@ -426,9 +428,9 @@ async fn sqlite_null_scoped_saves_remain_true_upserts() {
     let mut legacy_dlg = dialog_record("legacy-upsert-dlg", "flow-a");
     legacy_dlg.flow_path = None;
     legacy_dlg.updated_at = "2026-01-01T00:00:00Z".into();
-    store.save_dialog_state(&legacy_dlg).await.unwrap();
+    legacy_dlg.revision = store.save_dialog_state(&legacy_dlg).await.unwrap();
     legacy_dlg.updated_at = "2026-01-01T00:00:05Z".into();
-    store.save_dialog_state(&legacy_dlg).await.unwrap();
+    legacy_dlg.revision = store.save_dialog_state(&legacy_dlg).await.unwrap();
 
     let loaded_dlg = store
         .get_dialog_state(None, "legacy-upsert-dlg")
@@ -445,4 +447,29 @@ async fn sqlite_null_scoped_saves_remain_true_upserts() {
         )
         .unwrap();
     assert_eq!(dlg_count, 1, "NULL-scoped dialog save should upsert");
+}
+
+#[tokio::test]
+async fn sqlite_rejects_stale_session_snapshots() {
+    let (_dir, store) = sqlite_in_tempdir();
+
+    let mut conversation = record("sqlite-cas", "flow-a");
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    let stale_conversation = conversation.clone();
+    conversation.updated_at = "2026-01-01T00:00:01Z".into();
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    assert!(matches!(
+        store.save_conversation(&stale_conversation).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    let mut dialog = dialog_record("sqlite-dialog-cas", "flow-a");
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    let stale_dialog = dialog.clone();
+    dialog.updated_at = "2026-01-01T00:00:01Z".into();
+    dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
+    assert!(matches!(
+        store.save_dialog_state(&stale_dialog).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
 }

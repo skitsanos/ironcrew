@@ -5,6 +5,70 @@ use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
+const DEFAULT_MAX_SCHEMA_BYTES: usize = 256 * 1024;
+const HARD_MAX_SCHEMA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_VALIDATION_ERRORS: usize = 100;
+const MAX_ERROR_FIELD_BYTES: usize = 4096;
+const MAX_RESULT_BYTES: usize = 1024 * 1024;
+
+/// Compile a Draft 7 schema without permitting external document retrieval.
+///
+/// `jsonschema` is built without its HTTP/file retrieval features, and this
+/// explicit walk rejects every non-fragment `$ref` before compilation. Local
+/// references such as `#/definitions/item` remain supported.
+pub fn compile_local_draft7(
+    schema: &serde_json::Value,
+) -> std::result::Result<jsonschema::Validator, String> {
+    let max_bytes = match std::env::var("IRONCREW_JSON_SCHEMA_MAX_BYTES") {
+        Ok(raw) => {
+            let parsed = raw.parse::<usize>().map_err(|_| {
+                format!(
+                    "IRONCREW_JSON_SCHEMA_MAX_BYTES must be between 1024 and {HARD_MAX_SCHEMA_BYTES}"
+                )
+            })?;
+            if !(1024..=HARD_MAX_SCHEMA_BYTES).contains(&parsed) {
+                return Err(format!(
+                    "IRONCREW_JSON_SCHEMA_MAX_BYTES must be between 1024 and {HARD_MAX_SCHEMA_BYTES}"
+                ));
+            }
+            parsed
+        }
+        Err(_) => DEFAULT_MAX_SCHEMA_BYTES,
+    };
+
+    crate::utils::http::to_json_pretty_limited(schema, max_bytes)
+        .map_err(|error| format!("JSON Schema exceeds {max_bytes} bytes: {error}"))?;
+
+    reject_external_refs(schema)?;
+    jsonschema::draft7::new(schema).map_err(|error| error.to_string())
+}
+
+fn reject_external_refs(value: &serde_json::Value) -> std::result::Result<(), String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str)
+                && !reference.starts_with('#')
+            {
+                return Err(
+                    "External JSON Schema $ref values are disabled; use a local # fragment"
+                        .to_string(),
+                );
+            }
+            for child in object.values() {
+                reject_external_refs(child)?;
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                reject_external_refs(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct ValidateSchemaTool;
 
@@ -51,60 +115,104 @@ impl Tool for ValidateSchemaTool {
             .ok_or_else(|| IronCrewError::ToolExecution {
                 tool: "validate_schema".into(),
                 message: "Missing 'data' argument".into(),
-            })?;
+            })?
+            .to_owned();
+        if data_str.len() > MAX_DATA_BYTES {
+            return Err(IronCrewError::ToolExecution {
+                tool: "validate_schema".into(),
+                message: format!("JSON data exceeds {MAX_DATA_BYTES} bytes"),
+            });
+        }
 
         let schema_value = args
             .get("schema")
             .ok_or_else(|| IronCrewError::ToolExecution {
                 tool: "validate_schema".into(),
                 message: "Missing 'schema' argument".into(),
-            })?;
+            })?
+            .clone();
 
-        // Parse the data
-        let data: serde_json::Value =
-            serde_json::from_str(data_str).map_err(|e| IronCrewError::ToolExecution {
-                tool: "validate_schema".into(),
-                message: format!("Invalid JSON data: {}", e),
-            })?;
+        tokio::task::spawn_blocking(move || {
+            let data: serde_json::Value =
+                serde_json::from_str(&data_str).map_err(|e| IronCrewError::ToolExecution {
+                    tool: "validate_schema".into(),
+                    message: format!("Invalid JSON data: {e}"),
+                })?;
+            let validator =
+                compile_local_draft7(&schema_value).map_err(|e| IronCrewError::ToolExecution {
+                    tool: "validate_schema".into(),
+                    message: format!("Invalid JSON Schema: {e}"),
+                })?;
 
-        // Compile the schema
-        let validator =
-            jsonschema::draft7::new(schema_value).map_err(|e| IronCrewError::ToolExecution {
-                tool: "validate_schema".into(),
-                message: format!("Invalid JSON Schema: {}", e),
-            })?;
-
-        // Validate
-        match validator.validate(&data) {
-            Ok(()) => Ok(serde_json::to_string_pretty(&json!({
-                "valid": true,
-                "errors": []
-            }))
-            .unwrap()),
-            Err(first_error) => {
-                // Collect all errors via iter_errors
-                let error_list: Vec<serde_json::Value> = std::iter::once(first_error)
-                    .map(|e| {
-                        json!({
-                            "path": e.instance_path().to_string(),
-                            "message": e.to_string(),
-                        })
-                    })
-                    .chain(validator.iter_errors(&data).skip(1).map(|e| {
-                        json!({
-                            "path": e.instance_path().to_string(),
-                            "message": e.to_string(),
-                        })
-                    }))
-                    .collect();
-
-                Ok(serde_json::to_string_pretty(&json!({
-                    "valid": false,
-                    "error_count": error_list.len(),
-                    "errors": error_list
-                }))
-                .unwrap())
+            let mut errors = Vec::new();
+            let mut truncated = false;
+            for error in validator.iter_errors(&data) {
+                if errors.len() == MAX_VALIDATION_ERRORS {
+                    truncated = true;
+                    break;
+                }
+                let path = error.instance_path().to_string();
+                let message = error.to_string();
+                errors.push(json!({
+                    "path": crate::utils::http::utf8_prefix(&path, MAX_ERROR_FIELD_BYTES),
+                    "message": crate::utils::http::utf8_prefix(&message, MAX_ERROR_FIELD_BYTES),
+                }));
             }
-        }
+
+            let result = json!({
+                "valid": errors.is_empty(),
+                "error_count": errors.len(),
+                "errors_truncated": truncated,
+                "errors": errors,
+            });
+            crate::utils::http::to_json_pretty_limited(&result, MAX_RESULT_BYTES).map_err(|e| {
+                IronCrewError::ToolExecution {
+                    tool: "validate_schema".into(),
+                    message: format!("Validation result exceeds {MAX_RESULT_BYTES} bytes: {e}"),
+                }
+            })
+        })
+        .await
+        .map_err(|e| IronCrewError::ToolExecution {
+            tool: "validate_schema".into(),
+            message: format!("Schema validation worker failed: {e}"),
+        })?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_fragment_refs_remain_supported() {
+        let schema = json!({
+            "definitions": {
+                "identifier": {"type": "integer"}
+            },
+            "type": "object",
+            "properties": {
+                "id": {"$ref": "#/definitions/identifier"}
+            }
+        });
+        let validator = compile_local_draft7(&schema).expect("local ref must compile");
+        assert!(validator.is_valid(&json!({"id": 7})));
+        assert!(!validator.is_valid(&json!({"id": "seven"})));
+    }
+
+    #[tokio::test]
+    async fn tool_rejects_remote_refs_before_validation() {
+        let tool = ValidateSchemaTool::new();
+        let error = tool
+            .execute(
+                json!({
+                    "data": "{}",
+                    "schema": {"$ref": "https://example.invalid/schema.json"}
+                }),
+                &ToolCallContext::default(),
+            )
+            .await
+            .expect_err("remote ref must be rejected");
+        assert!(error.to_string().contains("External JSON Schema $ref"));
     }
 }

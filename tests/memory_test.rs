@@ -4,7 +4,7 @@ use serde_json::json;
 #[tokio::test]
 async fn test_memory_set_get() {
     let store = MemoryStore::ephemeral();
-    store.set("key1".into(), json!("value1")).await;
+    store.set("key1".into(), json!("value1")).await.unwrap();
     let val = store.get("key1").await;
     assert_eq!(val, Some(json!("value1")));
 }
@@ -19,7 +19,7 @@ async fn test_memory_get_missing() {
 #[tokio::test]
 async fn test_memory_delete() {
     let store = MemoryStore::ephemeral();
-    store.set("key1".into(), json!("value1")).await;
+    store.set("key1".into(), json!("value1")).await.unwrap();
     assert!(store.delete("key1").await);
     assert_eq!(store.get("key1").await, None);
 }
@@ -27,8 +27,8 @@ async fn test_memory_delete() {
 #[tokio::test]
 async fn test_memory_keys() {
     let store = MemoryStore::ephemeral();
-    store.set("a".into(), json!(1)).await;
-    store.set("b".into(), json!(2)).await;
+    store.set("a".into(), json!(1)).await.unwrap();
+    store.set("b".into(), json!(2)).await.unwrap();
     let mut keys = store.keys().await;
     keys.sort();
     assert_eq!(keys, vec!["a", "b"]);
@@ -39,7 +39,8 @@ async fn test_memory_ttl_expiry() {
     let store = MemoryStore::ephemeral();
     store
         .set_with_options("temp".into(), json!("data"), vec![], Some(1))
-        .await;
+        .await
+        .unwrap();
     // Sleep a bit to let it expire
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(store.get("temp").await, None);
@@ -48,16 +49,16 @@ async fn test_memory_ttl_expiry() {
 #[tokio::test]
 async fn test_memory_update_existing() {
     let store = MemoryStore::ephemeral();
-    store.set("key".into(), json!("v1")).await;
-    store.set("key".into(), json!("v2")).await;
+    store.set("key".into(), json!("v1")).await.unwrap();
+    store.set("key".into(), json!("v2")).await.unwrap();
     assert_eq!(store.get("key").await, Some(json!("v2")));
 }
 
 #[tokio::test]
 async fn test_memory_clear() {
     let store = MemoryStore::ephemeral();
-    store.set("a".into(), json!(1)).await;
-    store.set("b".into(), json!(2)).await;
+    store.set("a".into(), json!(1)).await.unwrap();
+    store.set("b".into(), json!(2)).await.unwrap();
     store.clear().await;
     assert!(store.keys().await.is_empty());
 }
@@ -72,7 +73,8 @@ async fn test_memory_build_context() {
             vec!["research".into()],
             None,
         )
-        .await;
+        .await
+        .unwrap();
     store
         .set_with_options(
             "notes".into(),
@@ -80,7 +82,8 @@ async fn test_memory_build_context() {
             vec!["notes".into()],
             None,
         )
-        .await;
+        .await
+        .unwrap();
     let ctx = store.build_context("research findings about Rust", 5).await;
     assert!(ctx.contains("Rust is fast"));
 }
@@ -93,8 +96,11 @@ async fn test_memory_persistent_roundtrip() {
     // Write
     {
         let store = MemoryStore::persistent(path.clone()).unwrap();
-        store.set("key1".into(), json!("value1")).await;
-        store.set("key2".into(), json!({"nested": true})).await;
+        store.set("key1".into(), json!("value1")).await.unwrap();
+        store
+            .set("key2".into(), json!({"nested": true}))
+            .await
+            .unwrap();
         store.save().await.unwrap();
     }
 
@@ -114,10 +120,10 @@ async fn test_memory_eviction_max_items() {
     };
     let store = MemoryStore::ephemeral_with_config(config);
 
-    store.set("a".into(), json!("value_a")).await;
-    store.set("b".into(), json!("value_b")).await;
-    store.set("c".into(), json!("value_c")).await;
-    store.set("d".into(), json!("value_d")).await; // should trigger eviction
+    store.set("a".into(), json!("value_a")).await.unwrap();
+    store.set("b".into(), json!("value_b")).await.unwrap();
+    store.set("c".into(), json!("value_c")).await.unwrap();
+    store.set("d".into(), json!("value_d")).await.unwrap(); // should trigger eviction
 
     let keys = store.keys().await;
     assert_eq!(keys.len(), 3);
@@ -131,14 +137,14 @@ async fn test_memory_eviction_preserves_accessed() {
     };
     let store = MemoryStore::ephemeral_with_config(config);
 
-    store.set("a".into(), json!("value_a")).await;
-    store.set("b".into(), json!("value_b")).await;
+    store.set("a".into(), json!("value_a")).await.unwrap();
+    store.set("b".into(), json!("value_b")).await.unwrap();
 
     // Access 'a' to increase its access_count
     store.get("a").await;
     store.get("a").await;
 
-    store.set("c".into(), json!("value_c")).await; // should evict 'b' (less accessed)
+    store.set("c".into(), json!("value_c")).await.unwrap(); // should evict 'b' (less accessed)
 
     assert!(store.get("a").await.is_some()); // 'a' preserved (more accessed)
     assert!(store.get("c").await.is_some()); // 'c' is new
@@ -147,13 +153,14 @@ async fn test_memory_eviction_preserves_accessed() {
 #[tokio::test]
 async fn test_memory_token_estimation() {
     let store = MemoryStore::ephemeral();
-    store.set("short".into(), json!("hi")).await;
+    store.set("short".into(), json!("hi")).await.unwrap();
     store
         .set(
             "long".into(),
             json!("this is a longer string with more tokens in it"),
         )
-        .await;
+        .await
+        .unwrap();
 
     let stats = store.stats().await;
     assert_eq!(stats.total_items, 2);
@@ -168,15 +175,91 @@ async fn test_memory_eviction_max_tokens() {
     };
     let store = MemoryStore::ephemeral_with_config(config);
 
-    store.set("small".into(), json!("hi")).await; // ~1 token
+    store.set("small".into(), json!("hi")).await.unwrap(); // ~1 token
     store
         .set(
             "big".into(),
             json!("this is a much longer string that has many more tokens"),
         )
-        .await; // many tokens
+        .await
+        .unwrap(); // many tokens
 
     let stats = store.stats().await;
     // Should have evicted to stay under 10 tokens
     assert!(stats.total_tokens <= 10 || stats.total_items <= 1);
+}
+
+#[test]
+fn corrupt_persistent_memory_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.json");
+    std::fs::write(&path, b"{ definitely-not-json").unwrap();
+
+    let error = match MemoryStore::persistent(path) {
+        Ok(_) => panic!("corrupt memory unexpectedly loaded"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid JSON"));
+}
+
+#[tokio::test]
+async fn memory_input_and_context_are_bounded() {
+    let store = MemoryStore::ephemeral();
+    let oversized = "x".repeat(1024 * 1024 + 1);
+    let error = store
+        .set("too-large".into(), json!(oversized))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("MAX_VALUE_BYTES"));
+
+    let large_but_valid = format!("needle {}", "é".repeat(200_000));
+    store
+        .set("bounded".into(), json!(large_but_valid))
+        .await
+        .unwrap();
+    let context = store.build_context("needle", usize::MAX).await;
+    assert!(context.len() <= 64 * 1024);
+    assert!(context.is_char_boundary(context.len()));
+}
+
+#[tokio::test]
+async fn concurrent_saves_leave_the_latest_in_memory_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private").join("memory.json");
+    let store = MemoryStore::persistent(path.clone()).unwrap();
+
+    let mut tasks = Vec::new();
+    for index in 0..32u64 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            store.set("counter".into(), json!(index)).await.unwrap();
+            store.save().await.unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let expected = store.get("counter").await.unwrap();
+    store.save().await.unwrap();
+    let reloaded = MemoryStore::persistent(path).unwrap();
+    assert_eq!(reloaded.get("counter").await, Some(expected));
+
+    let leftovers = std::fs::read_dir(dir.path().join("private"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .count();
+    assert_eq!(leftovers, 0);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
 }

@@ -2,7 +2,6 @@
 -- Model: llama-3.3-70b-versatile (fast inference)
 -- Requires: GROQ_API_KEY
 
--- API key is auto-resolved from GROQ_API_KEY env var based on base_url.
 local crew = Crew.new({
     goal = "Verify Groq via OpenAI compat",
     provider = "openai",

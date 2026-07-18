@@ -2,23 +2,126 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::engine::agent::Agent;
-use crate::engine::interpolate::interpolate;
+use crate::engine::interpolate::{interpolate_bounded, prompt_char_limit};
 use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
+use crate::lua::limits::{LuaExecutionGuard, LuaLimits, install_lua_limits};
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
 // Thread-local Lua VM reused for hook execution to avoid per-call allocation.
 thread_local! {
-    static HOOK_LUA: RefCell<mlua::Lua> = RefCell::new(mlua::Lua::new());
+    static HOOK_LUA: RefCell<Option<std::result::Result<mlua::Lua, String>>> =
+        const { RefCell::new(None) };
+}
+
+fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
+    HOOK_LUA.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let initialized = slot.get_or_insert_with(|| {
+            let lua = mlua::Lua::new();
+            install_lua_limits(
+                &lua,
+                LuaLimits::from_env().map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(lua)
+        });
+        let lua = match initialized {
+            Ok(lua) => lua,
+            Err(error) => {
+                tracing::error!(%error, "Hook Lua VM could not be initialized");
+                return fallback;
+            }
+        };
+        let _execution = match LuaExecutionGuard::begin(lua) {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "Hook Lua execution could not start");
+                return fallback;
+            }
+        };
+        operation(lua)
+    })
+}
+
+const PROMPT_TRUNCATION_MARKER: &str = "\n\n[... prompt truncated due to size limit]";
+
+/// Incrementally builds a character-bounded prompt. This avoids first joining
+/// every dependency/tool output into one unbounded temporary allocation and
+/// only then truncating it.
+struct BoundedPrompt {
+    text: String,
+    max_chars: usize,
+    chars: usize,
+    truncated: bool,
+}
+
+impl BoundedPrompt {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            text: String::with_capacity(max_chars.min(16 * 1024)),
+            max_chars,
+            chars: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, value: &str) {
+        if self.truncated || self.chars >= self.max_chars {
+            self.truncated |= !value.is_empty();
+            return;
+        }
+
+        let remaining = self.max_chars - self.chars;
+        let mut count = 0usize;
+        let mut boundary = value.len();
+        for (byte_index, _) in value.char_indices() {
+            if count == remaining {
+                boundary = byte_index;
+                self.truncated = true;
+                break;
+            }
+            count += 1;
+        }
+        self.text.push_str(&value[..boundary]);
+        self.chars += count.min(remaining);
+    }
+
+    fn section(&mut self, label: &str, value: &str) {
+        if !self.text.is_empty() {
+            self.push("\n\n");
+        }
+        self.push(label);
+        self.push(value);
+    }
+
+    fn finish(mut self) -> (String, bool) {
+        if self.truncated {
+            let marker_chars = PROMPT_TRUNCATION_MARKER.chars().count();
+            let keep_chars = self.max_chars.saturating_sub(marker_chars);
+            if let Some((boundary, _)) = self.text.char_indices().nth(keep_chars) {
+                self.text.truncate(boundary);
+            }
+            let remaining = self.max_chars.saturating_sub(self.text.chars().count());
+            let marker_boundary = PROMPT_TRUNCATION_MARKER
+                .char_indices()
+                .nth(remaining)
+                .map(|(index, _)| index)
+                .unwrap_or(PROMPT_TRUNCATION_MARKER.len());
+            self.text
+                .push_str(&PROMPT_TRUNCATION_MARKER[..marker_boundary]);
+        }
+        self.text.shrink_to_fit();
+        (self.text, self.truncated)
+    }
 }
 
 /// Run a before_task hook using the thread-local Lua VM.
 /// Returns the (possibly modified) task description.
 fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> String {
-    HOOK_LUA.with(|cell| {
-        let lua = cell.borrow();
+    with_hook_lua(task_description.to_string(), |lua| {
         let func = match lua.load(bytecode).into_function() {
             Ok(f) => f,
             Err(e) => {
@@ -49,8 +152,7 @@ fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> 
 /// Run an after_task hook using the thread-local Lua VM.
 /// Returns the (possibly modified) output.
 fn run_after_hook(bytecode: &[u8], task_name: &str, output: &str, success: bool) -> String {
-    HOOK_LUA.with(|cell| {
-        let lua = cell.borrow();
+    with_hook_lua(output.to_string(), |lua| {
         let func = match lua.load(bytecode).into_function() {
             Ok(f) => f,
             Err(e) => {
@@ -99,8 +201,14 @@ pub struct TaskExecutionContext<'a> {
 
 impl<'a> TaskExecutionContext<'a> {
     pub async fn execute(&self) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+        let max_prompt_chars = prompt_char_limit();
         // Run before_task hook if present
-        let raw_description = interpolate(&self.task.description, self.completed_results);
+        let raw_description = interpolate_bounded(
+            &self.task.description,
+            self.completed_results,
+            max_prompt_chars,
+        )
+        .0;
         let description = if let Some(bytecode) = self.before_task_hook {
             run_before_hook(bytecode, &self.task.name, &raw_description)
         } else {
@@ -110,6 +218,9 @@ impl<'a> TaskExecutionContext<'a> {
         let mut messages = Vec::new();
         let mut total_usage = TaskTokenUsage::default();
         let mut accumulated_reasoning = String::new();
+        let reasoning_limit = max_reasoning_bytes();
+        let mut reasoning_truncated = false;
+        let history_max_bytes = chat_history_max_bytes();
 
         // System prompt
         let system_content = self.agent.system_prompt.clone().unwrap_or_else(|| {
@@ -123,59 +234,43 @@ impl<'a> TaskExecutionContext<'a> {
             .task
             .expected_output
             .as_ref()
-            .map(|s| interpolate(s, self.completed_results));
+            .map(|s| interpolate_bounded(s, self.completed_results, max_prompt_chars).0);
         let context = self
             .task
             .context
             .as_ref()
-            .map(|s| interpolate(s, self.completed_results));
+            .map(|s| interpolate_bounded(s, self.completed_results, max_prompt_chars).0);
 
-        // Build user prompt with interpolated context
-        let mut prompt_parts = vec![format!("Task: {}", description)];
-
+        // Cap total prompt size while constructing it, so a large collection
+        // of dependency outputs never creates an unbounded temporary string.
+        let mut prompt = BoundedPrompt::new(max_prompt_chars);
+        prompt.section("Task: ", &description);
         if let Some(ref expected) = expected_output {
-            prompt_parts.push(format!("Expected output: {}", expected));
+            prompt.section("Expected output: ", expected);
         }
-
         if let Some(ref ctx) = context {
-            prompt_parts.push(format!("Additional context: {}", ctx));
+            prompt.section("Additional context: ", ctx);
         }
-
-        // Inject memory context if available
         if !self.memory_context.is_empty() {
-            prompt_parts.push(format!("Relevant memory:\n{}", self.memory_context));
+            prompt.section("Relevant memory:\n", &self.memory_context);
         }
-
-        // Inject messages from other agents
         if !self.messages_context.is_empty() {
-            prompt_parts.push(self.messages_context.to_string());
+            prompt.section("", &self.messages_context);
         }
-
-        // Inject dependency results
         for dep_name in &self.task.depends_on {
             if let Some(dep_result) = self.completed_results.get(dep_name)
                 && dep_result.success
             {
-                prompt_parts.push(format!("Result from '{}': {}", dep_name, dep_result.output));
+                prompt.section(&format!("Result from '{}': ", dep_name), &dep_result.output);
             }
         }
-
-        // Cap total prompt size to prevent OOM from large intermediate outputs
-        let max_prompt_chars: usize = std::env::var("IRONCREW_MAX_PROMPT_CHARS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100 * 1024); // 100KB default
-
-        let mut user_prompt = prompt_parts.join("\n\n");
-        if user_prompt.len() > max_prompt_chars {
+        let (user_prompt, truncated) = prompt.finish();
+        if truncated {
             tracing::warn!(
-                "Task '{}': prompt truncated from {} to {} chars",
+                "Task '{}': prompt truncated to {} chars",
                 self.task.name,
-                user_prompt.len(),
                 max_prompt_chars
             );
-            user_prompt.truncate(max_prompt_chars);
-            user_prompt.push_str("\n\n[... prompt truncated due to size limit]");
         }
 
         messages.push(ChatMessage::user(&user_prompt));
@@ -187,6 +282,12 @@ impl<'a> TaskExecutionContext<'a> {
         let mut rounds = 0;
 
         loop {
+            validate_chat_history(
+                &messages,
+                HARD_CHAT_HISTORY_MAX_MESSAGES,
+                history_max_bytes,
+                true,
+            )?;
             let request = ChatRequest {
                 messages: messages.clone(),
                 model: self.model.to_string(),
@@ -238,18 +339,27 @@ impl<'a> TaskExecutionContext<'a> {
 
             // Accumulate token usage
             if let Some(usage) = &response.usage {
-                total_usage.prompt_tokens += usage.prompt_tokens;
-                total_usage.completion_tokens += usage.completion_tokens;
-                total_usage.total_tokens += usage.total_tokens;
-                total_usage.cached_tokens += usage.cached_tokens;
+                total_usage.prompt_tokens = total_usage
+                    .prompt_tokens
+                    .saturating_add(usage.prompt_tokens);
+                total_usage.completion_tokens = total_usage
+                    .completion_tokens
+                    .saturating_add(usage.completion_tokens);
+                total_usage.total_tokens =
+                    total_usage.total_tokens.saturating_add(usage.total_tokens);
+                total_usage.cached_tokens = total_usage
+                    .cached_tokens
+                    .saturating_add(usage.cached_tokens);
             }
 
             // Accumulate reasoning content across tool-call rounds
             if let Some(ref reasoning) = response.reasoning {
                 if !accumulated_reasoning.is_empty() {
-                    accumulated_reasoning.push('\n');
+                    reasoning_truncated |=
+                        append_text_bounded(&mut accumulated_reasoning, "\n", reasoning_limit);
                 }
-                accumulated_reasoning.push_str(reasoning);
+                reasoning_truncated |=
+                    append_text_bounded(&mut accumulated_reasoning, reasoning, reasoning_limit);
             }
 
             // If no tool calls, return the content
@@ -269,6 +379,13 @@ impl<'a> TaskExecutionContext<'a> {
                 let reasoning = if accumulated_reasoning.is_empty() {
                     None
                 } else {
+                    if reasoning_truncated {
+                        tracing::warn!(
+                            task = %self.task.name,
+                            limit = reasoning_limit,
+                            "Reasoning text was truncated to the configured byte limit"
+                        );
+                    }
                     Some(accumulated_reasoning)
                 };
 
@@ -295,6 +412,12 @@ impl<'a> TaskExecutionContext<'a> {
                 Some(response.tool_calls.clone()),
                 response.raw_blocks.clone(),
             ));
+            validate_chat_history(
+                &messages,
+                HARD_CHAT_HISTORY_MAX_MESSAGES,
+                history_max_bytes,
+                false,
+            )?;
 
             // Execute tool calls and add tool result messages
             for tool_call in &response.tool_calls {
@@ -311,12 +434,7 @@ impl<'a> TaskExecutionContext<'a> {
                     .tool_registry
                     .dispatch_timeout(&tool_call.function.name, &args)
                     .unwrap_or_else(|| {
-                        std::time::Duration::from_secs(
-                            std::env::var("IRONCREW_TOOL_TIMEOUT")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(60),
-                        )
+                        std::time::Duration::from_secs(crate::lua::agent_turn::tool_timeout_secs())
                     });
 
                 let tool_ctx = ToolCallContext {
@@ -346,6 +464,12 @@ impl<'a> TaskExecutionContext<'a> {
                 };
 
                 messages.push(ChatMessage::tool(&tool_call.id, &result_text));
+                validate_chat_history(
+                    &messages,
+                    HARD_CHAT_HISTORY_MAX_MESSAGES,
+                    history_max_bytes,
+                    false,
+                )?;
             }
         }
     }
@@ -422,4 +546,29 @@ pub async fn execute_task_standalone_with_hooks(
         ask_human,
     };
     ctx.execute().await
+}
+
+#[cfg(test)]
+mod bounded_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn unicode_prompt_truncation_is_character_safe_and_bounded() {
+        let mut prompt = BoundedPrompt::new(12);
+        prompt.section("Task: ", "🦀🦀🦀🦀🦀🦀🦀🦀");
+        let (text, truncated) = prompt.finish();
+        assert!(truncated);
+        assert!(text.chars().count() <= 12);
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn prompt_builder_stops_copying_after_limit() {
+        let mut prompt = BoundedPrompt::new(64);
+        prompt.section("Task: ", &"x".repeat(1_000_000));
+        prompt.section("Result: ", &"y".repeat(1_000_000));
+        let (text, truncated) = prompt.finish();
+        assert!(truncated);
+        assert!(text.len() <= 64);
+    }
 }

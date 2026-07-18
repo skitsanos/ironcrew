@@ -33,6 +33,7 @@ crew:add_agent({
 })
 
 crew:add_task({
+    name        = "inspect_repository",
     description = "Check the git status and list the last 5 commits of the repository at '.'.",
     agent       = "git_analyst",
     expected_output = "A brief summary: current branch, any uncommitted changes, last 5 commits with messages and authors.",

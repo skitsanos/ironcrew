@@ -13,11 +13,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::engine::eventbus::EventBus;
 use crate::engine::input_bridge::InputBridge;
 use crate::engine::store::StateStore;
+
+#[derive(Clone, Copy)]
+pub struct CachedReadiness {
+    pub checked_at: std::time::Instant,
+    pub ready: bool,
+    pub component: &'static str,
+}
 
 /// A running crew: its event bus and an abort handle to cancel it.
 pub struct ActiveRun {
@@ -30,6 +38,9 @@ pub struct ActiveRun {
     /// and answer endpoints reach the suspended flow through this. Dropped
     /// with the entry, so pending oneshots die when the run is cleaned up.
     pub input_bridge: Arc<InputBridge>,
+    /// Becomes `true` after the monitor has persisted and emitted exactly one
+    /// terminal outcome. Shutdown waits on this after aborting active work.
+    pub terminal: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
@@ -42,14 +53,39 @@ pub type ActiveConversationsMap =
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
+    /// Cleared as soon as graceful shutdown begins so readiness fails before
+    /// active work is cancelled and drained.
+    pub accepting_traffic: AtomicBool,
     pub active_runs: Arc<RwLock<HashMap<String, ActiveRun>>>,
     pub active_conversations: ActiveConversationsMap,
     /// Hard cap on `active_conversations.len()` — reads
     /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
     pub max_active_conversations: usize,
+    /// Atomic admission control for active conversations. Each live
+    /// `ConversationHandle` owns one permit for its entire in-memory lifetime.
+    pub conversation_permits: Arc<Semaphore>,
     /// Hard cap on `active_runs.len()` — reads `IRONCREW_MAX_ACTIVE_RUNS`
     /// once at boot. Backpressure against unbounded concurrent runs.
     pub max_active_runs: usize,
+    /// Atomic admission control for active runs. The run monitor owns the
+    /// permit until it has persisted and emitted the terminal outcome.
+    pub run_permits: Arc<Semaphore>,
+    /// Global admission control for long-lived run and conversation SSE
+    /// connections. The stream owns a permit until the client disconnects.
+    pub max_sse_connections: usize,
+    pub sse_permits: Arc<Semaphore>,
+    /// Hard lifetime for an HTTP run, captured once at server startup.
+    pub max_run_lifetime: std::time::Duration,
+    /// Number of HTTP run finalizers currently retrying a durable terminal
+    /// transition. Any non-zero value fails readiness so ingress stops adding
+    /// work while persistence is degraded.
+    pub terminal_persistence_failures: AtomicUsize,
+    /// Set by the lease heartbeat/reconciler loop. A failed maintenance write
+    /// keeps readiness down until a complete heartbeat+reconcile cycle passes.
+    pub store_maintenance_healthy: AtomicBool,
+    /// Coalesces unauthenticated readiness probes and caches the expensive
+    /// storage/schema result for a short interval.
+    pub readiness_cache: tokio::sync::Mutex<Option<CachedReadiness>>,
     /// Server-wide persistence singleton. Bootstrapped once at
     /// `cmd_serve` startup and reused across every handler so Postgres
     /// migrations / table checks don't re-run per request, and so every
@@ -164,7 +200,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     use handlers::*;
 
     // Public routes (no auth required)
-    let public = Router::new().route("/health", get(health));
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness));
 
     // Protected routes (auth required when IRONCREW_API_TOKEN is set)
     let protected = Router::new()

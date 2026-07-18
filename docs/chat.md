@@ -96,8 +96,9 @@ Body:
 ```
 
 - `agent` — required. Must match an agent declared in `crew.lua`.
-- `max_history` — optional per-session cap (defaults to
-  `IRONCREW_CONVERSATION_MAX_HISTORY` or 50).
+- `max_history` — optional per-session cap. HTTP sessions default to
+  `IRONCREW_API_CONVERSATION_MAX_HISTORY` (50) and reject zero or values above
+  that server policy (hard ceiling 1000).
 
 Response:
 
@@ -134,7 +135,7 @@ orphaned record behind.
 Body:
 
 ```json
-{ "content": "Hello", "images": ["file:///abs/path.png"] }
+{ "content": "Hello", "images": ["images/chart.png"] }
 ```
 
 Blocks until the full turn (including any tool-call rounds) completes.
@@ -155,6 +156,15 @@ Returns:
 
 Returns `404` if no session is active. **`POST /messages` never creates a
 session implicitly — call `/start` first.**
+
+Paths are project-relative; remote `https://` image URLs are also accepted and
+use the protected public-network client. A remote image must return a successful
+status and an `image/jpeg`, `image/png`, `image/gif`, or `image/webp` content
+type; its body is streamed under the byte cap. Message text defaults to a 256 KiB
+cap. Image defaults are 4 locators/20 MiB decoded per message and 16
+locators/32 MiB decoded per conversation, with a 2048-byte locator cap. Tune
+these with the `IRONCREW_API_*` variables below; the process also applies
+`IRONCREW_MAX_IMAGE_BYTES` to each loaded image.
 
 ### GET `/history`
 
@@ -256,17 +266,24 @@ throughout.
 
 | Variable                               | Default | Purpose                                                      |
 | -------------------------------------- | ------- | ------------------------------------------------------------ |
-| `IRONCREW_API_TOKEN`                   | —       | Bearer token for the entire protected REST API               |
+| `IRONCREW_API_TOKEN`                   | —       | Bearer token for the protected REST API; when set, must be 32–4096 printable bytes |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS`      | 1800    | Idle window after which a session handle is evicted          |
-| `IRONCREW_MAX_ACTIVE_CONVERSATIONS`    | 100     | Simultaneous in-memory session cap                           |
+| `IRONCREW_MAX_ACTIVE_CONVERSATIONS`    | 8       | Simultaneous in-memory session cap                           |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | 20      | Default page size for `GET /conversations`                   |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT`     | 100     | Hard cap on `?limit=`                                        |
-| `IRONCREW_CONVERSATION_MAX_HISTORY`    | 50      | Default `max_history` for a conversation (0 = unbounded)     |
+| `IRONCREW_CONVERSATION_MAX_HISTORY`    | 50      | Default retained messages for Lua/CLI conversations (hard ceiling 4096; zero is rejected) |
+| `IRONCREW_API_CONVERSATION_MAX_HISTORY` | 50     | HTTP `max_history` default/policy cap (hard ceiling 1000)     |
+| `IRONCREW_API_MESSAGE_MAX_BYTES`       | 262144  | Maximum text bytes in one HTTP message (hard ceiling 4 MiB)   |
+| `IRONCREW_API_MAX_IMAGES_PER_MESSAGE`  | 4       | Image-count cap per message (hard ceiling 32)                 |
+| `IRONCREW_API_MAX_IMAGES_PER_CONVERSATION` | 16  | Cumulative image-count cap (hard ceiling 256)                 |
+| `IRONCREW_API_MAX_IMAGE_BYTES_PER_MESSAGE` | 20971520 | Decoded image-byte cap per message (hard ceiling 100 MiB) |
+| `IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION` | 33554432 | Cumulative decoded image-byte cap (hard ceiling 512 MiB) |
+| `IRONCREW_API_MAX_IMAGE_LOCATOR_BYTES` | 2048    | Path/URL/data-URL locator cap (hard ceiling 16 KiB)            |
 
 ## Live curl session
 
 ```sh
-export IRONCREW_API_TOKEN=dev-token
+export IRONCREW_API_TOKEN=dev-token-change-me-32-bytes-minimum
 BASE=http://127.0.0.1:3000
 
 curl -sX POST "$BASE/flows/chat-http/conversations/demo/start" \

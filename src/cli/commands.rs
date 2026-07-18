@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::lua::api::{load_agents_from_files, load_tool_defs_from_files};
+use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::sandbox::create_tool_lua;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -15,18 +16,19 @@ pub async fn cmd_run(
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
-    // Sweep orphaned Running records from a prior crashed ironcrew run
-    // process before this invocation's own save_run_intent writes. Safe:
-    // reconcile only touches status='running' rows; the new run's intent
-    // hasn't been written yet.
+    // Sweep only expired ownership leases from prior crashed processes before
+    // this invocation writes its own run intent.
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
-    if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await {
+    let lease_store = if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await {
         let _ = crate::engine::reconciler::reconcile_stuck_runs(&store)
             .await
             .map_err(|e| {
                 tracing::debug!("Reconciler failed (non-fatal): {e}");
             });
-    }
+        Some(store)
+    } else {
+        None
+    };
 
     // Human-input transport for crew:ask_human(): CLI mode prompts on the
     // terminal (stderr prompt, stdin answer). `run_id: None` — the run
@@ -68,14 +70,37 @@ pub async fn cmd_run(
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = std::fs::read_to_string(entrypoint)?;
+    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
     tracing::info!("Running {}", entrypoint.display());
 
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(IronCrewError::Lua)?;
+    let heartbeat_handle = lease_store.map(|heartbeat_store| {
+        let heartbeat_interval =
+            (heartbeat_store.run_lease_ttl() / 3).max(std::time::Duration::from_secs(1));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = heartbeat_store.heartbeat_owned_runs().await {
+                    tracing::warn!(%error, "Failed to refresh CLI run leases");
+                }
+            }
+        })
+    });
+
+    let execution_result = {
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&script)
+            .exec_async()
+            .await
+            .map_err(IronCrewError::Lua)
+    };
+
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    execution_result?;
 
     // In --json mode, read the run record and output structured JSON
     if json_output {
@@ -168,7 +193,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
 
     // 3. Validate entrypoint syntax
     if let Some(entrypoint) = loader.entrypoint() {
-        let script = std::fs::read_to_string(entrypoint)?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
         lua.load(&script).into_function().map_err(|e| {
             IronCrewError::Validation(format!("Syntax error in {}: {}", entrypoint.display(), e))
         })?;
@@ -475,7 +500,7 @@ pub fn cmd_doctor(path: &Path) -> Result<()> {
     if crew_path.exists() {
         // Check syntax
         let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
-        let script = std::fs::read_to_string(&crew_path)?;
+        let script = crate::lua::source::read_lua_source(&crew_path)?;
         match lua.load(&script).into_function() {
             Ok(_) => println!("    {}{} found (valid syntax)", crew_label, crew_dots),
             Err(e) => {
@@ -582,7 +607,7 @@ pub fn cmd_fmt(path: &Path) -> Result<()> {
     // Entrypoint
     if let Some(entrypoint) = loader.entrypoint() {
         let label = entrypoint.file_name().unwrap_or_default().to_string_lossy();
-        let script = std::fs::read_to_string(entrypoint)?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
         let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
         let dots = ".".repeat(30usize.saturating_sub(label.len()));
         match lua.load(&script).into_function() {

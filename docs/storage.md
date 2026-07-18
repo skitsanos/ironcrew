@@ -20,7 +20,7 @@ otherwise.
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |
 | SQLite | `sqlite` | Single-server and Docker deployments, faster queries |
-| PostgreSQL | `postgres` | Production cloud, multi-instance, shared state. PostgreSQL 15+ required |
+| PostgreSQL | `postgres` | Durable production cloud records and restart recovery. PostgreSQL 15+ required; keep one HTTP executor |
 
 ## Configuration
 
@@ -31,8 +31,15 @@ Environment variables control storage:
 | `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
 | `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) | — |
-| `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases. Only alphanumeric and underscore allowed (`^[a-zA-Z0-9_]*$`) | `""` (table = `runs`) |
-| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (sized for concurrent HTTP requests, not per-flow) | `10` |
+| `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases: at most 37 lowercase ASCII alphanumeric/underscore bytes | `""` (table = `runs`) |
+| `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (range 1–128; sized for concurrent HTTP requests, not per-flow) | `10` |
+| `IRONCREW_DB_CONNECT_RETRIES` | Connection retries after the initial PostgreSQL connection attempt (range 0–100) | `10` |
+| `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (range 1–30000) | `1000` |
+| `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (range 1–120 seconds) | `30` |
+| `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable process/pod owner identity; generated once per process when absent | generated |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (range 1–86400 seconds) | `60` |
+| `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum JSON run-record bytes; larger configured values clamp to 128 MiB | `67108864` (64 MiB) |
+| `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON list/count/clean scan; use PostgreSQL above this scale | `10000` (hard ceiling `100000`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` | `20` |
 | `IRONCREW_RUNS_MAX_LIMIT` | Hard cap on `?limit=` for run listing | `100` |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/conversations` | `20` |
@@ -74,7 +81,8 @@ my-flow/.ironcrew/runs/
 **Limitations:**
 - Listing runs requires reading every file (slow with thousands of runs)
 - No indexing — status filtering scans all records
-- Concurrent writes may conflict (rare in practice)
+- Process-local handles serialize updates to the same runs directory, but JSON
+  remains a single-process backend and is not safe on a shared multi-pod volume
 
 ## SQLite Backend
 
@@ -158,7 +166,7 @@ PostgreSQL is included by default in the standard binary. To build a minimal
 binary without PostgreSQL support:
 
 ```bash
-cargo build --release --no-default-features
+cargo build --release --locked --no-default-features
 ```
 
 Configure:
@@ -173,7 +181,7 @@ on PostgreSQL 15 features for flow-scoped session uniqueness and is intended
 for extension-capable deployments such as installations that use `pgvector`.
 
 **Advantages:**
-- Shared state across multiple IronCrew instances
+- Durable records shared independently of the container filesystem
 - **JSONB columns** for `task_results` and `tags` — query into JSON natively with SQL
 - Full SQL querying power (joins, aggregation, GIN indexes on JSONB)
 - Production-grade durability and replication
@@ -183,6 +191,9 @@ for extension-capable deployments such as installations that use `pgvector`.
 - Requires an external PostgreSQL server
 - Requires PostgreSQL 15+
 - Adds compile-time dependency on `sqlx`
+- Does not distribute active run handles, conversation Lua VMs, pending human
+  questions, cancellation, or SSE state; `ironcrew serve` therefore remains a
+  one-replica deployment
 
 ### Schema
 
@@ -238,23 +249,26 @@ CREATE INDEX idx_runs_task_results ON runs USING GIN (task_results);
 
 ### Docker with PostgreSQL
 
-```dockerfile
-# Build with postgres support
-FROM rust:latest AS builder
-RUN cargo build --release --features postgres
+PostgreSQL is enabled in the standard image. Keep the DSN in a secret-bearing
+environment file rather than a Docker layer:
 
-# Runtime
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/ironcrew /usr/local/bin/
-ENV IRONCREW_STORE=postgres
-ENV DATABASE_URL=postgres://user:pass@db:5432/ironcrew
-CMD ["ironcrew", "serve", "--host", "0.0.0.0"]
+```bash
+docker build --pull -t ironcrew .
+docker run --env-file .env \
+  -e IRONCREW_STORE=postgres \
+  -v ./flows:/flows:ro \
+  -p 3000:3000 \
+  ironcrew
 ```
 
 ### Shared Database with Table Prefix
 
 Multiple IronCrew projects can share a single PostgreSQL database using
 `IRONCREW_PG_TABLE_PREFIX`:
+
+Prefixes are limited to 37 lowercase ASCII letters, digits, and underscores so
+every derived table and index name remains below PostgreSQL's 63-byte identifier
+limit without case-folding or truncation collisions.
 
 ```bash
 # Project A
@@ -276,7 +290,7 @@ Each prefix gets its own table, fully isolated within the same database.
 PostgreSQL is included by default. To build a smaller binary without it:
 
 ```bash
-cargo build --release --no-default-features
+cargo build --release --locked --no-default-features
 ```
 
 If you set `IRONCREW_STORE=postgres` on a binary built without PostgreSQL, you
@@ -292,7 +306,11 @@ All IronCrew features use the same store:
 
 | Feature | Store operation |
 |---------|----------------|
-| `crew:run()` | `save_run` — saves the run record after execution |
+| `crew:run()` | `save_run_intent` at start, then `update_run_completion` at termination |
+| `crew:ask_human()` | `update_run_status` — transitions between `running` and `waiting_for_input` |
+| process startup | `reconcile_abandoned_runs` — marks only expired/unleased in-flight runs as `abandoned` |
+| run heartbeat | `heartbeat_owned_runs` — refreshes leases owned by this process |
+| readiness | `health_check` — performs a minimal backend round-trip |
 | `ironcrew runs` | `list_runs_summary` + `count_runs` — paginated metadata listing |
 | `ironcrew inspect` | `get_run` — retrieves a specific run by ID |
 | `ironcrew clean` | `list_runs_summary` + `delete_run` — removes old records |
@@ -303,19 +321,41 @@ All IronCrew features use the same store:
 | `crew:conversation({id=...})` | `save_conversation` / `get_conversation` — resume-by-id chat sessions |
 | `crew:dialog({id=...})` | `save_dialog_state` / `get_dialog_state` — resume-by-id multi-agent dialogs |
 
+### Run ownership and terminal writes
+
+An in-flight record carries an owner id and lease deadline. The owning process
+refreshes its leases periodically; startup reconciliation abandons only
+expired (or legacy unleased) records, never a healthy run owned by another
+process. `update_run_completion` is an owner-checked compare-and-set: the first
+terminal writer wins, and a later timeout, abort, panic, or completion cannot
+replace that terminal payload. This protects restart recovery, but does not
+make process-local HTTP control state horizontally scalable.
+
 ## The StateStore Trait
 
-The storage system is built on a single async trait covering both run
-history (paginated, metadata-first) and persistent sessions (stable-id,
-upsert-style). Listing uses `list_runs_summary` + `count_runs` so a
-caller never pays to transfer `task_results` when they only need a
-summary view.
+The storage system is built on a single async trait covering run lifecycle and
+history, persistent sessions, and the audit log. Run listing is paginated and
+metadata-first; sessions use stable IDs, flow scoping, and revision-guarded
+updates. Listing uses
+`list_runs_summary` + `count_runs` so a caller never pays to transfer
+`task_results` when they only need a summary view.
 
 ```rust
 #[async_trait]
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────
-    async fn save_run(&self, record: &RunRecord) -> Result<String>;
+    async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        completion: RunCompletion,
+    ) -> Result<RunTransition>;
+    async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()>;
+    fn instance_id(&self) -> &str;
+    fn run_lease_ttl(&self) -> Duration;
+    async fn heartbeat_owned_runs(&self) -> Result<usize>;
+    async fn health_check(&self) -> Result<()>;
+    async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize>;
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
 
     /// Paginated, metadata-only list. `limit=0` means unlimited.
@@ -347,8 +387,22 @@ pub trait StateStore: Send + Sync {
     async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64>;
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
-    async fn get_dialog_state(&self, id: &str) -> Result<Option<DialogStateRecord>>;
-    async fn delete_dialog_state(&self, id: &str) -> Result<()>;
+    async fn get_dialog_state(
+        &self,
+        flow_path: Option<&str>,
+        id: &str,
+    ) -> Result<Option<DialogStateRecord>>;
+    async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()>;
+
+    // ─── Audit log ─────────────────────────────────────────
+    async fn save_audit_event(&self, event: &AuditEvent) -> Result<String>;
+    async fn list_audit_events(
+        &self,
+        filter: &AuditFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEvent>>;
+    async fn count_audit_events(&self, filter: &AuditFilter) -> Result<u64>;
 }
 ```
 
@@ -386,8 +440,9 @@ typically dominates a record's on-disk size.
 **Sessions vs runs:** `get_*` returns `Option` for sessions (so the caller
 can distinguish "first time this id is used" from a real error) but `Result`
 for runs (because `get_run` is always called with an id the caller believes
-exists). Session `save_*` is idempotent upsert — calling it with an
-existing id overwrites the prior record.
+exists). Session saves use optimistic concurrency: each loaded snapshot carries
+a `revision`, a successful save returns the next revision, and a stale writer
+fails with a conflict instead of overwriting turns completed by another pod.
 
 ### Session storage layout
 
@@ -410,14 +465,17 @@ listing queries.
 
 ```sql
 CREATE TABLE IF NOT EXISTS {prefix}conversations (
-    id          TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     flow_name   TEXT NOT NULL,
+    flow_path   TEXT,
     agent_name  TEXT NOT NULL,
     messages    JSONB NOT NULL DEFAULT '[]',
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    revision    BIGINT NOT NULL DEFAULT 0
 );
-ALTER TABLE {prefix}conversations ADD COLUMN IF NOT EXISTS flow_path TEXT;
+CREATE UNIQUE INDEX uniq_{prefix}conversations_flow_id
+    ON {prefix}conversations (flow_path, id) NULLS NOT DISTINCT;
 
 CREATE INDEX IF NOT EXISTS idx_{prefix}conversations_updated_at
     ON {prefix}conversations (updated_at DESC);
@@ -427,8 +485,9 @@ CREATE INDEX IF NOT EXISTS idx_{prefix}conversations_flow_path
     ON {prefix}conversations (flow_path);
 
 CREATE TABLE IF NOT EXISTS {prefix}dialogs (
-    id          TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     flow_name   TEXT NOT NULL,
+    flow_path   TEXT,
     agent_names JSONB NOT NULL DEFAULT '[]',
     starter     TEXT NOT NULL,
     transcript  JSONB NOT NULL DEFAULT '[]',
@@ -436,9 +495,11 @@ CREATE TABLE IF NOT EXISTS {prefix}dialogs (
     stopped     BOOLEAN NOT NULL DEFAULT FALSE,
     stop_reason TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    revision    BIGINT NOT NULL DEFAULT 0
 );
-ALTER TABLE {prefix}dialogs ADD COLUMN IF NOT EXISTS flow_path TEXT;
+CREATE UNIQUE INDEX uniq_{prefix}dialogs_flow_id
+    ON {prefix}dialogs (flow_path, id) NULLS NOT DISTINCT;
 
 CREATE INDEX IF NOT EXISTS idx_{prefix}dialogs_updated_at
     ON {prefix}dialogs (updated_at DESC);
@@ -452,20 +513,21 @@ CREATE INDEX IF NOT EXISTS idx_{prefix}dialogs_flow_path
 
 ```sql
 CREATE TABLE IF NOT EXISTS conversations (
-    id         TEXT PRIMARY KEY,
+    id         TEXT NOT NULL,
     flow_name  TEXT NOT NULL,
+    flow_path  TEXT,
     agent_name TEXT NOT NULL,
     messages   TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    revision   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (flow_path, id)
 );
--- Idempotent migration for pre-flow_path schemas (duplicate-column errors
--- are swallowed):
-ALTER TABLE conversations ADD COLUMN flow_path TEXT;
 
 CREATE TABLE IF NOT EXISTS dialogs (
-    id          TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     flow_name   TEXT NOT NULL,
+    flow_path   TEXT,
     agent_names TEXT NOT NULL,
     starter     TEXT NOT NULL,
     transcript  TEXT NOT NULL,
@@ -473,10 +535,15 @@ CREATE TABLE IF NOT EXISTS dialogs (
     stopped     INTEGER NOT NULL DEFAULT 0,
     stop_reason TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    revision    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (flow_path, id)
 );
-ALTER TABLE dialogs ADD COLUMN flow_path TEXT;
 ```
+
+Bootstrap migrates legacy `id PRIMARY KEY` session tables to these composite
+keys and adds `revision` with a zero default. Revision zero is accepted only
+for a new row or the first guarded update of a legacy row.
 
 ### Session ID validation
 
@@ -522,5 +589,5 @@ A future `ironcrew migrate` command may automate this.
 | Debugging runs | `json` — human-readable files |
 | CI/CD pipelines | `json` — ephemeral, no state needed |
 | Production single-server | `sqlite` — handles concurrent reads well |
-| Production multi-instance | `postgres` — shared state, replication |
-| Cloud deployment (Railway, Fly.io) | `postgres` — managed database available |
+| Production HTTP service | `postgres` — durable shared records, with exactly one live HTTP executor |
+| Cloud deployment (Railway, OpenShift) | `postgres` — managed/cluster database available; keep the service at one replica |
