@@ -20,18 +20,51 @@ local crew = Crew.new({
     base_url = env("OPENAI_BASE_URL"),
 })
 
--- 1. Ask the human for the topic (free-form answer).
-local topic = crew:ask_human({
-    prompt    = "What should the announcement be about?",
-    timeout_s = 300,
-    default   = "our new CLI release",
-})
+crew:add_agent(Agent.new({
+    name = "announcer",
+    goal = "Write concise, accurate product announcements",
+    capabilities = { "writing", "editing" },
+    temperature = 0.4,
+}))
 
+-- Define the task before asking so `ironcrew graph` can capture the complete
+-- workflow without invoking the live input bridge. The human's answer is put
+-- in shared memory before the task runs.
 crew:add_task({
     name = "draft",
-    description = "Write a 3-sentence product announcement about: " .. topic,
+    agent = "announcer",
+    description = [[
+Write a three-sentence product announcement about the topic stored in shared
+memory as `announcement_topic`. Be specific and avoid unsupported claims.
+]],
     expected_output = "A short announcement draft",
 })
+
+-- 1. Ask for the topic unless the caller supplied `input.topic`. Keyed HTTP
+-- runs persist their acceptance before Lua setup, so this pre-run question is
+-- answerable through the normal questions/answer endpoints too. The
+-- setup-only branch is hermetic for CI.
+local topic
+if input and input.setup_only == true then
+    topic = "the offline CI setup probe"
+elseif input and type(input.topic) == "string" and input.topic ~= "" then
+    topic = input.topic
+else
+    topic = crew:ask_human({
+        prompt    = "What should the announcement be about?",
+        timeout_s = 300,
+        default   = "our new CLI release",
+    })
+end
+
+crew:memory_set("announcement_topic", topic)
+
+-- CI uses this branch to exercise the real Lua setup without a prompt or LLM
+-- call. Normal runs never set this input.
+if input and input.setup_only == true then
+    print("ask-human setup probe passed")
+    return
+end
 
 local results = crew:run()
 local draft = results[1] and results[1].output or "(no draft)"
@@ -39,7 +72,7 @@ local draft = results[1] and results[1].output or "(no draft)"
 print("=== Draft ===")
 print(draft)
 
--- 2. Approval gate before "publishing" (constrained choices).
+-- 2. Human approval checkpoint before "publishing" (constrained choices).
 local decision = crew:ask_human({
     prompt    = "Publish this draft?",
     choices   = { "publish", "hold" },
@@ -50,5 +83,7 @@ local decision = crew:ask_human({
 if decision == "publish" then
     print("Published.")
 else
-    print("Held for review (answer was: " .. tostring(decision) .. ")")
+    -- Do not echo free-form human input: HTTP answers may contain secrets,
+    -- and print output is replayed as an SSE log event in server mode.
+    print("Held for review.")
 end

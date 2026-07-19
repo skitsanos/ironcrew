@@ -90,55 +90,46 @@ async fn ask_human_returns_the_posted_answer() {
 
     let flow = tokio::spawn(async move { lua.load(script).eval_async::<String>().await });
 
-    // Wait for the question to be registered, then answer it like the
-    // HTTP endpoint would.
+    // An event-driven client must be able to answer synchronously when it
+    // receives the request. This catches event-before-registration races that
+    // otherwise surface as a transient 404 behind a slower durable store.
     let question_id = loop {
-        let pending = bridge.list();
-        if let Some(q) = pending.first() {
-            assert_eq!(q.prompt, "Proceed with deploy?");
-            assert_eq!(q.choices, vec!["yes".to_string(), "no".to_string()]);
-            break q.question_id.clone();
+        let event = events.recv().await.unwrap();
+        if let CrewEvent::HumanInputRequested {
+            question_id,
+            prompt,
+            choices,
+            timeout_s,
+            kind,
+        } = &*event
+        {
+            assert_eq!(prompt, "Proceed with deploy?");
+            assert_eq!(choices, &["yes".to_string(), "no".to_string()]);
+            assert_eq!(*timeout_s, 30);
+            assert_eq!(kind, "question");
+            bridge
+                .answer(question_id, serde_json::json!("yes"))
+                .expect("request event must only publish after registration");
+            break question_id.clone();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     };
-    bridge
-        .answer(&question_id, serde_json::json!("yes"))
-        .unwrap();
 
     let answer = flow.await.unwrap().unwrap();
     assert_eq!(answer, "yes");
 
-    // Events: requested (with metadata) then received (answered, no content).
-    let mut saw_requested = false;
+    // Events: requested (already consumed above) then received (answered, no content).
     let mut saw_received = false;
     while let Ok(ev) = events.try_recv() {
-        match &*ev {
-            CrewEvent::HumanInputRequested {
-                question_id: qid,
-                prompt,
-                choices,
-                timeout_s,
-                kind,
-            } => {
-                assert_eq!(kind, "question");
-                assert_eq!(qid, &question_id);
-                assert_eq!(prompt, "Proceed with deploy?");
-                assert_eq!(choices.len(), 2);
-                assert_eq!(*timeout_s, 30);
-                saw_requested = true;
-            }
-            CrewEvent::HumanInputReceived {
-                question_id: qid,
-                outcome,
-            } => {
-                assert_eq!(qid, &question_id);
-                assert_eq!(outcome, "answered");
-                saw_received = true;
-            }
-            _ => {}
+        if let CrewEvent::HumanInputReceived {
+            question_id: qid,
+            outcome,
+        } = &*ev
+        {
+            assert_eq!(qid, &question_id);
+            assert_eq!(outcome, "answered");
+            saw_received = true;
         }
     }
-    assert!(saw_requested, "HumanInputRequested not emitted");
     assert!(saw_received, "HumanInputReceived not emitted");
 }
 

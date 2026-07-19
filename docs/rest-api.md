@@ -173,7 +173,9 @@ curl -X POST http://localhost:3000/flows/my-crew/abort/abc-123
 
 This immediately cancels all in-flight LLM calls and drops pending tasks.
 The SSE stream receives a `run_complete` event with `status: "aborted"`.
-The run is cleaned up after 5 seconds.
+Pending human-input questions expire before the abort response returns. The
+run's event bus remains available for late SSE recovery and is cleaned up after
+5 seconds.
 
 A run can end with one of these statuses:
 - `success` / `partial_failure` / `failed` — normal completion
@@ -219,7 +221,8 @@ flow-scoped and never confirms that a run exists under a different flow.
 `ask_human` tool) or `"approval"` (from a
 [tool approval gate](crews.md#approval-gates-require_approval)) — render an
 answer form for the first, allow/always/deny buttons for the second. For
-approvals, only the exact tokens `allow`/`yes`/`always` permit the call;
+approvals, only the standalone tokens `allow`/`yes`/`always`/`allow-always`
+permit the call after case-folding and trimming surrounding whitespace;
 anything else denies (free text is forwarded to the agent as the denial
 reason).
 
@@ -237,13 +240,20 @@ suspended flow receives it as a Lua value. First writer wins: a second answer
 to the same question gets `404` (the question is gone), never a silent
 overwrite. `choices` are advisory — the endpoint accepts free-form answers
 even when choices were offered; flows that need strict values validate in Lua.
+An answer larger than `IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES` (65,536 serialized
+bytes by default) gets `413 Payload Too Large` and leaves the question pending
+so the client can retry with a smaller value.
 
 Both endpoints are recorded in the [audit log](#get-audit) (actions
-`flow.run.questions_list` / `flow.run.question_answer`). The audit record and
-the SSE events carry the `question_id` but **never the answer content** —
-answers may contain secrets.
+`flow.run.questions_list` / `flow.run.question_answer`). The bridge-generated
+audit records and `human_input_*` SSE events carry the `question_id` but never
+the answer content. This does not sanitize arbitrary flow logs, model output,
+or tool output: flows and prompts must not echo sensitive answers themselves.
 
-Aborting a suspended run works unchanged; its pending questions expire with it.
+Aborting a suspended run expires its pending questions before the abort
+response returns. Both question endpoints then return `404`; the separate SSE
+event bus remains available for terminal-event replay during its retention
+window.
 
 ## SSE Event Stream
 
@@ -433,6 +443,15 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
 
 To fetch a full `RunRecord` (including `task_results`), call
 `GET /flows/{flow}/runs/{id}`.
+
+During a sustained terminal-persistence outage, IronCrew prioritizes bounded
+server memory and durable terminal metadata over retaining large process-local
+outputs indefinitely. The full task results receive their normal write attempt;
+payloads no larger than 1 MiB receive one additional full attempt. If those
+writes fail, status, timing, and aggregate token counts continue retrying after
+the staged task results are released, so a recovered terminal record can have
+an empty `task_results` array. See [Cloud Deployment](cloud-deployment.md) for
+the Railway/OpenShift operational rationale.
 
 ### Get Run Details
 

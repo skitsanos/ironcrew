@@ -59,3 +59,30 @@ fn generate_html_produces_valid_file() {
     assert!(html.contains("__ICON_DATA_URIS"));
     assert!(html.contains("data:image/svg+xml"));
 }
+
+#[test]
+fn hitl_examples_capture_their_human_control_contracts() {
+    let ask =
+        ironcrew::cli::graph_extract::extract_graph_data(Path::new("examples/ask-human")).unwrap();
+    assert_eq!(ask.human_inputs.len(), 2);
+    assert_eq!(
+        ask.human_inputs[0].prompt,
+        "What should the announcement be about?"
+    );
+    assert_eq!(ask.human_inputs[1].prompt, "Publish this draft?");
+    assert_eq!(
+        ask.human_inputs[1].choices,
+        vec!["publish".to_string(), "hold".to_string()]
+    );
+
+    let approval =
+        ironcrew::cli::graph_extract::extract_graph_data(Path::new("examples/human-approval"))
+            .unwrap();
+    assert_eq!(approval.require_approval, vec!["file_write"]);
+    let agent = approval
+        .agents
+        .iter()
+        .find(|agent| agent.name == "release_manager")
+        .unwrap();
+    assert_eq!(agent.tools, vec!["ask_human", "file_write"]);
+}

@@ -18,7 +18,6 @@ use async_trait::async_trait;
 
 use crate::engine::eventbus::CrewEvent;
 use crate::engine::input_bridge::{AskOutcome, default_timeout_secs};
-use crate::engine::run_history::RunStatus;
 use crate::llm::provider::ToolSchema;
 use crate::tools::{Tool, ToolCallContext};
 use crate::utils::error::{IronCrewError, Result};
@@ -137,36 +136,34 @@ impl Tool for AskHumanTool {
         let store = ask.store.clone().or_else(|| ctx.store.clone());
 
         let question_id = uuid::Uuid::new_v4().to_string();
-        if let Some(bus) = &eventbus {
-            bus.emit(CrewEvent::HumanInputRequested {
-                question_id: question_id.clone(),
-                prompt: prompt.clone(),
-                choices: choices.clone(),
-                timeout_s,
-                kind: "question".into(),
-            });
-        }
-
-        // Best-effort status flip — same semantics as crew:ask_human.
-        if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-            && let Err(e) = store
-                .update_run_status(run_id, RunStatus::WaitingForInput)
-                .await
-        {
-            tracing::debug!("ask_human tool: run status not updated: {}", e);
-        }
+        let requested_event = CrewEvent::HumanInputRequested {
+            question_id: question_id.clone(),
+            prompt: prompt.clone(),
+            choices: choices.clone(),
+            timeout_s,
+            kind: "question".into(),
+        };
+        let requested_eventbus = eventbus.clone();
 
         let outcome = ask
             .bridge
-            .ask(&question_id, &prompt, &choices, timeout_s, "question")
+            .with_run_wait_status(
+                store.clone(),
+                ask.run_id.as_deref(),
+                ask.bridge.ask_when_ready(
+                    &question_id,
+                    &prompt,
+                    &choices,
+                    timeout_s,
+                    "question",
+                    move || {
+                        if let Some(bus) = requested_eventbus {
+                            bus.emit(requested_event);
+                        }
+                    },
+                ),
+            )
             .await?;
-
-        if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-            && ask.bridge.pending_count() == 0
-            && let Err(e) = store.update_run_status(run_id, RunStatus::Running).await
-        {
-            tracing::debug!("ask_human tool: run status not restored: {}", e);
-        }
 
         match outcome {
             AskOutcome::Answered(value) => {

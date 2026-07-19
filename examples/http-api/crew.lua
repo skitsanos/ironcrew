@@ -34,6 +34,24 @@ end
 local posts = api_response.json
 log("info", "Fetched " .. #posts .. " posts from API")
 
+-- Exercise the POST helper too. JSONPlaceholder returns the simulated record
+-- (including a generated id) without persisting it.
+local create_response = http.post("https://jsonplaceholder.typicode.com/posts", {
+    json = {
+        title = "IronCrew HTTP helper demo",
+        body = "Created from crew.lua with http.post()",
+        userId = 1,
+    },
+    timeout = 15,
+})
+
+if create_response.ok then
+    local created = create_response.json
+    log("info", "POST demo returned id " .. tostring(created and created.id))
+else
+    log("warn", "POST demo failed with status " .. tostring(create_response.status))
+end
+
 -- Store in memory for the agent to use
 crew:memory_set("api_data", json_stringify(posts))
 

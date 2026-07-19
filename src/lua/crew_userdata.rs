@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::engine::crew::Crew;
 use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
+use crate::engine::run_history::RunCompletion;
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
@@ -21,6 +22,59 @@ use super::dialog::build_dialog;
 use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
 use super::parsers::{agent_from_lua_table, task_from_lua_table};
 use super::subflow::{SubflowContext, SubflowDepth, invoke_subflow};
+
+// ---------------------------------------------------------------------------
+// API-owned run lifecycle
+// ---------------------------------------------------------------------------
+
+/// Completion produced by `crew:run()` while the enclosing HTTP-owned Lua
+/// entrypoint is still executing.
+///
+/// CLI runs do not install this context and continue to persist completion
+/// directly from `crew:run()`. The HTTP runner installs it so flow-level Lua
+/// can safely continue after the crew finishes (including suspending on a
+/// later `crew:ask_human()`) without making the durable run terminal early.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedRunCompletion {
+    pub(crate) run_id: String,
+    pub(crate) completion: RunCompletion,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StagedRunSummary {
+    pub(crate) run_id: String,
+    pub(crate) status: crate::engine::run_history::RunStatus,
+    pub(crate) duration_ms: u64,
+    pub(crate) total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApiRunLifecycle {
+    completion: Arc<Mutex<Option<StagedRunCompletion>>>,
+}
+
+impl ApiRunLifecycle {
+    async fn stage(&self, run_id: String, completion: RunCompletion) {
+        *self.completion.lock().await = Some(StagedRunCompletion { run_id, completion });
+    }
+
+    pub(crate) async fn take_completion(&self) -> Option<StagedRunCompletion> {
+        self.completion.lock().await.take()
+    }
+
+    pub(crate) async fn completion_summary(&self) -> Option<StagedRunSummary> {
+        self.completion
+            .lock()
+            .await
+            .as_ref()
+            .map(|staged| StagedRunSummary {
+                run_id: staged.run_id.clone(),
+                status: staged.completion.status.clone(),
+                duration_ms: staged.completion.duration_ms,
+                total_tokens: staged.completion.total_tokens,
+            })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LuaCrew — Lua userdata wrapping a Crew + Runtime
@@ -440,47 +494,31 @@ impl UserData for LuaCrew {
             let store = lua.app_data_ref::<Arc<dyn StateStore>>().map(|s| s.clone());
 
             let question_id = uuid::Uuid::new_v4().to_string();
-            eventbus.emit(crate::engine::eventbus::CrewEvent::HumanInputRequested {
+            let requested_event = crate::engine::eventbus::CrewEvent::HumanInputRequested {
                 question_id: question_id.clone(),
                 prompt: prompt.clone(),
                 choices: choices.clone(),
                 timeout_s,
                 kind: "question".into(),
-            });
-
-            // Mark the run suspended. Idempotent under concurrent questions
-            // (both writers set the same value); a failed write is logged,
-            // not fatal — the question itself still works.
-            if let (Some(store), Some(run_id)) = (&store, &ctx.run_id)
-                && let Err(e) = store
-                    .update_run_status(
-                        run_id,
-                        crate::engine::run_history::RunStatus::WaitingForInput,
-                    )
-                    .await
-            {
-                // Debug, not warn: ask_human outside crew:run() has no run
-                // record yet — a normal pattern, not an operator problem. The
-                // questions endpoint is the authoritative waiting signal.
-                tracing::debug!("ask_human: run status not updated: {}", e);
-            }
+            };
+            let requested_eventbus = eventbus.clone();
 
             let outcome = ctx
                 .bridge
-                .ask(&question_id, &prompt, &choices, timeout_s, "question")
+                .with_run_wait_status(
+                    store.clone(),
+                    ctx.run_id.as_deref(),
+                    ctx.bridge.ask_when_ready(
+                        &question_id,
+                        &prompt,
+                        &choices,
+                        timeout_s,
+                        "question",
+                        move || requested_eventbus.emit(requested_event),
+                    ),
+                )
                 .await
                 .map_err(mlua::Error::external)?;
-
-            // Restore Running only when no sibling question is still pending
-            // (parallel branches may each be waiting on their own answer).
-            if let (Some(store), Some(run_id)) = (&store, &ctx.run_id)
-                && ctx.bridge.pending_count() == 0
-                && let Err(e) = store
-                    .update_run_status(run_id, crate::engine::run_history::RunStatus::Running)
-                    .await
-            {
-                tracing::debug!("ask_human: run status not restored: {}", e);
-            }
 
             match outcome {
                 crate::engine::input_bridge::AskOutcome::Answered(value) => {
@@ -708,6 +746,9 @@ impl UserData for LuaCrew {
 
         methods.add_async_method("run", |lua, this, ()| async move {
             let run_start = chrono::Utc::now();
+            let api_lifecycle = lua
+                .app_data_ref::<ApiRunLifecycle>()
+                .map(|lifecycle| lifecycle.clone());
 
             // Lazy agent-as-tool finalization — fails fast with a validation
             // error if any agent__<name> refs an unknown agent. Also handles
@@ -820,45 +861,47 @@ impl UserData for LuaCrew {
                         total_ms,
                     );
                     record.tags = tags.clone();
-                    // FATAL on failure: --json mode and the HTTP handler re-fetch
-                    // the record from the store; a lingering Running record would
-                    // surface as the response. Reconciler will sweep it later.
-                    store
-                        .update_run_completion(
-                            &run_id,
-                            crate::engine::run_history::RunCompletion {
-                                status: record.status.clone(),
-                                finished_at: run_end.to_rfc3339(),
-                                duration_ms: total_ms,
-                                // `create_run_record` already cloned the results so the
-                                // originals remain available for the Lua return value.
-                                // Transfer that owned copy into persistence instead of
-                                // deep-cloning every TaskResult a second time.
-                                task_results: std::mem::take(&mut record.task_results),
-                                total_tokens: record.total_tokens,
-                                cached_tokens: record.cached_tokens,
-                            },
-                        )
-                        .await
-                        .map_err(mlua::Error::external)?;
+                    let completion = RunCompletion {
+                        status: record.status.clone(),
+                        finished_at: run_end.to_rfc3339(),
+                        duration_ms: total_ms,
+                        // `create_run_record` already cloned the results so the
+                        // originals remain available for the Lua return value.
+                        // Transfer that owned copy into persistence instead of
+                        // deep-cloning every TaskResult a second time.
+                        task_results: std::mem::take(&mut record.task_results),
+                        total_tokens: record.total_tokens,
+                        cached_tokens: record.cached_tokens,
+                    };
+                    if let Some(lifecycle) = api_lifecycle.as_ref() {
+                        lifecycle.stage(run_id.clone(), completion).await;
+                    } else {
+                        // CLI-owned runs finish at `crew:run()`, so preserve
+                        // their historical immediate persistence behavior.
+                        store
+                            .update_run_completion(&run_id, completion)
+                            .await
+                            .map_err(mlua::Error::external)?;
+                    }
                     results
                 }
                 Err(e) => {
-                    // Best-effort completion on the error path: swallow errors
-                    // because the caller's failure takes precedence.
-                    let _ = store
-                        .update_run_completion(
-                            &run_id,
-                            crate::engine::run_history::RunCompletion {
-                                status: crate::engine::run_history::RunStatus::Failed,
-                                finished_at: run_end.to_rfc3339(),
-                                duration_ms: total_ms,
-                                task_results: Vec::new(),
-                                total_tokens: 0,
-                                cached_tokens: 0,
-                            },
-                        )
-                        .await;
+                    let completion = RunCompletion {
+                        status: crate::engine::run_history::RunStatus::Failed,
+                        finished_at: run_end.to_rfc3339(),
+                        duration_ms: total_ms,
+                        task_results: Vec::new(),
+                        total_tokens: 0,
+                        cached_tokens: 0,
+                    };
+                    if let Some(lifecycle) = api_lifecycle.as_ref() {
+                        lifecycle.stage(run_id.clone(), completion).await;
+                    } else {
+                        // Best-effort completion on the error path: swallow
+                        // persistence errors because the crew failure takes
+                        // precedence for CLI callers.
+                        let _ = store.update_run_completion(&run_id, completion).await;
+                    }
                     return Err(mlua::Error::external(e));
                 }
             };

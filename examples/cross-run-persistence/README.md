@@ -4,6 +4,9 @@ Demonstrates how `crew:conversation({...})` and `crew:dialog({...})` can
 **resume across separate `ironcrew run` invocations** (or API requests)
 by keying the session on a stable `id`.
 
+The effective persistence key is `(flow_path, id)`: the project directory
+name supplies `flow_path`, so two flows may safely use the same session id.
+
 ## What it shows
 
 1. **A support conversation** (`support-ticket-4821`) that remembers a
@@ -31,7 +34,7 @@ something that was only said on the first run.
 
 ## How persistence is wired
 
-### The `id` field is the persistence key
+### The `id` field is the persistence key within a flow
 
 ```lua
 local chat = crew:conversation({
@@ -50,10 +53,12 @@ local debate = crew:dialog({
 When you supply `id`, IronCrew:
 
 1. **Validates** the id (ASCII alphanumerics, `-`, `_`, `.`; 1-128 chars).
-2. **Queries the store** for a prior record with that id.
-3. On **hit**, loads the prior messages / transcript / turn counter /
+2. **Derives the flow scope** from the project directory name
+   (`cross-run-persistence` here).
+3. **Queries the store** for the `(flow_path, id)` pair.
+4. On **hit**, loads the prior messages / transcript / turn counter /
    stop flag into the new session so it resumes exactly where it left off.
-4. On **miss**, starts fresh. The record is written by the first autosave.
+5. On **miss**, starts fresh. The record is written by the first autosave.
 
 If you omit `id`, you get the pre-2.8 behavior: an auto-generated UUID,
 no persistence, ephemeral session that disappears when the process exits.
@@ -81,24 +86,29 @@ chat:save()   -- single write at the end
 ### Storage location
 
 Sessions live in the same `StateStore` backend as run history, configured
-via `IRONCREW_STORE`:
+via `IRONCREW_STORE`. Files and the default SQLite database are relative to
+the flow project directory:
 
-| Backend     | Conversations                                   | Dialogs                                    |
-|-------------|--------------------------------------------------|--------------------------------------------|
-| `json` (default) | `.ironcrew/conversations/<id>.json`             | `.ironcrew/dialogs/<id>.json`              |
-| `sqlite`    | `conversations` table in `.ironcrew/ironcrew.db` | `dialogs` table in `.ironcrew/ironcrew.db` |
-| `postgres`  | `conversations` table (with prefix)              | `dialogs` table (with prefix)              |
+| Backend | Session storage |
+|---|---|
+| `json` (default) | `<project>/.ironcrew/conversations/<flow_path>/<id>.json` and `<project>/.ironcrew/dialogs/<flow_path>/<id>.json` |
+| `sqlite` | `conversations` and `dialogs` in `<project>/.ironcrew/ironcrew.db`, uniquely keyed by `(flow_path, id)` |
+| `postgres` | Prefixed `conversations` and `dialogs` tables, uniquely keyed by `(flow_path, id)` |
 
 Want to wipe a session for a fresh test run?
 
 ```bash
+cd examples/cross-run-persistence
+
 # JSON backend
-rm .ironcrew/conversations/support-ticket-4821.json
-rm .ironcrew/dialogs/ship-decision-q2.json
+rm .ironcrew/conversations/cross-run-persistence/support-ticket-4821.json
+rm .ironcrew/dialogs/cross-run-persistence/ship-decision-q2.json
 
 # SQLite backend
-sqlite3 .ironcrew/ironcrew.db "DELETE FROM conversations WHERE id = 'support-ticket-4821'"
-sqlite3 .ironcrew/ironcrew.db "DELETE FROM dialogs WHERE id = 'ship-decision-q2'"
+sqlite3 .ironcrew/ironcrew.db \
+  "DELETE FROM conversations WHERE flow_path = 'cross-run-persistence' AND id = 'support-ticket-4821'"
+sqlite3 .ironcrew/ironcrew.db \
+  "DELETE FROM dialogs WHERE flow_path = 'cross-run-persistence' AND id = 'ship-decision-q2'"
 ```
 
 Or from Lua:
@@ -143,10 +153,13 @@ debate:delete()
   `agents = { "alice", "bob" }` and try to resume it with
   `agents = { "alice", "carol" }`, the resume fails with a clear validation
   error. Dialogs are tied to their participant set.
-- **Last-write-wins concurrency.** Two processes using the same session id
-  at the same time will race. For single-user CLI flows this is almost never
-  an issue, but don't use the same id for concurrent requests in a server
-  hosted via `ironcrew serve` without your own external locking.
+- **Concurrent writers are rejected.** Session records carry an optimistic
+  revision. If two processes update the same `(flow_path, id)`, a stale write
+  fails with a revision conflict instead of silently overwriting newer state.
+  Re-open the session to reload before deciding whether to retry. HTTP message
+  retries additionally follow the idempotency contract in `docs/rest-api.md`.
+- **Flow scope is part of identity.** Reusing `support-ticket-4821` in a
+  different flow creates a distinct session; it does not resume this one.
 - **IDs are restricted.** Alphanumerics + `-`, `_`, `.`, 1-128 chars. Spaces,
   slashes, and SQL metacharacters are rejected at the Lua layer before they
   reach the store — use a UUID, a slug, or a deterministic hash of whatever

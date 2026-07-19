@@ -11,6 +11,12 @@ pub struct GraphData {
     pub agents: Vec<GraphAgent>,
     pub tools: Vec<GraphTool>,
     pub tasks: Vec<GraphTask>,
+    /// Crew-level tool patterns that require a human approval gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_approval: Vec<String>,
+    /// Flow-authored `crew:ask_human()` checkpoints reached during capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_inputs: Vec<GraphHumanInput>,
     #[serde(default)]
     pub functions: Vec<()>,
     #[serde(default)]
@@ -21,6 +27,16 @@ pub struct GraphData {
     pub dialogs: Vec<()>,
     #[serde(default)]
     pub messages: Vec<()>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphHumanInput {
+    pub prompt: String,
+    pub choices: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
