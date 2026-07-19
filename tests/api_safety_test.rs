@@ -230,6 +230,8 @@ async fn idempotent_run_replays_one_acceptance_and_rejects_key_reuse() {
     assert!(first.headers().get("Idempotency-Replayed").is_none());
     let first_body: serde_json::Value = first.json().await.unwrap();
     let first_run_id = first_body["run_id"].as_str().unwrap();
+    assert_eq!(first_body["owner_instance_id"], server.store.instance_id());
+    assert_eq!(first_body["control_scope"], "process");
     assert!(
         server.store.get_run(first_run_id).await.is_ok(),
         "a keyed started response must never reference a run that is not durable"
@@ -740,4 +742,31 @@ async fn liveness_stays_up_while_readiness_checks_shutdown_flows_and_storage() {
     );
     let body: serde_json::Value = storage_down.json().await.unwrap();
     assert_eq!(body["component"], "storage");
+}
+
+#[tokio::test]
+async fn capabilities_reports_process_scoped_live_control() {
+    let server = spawn_server(1, 1, Duration::from_secs(60)).await;
+    let response = reqwest::get(format!("{}/capabilities", server.base))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["instance_id"], server.store.instance_id());
+    assert_eq!(body["topology"], "single_executor");
+    assert_eq!(body["control_scope"], "process");
+    assert_eq!(body["multi_replica_control"], false);
+    assert_eq!(body["live_control"]["human_input"], "process");
+    assert_eq!(body["live_control"]["sse_replay"], "process");
+    assert_eq!(
+        body["live_control"]["run_abort"]["cross_instance"],
+        "keyed_store_if_supported"
+    );
 }

@@ -24,13 +24,16 @@ files. (This replaces the earlier per-request loading, which raced on the
 environment and could bleed one flow's secrets into another.)
 
 For production sizing, session-cap tuning, SSE proxy guidance, and horizontal
-scaling considerations, see [HTTP Scaling](http-scaling.md).
+scaling considerations, see [HTTP Scaling](http-scaling.md). The exact shared
+and process-local boundary is documented in the
+[Multi-Replica Deployment Contract](multi-replica.md).
 
 ## Endpoints
 
 | Method   | Path                                               | Description                                         |
 |----------|----------------------------------------------------|-----------------------------------------------------|
 | GET      | `/health`                                          | Health check (returns version)                      |
+| GET      | `/capabilities`                                    | Authenticated instance/control-scope diagnostics    |
 | POST     | `/flows/{flow}/run`                                | Start a crew run (async)                            |
 | POST     | `/flows/{flow}/abort/{run_id}`                     | Abort a running crew                                |
 | GET      | `/flows/{flow}/events/{run_id}`                    | SSE event stream for a run                          |
@@ -70,12 +73,26 @@ Response:
 {
   "run_id": "a1b2c3d4-...",
   "status": "started",
-  "events_url": "/flows/research-crew/events/a1b2c3d4-..."
+  "events_url": "/flows/research-crew/events/a1b2c3d4-...",
+  "owner_instance_id": "ironcrew-1234-...",
+  "control_scope": "process"
 }
 ```
 
 The `run_id` is consistent across the initial response, SSE events, and the
-persisted run record. Use the `events_url` to subscribe to real-time progress.
+persisted run record. `owner_instance_id` identifies the process that owns the
+live Lua execution; it is diagnostic metadata, not a routable URL.
+`control_scope: "process"` warns that HITL and live SSE still require that
+owner. Use the `events_url` to subscribe to real-time progress.
+
+### Runtime capabilities
+
+`GET /capabilities` is protected by the normal API authentication policy and
+returns `Cache-Control: no-store`. It reports the current instance id and the
+scope of each live-control surface. `multi_replica_control: false` means not
+all run/HITL/SSE/conversation controls can enter through an arbitrary replica;
+it remains `false` even though PostgreSQL-backed keyed runs support the bounded
+cross-instance cancellation path described below.
 
 An optional top-level `tags` array is attached to the run record. It accepts
 unique, non-empty, trimmed strings without control characters. The defaults
@@ -171,15 +188,30 @@ curl -X POST http://localhost:3000/flows/my-crew/abort/abc-123
 # {"run_id":"abc-123","status":"aborted"}
 ```
 
-This immediately cancels all in-flight LLM calls and drops pending tasks.
-The SSE stream receives a `run_complete` event with `status: "aborted"`.
-Pending human-input questions expire before the abort response returns. The
-run's event bus remains available for late SSE recovery and is cleaned up after
-5 seconds.
+That immediately cancels all in-flight LLM calls and drops pending tasks when
+the request reaches the owner process. The SSE stream receives a `run_complete`
+event with `status: "aborted"`, and pending human-input questions expire before
+the local abort response returns. The run's event bus remains available for
+late SSE recovery and is cleaned up after 5 seconds.
+
+For a PostgreSQL-backed run created with an `Idempotency-Key`, another replica
+can durably request cancellation through the shared ledger. Its `200` response
+has `status: "cancellation_requested"`, `control_scope: "shared_store"`, the
+owner id, and an `already_requested` flag. The owner observes that request on
+its fenced heartbeat, stops the worker, and then persists `aborted`; therefore
+the cancellation response is an acknowledgement, not proof that the run is
+already terminal.
+
+If an active run belongs to another instance and the configured backend has no
+durable cancellation mailbox (including JSON, SQLite, or an unkeyed run), the
+endpoint returns `409` with `code: "run_owned_by_another_instance"` and
+`retryable: true`. An in-flight durable record owned by this instance but
+missing its local control handle returns retryable `503`. Missing, terminal,
+and cross-flow runs remain `404` where flow isolation requires it.
 
 A run can end with one of these statuses:
 - `success` / `partial_failure` / `failed` — normal completion
-- `timeout` — 30-minute lifetime exceeded
+- `timed_out` — configured maximum lifetime exceeded
 - `aborted` — cancelled via this endpoint
 
 ## Mid-Run Questions (`crew:ask_human`)
@@ -213,9 +245,13 @@ curl http://localhost:3000/flows/my-crew/questions/abc-123
 }
 ```
 
-`status` is `"running"` with an empty array when nothing is pending. `404`
-when the run is not active under this flow — like `abort`, the endpoint is
-flow-scoped and never confirms that a run exists under a different flow.
+`status` is `"running"` with an empty array when nothing is pending. A live
+run owned by another instance returns the structured retryable `409` described
+above; the question bridge has not moved to that replica. A same-owner durable
+record with no local bridge returns retryable `503`. Missing, terminal, and
+cross-flow runs return `404`, so the endpoint never confirms that a run exists
+under a different flow. The answer endpoint uses the same ownership contract
+and never reports delivery unless its local bridge accepted the answer.
 
 `kind` is `"question"` (from `crew:ask_human()` or the agent-facing
 `ask_human` tool) or `"approval"` (from a
@@ -250,10 +286,11 @@ audit records and `human_input_*` SSE events carry the `question_id` but never
 the answer content. This does not sanitize arbitrary flow logs, model output,
 or tool output: flows and prompts must not echo sensitive answers themselves.
 
-Aborting a suspended run expires its pending questions before the abort
-response returns. Both question endpoints then return `404`; the separate SSE
-event bus remains available for terminal-event replay during its retention
-window.
+Locally aborting a suspended run expires its pending questions before the
+response returns. A durable cross-instance cancellation only acknowledges the
+mailbox write; the questions expire when the owner observes it. Once terminal,
+both question endpoints return `404`; the separate owner-local SSE event bus
+remains available during its retention window.
 
 ## SSE Event Stream
 
@@ -265,10 +302,14 @@ curl -N http://localhost:3000/flows/research-crew/events/a1b2c3d4-...
 
 ### Replay Buffer
 
-Late subscribers receive all past events before switching to the live stream.
-The replay buffer holds up to 1000 events. If a run has already completed by the
-time you connect, you receive the full history (including `run_complete`) and the
-stream closes immediately.
+Late subscribers on the owner receive all events retained by its process-local
+replay buffer before switching to the live stream. The replay buffer holds up
+to 1000 events by default. If a run has completed and that local bus is still
+retained, the subscriber receives its retained history including
+`run_complete`. Any replica can synthesize one `run_complete` event from a
+terminal durable run record and then close the stream; it cannot reconstruct
+the earlier event history. An active foreign-owned run returns structured
+`409` rather than an unrelated stream.
 
 ### Output Truncation
 

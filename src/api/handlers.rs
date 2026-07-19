@@ -14,7 +14,7 @@ use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::idempotency::{
     IdempotencyClaim, IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup,
     IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyRecord, PrincipalId, RUN_OPERATION,
-    RunFenceHeartbeat, RunIntentSignal,
+    RunCancellationRequest, RunFenceHeartbeat, RunIntentSignal,
 };
 use crate::engine::input_bridge::AnswerError;
 use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
@@ -55,13 +55,28 @@ fn replay_run(record: &IdempotencyRecord) -> RunFlowResult {
             "Stored idempotency response has an invalid status".into(),
         ));
     }
-    let body = serde_json::from_str(body).map_err(|error| {
+    let mut body: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         tracing::error!(%error, "Stored run idempotency response is corrupt");
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Stored idempotency response is corrupt".into(),
         )
     })?;
+    let object = body.as_object_mut().ok_or_else(|| {
+        tracing::error!("Stored run idempotency response is not a JSON object");
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response is corrupt".into(),
+        )
+    })?;
+    // Older retained responses predate replica diagnostics. Enrich them at
+    // replay time without changing the durable idempotency payload so every
+    // caller can identify the process that accepted the run.
+    object.insert(
+        "owner_instance_id".into(),
+        serde_json::json!(record.owner_instance_id),
+    );
+    object.insert("control_scope".into(), serde_json::json!("process"));
     Ok((super::idempotency::replay_headers(), Json(body)))
 }
 
@@ -350,6 +365,39 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+/// Authenticated runtime-capability snapshot. This deliberately separates
+/// shared durable records from the live control objects that still reside in
+/// one process, so operators and clients cannot mistake a shared store for a
+/// distributed execution plane.
+pub async fn capabilities(
+    State(state): State<Arc<AppState>>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    (
+        headers,
+        Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "instance_id": state.store.instance_id(),
+            "topology": "single_executor",
+            "control_scope": "process",
+            "multi_replica_control": false,
+            "live_control": {
+                "run_abort": {
+                    "local": "process",
+                    "cross_instance": "keyed_store_if_supported",
+                },
+                "human_input": "process",
+                "sse_replay": "process",
+                "conversations": "process",
+            },
+        })),
+    )
+}
+
 /// Readiness probe: unlike the compatibility `/health` liveness endpoint,
 /// this verifies both the configured flows directory and the persistence
 /// backend before allowing the pod to receive traffic.
@@ -483,6 +531,156 @@ fn run_not_found(error: &IronCrewError, run_id: &str) -> bool {
         IronCrewError::Validation(message)
             if message == &format!("Run '{}' not found", run_id)
     )
+}
+
+#[derive(Debug)]
+enum DurableRunLocation {
+    Missing,
+    Terminal(Box<crate::engine::run_history::RunRecord>),
+    ActiveOnThisInstance,
+    ActiveOwnerUnknown,
+    ActiveOnOtherInstance(String),
+}
+
+/// Classify a miss in the process-local active-run registry using the durable
+/// record. Flow scoping is checked before ownership is exposed so a caller can
+/// never use control endpoints to discover another flow's run or owner.
+async fn durable_run_location(
+    state: &AppState,
+    flow_slug: &str,
+    run_id: &str,
+) -> Result<DurableRunLocation, IronCrewError> {
+    let record = match state.store.get_run(run_id).await {
+        Ok(record) => record,
+        Err(error) if run_not_found(&error, run_id) => return Ok(DurableRunLocation::Missing),
+        Err(error) => return Err(error),
+    };
+    if record.flow != flow_slug {
+        return Ok(DurableRunLocation::Missing);
+    }
+    if record.status.is_terminal() {
+        return Ok(DurableRunLocation::Terminal(Box::new(record)));
+    }
+    if record.owner_instance_id.is_empty() {
+        Ok(DurableRunLocation::ActiveOwnerUnknown)
+    } else if record.owner_instance_id == state.store.instance_id() {
+        Ok(DurableRunLocation::ActiveOnThisInstance)
+    } else {
+        Ok(DurableRunLocation::ActiveOnOtherInstance(
+            record.owner_instance_id,
+        ))
+    }
+}
+
+fn structured_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": message.into() })))
+}
+
+fn foreign_run_owner_error(
+    run_id: &str,
+    owner_instance_id: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "Run is active on another IronCrew instance",
+            "code": "run_owned_by_another_instance",
+            "run_id": run_id,
+            "owner_instance_id": owner_instance_id,
+            "control_scope": "process",
+            "retryable": true,
+        })),
+    )
+}
+
+fn local_run_control_unavailable_error(
+    run_id: &str,
+    owner_instance_id: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "Run control is temporarily unavailable on its owner instance",
+            "code": "run_control_temporarily_unavailable",
+            "run_id": run_id,
+            "owner_instance_id": owner_instance_id,
+            "control_scope": "process",
+            "retryable": true,
+        })),
+    )
+}
+
+fn run_location_error(
+    state: &AppState,
+    run_id: &str,
+    location: DurableRunLocation,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match location {
+        DurableRunLocation::ActiveOnOtherInstance(owner) => foreign_run_owner_error(run_id, owner),
+        DurableRunLocation::ActiveOnThisInstance => {
+            local_run_control_unavailable_error(run_id, state.store.instance_id())
+        }
+        DurableRunLocation::ActiveOwnerUnknown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Run control owner is unavailable",
+                "code": "run_control_owner_unknown",
+                "run_id": run_id,
+                "control_scope": "process",
+                "retryable": true,
+            })),
+        ),
+        DurableRunLocation::Missing | DurableRunLocation::Terminal(_) => structured_error(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found or already completed", run_id),
+        ),
+    }
+}
+
+fn run_location_store_error(error: IronCrewError) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(%error, "Failed to classify durable run ownership");
+    structured_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Run ownership is temporarily unavailable",
+    )
+}
+
+async fn request_foreign_run_abort(
+    state: &AppState,
+    flow_slug: &str,
+    run_id: &str,
+    observed_owner: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match state
+        .store
+        .request_run_cancellation(run_id, flow_slug)
+        .await
+        .map_err(run_location_store_error)?
+    {
+        RunCancellationRequest::Requested {
+            owner_instance_id,
+            already_requested,
+        } => Ok(Json(serde_json::json!({
+            "run_id": run_id,
+            "status": "cancellation_requested",
+            "owner_instance_id": owner_instance_id,
+            "control_scope": "shared_store",
+            "already_requested": already_requested,
+        }))),
+        RunCancellationRequest::Terminal(status) => Ok(Json(serde_json::json!({
+            "run_id": run_id,
+            "status": status.to_string(),
+            "terminal": true,
+        }))),
+        RunCancellationRequest::NotFound => Err(structured_error(
+            StatusCode::NOT_FOUND,
+            format!("Run '{}' not found or already completed", run_id),
+        )),
+        RunCancellationRequest::NotDurable => Err(foreign_run_owner_error(run_id, observed_owner)),
+    }
 }
 
 // A terminal completion may contain up to the aggregate run-results ceiling.
@@ -876,6 +1074,8 @@ pub async fn run_flow(
         "run_id": run_id,
         "status": "started",
         "events_url": format!("/flows/{}/events/{}", flow, run_id),
+        "owner_instance_id": state.store.instance_id(),
+        "control_scope": "process",
     });
 
     // The acceptance response and its run id are claimed durably before Lua
@@ -1171,6 +1371,16 @@ pub async fn run_flow(
                 work_handle.abort();
                 let _ = work_handle.handle_mut().await;
                 match outcome {
+                    RunFenceHeartbeat::CancelRequested => {
+                        tracing::info!(run_id = %run_id_clone, "Run worker stopped after a durable cancellation request");
+                        (
+                            RunStatus::Aborted,
+                            started.elapsed().as_millis() as u64,
+                            0,
+                            None,
+                            Some(RunFenceHeartbeat::CancelRequested),
+                        )
+                    }
                     RunFenceHeartbeat::Terminal(status) => {
                         tracing::debug!(run_id = %run_id_clone, %status, "Run worker stopped after its durable record became terminal");
                         let terminal_result = RunFenceHeartbeat::Terminal(status.clone());
@@ -1609,42 +1819,57 @@ pub async fn abort_run(
     Path((flow, run_id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
+        .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     // Scope to the flow in the URL: resolve it to the canonical slug and only
     // abort a run that belongs to it, so `DELETE /flows/A/runs/{id}` can't
     // cancel flow B's run.
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
-        match resolve_flow_path(&state, &flow) {
-            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
-            Ok(p) => {
-                let flow_slug = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let active_runs = state.active_runs.read().await;
-                match active_runs.get(&run_id) {
-                    Some(active_run) if active_run.flow == flow_slug => {
-                        active_run.abort_handle.abort();
-                        active_run.input_bridge.expire_all();
-                        tracing::info!("Run {} aborted by client", run_id);
-                        Ok(Json(serde_json::json!({
-                            "run_id": run_id,
-                            "status": "aborted",
-                        })))
-                    }
-                    // Found but belongs to another flow → same 404 as
-                    // truly-missing, so the endpoint doesn't confirm the run
-                    // exists under a different flow.
-                    _ => Err(error_response(
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> = async {
+        let path = resolve_flow_path(&state, &flow)
+            .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
+        let flow_slug = path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let handled_locally = {
+            let active_runs = state.active_runs.read().await;
+            match active_runs.get(&run_id) {
+                Some(active_run) if active_run.flow == flow_slug => {
+                    active_run.abort_handle.abort();
+                    active_run.input_bridge.expire_all();
+                    true
+                }
+                Some(_) => {
+                    return Err(structured_error(
                         StatusCode::NOT_FOUND,
                         format!("Run '{}' not found or already completed", run_id),
-                    )),
+                    ));
                 }
+                None => false,
             }
         };
+        if handled_locally {
+            tracing::info!("Run {} aborted by client", run_id);
+            return Ok(Json(serde_json::json!({
+                "run_id": run_id,
+                "status": "aborted",
+            })));
+        };
+
+        let location = durable_run_location(&state, &flow_slug, &run_id)
+            .await
+            .map_err(run_location_store_error)?;
+        match location {
+            DurableRunLocation::ActiveOnOtherInstance(owner) => {
+                request_foreign_run_abort(&state, &flow_slug, &run_id, owner).await
+            }
+            location => Err(run_location_error(&state, &run_id, location)),
+        }
+    }
+    .await;
 
     let (success, status_code) = match &result {
         Ok(_) => (true, 200u16),
@@ -1679,45 +1904,59 @@ pub async fn list_questions(
     Path((flow, run_id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
-        match resolve_flow_path(&state, &flow) {
-            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
-            Ok(p) => {
-                let flow_slug = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let active_runs = state.active_runs.read().await;
-                match active_runs.get(&run_id) {
-                    Some(active_run)
-                        if active_run.flow == flow_slug
-                            && !active_run.input_bridge.is_expired() =>
-                    {
-                        let questions = active_run.input_bridge.list();
-                        let status = if questions.is_empty() {
-                            "running"
-                        } else {
-                            "waiting_for_input"
-                        };
-                        Ok(Json(serde_json::json!({
-                            "run_id": run_id,
-                            "status": status,
-                            "questions": questions,
-                        })))
-                    }
-                    // Found but belongs to another flow → same 404 as
-                    // truly-missing (don't confirm existence across flows).
-                    _ => Err(error_response(
+        .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> = async {
+        let path = resolve_flow_path(&state, &flow)
+            .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
+        let flow_slug = path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let local_bridge = {
+            let active_runs = state.active_runs.read().await;
+            match active_runs.get(&run_id) {
+                Some(active_run) if active_run.flow == flow_slug => {
+                    Some(active_run.input_bridge.clone())
+                }
+                Some(_) => {
+                    return Err(structured_error(
                         StatusCode::NOT_FOUND,
                         format!("Run '{}' not found or already completed", run_id),
-                    )),
+                    ));
                 }
+                None => None,
             }
         };
+        if let Some(bridge) = local_bridge {
+            if bridge.is_expired() {
+                return Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!("Run '{}' not found or already completed", run_id),
+                ));
+            }
+            let questions = bridge.list();
+            let status = if questions.is_empty() {
+                "running"
+            } else {
+                "waiting_for_input"
+            };
+            return Ok(Json(serde_json::json!({
+                "run_id": run_id,
+                "status": status,
+                "questions": questions,
+            })));
+        };
+
+        let location = durable_run_location(&state, &flow_slug, &run_id)
+            .await
+            .map_err(run_location_store_error)?;
+        Err(run_location_error(&state, &run_id, location))
+    }
+    .await;
 
     let (success, status_code) = match &result {
         Ok(_) => (true, 200u16),
@@ -1756,51 +1995,64 @@ pub async fn answer_question(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<AnswerRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
+        .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let question_id = body.question_id.clone();
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> =
-        match resolve_flow_path(&state, &flow) {
-            Err(e) => Err(error_response(flow_status(&e), sanitize_error(&e))),
-            Ok(p) => {
-                let flow_slug = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let active_runs = state.active_runs.read().await;
-                match active_runs.get(&run_id) {
-                    Some(active_run) if active_run.flow == flow_slug => {
-                        match active_run.input_bridge.answer(&question_id, body.answer) {
-                            Ok(()) => Ok(Json(serde_json::json!({
-                                "run_id": run_id,
-                                "question_id": question_id,
-                                "status": "delivered",
-                            }))),
-                            Err(AnswerError::TooLarge { max_bytes }) => Err(error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                format!("Question answer exceeds the {max_bytes}-byte limit"),
-                            )),
-                            Err(AnswerError::Invalid(message)) => {
-                                Err(error_response(StatusCode::BAD_REQUEST, message))
-                            }
-                            Err(AnswerError::UnknownOrExpired { .. }) => Err(error_response(
-                                StatusCode::NOT_FOUND,
-                                format!(
-                                    "Question '{}' not found or expired on run '{}'",
-                                    question_id, run_id
-                                ),
-                            )),
-                        }
-                    }
-                    _ => Err(error_response(
+    let result: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> = async {
+        let path = resolve_flow_path(&state, &flow)
+            .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
+        let flow_slug = path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let local_bridge = {
+            let active_runs = state.active_runs.read().await;
+            match active_runs.get(&run_id) {
+                Some(active_run) if active_run.flow == flow_slug => {
+                    Some(active_run.input_bridge.clone())
+                }
+                Some(_) => {
+                    return Err(structured_error(
                         StatusCode::NOT_FOUND,
                         format!("Run '{}' not found or already completed", run_id),
-                    )),
+                    ));
                 }
+                None => None,
             }
         };
+        if let Some(bridge) = local_bridge {
+            return match bridge.answer(&question_id, body.answer) {
+                Ok(()) => Ok(Json(serde_json::json!({
+                    "run_id": run_id,
+                    "question_id": question_id,
+                    "status": "delivered",
+                }))),
+                Err(AnswerError::TooLarge { max_bytes }) => Err(structured_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Question answer exceeds the {max_bytes}-byte limit"),
+                )),
+                Err(AnswerError::Invalid(message)) => {
+                    Err(structured_error(StatusCode::BAD_REQUEST, message))
+                }
+                Err(AnswerError::UnknownOrExpired { .. }) => Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Question '{}' not found or expired on run '{}'",
+                        question_id, run_id
+                    ),
+                )),
+            };
+        };
+
+        let location = durable_run_location(&state, &flow_slug, &run_id)
+            .await
+            .map_err(run_location_store_error)?;
+        Err(run_location_error(&state, &run_id, location))
+    }
+    .await;
 
     let (success, status_code) = match &result {
         Ok(_) => (true, 200u16),
@@ -1918,19 +2170,19 @@ pub async fn flow_events(
     Path((flow, run_id)): Path<(String, String)>,
 ) -> Result<
     Sse<impl futures::stream::Stream<Item = std::result::Result<Event, Infallible>>>,
-    (StatusCode, Json<ErrorResponse>),
+    (StatusCode, Json<serde_json::Value>),
 > {
     validate_run_id(&run_id)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
+        .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+        .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
     let flow_slug = flow_path
         .file_name()
         .and_then(|segment| segment.to_str())
         .unwrap_or("");
 
     let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
-        error_response(
+        structured_error(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "SSE connection limit reached ({})",
@@ -1939,24 +2191,41 @@ pub async fn flow_events(
         )
     })?;
 
-    let active_runs = state.active_runs.read().await;
-    let active_run = active_runs.get(&run_id).ok_or_else(|| {
-        error_response(
-            StatusCode::NOT_FOUND,
-            format!("Run '{}' not found or already completed", run_id),
-        )
-    })?;
-    if active_run.flow != flow_slug {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("Run '{}' not found or already completed", run_id),
-        ));
-    }
-
     // Subscribe and snapshot under one EventBus critical section so an event
     // cannot land in the replay/subscription gap.
-    let (replay, mut rx) = active_run.eventbus.subscribe_with_replay();
-    drop(active_runs);
+    let local_subscription = {
+        let active_runs = state.active_runs.read().await;
+        match active_runs.get(&run_id) {
+            Some(active_run) if active_run.flow == flow_slug => {
+                Some(active_run.eventbus.subscribe_with_replay())
+            }
+            Some(_) => {
+                return Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!("Run '{}' not found or already completed", run_id),
+                ));
+            }
+            None => None,
+        }
+    };
+    let (replay, rx) = match local_subscription {
+        Some((replay, rx)) => (replay, Some(rx)),
+        None => match durable_run_location(&state, flow_slug, &run_id)
+            .await
+            .map_err(run_location_store_error)?
+        {
+            DurableRunLocation::Terminal(record) => (
+                vec![Arc::new(CrewEvent::RunComplete {
+                    run_id: record.run_id,
+                    status: record.status.to_string(),
+                    duration_ms: record.duration_ms,
+                    total_tokens: record.total_tokens,
+                })],
+                None,
+            ),
+            location => return Err(run_location_error(&state, &run_id, location)),
+        },
+    };
 
     // Optional output truncation (disabled by default)
     let sse_max_chars: Option<usize> = std::env::var("IRONCREW_SSE_OUTPUT_MAX_CHARS")
@@ -1978,6 +2247,10 @@ pub async fn flow_events(
                 return; // Run already finished, no need for live stream
             }
         }
+
+        let Some(mut rx) = rx else {
+            return;
+        };
 
         // Then: stream live events
         loop {
@@ -2354,8 +2627,11 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
 mod truncate_tests {
     use super::{
         RunWorkResult, TERMINAL_RESULT_RETRY_RETAINED_BYTES, TerminalPersistence,
-        TerminalResultRetention, classify_work_result, persist_terminal_outcome, truncate_utf8,
-        validate_run_id, validate_run_tags,
+        TerminalResultRetention, classify_work_result, persist_terminal_outcome, replay_run,
+        truncate_utf8, validate_run_id, validate_run_tags,
+    };
+    use crate::engine::idempotency::{
+        IdempotencyRecord, IdempotencyState, PrincipalId, RUN_OPERATION,
     };
     use crate::engine::run_history::{JsonFileStore, RunCompletion, RunStatus};
     use crate::engine::store::StateStore;
@@ -2436,6 +2712,38 @@ mod truncate_tests {
             "tags": ["x".repeat(super::HARD_API_MAX_TAG_BYTES + 1)]
         });
         assert!(validate_run_tags(Some(&too_large)).is_err());
+    }
+
+    #[test]
+    fn legacy_run_replay_is_enriched_with_owner_metadata() {
+        let record = IdempotencyRecord {
+            key_hash: "a".repeat(64),
+            principal_id: PrincipalId::legacy(),
+            request_fingerprint: "b".repeat(64),
+            operation: RUN_OPERATION.into(),
+            scope: "legacy-flow".into(),
+            resource_id: "legacy-run".into(),
+            exclusive_scope: None,
+            attempt_id: "attempt-1".into(),
+            owner_instance_id: "owner-a".into(),
+            base_revision: None,
+            state: IdempotencyState::Running,
+            response_status: Some(200),
+            response_body: Some(r#"{"run_id":"legacy-run","status":"started"}"#.into()),
+            lease_expires_at: "2026-07-19T12:01:00Z".into(),
+            created_at: "2026-07-19T12:00:00Z".into(),
+            updated_at: "2026-07-19T12:00:00Z".into(),
+            completed_at: None,
+            expires_at: None,
+            ttl_seconds: 86_400,
+        };
+
+        let (_, axum::Json(body)) = match replay_run(&record) {
+            Ok(response) => response,
+            Err(_) => panic!("valid legacy response must replay"),
+        };
+        assert_eq!(body["owner_instance_id"], "owner-a");
+        assert_eq!(body["control_scope"], "process");
     }
 
     fn result_completion(output_bytes: usize) -> RunCompletion {

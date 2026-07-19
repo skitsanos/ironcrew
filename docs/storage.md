@@ -36,7 +36,7 @@ Environment variables control storage:
 | `IRONCREW_DB_CONNECT_RETRIES` | Connection retries after the initial PostgreSQL connection attempt (range 0–100) | `10` |
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (range 1–30000) | `1000` |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (range 1–120 seconds) | `30` |
-| `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable process/pod owner identity; generated once per process when absent | generated |
+| `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable ASCII process/pod owner identity; generated once per process when absent | generated |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (range 1–86400 seconds) | `60` |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require `Idempotency-Key` on run/message mutation endpoints | `false` |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Terminal ledger retention, 60–2592000 seconds; must be at least max run lifetime + 3600 | `86400` |

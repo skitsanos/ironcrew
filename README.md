@@ -102,6 +102,8 @@ ironcrew run .
 | [Chat & Conversations](docs/chat.md) | Phase 1 HITL — `ironcrew chat` REPL and HTTP conversation endpoints |
 | [REST API](docs/rest-api.md) | Endpoints, SSE events, input parameters, Docker deployment |
 | [HTTP Scaling](docs/http-scaling.md) | Capacity planning, session limits, SSE/proxy tuning, horizontal scaling |
+| [Multi-Replica Contract](docs/multi-replica.md) | Shared PostgreSQL guarantees, process-local control, platform constraints, and the scale-out roadmap |
+| [Crew Effectiveness Evaluation](evaluations/crew-effectiveness/README.md) | Reproducible single-agent vs DAG vs collaborative quality, latency, and token comparison |
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
 | [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |

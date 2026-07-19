@@ -7,7 +7,7 @@ use crate::engine::audit::{AuditEvent, AuditFilter};
 use crate::engine::idempotency::{
     ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
     IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
-    IdempotencyUsage, PrincipalId, RunFenceHeartbeat,
+    IdempotencyUsage, PrincipalId, RunCancellationRequest, RunFenceHeartbeat,
 };
 use crate::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -111,9 +111,14 @@ impl RunLeaseConfig {
 
 fn validate_instance_id(value: String) -> Result<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 255 || trimmed.chars().any(char::is_control) {
+    if trimmed.is_empty()
+        || trimmed.len() > 255
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+    {
         return Err(crate::utils::error::IronCrewError::Validation(
-            "IRONCREW_INSTANCE_ID must be 1-255 printable characters".into(),
+            "IRONCREW_INSTANCE_ID must be 1-255 printable ASCII bytes".into(),
         ));
     }
     Ok(trimmed.to_string())
@@ -264,6 +269,18 @@ pub trait StateStore: Send + Sync {
         attempt_id: &str,
         new_lease_expires_at: &str,
     ) -> Result<RunFenceHeartbeat>;
+
+    /// Durably request cancellation of a keyed HTTP run. PostgreSQL uses the
+    /// linked idempotency ledger as a cross-replica control mailbox; backends
+    /// without shared control return `NotDurable` and retain process-local
+    /// cancellation semantics.
+    async fn request_run_cancellation(
+        &self,
+        _run_id: &str,
+        _flow: &str,
+    ) -> Result<RunCancellationRequest> {
+        Ok(RunCancellationRequest::NotDurable)
+    }
 
     #[allow(dead_code)] // retained for downstream StateStore API compatibility
     async fn complete_idempotency(
@@ -500,6 +517,8 @@ mod tests {
     fn run_lease_config_validates_identity_and_deadline() {
         assert!(RunLeaseConfig::new("", Duration::from_secs(60)).is_err());
         assert!(RunLeaseConfig::new("bad\nidentity", Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("pod-α", Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("x".repeat(256), Duration::from_secs(60)).is_err());
         assert!(RunLeaseConfig::new("pod-a", Duration::ZERO).is_err());
         assert!(RunLeaseConfig::new("pod-a", Duration::from_millis(999)).is_err());
 

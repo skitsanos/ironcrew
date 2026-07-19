@@ -1,0 +1,771 @@
+{
+  "binary": {
+    "path": "/Users/skitsanos/FTP/Projects/rust/ironcrew/target/debug/ironcrew",
+    "sha256": "f1eea38285086cf8ebee252aef8de5dd2370de8d283c2386b75334e4034f0e69",
+    "version": "ironcrew 2.22.0"
+  },
+  "configuration": {
+    "order_seed": 20260719,
+    "planned_llm_calls_per_run": {
+      "collaborative": 4,
+      "dag": 3,
+      "single": 1
+    },
+    "repetitions": 1,
+    "temperature": 0.0,
+    "variants": [
+      "single",
+      "dag",
+      "collaborative"
+    ]
+  },
+  "dataset": {
+    "answer_contract": "source-visible-single-select-v1",
+    "case_count": 3,
+    "cases_sha256": "781b46d71581f64ef584d7705dde12b0229ac0a00b23d86013cc8f4a4afdea8f",
+    "correctness_rule": "exact-option-id-v1",
+    "name": "grounded-decisions-options-v1",
+    "oracle_injected_into_prompt": false,
+    "oracle_sha256": "a2c5a146301d935cbfe42a7d799d8986b8184702edf2ccebfb4e418065c5e942"
+  },
+  "effectiveness_evidence": true,
+  "generated_at": "2026-07-19T11:38:56.184581+00:00",
+  "mock_provider_stats": null,
+  "mode": "live",
+  "notice": "Exploratory live-provider evidence on a small synthetic dataset. Interpret quality, token, and latency deltas together; this is not broad proof of superiority.",
+  "pairwise": [
+    {
+      "baseline": "single",
+      "candidate": "dag",
+      "losses": 0,
+      "mean_grounded_correctness_delta": 0.3333333333333333,
+      "paired_count": 3,
+      "ties": 2,
+      "wins": 1
+    },
+    {
+      "baseline": "single",
+      "candidate": "collaborative",
+      "losses": 0,
+      "mean_grounded_correctness_delta": 0.5,
+      "paired_count": 3,
+      "ties": 1,
+      "wins": 2
+    }
+  ],
+  "provider": {
+    "model": "gpt-4.1",
+    "name": "process-configured-openai-compatible"
+  },
+  "revision": {
+    "dirty": true,
+    "sha": "f3bde449422614a359c78b466da6395a26c62de5"
+  },
+  "runs": [
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "approval-policy",
+      "citation_f1": 1.0,
+      "citation_fn": 0,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 1.0,
+      "citation_tp": 8,
+      "client_duration_ms": 9026,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "not_compliant",
+            "citations": [
+              "E1",
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "block_deployment",
+            "citations": [
+              "E1",
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "approval-policy"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 4,
+      "repetition": 0,
+      "run_duration_ms": 9003,
+      "run_id": "0d7e005b-ec86-40f4-9298-6188af459892",
+      "run_status": "Success",
+      "task_count": 2,
+      "task_failures": 0,
+      "task_names": [
+        "discussion",
+        "final"
+      ],
+      "total_tokens": 4423,
+      "variant": "collaborative"
+    },
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "approval-policy",
+      "citation_f1": 1.0,
+      "citation_fn": 0,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 1.0,
+      "citation_tp": 8,
+      "client_duration_ms": 3898,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "not_compliant",
+            "citations": [
+              "E1",
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "block_deployment",
+            "citations": [
+              "E1",
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "approval-policy"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 3,
+      "repetition": 0,
+      "run_duration_ms": 3862,
+      "run_id": "b23a1d6b-4426-4afc-835c-af81ad663b3a",
+      "run_status": "Success",
+      "task_count": 3,
+      "task_failures": 0,
+      "task_names": [
+        "challenge",
+        "extract",
+        "final"
+      ],
+      "total_tokens": 2885,
+      "variant": "dag"
+    },
+    {
+      "agent_count": 1,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": false,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": false,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "approval-policy",
+      "citation_f1": 0.6666666666666666,
+      "citation_fn": 4,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 0.5,
+      "citation_tp": 4,
+      "client_duration_ms": 1007,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 0,
+      "grounded_correctness": 0.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "not_compliant",
+            "citations": [
+              "E1",
+              "E2"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "block_deployment",
+            "citations": [
+              "E1",
+              "E2"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "approval-policy"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 1,
+      "repetition": 0,
+      "run_duration_ms": 981,
+      "run_id": "77f29cbf-4395-4d87-a5fc-fb9bb93048ef",
+      "run_status": "Success",
+      "task_count": 1,
+      "task_failures": 0,
+      "task_names": [
+        "final"
+      ],
+      "total_tokens": 600,
+      "variant": "single"
+    },
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "incident-rollback",
+      "citation_f1": 1.0,
+      "citation_fn": 0,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 1.0,
+      "citation_tp": 5,
+      "client_duration_ms": 12946,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "rollback_r17",
+            "citations": [
+              "E2",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "database",
+            "citations": [
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "incident-rollback"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 4,
+      "repetition": 0,
+      "run_duration_ms": 12916,
+      "run_id": "3bfb0be1-e0c2-419c-b336-fa7464866e77",
+      "run_status": "Success",
+      "task_count": 2,
+      "task_failures": 0,
+      "task_names": [
+        "discussion",
+        "final"
+      ],
+      "total_tokens": 4757,
+      "variant": "collaborative"
+    },
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": false,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "incident-rollback",
+      "citation_f1": 0.888888888888889,
+      "citation_fn": 1,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 0.8,
+      "citation_tp": 4,
+      "client_duration_ms": 5598,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 1,
+      "grounded_correctness": 0.5,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "rollback_r17",
+            "citations": [
+              "E2",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "database",
+            "citations": [
+              "E2",
+              "E3"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "incident-rollback"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 3,
+      "repetition": 0,
+      "run_duration_ms": 5569,
+      "run_id": "790acd23-708b-4234-8b9d-760ffbe3ab64",
+      "run_status": "Success",
+      "task_count": 3,
+      "task_failures": 0,
+      "task_names": [
+        "challenge",
+        "extract",
+        "final"
+      ],
+      "total_tokens": 2816,
+      "variant": "dag"
+    },
+    {
+      "agent_count": 1,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": false,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "incident-rollback",
+      "citation_f1": 0.7499999999999999,
+      "citation_fn": 2,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 0.6,
+      "citation_tp": 3,
+      "client_duration_ms": 1090,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 1,
+      "grounded_correctness": 0.5,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "rollback_r17",
+            "citations": [
+              "E2",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "database",
+            "citations": [
+              "E3"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "incident-rollback"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 1,
+      "repetition": 0,
+      "run_duration_ms": 1070,
+      "run_id": "4377d731-70e1-4a6d-af95-e5207cad0006",
+      "run_status": "Success",
+      "task_count": 1,
+      "task_failures": 0,
+      "task_names": [
+        "final"
+      ],
+      "total_tokens": 623,
+      "variant": "single"
+    },
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "pod-capacity",
+      "citation_f1": 0.9090909090909091,
+      "citation_fn": 0,
+      "citation_fp": 1,
+      "citation_precision": 0.8333333333333334,
+      "citation_recall": 1.0,
+      "citation_tp": 5,
+      "client_duration_ms": 8752,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "five_pods",
+            "citations": [
+              "E1",
+              "E2",
+              "E3",
+              "E4"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "ten_gib",
+            "citations": [
+              "E1",
+              "E2"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "pod-capacity"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 4,
+      "repetition": 0,
+      "run_duration_ms": 8723,
+      "run_id": "568d8406-befe-49e5-b16f-97a61555e360",
+      "run_status": "Success",
+      "task_count": 2,
+      "task_failures": 0,
+      "task_names": [
+        "discussion",
+        "final"
+      ],
+      "total_tokens": 4372,
+      "variant": "collaborative"
+    },
+    {
+      "agent_count": 3,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "pod-capacity",
+      "citation_f1": 1.0,
+      "citation_fn": 0,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 1.0,
+      "citation_tp": 5,
+      "client_duration_ms": 4123,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "five_pods",
+            "citations": [
+              "E1",
+              "E2",
+              "E3"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "ten_gib",
+            "citations": [
+              "E1",
+              "E2"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "pod-capacity"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 3,
+      "repetition": 0,
+      "run_duration_ms": 4096,
+      "run_id": "f2566288-39d0-4cda-b0ba-428fd14c9fae",
+      "run_status": "Success",
+      "task_count": 3,
+      "task_failures": 0,
+      "task_names": [
+        "challenge",
+        "extract",
+        "final"
+      ],
+      "total_tokens": 2855,
+      "variant": "dag"
+    },
+    {
+      "agent_count": 1,
+      "answer_details": [
+        {
+          "correct": true,
+          "question_id": "Q1",
+          "support_satisfied": true,
+          "unknown_citations": []
+        },
+        {
+          "correct": true,
+          "question_id": "Q2",
+          "support_satisfied": true,
+          "unknown_citations": []
+        }
+      ],
+      "answers_correct": 2,
+      "answers_total": 2,
+      "cached_tokens": 0,
+      "case_id": "pod-capacity",
+      "citation_f1": 1.0,
+      "citation_fn": 0,
+      "citation_fp": 0,
+      "citation_precision": 1.0,
+      "citation_recall": 1.0,
+      "citation_tp": 5,
+      "client_duration_ms": 958,
+      "correctness": 1.0,
+      "execution_ok": true,
+      "failure_reason": null,
+      "grounded_correct": 2,
+      "grounded_correctness": 1.0,
+      "model_output": {
+        "answers": [
+          {
+            "answer": "five_pods",
+            "citations": [
+              "E1",
+              "E2",
+              "E3"
+            ],
+            "question_id": "Q1"
+          },
+          {
+            "answer": "ten_gib",
+            "citations": [
+              "E1",
+              "E2"
+            ],
+            "question_id": "Q2"
+          }
+        ],
+        "case_id": "pod-capacity"
+      },
+      "observed_llm_calls": null,
+      "output_parse_ok": true,
+      "output_schema_ok": true,
+      "planned_llm_calls": 1,
+      "repetition": 0,
+      "run_duration_ms": 929,
+      "run_id": "d854331c-bb81-4e34-a46c-190e06d2e7f8",
+      "run_status": "Success",
+      "task_count": 1,
+      "task_failures": 0,
+      "task_names": [
+        "final"
+      ],
+      "total_tokens": 606,
+      "variant": "single"
+    }
+  ],
+  "schema_version": "ironcrew.crew-eval.v1",
+  "summary": [
+    {
+      "citation_f1": 0.8,
+      "citation_precision": 1.0,
+      "citation_recall": 0.6666666666666666,
+      "correctness": 1.0,
+      "execution_success_rate": 1.0,
+      "grounded_correctness": 0.5,
+      "latency_ms": {
+        "median": 981.0,
+        "p95": 1070.0
+      },
+      "parse_success_rate": 1.0,
+      "run_count": 3,
+      "schema_success_rate": 1.0,
+      "tokens": {
+        "median": 606.0,
+        "total": 1829
+      },
+      "variant": "single"
+    },
+    {
+      "citation_f1": 0.9714285714285714,
+      "citation_precision": 1.0,
+      "citation_recall": 0.9444444444444444,
+      "correctness": 1.0,
+      "execution_success_rate": 1.0,
+      "grounded_correctness": 0.8333333333333334,
+      "latency_ms": {
+        "median": 4096.0,
+        "p95": 5569.0
+      },
+      "parse_success_rate": 1.0,
+      "run_count": 3,
+      "schema_success_rate": 1.0,
+      "tokens": {
+        "median": 2855.0,
+        "total": 8556
+      },
+      "variant": "dag"
+    },
+    {
+      "citation_f1": 0.972972972972973,
+      "citation_precision": 0.9473684210526315,
+      "citation_recall": 1.0,
+      "correctness": 1.0,
+      "execution_success_rate": 1.0,
+      "grounded_correctness": 1.0,
+      "latency_ms": {
+        "median": 9003.0,
+        "p95": 12916.0
+      },
+      "parse_success_rate": 1.0,
+      "run_count": 3,
+      "schema_success_rate": 1.0,
+      "tokens": {
+        "median": 4423.0,
+        "total": 13552
+      },
+      "variant": "collaborative"
+    }
+  ]
+}

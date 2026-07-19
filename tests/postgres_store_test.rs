@@ -16,7 +16,8 @@ use ironcrew::engine::audit::{AuditEvent, AuditFilter};
 use ironcrew::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
     IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
-    IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION, RunFenceHeartbeat,
+    IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION, RunCancellationRequest,
+    RunFenceHeartbeat,
 };
 use ironcrew::engine::postgres_store::PostgresStore;
 use ironcrew::engine::run_history::{
@@ -766,7 +767,7 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(idempotency_columns, 19);
+    assert_eq!(idempotency_columns, 20);
     let idempotency_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes \
          WHERE schemaname = current_schema() AND tablename = $1",
@@ -2733,5 +2734,138 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
             .await
             .unwrap(),
         RunFenceHeartbeat::Lost
+    );
+}
+
+#[tokio::test]
+async fn pg_keyed_run_cancellation_crosses_instance_boundary() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_keyed_run_cancellation_crosses_instance_boundary: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "cancel_run_";
+    reset(&url, prefix).await;
+    let owner = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let peer = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut claim = idempotency_claim(
+        'a',
+        'b',
+        RUN_OPERATION,
+        "cancel-me",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    claim.response_status = Some(202);
+    claim.response_body = Some("{\"run_id\":\"cancel-me\"}".into());
+    assert!(matches!(
+        owner
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    owner
+        .save_run_intent(intent(
+            "cancel-me",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        peer.request_run_cancellation("cancel-me", "other-flow")
+            .await
+            .unwrap(),
+        RunCancellationRequest::NotFound
+    );
+    assert_eq!(
+        peer.request_run_cancellation("cancel-me", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::Requested {
+            owner_instance_id: "owner-a".into(),
+            already_requested: false,
+        }
+    );
+    assert_eq!(
+        peer.request_run_cancellation("cancel-me", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::Requested {
+            owner_instance_id: "owner-a".into(),
+            already_requested: true,
+        }
+    );
+    assert_eq!(
+        owner
+            .heartbeat_idempotent_run(
+                "cancel-me",
+                &claim.key_hash,
+                &claim.attempt_id,
+                "9999-12-31T23:59:59Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::CancelRequested
+    );
+
+    owner
+        .save_run_intent(intent(
+            "unkeyed-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.request_run_cancellation("unkeyed-run", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::NotDurable
+    );
+
+    owner
+        .update_run_completion(
+            "cancel-me",
+            RunCompletion {
+                status: RunStatus::Aborted,
+                finished_at: "2026-07-19T12:01:00Z".into(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.request_run_cancellation("cancel-me", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::Terminal(RunStatus::Aborted)
+    );
+    assert_eq!(
+        peer.request_run_cancellation("missing", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::NotFound
     );
 }
