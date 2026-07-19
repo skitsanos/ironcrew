@@ -108,7 +108,27 @@ jobs:
           cargo test --locked --all-features
           --test postgres_store_test
           --test multi_replica_http_test
+          --test two_process_replica_acceptance_test
           -- --test-threads=1
+      - name: Run replica soak contract smoke
+        run: |
+          python3 -m unittest discover \
+            -s evaluations/replica-soak \
+            -p 'test_*.py'
+          DATABASE_URL="$IRONCREW_TEST_PG_URL" \
+          python3 evaluations/replica-soak/soak.py \
+            --binary target/debug/ironcrew \
+            --runs 2 \
+            --duration-seconds 30 \
+            --concurrency 1 \
+            --report /tmp/ironcrew-replica-soak-ci/result.json
+      - name: Upload replica soak contract evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-soak-contract
+          path: /tmp/ironcrew-replica-soak-ci
+          if-no-files-found: ignore
 
   windows-check:
     name: Windows compile check

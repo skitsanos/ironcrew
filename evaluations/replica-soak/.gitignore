@@ -1,0 +1,4 @@
+reports/*.json
+reports/*.log
+!reports/.gitignore
+__pycache__/

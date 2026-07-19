@@ -379,13 +379,15 @@ service.
 
 **Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once per process startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run once during each process boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
 
-The current PostgreSQL runtime role is also the bootstrap/migration role: it
-must be able to create and alter IronCrew tables, indexes, functions, and
-triggers. An advisory lock serializes concurrent replica bootstrap, and the
-schema-version marker avoids repeating the event-journal reconciliation work,
-but it does not remove the DDL requirement. A separate migration job plus a
-least-privileged runtime role is a future hardening step; do not revoke DDL
-permissions from the configured role yet.
+The current PostgreSQL runtime role is also the bootstrap/migration role. Each
+process starts an atomic bootstrap transaction, takes an exclusive
+transaction-scoped advisory lock, and may create or alter IronCrew tables and
+indexes and create or replace functions and triggers before verifying the
+schema. The configured role therefore needs schema-owner-like DDL permissions
+over the IronCrew schema objects today; a DML-only runtime role is not
+supported. A separate migration job plus a least-privileged runtime role is a
+future hardening step; do not revoke DDL permissions from the configured role
+yet.
 
 **Terminal-write outage memory bound.** A healthy terminal write persists the
 full task-result payload. If storage rejects that write, IronCrew will retain
@@ -639,10 +641,19 @@ spec:
   ports: [{ port: 80, targetPort: 8080 }]
 ```
 
-The startup window above is five minutes, which covers the default exponential
-PostgreSQL connection retries. Startup probes prevent liveness/readiness checks
-from interfering during that window; readiness then removes a pod from Service
-traffic during a later storage outage without killing it.
+The startup probe above allows 300 seconds, but that does not cover the
+worst-case default PostgreSQL retry envelope. Ten retries after the initial
+attempt mean 11 connection attempts. If every attempt consumes the default
+30-second timeout, the attempts take up to 330 seconds and the ten backoffs add
+another 181 seconds (`1 + 2 + 4 + 8 + 16 + 5 * 30`), for approximately 511
+seconds before the PostgreSQL version check and bootstrap begin. Bootstrap can
+then wait on its advisory lock and database DDL without a separate bounded
+timeout. Treat 300 seconds as a deployment budget: either increase the startup
+probe or lower the retry, backoff, and connection-timeout settings so their
+configured envelope fits with bootstrap headroom. Startup probes prevent
+liveness/readiness checks from interfering during that window; readiness then
+removes a pod from Service traffic during a later storage outage without
+killing it.
 
 ### Flows as ConfigMap
 
@@ -664,7 +675,10 @@ production baseline. It deliberately uses:
 - one replica with Deployment strategy `Recreate` as the conservative baseline
   for applications that also use owner-local conversations or unkeyed controls
 - `/health/ready` for startup and readiness, and `/health/live` for liveness
-- a five-minute startup budget for PostgreSQL initialization/retries
+- a 300-second startup-probe budget, which is shorter than the approximately
+  511-second worst-case default connection-retry envelope and excludes
+  bootstrap advisory-lock and DDL wait time; tune the probe and database retry
+  settings together
 - `restricted-v2`-compatible security settings: arbitrary non-root UID, no
   privilege escalation, all capabilities dropped, runtime-default seccomp, and
   a read-only root filesystem
