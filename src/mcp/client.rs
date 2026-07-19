@@ -129,6 +129,8 @@ struct McpProcessGroupGuard {
 
 impl McpProcessGroupGuard {
     fn new(process_id: Option<u32>) -> Self {
+        #[cfg(not(unix))]
+        let _ = process_id;
         Self {
             #[cfg(unix)]
             pgid: process_id.and_then(|id| i32::try_from(id).ok()),

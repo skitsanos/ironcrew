@@ -125,6 +125,8 @@ fn read_options() -> OpenOptions {
     // Opening a FIFO for reading would otherwise wait indefinitely before we
     // could inspect its type. Non-blocking open lets us reject it below.
     options._cap_fs_ext_nonblock(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
     options
 }
 
@@ -209,9 +211,7 @@ fn open_read_file_no_symlinks(root: &Dir, path: &Path) -> std::io::Result<File> 
         return Err(symlink_read_error());
     }
 
-    let mut options = read_options();
-    #[cfg(unix)]
-    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let options = read_options();
     let file = directory.open_with(file_name, &options)?;
     if file.metadata()?.file_type().is_symlink() {
         return Err(symlink_read_error());
