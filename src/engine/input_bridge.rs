@@ -17,9 +17,13 @@ use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::engine::human_input::{
+    DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputReadOutcome,
+    HumanInputRegistrationOutcome,
+};
 use crate::utils::error::{IronCrewError, Result};
 
 /// Default per-question timeout (seconds) when the flow omits `timeout_s`.
@@ -28,6 +32,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// Default cap on simultaneously pending questions per run — a runaway
 /// `foreach_parallel` guard, not a workflow limit.
 const DEFAULT_MAX_PENDING: usize = 16;
+const DEFAULT_MAX_PENDING_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_CHOICES: usize = 100;
@@ -35,10 +40,15 @@ const DEFAULT_MAX_CHOICES_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_ANSWER_BYTES: usize = 64 * 1024;
 const HARD_MAX_TIMEOUT_SECS: u64 = 86_400;
 const HARD_MAX_PENDING: usize = 256;
+const HARD_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const HARD_MAX_CHOICES: usize = 1_000;
 const HARD_MAX_CHOICES_BYTES: usize = 1024 * 1024;
 const HARD_MAX_ANSWER_BYTES: usize = 1024 * 1024;
+const DEFAULT_DURABLE_POLL_INTERVAL_MS: u64 = 500;
+const HARD_MAX_DURABLE_POLL_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_DURABLE_READ_TIMEOUT_MS: u64 = 2_000;
+const HARD_MAX_DURABLE_READ_TIMEOUT_MS: u64 = 30_000;
 
 fn positive_env_limit<T>(name: &str, default: T, hard_max: T) -> T
 where
@@ -69,11 +79,19 @@ fn max_timeout_secs() -> u64 {
     )
 }
 
-fn max_pending() -> usize {
+pub(crate) fn max_pending() -> usize {
     positive_env_limit(
         "IRONCREW_ASK_HUMAN_MAX_PENDING",
         DEFAULT_MAX_PENDING,
         HARD_MAX_PENDING,
+    )
+}
+
+pub(crate) fn max_pending_bytes() -> usize {
+    positive_env_limit(
+        "IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES",
+        DEFAULT_MAX_PENDING_BYTES,
+        HARD_MAX_PENDING_BYTES,
     )
 }
 
@@ -85,6 +103,26 @@ fn max_answer_bytes() -> usize {
     )
 }
 
+fn durable_poll_interval() -> std::time::Duration {
+    let millis = positive_env_limit(
+        "IRONCREW_HITL_POLL_INTERVAL_MS",
+        DEFAULT_DURABLE_POLL_INTERVAL_MS,
+        HARD_MAX_DURABLE_POLL_INTERVAL_MS,
+    )
+    .max(50);
+    std::time::Duration::from_millis(millis)
+}
+
+fn durable_read_timeout() -> std::time::Duration {
+    let millis = positive_env_limit(
+        "IRONCREW_HITL_READ_TIMEOUT_MS",
+        DEFAULT_DURABLE_READ_TIMEOUT_MS,
+        HARD_MAX_DURABLE_READ_TIMEOUT_MS,
+    )
+    .max(100);
+    std::time::Duration::from_millis(millis)
+}
+
 /// Why an HTTP-delivered answer was rejected. Keeping payload validation
 /// distinct from question lookup lets transports return an accurate 4xx
 /// status without parsing error strings.
@@ -92,26 +130,18 @@ fn max_answer_bytes() -> usize {
 pub enum AnswerError {
     #[error("Invalid question answer: {0}")]
     Invalid(String),
+    #[error("Durable human-input transport is unavailable: {0}")]
+    Unavailable(String),
     #[error("Question answer exceeds IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES ({max_bytes})")]
     TooLarge { max_bytes: usize },
     #[error("Unknown or expired question '{question_id}'")]
     UnknownOrExpired { question_id: String },
 }
 
-fn validate_http_answer_size(value: &serde_json::Value) -> std::result::Result<(), AnswerError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buffer.len());
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = Counter(0);
+pub(crate) fn validate_http_answer_size(
+    value: &serde_json::Value,
+) -> std::result::Result<(), AnswerError> {
+    let mut counter = SerializedByteCounter(0);
     serde_json::to_writer(&mut counter, value)
         .map_err(|error| AnswerError::Invalid(error.to_string()))?;
     let max_answer = max_answer_bytes();
@@ -121,6 +151,22 @@ fn validate_http_answer_size(value: &serde_json::Value) -> std::result::Result<(
         });
     }
     Ok(())
+}
+
+struct SerializedByteCounter(usize);
+
+impl std::io::Write for SerializedByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("serialized value is too large"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn validate_answer_size(value: &serde_json::Value) -> Result<()> {
@@ -138,7 +184,7 @@ pub enum BridgeMode {
 
 /// Public metadata for a pending question (everything but the wake-up
 /// channel) — the shape returned by `GET /flows/{flow}/questions/{run_id}`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuestionInfo {
     pub question_id: String,
     pub prompt: String,
@@ -150,10 +196,98 @@ pub struct QuestionInfo {
     pub kind: String,
 }
 
+fn serialized_question_bytes(question: &QuestionInfo) -> Result<usize> {
+    let mut counter = SerializedByteCounter(0);
+    serde_json::to_writer(&mut counter, question).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Failed to measure pending human-input metadata: {error}"
+        ))
+    })?;
+    Ok(counter.0)
+}
+
 struct PendingQuestion {
     info: QuestionInfo,
     tx: oneshot::Sender<serde_json::Value>,
     generation: u64,
+    metadata_bytes: usize,
+    transport: PendingTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTransport {
+    /// The local entry exists only to reserve its id while the durable store
+    /// transaction is in flight. It must not be published or answered yet.
+    Registering,
+    ProcessLocal,
+    SharedStore,
+}
+
+#[derive(Clone)]
+struct DurableInputContext {
+    store: std::sync::Arc<dyn crate::engine::store::StateStore>,
+    flow: String,
+    run_id: String,
+    key_hash: String,
+    attempt_id: String,
+}
+
+impl DurableInputContext {
+    fn registration(&self, question: QuestionInfo) -> DurableHumanInputRegistration {
+        DurableHumanInputRegistration {
+            flow: self.flow.clone(),
+            run_id: self.run_id.clone(),
+            question,
+            key_hash: self.key_hash.clone(),
+            attempt_id: self.attempt_id.clone(),
+        }
+    }
+}
+
+/// Best-effort durable row cleanup for cancelled suspension futures. Normal
+/// completion calls `close`; dropping an in-flight branch schedules the same
+/// fenced delete without blocking the executor.
+struct DurableRegistrationCleanup {
+    context: DurableInputContext,
+    registration: Option<DurableHumanInputRegistration>,
+}
+
+impl DurableRegistrationCleanup {
+    fn new(context: DurableInputContext, registration: DurableHumanInputRegistration) -> Self {
+        Self {
+            context,
+            registration: Some(registration),
+        }
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        let Some(registration) = self.registration.as_ref() else {
+            return Ok(());
+        };
+        self.context.store.close_human_input(registration).await?;
+        self.registration = None;
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.registration = None;
+    }
+}
+
+impl Drop for DurableRegistrationCleanup {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let store = self.context.store.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = store.close_human_input(&registration).await {
+                    tracing::warn!(%error, "Cancelled human-input mailbox cleanup failed");
+                }
+            });
+        }
+    }
 }
 
 /// How a question resolved, from the asker's point of view.
@@ -188,6 +322,10 @@ pub struct AskHumanContext {
 pub struct InputBridge {
     mode: BridgeMode,
     pending: Mutex<HashMap<String, PendingQuestion>>,
+    /// Exact keyed-run fence used by PostgreSQL to share questions and route
+    /// encrypted answers across replicas. Unkeyed and local-store runs leave
+    /// this unset and retain the in-process oneshot transport.
+    durable: Option<DurableInputContext>,
     /// Only one attended terminal reader may own stdin at a time. HTTP mode
     /// never acquires this lock and retains fully concurrent questions.
     tty_prompt: tokio::sync::Mutex<()>,
@@ -282,12 +420,44 @@ impl InputBridge {
         Self {
             mode,
             pending: Mutex::new(HashMap::new()),
+            durable: None,
             tty_prompt: tokio::sync::Mutex::new(()),
             run_status_waiters: Mutex::new(0),
             run_status_updates: tokio::sync::Mutex::new(()),
             next_question_generation: AtomicU64::new(1),
             expired: AtomicBool::new(false),
         }
+    }
+
+    /// Create the HTTP bridge for a keyed run that may have a shared durable
+    /// human-input mailbox. Backends without that capability return
+    /// `NotDurable` during registration and transparently retain local
+    /// delivery semantics.
+    pub fn new_durable_http(
+        store: std::sync::Arc<dyn crate::engine::store::StateStore>,
+        flow: impl Into<String>,
+        run_id: impl Into<String>,
+        key_hash: impl Into<String>,
+        attempt_id: impl Into<String>,
+    ) -> Self {
+        let mut bridge = Self::new(BridgeMode::Http);
+        bridge.durable = Some(DurableInputContext {
+            store,
+            flow: flow.into(),
+            run_id: run_id.into(),
+            key_hash: key_hash.into(),
+            attempt_id: attempt_id.into(),
+        });
+        bridge
+    }
+
+    /// Whether questions registered by this bridge can be discovered and
+    /// answered through another replica. Only keyed HTTP runs backed by a
+    /// store with an explicitly configured encrypted mailbox qualify.
+    pub fn supports_shared_human_input(&self) -> bool {
+        self.durable
+            .as_ref()
+            .is_some_and(|context| context.store.supports_durable_human_input())
     }
 
     fn begin_run_status_wait(
@@ -390,7 +560,11 @@ impl InputBridge {
     /// endpoint and for UIs recovering state after a missed SSE event.
     pub fn list(&self) -> Vec<QuestionInfo> {
         let map = self.pending.lock().expect("input bridge lock poisoned");
-        let mut infos: Vec<QuestionInfo> = map.values().map(|q| q.info.clone()).collect();
+        let mut infos: Vec<QuestionInfo> = map
+            .values()
+            .filter(|question| question.transport != PendingTransport::Registering)
+            .map(|question| question.info.clone())
+            .collect();
         infos.sort_by(|a, b| a.asked_at.cmp(&b.asked_at));
         infos
     }
@@ -428,19 +602,93 @@ impl InputBridge {
         value: serde_json::Value,
     ) -> std::result::Result<(), AnswerError> {
         validate_http_answer_size(&value)?;
-        let q = self
-            .pending
-            .lock()
-            .expect("input bridge lock poisoned")
-            .remove(question_id)
-            .ok_or_else(|| AnswerError::UnknownOrExpired {
-                question_id: question_id.to_string(),
-            })?;
+        let q = {
+            let mut pending = self.pending.lock().expect("input bridge lock poisoned");
+            let Some(question) = pending.get(question_id) else {
+                return Err(AnswerError::UnknownOrExpired {
+                    question_id: question_id.to_string(),
+                });
+            };
+            if question.transport == PendingTransport::Registering {
+                return Err(AnswerError::Unavailable(
+                    "question registration is still in progress".into(),
+                ));
+            }
+            pending
+                .remove(question_id)
+                .expect("checked pending question must still exist")
+        };
         // Send fails only if the asker gave up (timed out) between our
         // remove and this send — surface that as expired, not success.
         q.tx.send(value).map_err(|_| AnswerError::UnknownOrExpired {
             question_id: question_id.to_string(),
         })
+    }
+
+    /// Accept an answer from the HTTP control plane. Durable questions first
+    /// perform the encrypted PostgreSQL compare-and-set, making the first
+    /// answer win across all replicas. The owner then wakes its local waiter;
+    /// a peer reports the durable queue result and the owner's bounded poller
+    /// performs that wake-up shortly afterwards.
+    pub async fn answer_http(
+        &self,
+        question_id: &str,
+        value: serde_json::Value,
+    ) -> std::result::Result<HumanInputAnswerOutcome, AnswerError> {
+        validate_http_answer_size(&value)?;
+        let transport = {
+            let pending = self.pending.lock().expect("input bridge lock poisoned");
+            let question =
+                pending
+                    .get(question_id)
+                    .ok_or_else(|| AnswerError::UnknownOrExpired {
+                        question_id: question_id.to_string(),
+                    })?;
+            question.transport
+        };
+
+        let durable = match transport {
+            PendingTransport::Registering => {
+                return Err(AnswerError::Unavailable(
+                    "question registration is still in progress".into(),
+                ));
+            }
+            PendingTransport::ProcessLocal => {
+                self.answer(question_id, value)?;
+                return Ok(HumanInputAnswerOutcome::NotDurable);
+            }
+            PendingTransport::SharedStore => self
+                .durable
+                .as_ref()
+                .expect("shared question requires durable bridge context")
+                .clone(),
+        };
+
+        match durable
+            .store
+            .answer_human_input(&durable.flow, &durable.run_id, question_id, &value)
+            .await
+            .map_err(|error| AnswerError::Unavailable(error.to_string()))?
+        {
+            outcome @ HumanInputAnswerOutcome::Queued { .. } => {
+                // A successful mailbox CAS is authoritative. Best-effort
+                // local wake-up minimizes owner latency; if the waiter crossed
+                // its timeout boundary, the queued response remains truthful
+                // and the normal close path removes the row.
+                let _ = self.answer(question_id, value);
+                Ok(outcome)
+            }
+            HumanInputAnswerOutcome::AlreadyAnswered => {
+                Ok(HumanInputAnswerOutcome::AlreadyAnswered)
+            }
+            HumanInputAnswerOutcome::NotFound => Err(AnswerError::UnknownOrExpired {
+                question_id: question_id.to_string(),
+            }),
+            HumanInputAnswerOutcome::NotDurable => {
+                self.answer(question_id, value)?;
+                Ok(HumanInputAnswerOutcome::NotDurable)
+            }
+        }
     }
 
     /// Ask a question and suspend until it resolves. Emitting events and
@@ -537,15 +785,79 @@ impl InputBridge {
         kind: &str,
         on_ready: impl FnOnce(),
     ) -> Result<AskOutcome> {
-        let (rx, generation) = self.register(question_id, prompt, choices, timeout_s, kind)?;
+        let (rx, generation, info) =
+            self.register(question_id, prompt, choices, timeout_s, kind)?;
         let _registration = PendingRegistration {
             bridge: self,
             question_id,
             generation,
         };
+        let mut durable_cleanup = None;
+        let durable_registration = if let Some(durable) = self.durable.as_ref() {
+            let registration = durable.registration(info);
+            // Arm cleanup before the registration write. If this future is
+            // cancelled after PostgreSQL commits but before it returns, Drop
+            // still owns a fully fenced best-effort delete.
+            durable_cleanup = Some(DurableRegistrationCleanup::new(
+                durable.clone(),
+                registration.clone(),
+            ));
+            let outcome = durable.store.register_human_input(&registration).await?;
+            {
+                let mut pending = self.pending.lock().expect("input bridge lock poisoned");
+                let question = pending.get_mut(question_id).ok_or_else(|| {
+                    IronCrewError::Validation(format!(
+                        "Question '{question_id}' expired during durable registration"
+                    ))
+                })?;
+                if question.generation != generation {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Question '{question_id}' was replaced during durable registration"
+                    )));
+                }
+                question.transport = match outcome {
+                    HumanInputRegistrationOutcome::Registered => PendingTransport::SharedStore,
+                    HumanInputRegistrationOutcome::NotDurable => PendingTransport::ProcessLocal,
+                };
+            }
+            match outcome {
+                HumanInputRegistrationOutcome::Registered => Some(registration),
+                HumanInputRegistrationOutcome::NotDurable => {
+                    durable_cleanup
+                        .as_mut()
+                        .expect("durable registration cleanup must be armed")
+                        .disarm();
+                    None
+                }
+            }
+        } else {
+            None
+        };
         on_ready();
 
-        Ok(await_http_answer(rx, std::time::Duration::from_secs(timeout_s)).await)
+        let outcome = await_http_answer(
+            rx,
+            std::time::Duration::from_secs(timeout_s),
+            self.durable.as_ref(),
+            durable_registration.as_ref(),
+        )
+        .await;
+        let cleanup = match durable_cleanup.as_mut() {
+            Some(cleanup) => cleanup.close().await,
+            None => Ok(()),
+        };
+        match (outcome, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(outcome), Err(cleanup_error)) => {
+                tracing::warn!(%cleanup_error, "Human-input mailbox cleanup will retry in background");
+                Ok(outcome)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => {
+                tracing::warn!(%cleanup_error, "Human-input cleanup also failed after polling error");
+                Err(error)
+            }
+        }
     }
 
     fn register(
@@ -555,7 +867,7 @@ impl InputBridge {
         choices: &[String],
         timeout_s: u64,
         kind: &str,
-    ) -> Result<(oneshot::Receiver<serde_json::Value>, u64)> {
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, u64, QuestionInfo)> {
         if question_id.is_empty()
             || question_id.len() > 128
             || question_id.chars().any(char::is_control)
@@ -569,6 +881,19 @@ impl InputBridge {
                 "Question kind must be 'question' or 'approval'".into(),
             ));
         }
+        let info = QuestionInfo {
+            question_id: question_id.to_string(),
+            prompt: prompt.to_string(),
+            choices: choices.to_vec(),
+            asked_at: chrono::Utc::now().to_rfc3339(),
+            timeout_s,
+            kind: kind.to_string(),
+        };
+        // Count the exact retained JSON representation rather than raw input
+        // bytes: escaping control characters can otherwise expand metadata by
+        // several times when it is encrypted or returned by the API.
+        let metadata_bytes = serialized_question_bytes(&info)?;
+
         let mut map = self.pending.lock().expect("input bridge lock poisoned");
         if self.expired.load(Ordering::Acquire) {
             return Err(IronCrewError::Validation(
@@ -587,6 +912,18 @@ impl InputBridge {
                 map.len()
             )));
         }
+        let retained_bytes = map.values().try_fold(0usize, |total, question| {
+            total.checked_add(question.metadata_bytes)
+        });
+        let pending_limit = max_pending_bytes();
+        if retained_bytes
+            .and_then(|retained| retained.checked_add(metadata_bytes))
+            .is_none_or(|total| total > pending_limit)
+        {
+            return Err(IronCrewError::Validation(format!(
+                "Pending ask_human metadata exceeds IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES ({pending_limit})"
+            )));
+        }
         let (tx, rx) = oneshot::channel();
         let generation = self
             .next_question_generation
@@ -594,37 +931,118 @@ impl InputBridge {
         map.insert(
             question_id.to_string(),
             PendingQuestion {
-                info: QuestionInfo {
-                    question_id: question_id.to_string(),
-                    prompt: prompt.to_string(),
-                    choices: choices.to_vec(),
-                    asked_at: chrono::Utc::now().to_rfc3339(),
-                    timeout_s,
-                    kind: kind.to_string(),
-                },
+                info: info.clone(),
                 tx,
                 generation,
+                metadata_bytes,
+                transport: if self.durable.is_some() {
+                    PendingTransport::Registering
+                } else {
+                    PendingTransport::ProcessLocal
+                },
             },
         );
-        Ok((rx, generation))
+        Ok((rx, generation, info))
+    }
+}
+
+enum DurablePollResult {
+    Read(Result<HumanInputReadOutcome>),
+    QueryTimedOut,
+}
+
+async fn poll_durable_answer(
+    context: Option<(
+        std::sync::Arc<dyn crate::engine::store::StateStore>,
+        DurableHumanInputRegistration,
+    )>,
+    delay: std::time::Duration,
+) -> DurablePollResult {
+    let Some((store, registration)) = context else {
+        return std::future::pending::<DurablePollResult>().await;
+    };
+    tokio::time::sleep(delay).await;
+    match tokio::time::timeout(
+        durable_read_timeout(),
+        store.read_human_input(&registration),
+    )
+    .await
+    {
+        Ok(result) => DurablePollResult::Read(result),
+        Err(_) => DurablePollResult::QueryTimedOut,
     }
 }
 
 async fn await_http_answer(
-    rx: oneshot::Receiver<serde_json::Value>,
+    mut rx: oneshot::Receiver<serde_json::Value>,
     timeout: std::time::Duration,
-) -> AskOutcome {
-    tokio::select! {
-        // If delivery and the deadline become observable in the same poll,
-        // an answer already accepted by `answer()` deterministically wins.
-        biased;
-        answer = rx => match answer {
-            Ok(value) => AskOutcome::Answered(value),
-            // Sender dropped without a send — only possible if the question
-            // was force-removed; treat as timeout.
-            Err(_) => AskOutcome::TimedOut,
-        },
-        _ = tokio::time::sleep(timeout) => AskOutcome::TimedOut,
+    durable: Option<&DurableInputContext>,
+    registration: Option<&DurableHumanInputRegistration>,
+) -> Result<AskOutcome> {
+    let mut deadline = std::pin::pin!(tokio::time::sleep(timeout));
+    let poll_context = durable
+        .zip(registration)
+        .map(|(context, registration)| (context.store.clone(), registration.clone()));
+    let mut poll = Box::pin(poll_durable_answer(
+        poll_context.clone(),
+        std::time::Duration::ZERO,
+    ));
+    let mut transient_failures = 0u32;
+
+    loop {
+        tokio::select! {
+            // If delivery and the deadline become observable in the same poll,
+            // an answer already accepted by `answer()` deterministically wins.
+            biased;
+            answer = &mut rx => return Ok(match answer {
+                Ok(value) => AskOutcome::Answered(value),
+                // Sender dropped without a send — only possible if the question
+                // was force-removed; treat as timeout.
+                Err(_) => AskOutcome::TimedOut,
+            }),
+            poll_result = &mut poll => {
+                match poll_result {
+                    DurablePollResult::Read(Ok(HumanInputReadOutcome::Answered(value))) => {
+                        return Ok(AskOutcome::Answered(value));
+                    }
+                    DurablePollResult::Read(Ok(
+                        HumanInputReadOutcome::Pending
+                        | HumanInputReadOutcome::NotFound
+                        | HumanInputReadOutcome::NotDurable,
+                    )) => {
+                        transient_failures = 0;
+                    }
+                    DurablePollResult::Read(Err(IronCrewError::Io(error))) => {
+                        transient_failures = transient_failures.saturating_add(1);
+                        if transient_failures == 1 || transient_failures.is_power_of_two() {
+                            tracing::warn!(
+                                transient_failures,
+                                %error,
+                                "Transient durable human-input read failed; retrying"
+                            );
+                        }
+                    }
+                    DurablePollResult::Read(Err(error)) => return Err(error),
+                    DurablePollResult::QueryTimedOut => {
+                        transient_failures = transient_failures.saturating_add(1);
+                        if transient_failures == 1 || transient_failures.is_power_of_two() {
+                            tracing::warn!(
+                                transient_failures,
+                                timeout_ms = durable_read_timeout().as_millis(),
+                                "Durable human-input read timed out; retrying"
+                            );
+                        }
+                    }
+                }
+                poll.set(poll_durable_answer(
+                    poll_context.clone(),
+                    durable_poll_interval(),
+                ));
+            },
+            _ = &mut deadline => {
+                return Ok(AskOutcome::TimedOut);
+            }
+        }
     }
 }
 
@@ -926,11 +1344,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provisional_durable_question_is_hidden_and_unanswerable() {
+        use crate::engine::run_history::JsonFileStore;
+        use crate::engine::store::StateStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store: std::sync::Arc<dyn StateStore> =
+            std::sync::Arc::new(JsonFileStore::new(temp.path().join(".ironcrew")).unwrap());
+        let bridge = InputBridge::new_durable_http(
+            store,
+            "test",
+            uuid::Uuid::new_v4().to_string(),
+            "key-hash",
+            "attempt-id",
+        );
+        let (receiver, _generation, _info) = bridge
+            .register("q-registering", "Still committing?", &[], 30, "question")
+            .unwrap();
+
+        assert!(bridge.list().is_empty());
+        assert!(matches!(
+            bridge.answer("q-registering", json!("too early")),
+            Err(AnswerError::Unavailable(_))
+        ));
+        assert!(matches!(
+            bridge
+                .answer_http("q-registering", json!("too early"))
+                .await,
+            Err(AnswerError::Unavailable(_))
+        ));
+
+        bridge
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut("q-registering")
+            .unwrap()
+            .transport = PendingTransport::ProcessLocal;
+        assert_eq!(bridge.list().len(), 1);
+        bridge.answer("q-registering", json!("ready")).unwrap();
+        assert_eq!(receiver.await.unwrap(), json!("ready"));
+    }
+
+    #[test]
+    fn pending_metadata_accounting_uses_exact_serialized_size() {
+        let question = QuestionInfo {
+            question_id: "escaped".into(),
+            prompt: "\0\n\t".repeat(128),
+            choices: vec!["\u{1}".repeat(128)],
+            asked_at: "2026-07-19T00:00:00Z".into(),
+            timeout_s: 30,
+            kind: "question".into(),
+        };
+        let measured = serialized_question_bytes(&question).unwrap();
+        let encoded = serde_json::to_vec(&question).unwrap();
+
+        assert_eq!(measured, encoded.len());
+        assert!(
+            measured
+                > question.prompt.len() + question.choices.iter().map(String::len).sum::<usize>(),
+            "JSON escaping must be reflected in the retained-byte budget"
+        );
+    }
+
+    #[tokio::test]
     async fn delivered_answer_wins_when_timeout_is_already_ready() {
         let (tx, rx) = oneshot::channel();
         tx.send(json!("at-the-deadline")).unwrap();
 
-        match await_http_answer(rx, std::time::Duration::ZERO).await {
+        match await_http_answer(rx, std::time::Duration::ZERO, None, None)
+            .await
+            .unwrap()
+        {
             AskOutcome::Answered(value) => assert_eq!(value, json!("at-the-deadline")),
             other => panic!("expected delivered answer to win, got {other:?}"),
         }

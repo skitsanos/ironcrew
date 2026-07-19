@@ -309,9 +309,14 @@ but can be overridden with `IRONCREW_STORE_PATH`. SQLite is a good choice when
 you have many runs and want faster queries or a single-file store.
 
 **PostgreSQL backend.** Set `IRONCREW_STORE=postgres` with `DATABASE_URL` for
-durable Cloud records and restart recovery. It does not distribute active run,
-conversation, question, cancellation, or SSE state, so keep the HTTP service
-at one replica. Pool size is configurable via
+durable cloud records and restart recovery. PostgreSQL coordinates
+idempotency-keyed cancellation and, with the shared HITL encryption keyring,
+encrypted cross-replica question listing/answer delivery. Its bounded run-event
+journal also supports cross-replica run SSE replay with `Last-Event-ID`;
+JSON/SQLite run SSE and every conversation SSE stream remain process-local.
+PostgreSQL does not distribute the active Lua VM or conversation handles, so
+keep one replica when clients require those surfaces through arbitrary
+routing. Pool size is configurable via
 `IRONCREW_DB_POOL_SIZE` (default 10). Table prefix (`IRONCREW_PG_TABLE_PREFIX`)
 allows sharing a database across projects — at most 37 lowercase ASCII letters,
 digits, and underscores are allowed.

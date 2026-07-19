@@ -27,13 +27,18 @@ const DEFAULT_WORK_RATE_PER_MINUTE: u64 = 60;
 const DEFAULT_WORK_BURST: u64 = 10;
 const DEFAULT_CONTROL_RATE_PER_MINUTE: u64 = 120;
 const DEFAULT_CONTROL_BURST: u64 = 20;
+const DEFAULT_OBSERVATION_RATE_PER_MINUTE: u64 = 600;
+const DEFAULT_OBSERVATION_BURST: u64 = 20;
 const HARD_MAX_RATE_PER_MINUTE: u64 = 60_000;
 const HARD_MAX_BURST: u64 = 10_000;
+const HARD_MAX_OBSERVATION_BURST: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MutationClass {
     Work,
     Control,
+    /// Bounded read-side polling that must not consume mutation capacity.
+    Observation,
 }
 
 impl MutationClass {
@@ -41,6 +46,7 @@ impl MutationClass {
         match self {
             Self::Work => "work",
             Self::Control => "control",
+            Self::Observation => "observation",
         }
     }
 }
@@ -89,13 +95,6 @@ impl AdmissionConfig {
                 )?,
             },
         })
-    }
-
-    fn policy(&self, class: MutationClass) -> RatePolicy {
-        match class {
-            MutationClass::Work => self.work,
-            MutationClass::Control => self.control,
-        }
     }
 }
 
@@ -168,6 +167,8 @@ pub struct AdmissionMetrics {
     work_limited: AtomicU64,
     control_admitted: AtomicU64,
     control_limited: AtomicU64,
+    observation_admitted: AtomicU64,
+    observation_limited: AtomicU64,
     internal_errors: AtomicU64,
     quota_rejections: [AtomicU64; 3],
 }
@@ -177,6 +178,7 @@ impl AdmissionMetrics {
         match class {
             MutationClass::Work => self.work_admitted.fetch_add(1, Ordering::Relaxed),
             MutationClass::Control => self.control_admitted.fetch_add(1, Ordering::Relaxed),
+            MutationClass::Observation => self.observation_admitted.fetch_add(1, Ordering::Relaxed),
         };
     }
 
@@ -184,6 +186,7 @@ impl AdmissionMetrics {
         match class {
             MutationClass::Work => self.work_limited.fetch_add(1, Ordering::Relaxed),
             MutationClass::Control => self.control_limited.fetch_add(1, Ordering::Relaxed),
+            MutationClass::Observation => self.observation_limited.fetch_add(1, Ordering::Relaxed),
         };
     }
 
@@ -198,6 +201,7 @@ impl AdmissionMetrics {
 
 pub struct AdmissionController {
     config: AdmissionConfig,
+    observation: RatePolicy,
     buckets: Mutex<HashMap<(PrincipalId, MutationClass), TokenBucket>>,
     metrics: AdmissionMetrics,
     durable_usage: tokio::sync::Mutex<Option<(Instant, IdempotencyUsage)>>,
@@ -205,8 +209,24 @@ pub struct AdmissionController {
 
 impl AdmissionController {
     pub fn new(config: AdmissionConfig) -> Self {
+        Self::new_with_observation(
+            config,
+            RatePolicy {
+                rate_per_minute: DEFAULT_OBSERVATION_RATE_PER_MINUTE,
+                burst: DEFAULT_OBSERVATION_BURST,
+            },
+        )
+    }
+
+    /// Construct an admission controller with an explicit observation policy.
+    ///
+    /// This separate constructor keeps existing `AdmissionConfig` struct
+    /// literals source-compatible while allowing embedders to tune bounded
+    /// read-side polling independently from mutation traffic.
+    pub fn new_with_observation(config: AdmissionConfig, observation: RatePolicy) -> Self {
         Self {
             config,
+            observation,
             buckets: Mutex::new(HashMap::new()),
             metrics: AdmissionMetrics::default(),
             durable_usage: tokio::sync::Mutex::new(None),
@@ -214,7 +234,22 @@ impl AdmissionController {
     }
 
     pub fn from_env() -> Result<Self> {
-        Ok(Self::new(AdmissionConfig::from_env()?))
+        let config = AdmissionConfig::from_env()?;
+        let observation = RatePolicy {
+            rate_per_minute: bounded_env_u64(
+                "IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE",
+                DEFAULT_OBSERVATION_RATE_PER_MINUTE,
+                1,
+                HARD_MAX_RATE_PER_MINUTE,
+            )?,
+            burst: bounded_env_u64(
+                "IRONCREW_ADMISSION_OBSERVATION_BURST",
+                DEFAULT_OBSERVATION_BURST,
+                1,
+                HARD_MAX_OBSERVATION_BURST,
+            )?,
+        };
+        Ok(Self::new_with_observation(config, observation))
     }
 
     pub fn metrics(&self) -> &AdmissionMetrics {
@@ -226,14 +261,26 @@ impl AdmissionController {
         principal: &Principal,
         class: MutationClass,
     ) -> std::result::Result<(), AdmissionFailure> {
-        let policy = self.config.policy(class);
+        self.admit_principal(principal.id(), class)
+    }
+
+    fn admit_principal(
+        &self,
+        principal: &PrincipalId,
+        class: MutationClass,
+    ) -> std::result::Result<(), AdmissionFailure> {
+        let policy = match class {
+            MutationClass::Work => self.config.work,
+            MutationClass::Control => self.config.control,
+            MutationClass::Observation => self.observation,
+        };
         let now = Instant::now();
         let mut buckets = self.buckets.lock().map_err(|_| {
             self.metrics.record_internal_error();
             AdmissionFailure::Unavailable
         })?;
         let bucket = buckets
-            .entry((principal.id().clone(), class))
+            .entry((principal.clone(), class))
             .or_insert_with(|| TokenBucket::full(policy, now));
         match bucket.try_take(policy, now) {
             Ok(()) => {
@@ -291,7 +338,7 @@ pub async fn enforce_mutation_admission(
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CACHE_CONTROL, "no-store")],
             axum::Json(serde_json::json!({
-                "error": "Mutation admission is temporarily unavailable"
+                "error": "Request admission is temporarily unavailable"
             })),
         )
             .into_response(),
@@ -316,6 +363,12 @@ fn harden_downstream_rate_response(mut response: Response) -> Response {
 }
 
 fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
+    // Polling a shared question mailbox performs indexed database reads plus
+    // bounded ciphertext decryption. Give it an independently bounded bucket
+    // so an aggressive UI poll loop cannot starve answer/abort capacity.
+    if method == Method::GET && is_question_poll_path(path) {
+        return Some(MutationClass::Observation);
+    }
     if method == Method::DELETE {
         return Some(MutationClass::Control);
     }
@@ -329,12 +382,27 @@ fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
     }
 }
 
+fn is_question_poll_path(path: &str) -> bool {
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some("flows"), Some(flow), Some("questions"), Some(run_id), None)
+            if !flow.is_empty() && !run_id.is_empty()
+    )
+}
+
 fn rate_limited_response(class: MutationClass, retry_after_seconds: u64) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         axum::Json(serde_json::json!({
             "error": format!(
-                "{} mutation rate limit exceeded; retry later",
+                "{} request rate limit exceeded; retry later",
                 class.label()
             )
         })),
@@ -471,6 +539,12 @@ pub async fn metrics(
         state.admission.config.control.rate_per_minute
     )
     .unwrap();
+    writeln!(
+        body,
+        "ironcrew_admission_rate_per_minute{{class=\"observation\"}} {}",
+        state.admission.observation.rate_per_minute
+    )
+    .unwrap();
     writeln!(body, "# TYPE ironcrew_admission_burst gauge").unwrap();
     writeln!(
         body,
@@ -482,6 +556,12 @@ pub async fn metrics(
         body,
         "ironcrew_admission_burst{{class=\"control\"}} {}",
         state.admission.config.control.burst
+    )
+    .unwrap();
+    writeln!(
+        body,
+        "ironcrew_admission_burst{{class=\"observation\"}} {}",
+        state.admission.observation.burst
     )
     .unwrap();
     writeln!(body, "# TYPE ironcrew_admission_requests_total counter").unwrap();
@@ -504,6 +584,16 @@ pub async fn metrics(
         &mut body,
         "ironcrew_admission_requests_total{class=\"control\",outcome=\"limited\"}",
         metrics.control_limited.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut body,
+        "ironcrew_admission_requests_total{class=\"observation\",outcome=\"admitted\"}",
+        metrics.observation_admitted.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut body,
+        "ironcrew_admission_requests_total{class=\"observation\",outcome=\"limited\"}",
+        metrics.observation_limited.load(Ordering::Relaxed),
     );
     writeln!(
         body,
@@ -690,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn work_and_control_routes_are_separate() {
+    fn work_control_and_observation_routes_are_separate() {
         assert_eq!(
             classify_mutation(&Method::POST, "/flows/a/run"),
             Some(MutationClass::Work)
@@ -707,7 +797,122 @@ mod tests {
             classify_mutation(&Method::DELETE, "/flows/a/runs/r"),
             Some(MutationClass::Control)
         );
+        assert_eq!(
+            classify_mutation(&Method::GET, "/flows/a/questions/run-1"),
+            Some(MutationClass::Observation)
+        );
+        assert_eq!(
+            classify_mutation(&Method::GET, "/other/a/questions/run-1"),
+            None
+        );
+        assert_eq!(
+            classify_mutation(&Method::GET, "/flows/a/questions/run-1/extra"),
+            None
+        );
         assert_eq!(classify_mutation(&Method::GET, "/metrics"), None);
+    }
+
+    fn test_controller(observation: RatePolicy, control: RatePolicy) -> AdmissionController {
+        AdmissionController::new_with_observation(
+            AdmissionConfig {
+                work: RatePolicy {
+                    rate_per_minute: 1,
+                    burst: 1,
+                },
+                control,
+            },
+            observation,
+        )
+    }
+
+    #[test]
+    fn sustained_question_polling_cannot_deplete_control_capacity() {
+        let controller = test_controller(
+            RatePolicy {
+                rate_per_minute: 1,
+                burst: 2,
+            },
+            RatePolicy {
+                rate_per_minute: 1,
+                burst: 1,
+            },
+        );
+        let principal = PrincipalId::anonymous();
+
+        assert!(
+            controller
+                .admit_principal(&principal, MutationClass::Observation)
+                .is_ok()
+        );
+        assert!(
+            controller
+                .admit_principal(&principal, MutationClass::Observation)
+                .is_ok()
+        );
+        assert!(matches!(
+            controller.admit_principal(&principal, MutationClass::Observation),
+            Err(AdmissionFailure::Limited {
+                class: MutationClass::Observation,
+                ..
+            })
+        ));
+
+        // The answer/abort/delete class retains its full independent burst.
+        assert!(
+            controller
+                .admit_principal(&principal, MutationClass::Control)
+                .is_ok()
+        );
+        assert!(matches!(
+            controller.admit_principal(&principal, MutationClass::Control),
+            Err(AdmissionFailure::Limited {
+                class: MutationClass::Control,
+                ..
+            })
+        ));
+        assert_eq!(controller.tracked_buckets(), 2);
+    }
+
+    #[test]
+    fn question_polling_has_an_independent_bounded_burst() {
+        let controller = test_controller(
+            RatePolicy {
+                rate_per_minute: 1,
+                burst: 1,
+            },
+            RatePolicy {
+                rate_per_minute: 1,
+                burst: 5,
+            },
+        );
+        let principal = PrincipalId::anonymous();
+
+        assert!(
+            controller
+                .admit_principal(&principal, MutationClass::Observation)
+                .is_ok()
+        );
+        assert!(matches!(
+            controller.admit_principal(&principal, MutationClass::Observation),
+            Err(AdmissionFailure::Limited {
+                class: MutationClass::Observation,
+                retry_after_seconds: 60,
+            })
+        ));
+        assert_eq!(
+            controller
+                .metrics()
+                .observation_admitted
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .observation_limited
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

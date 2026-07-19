@@ -368,10 +368,17 @@ be set in the shell or in `.env` files.
 | `IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES` | Maximum output bytes retained for one completed task (default: `8388608` = 8 MiB; hard ceiling: `33554432` = 32 MiB). The run fails instead of retaining an oversized result |
 | `IRONCREW_TASK_RESULT_MAX_REASONING_BYTES` | Maximum reasoning bytes retained for one completed task (default: `4194304` = 4 MiB; hard ceiling: `16777216` = 16 MiB). The run fails instead of retaining an oversized result |
 | `IRONCREW_RUN_RESULTS_MAX_BYTES` | Maximum aggregate serialized bytes retained in the run's task-result map (default: `33554432` = 32 MiB; hard ceiling: `50331648` = 48 MiB). Replacing a task result accounts for the replacement rather than double-counting it |
-| `IRONCREW_MAX_EVENTS` | Max events (count) in the EventBus replay buffer (default: `1000`) |
-| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | Max total bytes in the replay buffer (default: `4194304` = 4 MiB; range: 1024–67108864). This affects catch-up replay; live SSE delivery uses a bounded channel, so clients must reconnect/recover after lag or disconnect. |
-| `IRONCREW_EVENT_MAX_BYTES` | Maximum serialized size of one live or replay event (default: `262144` = 256 KiB). Oversized payload fields are truncated; an event that still cannot fit is replaced by a warning event |
+| `IRONCREW_MAX_EVENTS` | Per-run event count retained by the local replay buffer and PostgreSQL journal (default: `1000`; range: 1–10000). Oldest PostgreSQL rows are evicted with an explicit replay gap when this bound is reached. |
+| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | Per-run logical byte budget for the local replay buffer and PostgreSQL journal (default: `4194304` = 4 MiB; range: 1024–67108864). PostgreSQL accounts at least 1024 bytes per event; this is not a physical database-size limit. |
+| `IRONCREW_EVENT_MAX_BYTES` | Maximum serialized size of one live or durable event (default: `262144` = 256 KiB; range: 1024–16777216). Must not exceed the per-run or journal-page byte limit. Oversized fields are truncated; an event that still cannot fit becomes a warning event. |
 | `IRONCREW_EVENT_CHANNEL_CAPACITY` | Maximum live broadcast-ring entries per EventBus (default: `32`; hard ceiling: `256`). It is reduced automatically when needed so maximum-sized live events fit the replay byte budget |
+| `IRONCREW_EVENT_JOURNAL_RETENTION_SECS` | PostgreSQL run-event logical retention from append time (default: `3600`; range: 60–2592000 seconds). Reads hide expired rows immediately; bounded physical pruning follows on append/reconciliation. |
+| `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS` | Global logical retained-event budget across PostgreSQL run journals (default: `100000`; range: 1–10000000). Must be at least `IRONCREW_MAX_EVENTS`. |
+| `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES` | Global PostgreSQL journal logical-byte budget (default: `268435456` = 256 MiB; range: 1024–8589934592 = 8 GiB). Must be at least the per-run byte budget. Excludes indexes, row/JSONB overhead, WAL, dead tuples, and replication/backups. |
+| `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES` | Maximum logical bytes materialized by one PostgreSQL SSE page (default: the larger of `524288` and `IRONCREW_EVENT_MAX_BYTES`; range: 1024–67108864). Must be at least the single-event limit. Page count is derived as `min(IRONCREW_MAX_EVENTS, 64)`. |
+| `IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS` | PostgreSQL SSE journal polling interval while waiting for another event (default: `500`; range: 100–5000 ms). Applies per open run stream. |
+| `IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS` | Deadline for each PostgreSQL journal-page read (default: `2000`; range: 100–30000 ms). Five consecutive read failures/timeouts close the stream with an SSE error event. |
+| `IRONCREW_EVENT_JOURNAL_PRUNE_BATCH` | Rows selected per bounded PostgreSQL journal-prune step (default: `1000`; range: 1–10000). Must not exceed the global event cap. |
 | `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | Max messages per agent queue in the MessageBus (default: `1000`). Oldest dropped on overflow with a warning log. `0` disables the cap |
 | `IRONCREW_MESSAGEBUS_PENDING_CAP` | Max pending broadcasts (messages sent before any agent is registered) (default: `500`). `0` disables the cap |
 | `IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES` | Maximum content bytes in one inter-agent message (default: `65536`); excess content is UTF-8-safely truncated |
@@ -436,6 +443,8 @@ be set in the shell or in `.env` files.
 | `IRONCREW_ADMISSION_WORK_BURST` | Per-principal work-mutation burst capacity (default: `10`; range: 1–10000) |
 | `IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE` | Independent per-principal refill rate for abort, answer, and delete control mutations (default: `120`; range: 1–60000) |
 | `IRONCREW_ADMISSION_CONTROL_BURST` | Per-principal control-mutation burst capacity (default: `20`; range: 1–10000) |
+| `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | Independent per-principal process-local refill rate for `GET /flows/{flow}/questions/{run_id}` polling (default: `600`; range: 1–60000). Does not govern internal durable-SSE database polling. |
+| `IRONCREW_ADMISSION_OBSERVATION_BURST` | Per-principal question-poll burst capacity (default: `20`; range: 1–1000) |
 | `IRONCREW_HOST` | Server bind host used when `--host` is absent. If neither is set, `PORT` implies `0.0.0.0`; otherwise the default is `127.0.0.1` |
 | `IRONCREW_PORT` | Server bind port used when `--port` is absent. Takes precedence over platform `PORT` |
 | `PORT` | Platform-provided server port fallback (including Railway). Causes the default host to become `0.0.0.0` |
@@ -455,14 +464,20 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_SSE_CONNECTIONS` | Global cap on live run and conversation SSE connections (default: `16`; hard ceiling: `1024`) |
 | `IRONCREW_READINESS_CACHE_MS` | Storage-aware readiness result cache/coalescing interval (default: `1000`; hard ceiling: `10000`) |
 | `IRONCREW_RUN_SSE_RETENTION_SECS` | Time a completed run's event bus remains available for a late subscriber (default: `5`; hard ceiling: `300`) |
-| `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
+| `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in process-local JSON/SQLite SSE responses to N chars (disabled by default). PostgreSQL journal payloads are bounded at emission by `IRONCREW_EVENT_MAX_BYTES`; sanitize sensitive flow output before emitting it. |
 | `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | Hard deadline in seconds applied after SIGTERM/Ctrl+C. If graceful teardown hasn't completed by then, the process exits anyway (default: `10`; range: 1–300) |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | Post-serve drain window in milliseconds for background tasks spawned from `Drop` paths (notably reaping stdio MCP children) (default: `1000`; range: 0–30000) |
 
-Admission buckets are intentionally process-local for the supported topology of
-exactly one HTTP executor. Rate-limit breaches return `429` with numeric
+Admission buckets are intentionally process-local. With multiple HTTP
+replicas, multiply the configured capacity and memory budget by replica count;
+PostgreSQL's keyed cancellation/HITL coordination does not make these limits
+global. Rate-limit breaches return `429` with numeric
 `Retry-After` and `Cache-Control: no-store`; the independent control bucket
-keeps abort/answer/delete operations available when work admission is busy.
+keeps abort/answer/delete operations available when work admission is busy,
+and the observation bucket prevents aggressive question-list polling from
+consuming either mutation bucket. Durable SSE's internal PostgreSQL page reads
+are instead bounded by the SSE connection, page, poll, read-timeout, and pool
+settings.
 `GET /metrics` is protected by the same API authentication and exposes only
 fixed, low-cardinality labels—never principal names, bearer tokens, audit
 actors, flow names, or idempotency keys.
@@ -506,12 +521,18 @@ actors, flow names, or idempotency keys.
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | Max bytes captured per stream (stdout and stderr independently) by the `shell` tool (default: `1048576`; range: 1–16777216) |
 | `IRONCREW_JSON_SCHEMA_MAX_BYTES` | Maximum serialized JSON Schema accepted by `validate_schema` (default: `262144`; range: 1024–4194304). External `$ref` retrieval is disabled; local `#` fragments remain supported |
 | `IRONCREW_ASK_HUMAN_TIMEOUT` | Default question timeout when a flow omits `timeout_s` (default: `600`) |
-| `IRONCREW_ASK_HUMAN_MAX_TIMEOUT` | Maximum accepted per-question timeout (default: `3600`) |
-| `IRONCREW_ASK_HUMAN_MAX_PENDING` | Maximum simultaneously pending questions per run (default: `16`) |
-| `IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES` | Maximum question prompt bytes (default: `65536`) |
-| `IRONCREW_ASK_HUMAN_MAX_CHOICES` | Maximum choices on one question (default: `100`) |
-| `IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES` | Maximum aggregate bytes across choices (default: `65536`) |
-| `IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES` | Maximum serialized answer bytes (default: `65536`) |
+| `IRONCREW_ASK_HUMAN_MAX_TIMEOUT` | Maximum accepted per-question timeout (default: `3600`; hard ceiling: `86400` seconds) |
+| `IRONCREW_ASK_HUMAN_MAX_PENDING` | Maximum simultaneously pending questions per run (default: `16`; hard ceiling: `256`) |
+| `IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` | Maximum aggregate serialized metadata retained for pending questions in one run (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB). PostgreSQL permits the same ciphertext budget plus 28 AEAD-overhead bytes per allowed row. |
+| `IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES` | Maximum question prompt bytes (default: `65536`; hard ceiling: `1048576`) |
+| `IRONCREW_ASK_HUMAN_MAX_CHOICES` | Maximum choices on one question (default: `100`; hard ceiling: `1000`) |
+| `IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES` | Maximum aggregate bytes across choices (default: `65536`; hard ceiling: `1048576`) |
+| `IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES` | Maximum serialized answer bytes (default: `65536`; hard ceiling: `1048576`) |
+| `IRONCREW_HITL_ENCRYPTION_KEYS` | Secret JSON object mapping at most 8 key ids to canonical base64 encodings of 32-byte keys (maximum JSON size: 16384 bytes). Together with an active key id, enables encrypted PostgreSQL cross-replica questions and answers for idempotency-keyed HTTP runs. During rotation, keep old keys until no mailbox question/answer row references their fingerprints. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id from `IRONCREW_HITL_ENCRYPTION_KEYS` used for new question/answer ciphertext. Both variables must be set together; malformed or partial configuration fails PostgreSQL store startup. |
+| `IRONCREW_HITL_POLL_INTERVAL_MS` | Owner mailbox polling interval per pending durable question (default: `500`; effective range: 50–5000 ms). Lower values reduce answer latency but multiply PostgreSQL reads across pending questions, runs, and replicas. |
+| `IRONCREW_HITL_READ_TIMEOUT_MS` | Deadline for one owner-side durable-answer PostgreSQL read (default: `2000`; effective range: 100–30000 ms). Timeouts are retried after the poll interval until the question deadline. |
+| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | Per-process cap on concurrent PostgreSQL question-list/decrypt operations (default: `8`; range: 1–64). Exhaustion fails closed instead of queuing unbounded ciphertext materialization. |
 
 The HTTP, web-scrape, image, and provider-body/output byte settings use a
 shared process hard cap of `268435456` (256 MiB); zero, invalid, or excessive

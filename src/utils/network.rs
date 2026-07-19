@@ -235,6 +235,7 @@ pub fn secure_client_builder(policy: OutboundNetworkPolicy) -> reqwest::ClientBu
 
 /// Build an SSRF-aware client with redirects disabled. This is useful for
 /// protocols such as MCP where redirect behavior belongs to the transport.
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
 pub fn secure_no_redirect_client(
     policy: OutboundNetworkPolicy,
 ) -> Result<reqwest::Client, reqwest::Error> {

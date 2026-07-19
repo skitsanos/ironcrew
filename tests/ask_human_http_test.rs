@@ -208,8 +208,24 @@ async fn happy_path_question_lifecycle_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 413);
+    assert_eq!(resp.headers()[reqwest::header::CACHE_CONTROL], "no-store");
     let pending = wait_for_question(&client, &base, "askflow", &run_id).await;
     assert_eq!(pending["question_id"], question_id);
+
+    // Route middleware also protects extractor-generated failures, which do
+    // not pass through the handler's normal response constructor.
+    let malformed = client
+        .post(format!("{}/flows/askflow/answer/{}", base, run_id))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    assert_eq!(
+        malformed.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
 
     // Deliver the answer.
     let resp = client
@@ -219,6 +235,7 @@ async fn happy_path_question_lifecycle_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()[reqwest::header::CACHE_CONTROL], "no-store");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "delivered");
 

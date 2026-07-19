@@ -159,6 +159,21 @@ pub fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<
     (status, Json(ErrorResponse { error: message }))
 }
 
+/// Run-event and human-input payloads (including validation errors) can carry
+/// sensitive metadata. Apply this at the route boundary so extractor-generated
+/// 4xx responses receive the same cache policy as successful handlers.
+async fn sensitive_response_no_store(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Resolve a flow path with traversal prevention.
 pub fn resolve_flow_path(state: &AppState, flow: &str) -> crate::utils::error::Result<PathBuf> {
     use crate::utils::error::IronCrewError;
@@ -216,6 +231,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(health))
         .route("/health/ready", get(readiness));
 
+    let sensitive_run_control = Router::new()
+        .route("/flows/{flow}/events/{run_id}", get(flow_events))
+        .route("/flows/{flow}/questions/{run_id}", get(list_questions))
+        .route("/flows/{flow}/answer/{run_id}", post(answer_question))
+        .layer(axum::middleware::from_fn(sensitive_response_no_store));
+
     // Protected routes (auth required when either token source is configured).
     // Authentication is the outer layer: admission sees only server-issued
     // principal extensions, never X-Audit-Actor or source-IP guesses.
@@ -228,10 +249,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/runs/{id}", delete(delete_run))
         .route("/flows/{flow}/validate", get(validate_flow))
         .route("/flows/{flow}/agents", get(list_agents))
-        .route("/flows/{flow}/events/{run_id}", get(flow_events))
-        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints
-        .route("/flows/{flow}/questions/{run_id}", get(list_questions))
-        .route("/flows/{flow}/answer/{run_id}", post(answer_question))
+        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints. Their route
+        // layer also marks extractor-generated errors as non-cacheable.
+        .merge(sensitive_run_control)
         // Phase-1 Human-in-the-Loop conversation endpoints
         .route(
             "/flows/{flow}/conversations",

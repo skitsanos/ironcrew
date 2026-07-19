@@ -82,8 +82,11 @@ Response:
 The `run_id` is consistent across the initial response, SSE events, and the
 persisted run record. `owner_instance_id` identifies the process that owns the
 live Lua execution; it is diagnostic metadata, not a routable URL.
-`control_scope: "process"` warns that HITL and live SSE still require that
-owner. Use the `events_url` to subscribe to real-time progress.
+`control_scope: "process"` refers to execution ownership. PostgreSQL exposes a
+separate shared run-event journal, and a run started with an `Idempotency-Key`
+can also use the shared HITL mailbox when the deployment has a
+[human-input keyring](#cross-replica-delivery). Use `GET /capabilities` rather
+than the acceptance field to discover each control surface.
 
 ### Runtime capabilities
 
@@ -91,8 +94,12 @@ owner. Use the `events_url` to subscribe to real-time progress.
 returns `Cache-Control: no-store`. It reports the current instance id and the
 scope of each live-control surface. `multi_replica_control: false` means not
 all run/HITL/SSE/conversation controls can enter through an arbitrary replica;
-it remains `false` even though PostgreSQL-backed keyed runs support the bounded
-cross-instance cancellation path described below.
+it remains `false` even when PostgreSQL supports shared SSE replay and keyed
+runs support bounded cross-instance cancellation/encrypted HITL delivery. Inspect
+`live_control.human_input`: `"shared_store_for_keyed_runs"` means the keyring
+is active, while `"process"` means questions still require the owner replica.
+`live_control.sse_replay` is `"shared_store"` for PostgreSQL and `"process"`
+for JSON/SQLite.
 
 An optional top-level `tags` array is attached to the run record. It accepts
 unique, non-empty, trimmed strings without control characters. The defaults
@@ -232,6 +239,8 @@ curl http://localhost:3000/flows/my-crew/questions/abc-123
 {
   "run_id": "abc-123",
   "status": "waiting_for_input",
+  "owner_instance_id": "ironcrew-pod-a",
+  "control_scope": "shared_store",
   "questions": [
     {
       "question_id": "9c1e…",
@@ -245,13 +254,17 @@ curl http://localhost:3000/flows/my-crew/questions/abc-123
 }
 ```
 
-`status` is `"running"` with an empty array when nothing is pending. A live
-run owned by another instance returns the structured retryable `409` described
+`status` is `"running"` with an empty array when nothing is pending. Both
+question endpoints return `Cache-Control: no-store`. `control_scope` is
+`"shared_store"` for the configured PostgreSQL mailbox and `"process"` for
+owner-local delivery.
+
+Without the [cross-replica prerequisites](#cross-replica-delivery), a live run
+owned by another instance returns the structured retryable `409` described
 above; the question bridge has not moved to that replica. A same-owner durable
 record with no local bridge returns retryable `503`. Missing, terminal, and
 cross-flow runs return `404`, so the endpoint never confirms that a run exists
-under a different flow. The answer endpoint uses the same ownership contract
-and never reports delivery unless its local bridge accepted the answer.
+under a different flow.
 
 `kind` is `"question"` (from `crew:ask_human()` or the agent-facing
 `ask_human` tool) or `"approval"` (from a
@@ -268,7 +281,9 @@ reason).
 curl -X POST http://localhost:3000/flows/my-crew/answer/abc-123 \
   -H 'Content-Type: application/json' \
   -d '{"question_id": "9c1e…", "answer": "yes"}'
-# {"run_id":"abc-123","question_id":"9c1e…","status":"delivered"}
+# HTTP 202
+# {"run_id":"abc-123","question_id":"9c1e…","status":"queued",
+#  "owner_instance_id":"ironcrew-pod-a","control_scope":"shared_store"}
 ```
 
 `answer` may be any JSON value — a string, number, or a whole object; the
@@ -277,8 +292,73 @@ to the same question gets `404` (the question is gone), never a silent
 overwrite. `choices` are advisory — the endpoint accepts free-form answers
 even when choices were offered; flows that need strict values validate in Lua.
 An answer larger than `IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES` (65,536 serialized
-bytes by default) gets `413 Payload Too Large` and leaves the question pending
-so the client can retry with a smaller value.
+bytes by default, configurable up to the 1,048,576-byte hard maximum) gets
+`413 Payload Too Large` and leaves the question pending so the client can retry
+with a smaller value.
+
+A shared-mailbox answer returns `202 Accepted` and `status: "queued"` after
+PostgreSQL has accepted the encrypted value. The owner polls the mailbox and
+resumes the suspended coroutine; `202` is not proof that Lua has already
+consumed the answer. An owner-local or non-durable answer instead returns
+`200 OK` and `status: "delivered"`. In both modes, the first accepted writer
+wins and subsequent attempts return `404`.
+
+### Cross-replica delivery
+
+Arbitrary replicas can list and answer a pending question only when all of the
+following are true:
+
+- the run was started over HTTP with an `Idempotency-Key`;
+- every replica uses the same PostgreSQL database and table prefix;
+- every replica has the same `IRONCREW_HITL_ENCRYPTION_KEYS` JSON keyring and
+  a valid `IRONCREW_HITL_ACTIVE_KEY_ID`.
+
+The keyring is a JSON object whose values are canonical base64 encodings of
+32-byte keys. It accepts at most eight keys and 16 KiB of JSON. Question
+prompt/choices/timing metadata and answers are encrypted with AES-256-GCM
+before PostgreSQL persistence. Flow, run, question, owner, attempt, key digest,
+timestamps, and encryption-key fingerprint remain routing/fencing metadata in
+the database. Ciphertext authentication binds an answer to that exact run,
+question, owner, idempotency attempt, and key digest.
+
+The owner checks PostgreSQL once per pending question every
+`IRONCREW_HITL_POLL_INTERVAL_MS` (default `500` ms, minimum `50`, hard maximum
+`5000`). Each read has `IRONCREW_HITL_READ_TIMEOUT_MS` (default `2000` ms,
+effective range `100`–`30000`). Pending work is bounded by
+`IRONCREW_ASK_HUMAN_MAX_PENDING` (default `16`, hard maximum `256`) and
+`IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` (default 1 MiB, hard maximum 16 MiB) per
+run. Prompt, choice, timeout, and serialized answer caps still apply; see
+[the CLI environment reference](cli.md#environment-variables).
+At the defaults, one run parked on all 16 allowed questions performs about 32
+mailbox reads per second, so increase the interval or lower the pending cap
+before multiplying that workload across many Railway/OpenShift replicas.
+The default prompt plus aggregate-choice budget is 128 KiB of raw text per
+pending question, but the aggregate serialized metadata cap prevents 16 such
+questions from accumulating when they exceed 1 MiB together. PostgreSQL
+ciphertext admission additionally accounts for 28 AEAD bytes per allowed row.
+Keep the aggregate cap conservative on small pods.
+
+Concurrent PostgreSQL question-list/decrypt operations are bounded per process
+by `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` (default `8`, range `1`–`64`). The
+question-list endpoint is also subject to the process-local per-principal
+observation bucket (`IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE=600`,
+`IRONCREW_ADMISSION_OBSERVATION_BURST=20` by default); neither limit throttles
+the owner's internal answer polling.
+
+Keep the keyring in a Railway variable, OpenShift/Kubernetes `Secret`, or an
+external secret manager. Rotate it in two deployments: first add the new key
+to every replica while the old key remains active; then select the new active
+key everywhere while retaining the old key until no mailbox row references its
+question or answer fingerprint. Answer consumption, timeout, terminalization,
+and abandoned-run reconciliation normally clear those rows. Removing an old
+key based only on wall-clock age can strand an answer queued during an owner
+outage. Never place the keyring in the image or a checked-in manifest.
+
+This mailbox routes a command to the current owner; it does **not** move or
+recreate the Lua VM. It does not provide execution takeover after owner death
+or share live conversation handles. PostgreSQL SSE replay is a separate
+plaintext, bounded journal; the HITL keyring does not encrypt it. See the
+[Multi-Replica Deployment Contract](multi-replica.md) for the complete boundary.
 
 Both endpoints are recorded in the [audit log](#get-audit) (actions
 `flow.run.questions_list` / `flow.run.question_answer`). The bridge-generated
@@ -290,7 +370,8 @@ Locally aborting a suspended run expires its pending questions before the
 response returns. A durable cross-instance cancellation only acknowledges the
 mailbox write; the questions expire when the owner observes it. Once terminal,
 both question endpoints return `404`; the separate owner-local SSE event bus
-remains available during its retention window.
+may remain available for JSON/SQLite during its short retention window, while
+PostgreSQL replay follows the durable journal contract below.
 
 ## SSE Event Stream
 
@@ -300,30 +381,108 @@ remains available during its retention window.
 curl -N http://localhost:3000/flows/research-crew/events/a1b2c3d4-...
 ```
 
-### Replay Buffer
+Successful SSE responses use `Cache-Control: no-store, no-transform` and
+`X-Accel-Buffering: no`; validation/error responses are also non-cacheable.
+These streams can contain model output, reasoning, tool/log text, and other
+sensitive run data.
 
-Late subscribers on the owner receive all events retained by its process-local
-replay buffer before switching to the live stream. The replay buffer holds up
-to 1000 events by default. If a run has completed and that local bus is still
-retained, the subscriber receives its retained history including
-`run_complete`. Any replica can synthesize one `run_complete` event from a
-terminal durable run record and then close the stream; it cannot reconstruct
-the earlier event history. An active foreign-owned run returns structured
-`409` rather than an unrelated stream.
+### PostgreSQL replay and `Last-Event-ID`
+
+PostgreSQL-backed HTTP runs write a bounded event journal that any replica can
+read while the run is active or terminal. Every retained event has a canonical
+SSE id in the form `<run_id>:<sequence>`, for example:
+
+```text
+id: a1b2c3d4-...:17
+event: task_completed
+data: {"event":"task_completed","data":{...}}
+```
+
+Reconnect with the last id the client fully processed:
+
+```bash
+curl -N \
+  -H 'Last-Event-ID: a1b2c3d4-...:17' \
+  http://localhost:3000/flows/research-crew/events/a1b2c3d4-...
+```
+
+The sequence is a positive canonical decimal integer (no leading zeroes), and
+the run id in the header must equal the path run id. IronCrew resumes strictly
+after that sequence. Browsers using `EventSource` send the last received SSE
+id automatically when they reconnect.
+
+The journal is bounded, so replay can be incomplete. Without a cursor, a
+subscriber receives a `journal_gap` event before the next retained event when
+an earlier sequence range was omitted or evicted. Its data includes
+`first_sequence`, `last_sequence`, and one reason:
+`writer_backpressure`, `retention`, `global_capacity`, or `owner_lost`. The gap
+event's own SSE id is `<run_id>:<last_sequence>`; persist that id just like a
+normal event before continuing. A cursor older than the retained boundary is
+rejected instead of silently skipping data.
+
+Cursor failures are deterministic:
+
+| Condition | Status | Code/meaning |
+|---|---:|---|
+| malformed, non-ASCII, zero/non-canonical sequence | `400` | `invalid_cursor` |
+| cursor belongs to another run | `400` | `cursor_cross_run` |
+| sequence is newer than the journal | `409` | `cursor_ahead` |
+| sequence is older than the retained boundary | `409` | `cursor_expired` |
+| `Last-Event-ID` used with JSON or SQLite | `409` | shared replay is unavailable |
+
+Active-stream completeness is best-effort. The producer uses bounded queues,
+bytes, batches, retries, and deadlines; saturation or a database outage can
+create an explicit gap while the authoritative run continues. A normal
+persisted `run_complete` has a sequence/id and closes the stream. If that event
+was omitted or physically pruned but the run record is terminal, IronCrew
+synthesizes an unnumbered `run_complete` from the durable run record with
+`journal_complete: false` and `synthesized_from_run_record: true`, then closes.
+That fallback proves terminal state, not complete event history, and provides
+no cursor to acknowledge. After five consecutive journal read failures or
+timeouts, the stream emits an SSE `error` event and closes so the client can
+retry with its last fully processed id.
+
+JSON and SQLite keep the earlier process-local behavior: late subscribers on
+the owner receive its bounded in-memory replay and then live broadcasts. A
+foreign replica cannot reconstruct that stream, and `Last-Event-ID` receives
+`409`. A terminal run record can still produce one unnumbered completion, but
+not the missing history.
+
+PostgreSQL stores journal payloads as **plaintext JSONB**, not with the HITL
+encryption keyring. Most events retain their normal data, including potentially
+sensitive task/model/tool/log content. The durable `human_input_requested`
+form is the exception: it omits prompt and choices, includes the question id
+and authenticated questions endpoint, and requires the client to fetch the
+encrypted mailbox metadata separately. `human_input_received` never includes
+the answer. Because IronCrew currently has authentication but no per-flow
+read authorization, every configured API bearer token is effectively an
+administrator credential for run events; do not issue tokens directly to
+untrusted end users.
+
+The journal's count/byte settings are logical retention controls, not a
+PostgreSQL disk quota. Accounted bytes use at least 1 KiB per event and cover
+the JSON payload, but exclude tuple/page overhead, indexes, state/usage rows,
+WAL, replicas/backups, and dead tuples pending vacuum. Monitor actual database
+size and autovacuum in addition to these limits. See
+[Storage Backends](storage.md#bounded-postgresql-run-event-journal).
 
 ### Output Truncation
 
-By default, SSE events include the full task output. For flows that produce
-large outputs (e.g., VTT transcripts), set `IRONCREW_SSE_OUTPUT_MAX_CHARS`
-to cap the output field in `task_completed` and `collaboration_turn` events:
+By default, SSE events can include full task output up to the event-size cap.
+For process-local JSON/SQLite streams, set
+`IRONCREW_SSE_OUTPUT_MAX_CHARS` to further cap the output field in
+`task_completed` and `collaboration_turn` events:
 
 ```bash
 IRONCREW_SSE_OUTPUT_MAX_CHARS=500 ironcrew serve --flows-dir ./flows
 ```
 
-When truncated, the output ends with `... [truncated, N total chars]`.
-Run history and the `/flows/{flow}/runs/{id}` endpoint always return the
-full untruncated output.
+When truncated, the output ends with `... [truncated, N total bytes]`.
+This response-only setting does not rewrite PostgreSQL journal rows. Durable
+events are instead bounded before persistence by `IRONCREW_EVENT_MAX_BYTES`;
+flows should avoid emitting secrets regardless of either cap. Run history and
+the `/flows/{flow}/runs/{id}` endpoint retain their independently bounded task
+results.
 
 ### Event Types
 
@@ -351,8 +510,9 @@ full untruncated output.
 | `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended (either reached `max_turns` or a `should_stop` callback stopped it; `stop_reason` is present only when the callback stopped it) |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
-| `human_input_requested` | `question_id`, `prompt`, `choices`, `timeout_s`, `kind`    | The run suspended on a human question (`kind: "question"` from ask_human, `"approval"` from a tool approval gate) — render a form / allow-deny buttons and POST to the [answer endpoint](#answer-a-question) |
+| `human_input_requested` | local: `question_id`, `prompt`, `choices`, `timeout_s`, `kind`; durable: `question_id`, `timeout_s`, `kind`, `question_method`, `question_endpoint`, `question_metadata` | The run suspended on a human question. PostgreSQL replay deliberately uses `question_metadata: "omitted_from_event_journal"`; GET the authenticated questions endpoint to recover encrypted prompt/choices. |
 | `human_input_received` | `question_id`, `outcome`                                    | The question resolved (`outcome`: `"answered"` or `"timeout"`). Never carries the answer content — answers may contain secrets |
+| `journal_gap`        | `first_sequence`, `last_sequence`, `reason`                  | PostgreSQL replay omitted/evicted a sequence range. Its SSE id advances through `last_sequence`; do not infer events inside the gap. |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
 | `run_complete`       | `run_id`, `status`, `duration_ms`, `total_tokens`             | Run finished (terminal event)                |
 
@@ -367,8 +527,9 @@ The `token_usage` field in `task_completed` contains:
 }
 ```
 
-A `warning` event may be sent if the subscriber falls behind and events are
-dropped from the broadcast channel.
+A process-local `warning` event may be sent if a live subscriber falls behind
+its broadcast channel. PostgreSQL replay represents durable omissions with
+`journal_gap` instead.
 
 ### Conversation and Dialog Events
 
@@ -410,8 +571,10 @@ For HTTP chat deployments, keep in mind:
   IDs do not accumulate in process memory
 - `IRONCREW_CHAT_SESSION_IDLE_SECS` controls when inactive chat handles are
   evicted from RAM
-- SSE replay buffering is bounded separately by `IRONCREW_MAX_EVENTS` and
-  `IRONCREW_EVENT_REPLAY_MAX_BYTES` (default 4 MB; see `src/engine/eventbus.rs`)
+- SSE replay is bounded separately by `IRONCREW_MAX_EVENTS` and
+  `IRONCREW_EVENT_REPLAY_MAX_BYTES` (default 4 MiB). Conversation and
+  JSON/SQLite run replay consume process memory; PostgreSQL run replay uses the
+  bounded journal plus transient per-run producer queues and per-reader pages
 
 For tuning guidance and deployment patterns, see [HTTP Scaling](http-scaling.md).
 

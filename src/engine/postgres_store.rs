@@ -1,11 +1,13 @@
 #![cfg(feature = "postgres")]
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use tokio::sync::Semaphore;
 
 use crate::utils::error::{IronCrewError, Result};
 
@@ -15,6 +17,14 @@ const MAX_DB_POOL_SIZE: u32 = 128;
 const MAX_CONNECT_RETRIES: u32 = 100;
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
 const MAX_TABLE_PREFIX_BYTES: usize = 37;
+const MAX_DURABLE_HUMAN_INPUT_ROWS: usize = 256;
+const HUMAN_INPUT_AEAD_OVERHEAD_BYTES: usize = 28;
+const DEFAULT_HUMAN_INPUT_READ_CONCURRENCY: usize = 8;
+const MAX_HUMAN_INPUT_READ_CONCURRENCY: usize = 64;
+const HUMAN_INPUT_READ_CONCURRENCY_ENV: &str = "IRONCREW_HITL_PG_MAX_CONCURRENT_READS";
+const MIN_ACCOUNTED_RUN_EVENT_BYTES: i64 = 1024;
+const MAX_EVICTED_RUN_EVENTS_PER_APPEND: u64 = 65_536;
+const RUN_EVENT_SCHEMA_VERSION: i32 = 1;
 const IDEMPOTENCY_COLUMNS: &str = "key_hash, principal_id, request_fingerprint, operation, scope, \
     resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, state, \
     response_status, response_body, lease_expires_at, created_at, updated_at, completed_at, \
@@ -81,12 +91,23 @@ fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
     Duration::from_millis(base_ms.saturating_mul(factor).min(cap_ms))
 }
 
+use super::human_input::{
+    DurableHumanInputQuestion, DurableHumanInputRegistration, HumanInputAad,
+    HumanInputAnswerOutcome, HumanInputKeyring, HumanInputListOutcome, HumanInputReadOutcome,
+    HumanInputRegistrationOutcome, question_digest, validate_durable_answer,
+};
 use super::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
     IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource, IdempotencyQuotaScope,
     IdempotencyRecord, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
     RunCancellationRequest, RunFenceHeartbeat, validate_digest,
+};
+use super::input_bridge::{max_pending, max_pending_bytes};
+use super::run_events::{
+    EventJournalScope, HARD_MAX_EVENT_BYTES, RunEventAppendBatch, RunEventAppendOutcome,
+    RunEventBounds, RunEventEntry, RunEventGap, RunEventGapReason, RunEventJournalConfig,
+    RunEventPage, RunEventTerminalState,
 };
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -111,6 +132,15 @@ fn bind_params<'q>(
     query
 }
 
+fn validate_human_input_route(label: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(IronCrewError::Validation(format!(
+            "Human-input {label} must be 1..={max_bytes} printable bytes"
+        )));
+    }
+    Ok(())
+}
+
 pub struct PostgresStore {
     pool: PgPool,
     table_name: String,
@@ -119,6 +149,15 @@ pub struct PostgresStore {
     audit_events_table: String,
     idempotency_table: String,
     idempotency_accounting_table: String,
+    human_inputs_table: String,
+    run_events_table: String,
+    run_event_state_table: String,
+    run_event_usage_table: String,
+    human_input_keyring: Option<HumanInputKeyring>,
+    human_input_max_pending_rows: usize,
+    human_input_max_pending_ciphertext_bytes: usize,
+    human_input_read_slots: Semaphore,
+    run_event_journal_config: RunEventJournalConfig,
     lease: RunLeaseConfig,
 }
 
@@ -127,6 +166,136 @@ struct IdempotencyAccounting {
     records: usize,
     in_flight: usize,
     response_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RunEventStateRow {
+    flow: String,
+    owner_instance_id: String,
+    latest_sequence: u64,
+    dropped_through: u64,
+    retained_events: u64,
+    retained_bytes: u64,
+    journal_complete: bool,
+    eviction_reason: Option<RunEventGapReason>,
+    terminal_event_sequence: Option<u64>,
+}
+
+type RunEventStateDbRow = (
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    bool,
+    Option<String>,
+    Option<i64>,
+);
+
+#[derive(Debug, Clone, Copy)]
+struct RunEventUsageRow {
+    retained_events: u64,
+    retained_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RunEventDeleteCandidate {
+    run_id: String,
+    sequence: u64,
+    payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunEventRunEviction {
+    events: u64,
+    bytes: u64,
+    first_sequence: u64,
+    last_sequence: u64,
+    previous_dropped_through: u64,
+    new_dropped_through: u64,
+    reason: Option<RunEventGapReason>,
+}
+
+impl RunEventRunEviction {
+    fn merge(&mut self, other: &Self) {
+        if other.events == 0 {
+            return;
+        }
+        if self.events == 0 {
+            *self = other.clone();
+            return;
+        }
+        self.events = self.events.saturating_add(other.events);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.first_sequence = self.first_sequence.min(other.first_sequence);
+        self.last_sequence = self.last_sequence.max(other.last_sequence);
+        self.previous_dropped_through = self
+            .previous_dropped_through
+            .min(other.previous_dropped_through);
+        if other.new_dropped_through >= self.new_dropped_through {
+            self.new_dropped_through = other.new_dropped_through;
+            self.reason = other.reason;
+        }
+    }
+
+    fn gap(&self) -> Option<RunEventGap> {
+        let reason = self.reason?;
+        if self.new_dropped_through <= self.previous_dropped_through {
+            return None;
+        }
+        Some(RunEventGap {
+            first_sequence: self.previous_dropped_through.saturating_add(1),
+            last_sequence: self.new_dropped_through,
+            reason,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunEventPruneSummary {
+    by_run: BTreeMap<String, RunEventRunEviction>,
+}
+
+impl RunEventPruneSummary {
+    fn merge(&mut self, other: Self) {
+        for (run_id, eviction) in other.by_run {
+            self.by_run.entry(run_id).or_default().merge(&eviction);
+        }
+    }
+
+    fn for_run(&self, run_id: &str) -> RunEventRunEviction {
+        self.by_run.get(run_id).cloned().unwrap_or_default()
+    }
+}
+
+fn run_event_gap_reason_db(reason: RunEventGapReason) -> &'static str {
+    match reason {
+        RunEventGapReason::WriterBackpressure => "writer_backpressure",
+        RunEventGapReason::Retention => "retention",
+        RunEventGapReason::GlobalCapacity => "global_capacity",
+        RunEventGapReason::OwnerLost => "owner_lost",
+    }
+}
+
+fn parse_run_event_gap_reason(value: &str) -> Result<RunEventGapReason> {
+    match value {
+        "writer_backpressure" => Ok(RunEventGapReason::WriterBackpressure),
+        "retention" => Ok(RunEventGapReason::Retention),
+        "global_capacity" => Ok(RunEventGapReason::GlobalCapacity),
+        "owner_lost" => Ok(RunEventGapReason::OwnerLost),
+        _ => Err(IronCrewError::Validation(format!(
+            "PostgreSQL run-event state contains invalid eviction reason '{value}'"
+        ))),
+    }
+}
+
+fn nonnegative_u64(label: &str, value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        IronCrewError::Validation(format!(
+            "PostgreSQL run-event {label} is negative or out of range"
+        ))
+    })
 }
 
 impl PostgresStore {
@@ -143,8 +312,68 @@ impl PostgresStore {
         table_prefix: &str,
         lease: RunLeaseConfig,
     ) -> Result<Self> {
+        let keyring = HumanInputKeyring::from_env()?;
+        Self::new_with_lease_config_and_human_input_keyring(
+            database_url,
+            table_prefix,
+            lease,
+            keyring,
+        )
+        .await
+    }
+
+    /// Construct a store with an explicit durable human-input keyring.
+    ///
+    /// Production callers normally use [`Self::new_with_lease_config`], which
+    /// loads the keyring once from the environment. This constructor keeps
+    /// live-database tests deterministic and avoids process-global env races.
+    pub async fn new_with_lease_config_and_human_input_keyring(
+        database_url: &str,
+        table_prefix: &str,
+        lease: RunLeaseConfig,
+        human_input_keyring: Option<HumanInputKeyring>,
+    ) -> Result<Self> {
+        let run_event_journal_config = RunEventJournalConfig::from_env()?;
+        Self::new_with_runtime_config(
+            database_url,
+            table_prefix,
+            lease,
+            human_input_keyring,
+            run_event_journal_config,
+        )
+        .await
+    }
+
+    /// Construct a store with deterministic process-wide runtime features.
+    /// Production constructors load these immutable values once from env;
+    /// live PostgreSQL tests use this entrypoint to avoid environment races.
+    pub async fn new_with_runtime_config(
+        database_url: &str,
+        table_prefix: &str,
+        lease: RunLeaseConfig,
+        human_input_keyring: Option<HumanInputKeyring>,
+        run_event_journal_config: RunEventJournalConfig,
+    ) -> Result<Self> {
         // Validate table prefix to prevent SQL injection via env var
         validate_table_prefix(table_prefix)?;
+        run_event_journal_config.validate()?;
+        let human_input_max_pending_rows = max_pending().min(MAX_DURABLE_HUMAN_INPUT_ROWS);
+        let human_input_max_pending_ciphertext_bytes = max_pending_bytes()
+            .checked_add(
+                human_input_max_pending_rows.saturating_mul(HUMAN_INPUT_AEAD_OVERHEAD_BYTES),
+            )
+            .ok_or_else(|| {
+                IronCrewError::Validation("PostgreSQL human-input ciphertext limit overflow".into())
+            })?;
+        let human_input_read_concurrency: usize = parse_env(
+            HUMAN_INPUT_READ_CONCURRENCY_ENV,
+            DEFAULT_HUMAN_INPUT_READ_CONCURRENCY,
+        )?;
+        if !(1..=MAX_HUMAN_INPUT_READ_CONCURRENCY).contains(&human_input_read_concurrency) {
+            return Err(IronCrewError::Validation(format!(
+                "{HUMAN_INPUT_READ_CONCURRENCY_ENV} must be between 1 and {MAX_HUMAN_INPUT_READ_CONCURRENCY}"
+            )));
+        }
 
         let max_conn: u32 = parse_env("IRONCREW_DB_POOL_SIZE", 10)?;
         if max_conn == 0 || max_conn > MAX_DB_POOL_SIZE {
@@ -213,6 +442,10 @@ impl PostgresStore {
         let audit_events_table = format!("{}audit_events", table_prefix);
         let idempotency_table = format!("{}idempotency", table_prefix);
         let idempotency_accounting_table = format!("{}idempotency_accounting", table_prefix);
+        let human_inputs_table = format!("{}human_inputs", table_prefix);
+        let run_events_table = format!("{}run_events", table_prefix);
+        let run_event_state_table = format!("{}run_event_state", table_prefix);
+        let run_event_usage_table = format!("{}run_event_usage", table_prefix);
 
         let store = Self {
             pool,
@@ -222,6 +455,15 @@ impl PostgresStore {
             audit_events_table,
             idempotency_table,
             idempotency_accounting_table,
+            human_inputs_table,
+            run_events_table,
+            run_event_state_table,
+            run_event_usage_table,
+            human_input_keyring,
+            human_input_max_pending_rows,
+            human_input_max_pending_ciphertext_bytes,
+            human_input_read_slots: Semaphore::new(human_input_read_concurrency),
+            run_event_journal_config,
             lease,
         };
         store.bootstrap().await?;
@@ -316,6 +558,612 @@ impl PostgresStore {
         shared: bool,
     ) -> Result<()> {
         self.lock_advisory(tx, "run-fence", "global", shared).await
+    }
+
+    async fn delete_human_inputs_for_run(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+    ) -> Result<u64> {
+        let sql = format!("DELETE FROM {} WHERE run_id = $1", self.human_inputs_table);
+        let deleted = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(run_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input mailbox cleanup failed: {error}"
+                ))
+            })?;
+        Ok(deleted.rows_affected())
+    }
+
+    async fn lock_run_event_usage(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<RunEventUsageRow> {
+        let sql = format!(
+            "SELECT retained_events, retained_bytes FROM {} \
+             WHERE singleton = TRUE FOR UPDATE",
+            self.run_event_usage_table
+        );
+        let row: Option<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event global accounting lock failed: {error}"
+                ))
+            })?;
+        let (retained_events, retained_bytes) = row.ok_or_else(|| {
+            IronCrewError::Validation(
+                "PostgreSQL run-event global accounting row is missing".into(),
+            )
+        })?;
+        Ok(RunEventUsageRow {
+            retained_events: nonnegative_u64("global retained event count", retained_events)?,
+            retained_bytes: nonnegative_u64("global retained byte count", retained_bytes)?,
+        })
+    }
+
+    async fn run_event_state_for_update(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+    ) -> Result<Option<RunEventStateRow>> {
+        self.run_event_state(tx, run_id, "FOR UPDATE").await
+    }
+
+    async fn run_event_state_for_share(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+    ) -> Result<Option<RunEventStateRow>> {
+        self.run_event_state(tx, run_id, "FOR SHARE").await
+    }
+
+    async fn run_event_state(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        lock: &str,
+    ) -> Result<Option<RunEventStateRow>> {
+        let sql = format!(
+            "SELECT flow, owner_instance_id, latest_sequence, dropped_through, \
+                    retained_events, retained_bytes, journal_complete, \
+                    eviction_reason, terminal_event_sequence \
+             FROM {} WHERE run_id = $1 {lock}",
+            self.run_event_state_table,
+        );
+        let row: Option<RunEventStateDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event state lookup failed: {error}"
+                ))
+            })?;
+        row.map(
+            |(
+                flow,
+                owner_instance_id,
+                latest_sequence,
+                dropped_through,
+                retained_events,
+                retained_bytes,
+                journal_complete,
+                eviction_reason,
+                terminal_event_sequence,
+            )| {
+                Ok(RunEventStateRow {
+                    flow,
+                    owner_instance_id,
+                    latest_sequence: nonnegative_u64("latest sequence", latest_sequence)?,
+                    dropped_through: nonnegative_u64("dropped boundary", dropped_through)?,
+                    retained_events: nonnegative_u64(
+                        "per-run retained event count",
+                        retained_events,
+                    )?,
+                    retained_bytes: nonnegative_u64("per-run retained byte count", retained_bytes)?,
+                    journal_complete,
+                    eviction_reason: eviction_reason
+                        .as_deref()
+                        .map(parse_run_event_gap_reason)
+                        .transpose()?,
+                    terminal_event_sequence: terminal_event_sequence
+                        .map(|value| nonnegative_u64("terminal event sequence", value))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    async fn delete_run_event_candidates(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        candidates: &[RunEventDeleteCandidate],
+        reason: RunEventGapReason,
+    ) -> Result<RunEventPruneSummary> {
+        if candidates.is_empty() {
+            return Ok(RunEventPruneSummary::default());
+        }
+        let run_ids: Vec<String> = candidates
+            .iter()
+            .map(|candidate| candidate.run_id.clone())
+            .collect();
+        let sequences: Vec<i64> = candidates
+            .iter()
+            .map(|candidate| {
+                i64::try_from(candidate.sequence).map_err(|_| {
+                    IronCrewError::Validation("Run-event sequence exceeds PostgreSQL BIGINT".into())
+                })
+            })
+            .collect::<Result<_>>()?;
+        let sql = format!(
+            "DELETE FROM {events} AS event USING (\
+                 SELECT * FROM unnest($1::text[], $2::bigint[]) \
+                 AS selected(run_id, sequence)\
+             ) AS selected \
+             WHERE event.run_id = selected.run_id \
+               AND event.sequence = selected.sequence \
+             RETURNING event.run_id, event.sequence, event.accounted_bytes AS payload_bytes",
+            events = self.run_events_table
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&run_ids)
+            .bind(&sequences)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event bounded prune failed: {error}"
+                ))
+            })?;
+        if rows.len() != candidates.len() {
+            return Err(IronCrewError::Conflict(
+                "Run-event rows changed during bounded pruning".into(),
+            ));
+        }
+
+        let mut deleted_by_run: BTreeMap<String, RunEventRunEviction> = BTreeMap::new();
+        for row in rows {
+            let run_id: String = row.try_get("run_id").map_err(|error| {
+                IronCrewError::Validation(format!("Run-event run_id column: {error}"))
+            })?;
+            let sequence = nonnegative_u64(
+                "deleted sequence",
+                row.try_get::<i64, _>("sequence").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                })?,
+            )?;
+            let payload_bytes = nonnegative_u64(
+                "deleted payload byte count",
+                row.try_get::<i64, _>("payload_bytes").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event payload_bytes column: {error}"))
+                })?,
+            )?;
+            let eviction = deleted_by_run.entry(run_id).or_default();
+            eviction.events = eviction.events.saturating_add(1);
+            eviction.bytes = eviction.bytes.saturating_add(payload_bytes);
+            if eviction.first_sequence == 0 {
+                eviction.first_sequence = sequence;
+            } else {
+                eviction.first_sequence = eviction.first_sequence.min(sequence);
+            }
+            eviction.last_sequence = eviction.last_sequence.max(sequence);
+        }
+
+        for (run_id, eviction) in &mut deleted_by_run {
+            let state = self
+                .run_event_state_for_update(tx, run_id)
+                .await?
+                .ok_or_else(|| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event state for '{run_id}' is missing"
+                    ))
+                })?;
+            eviction.previous_dropped_through = state.dropped_through;
+            let retained_events = state
+                .retained_events
+                .checked_sub(eviction.events)
+                .ok_or_else(|| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event count accounting underflow for '{run_id}'"
+                    ))
+                })?;
+            let retained_bytes = state
+                .retained_bytes
+                .checked_sub(eviction.bytes)
+                .ok_or_else(|| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event byte accounting underflow for '{run_id}'"
+                    ))
+                })?;
+            let earliest_sql = format!(
+                "SELECT MIN(sequence) FROM {} WHERE run_id = $1",
+                self.run_events_table
+            );
+            let earliest: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(earliest_sql))
+                .bind(run_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event retained-bound lookup failed: {error}"
+                    ))
+                })?;
+            let new_dropped_through = if retained_events == 0 {
+                state.latest_sequence
+            } else {
+                let earliest = earliest
+                    .ok_or_else(|| {
+                        IronCrewError::Validation(
+                            "PostgreSQL run-event accounting retained rows are missing".into(),
+                        )
+                    })
+                    .and_then(|value| nonnegative_u64("earliest retained sequence", value))?;
+                state.dropped_through.max(earliest.saturating_sub(1))
+            };
+            eviction.new_dropped_through = new_dropped_through;
+            if new_dropped_through > state.dropped_through {
+                eviction.reason = Some(reason);
+            }
+            let eviction_reason = if new_dropped_through > state.dropped_through {
+                Some(run_event_gap_reason_db(reason))
+            } else {
+                state.eviction_reason.map(run_event_gap_reason_db)
+            };
+            let journal_complete =
+                state.journal_complete && eviction.last_sequence <= new_dropped_through;
+            let update_sql = format!(
+                "UPDATE {} SET retained_events = $1, retained_bytes = $2, \
+                     dropped_through = $3, eviction_reason = $4, \
+                     journal_complete = $5, updated_at = clock_timestamp() \
+                 WHERE run_id = $6",
+                self.run_event_state_table
+            );
+            let updated = sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(i64::try_from(retained_events).map_err(|_| {
+                    IronCrewError::Validation("Run-event retained count exceeds BIGINT".into())
+                })?)
+                .bind(i64::try_from(retained_bytes).map_err(|_| {
+                    IronCrewError::Validation("Run-event retained bytes exceed BIGINT".into())
+                })?)
+                .bind(i64::try_from(new_dropped_through).map_err(|_| {
+                    IronCrewError::Validation("Run-event dropped boundary exceeds BIGINT".into())
+                })?)
+                .bind(eviction_reason)
+                .bind(journal_complete)
+                .bind(run_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event state prune update failed: {error}"
+                    ))
+                })?;
+            if updated.rows_affected() != 1 {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run-event state for '{run_id}' changed during pruning"
+                )));
+            }
+        }
+
+        Ok(RunEventPruneSummary {
+            by_run: deleted_by_run,
+        })
+    }
+
+    async fn prune_expired_run_events(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<RunEventPruneSummary> {
+        let sql = format!(
+            "SELECT event.run_id, event.sequence, \
+                    event.accounted_bytes AS payload_bytes \
+             FROM {events} AS event \
+             WHERE event.expires_at <= clock_timestamp() \
+             ORDER BY event.expires_at, event.run_id, event.sequence \
+             LIMIT $1 FOR UPDATE OF event",
+            events = self.run_events_table
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(
+                i64::try_from(self.run_event_journal_config.prune_batch).map_err(|_| {
+                    IronCrewError::Validation("Run-event prune batch exceeds BIGINT".into())
+                })?,
+            )
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL expired run-event selection failed: {error}"
+                ))
+            })?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok(RunEventDeleteCandidate {
+                    run_id: row.try_get("run_id").map_err(|error| {
+                        IronCrewError::Validation(format!("Run-event run_id column: {error}"))
+                    })?,
+                    sequence: nonnegative_u64(
+                        "expired sequence",
+                        row.try_get("sequence").map_err(|error| {
+                            IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                        })?,
+                    )?,
+                    payload_bytes: nonnegative_u64(
+                        "expired payload byte count",
+                        row.try_get("payload_bytes").map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "Run-event payload_bytes column: {error}"
+                            ))
+                        })?,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.delete_run_event_candidates(tx, &candidates, RunEventGapReason::Retention)
+            .await
+    }
+
+    /// Opportunistic physical retention sweep run after core reconciliation
+    /// commits. Failure or lock contention is deliberately non-fatal: logical
+    /// reads already filter expired rows, and maintenance must never roll back
+    /// abandonment/idempotency recovery.
+    async fn prune_expired_run_events_best_effort(&self) {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                tracing::warn!(%error, "PostgreSQL run-event maintenance transaction unavailable");
+                return;
+            }
+        };
+        let lock_name = format!("ironcrew:{}:run-event-maintenance", self.run_events_table);
+        let acquired: bool =
+            match sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(lock_name)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    tracing::warn!(%error, "PostgreSQL run-event maintenance lock probe failed");
+                    return;
+                }
+            };
+        if !acquired {
+            let _ = tx.rollback().await;
+            return;
+        }
+        if let Err(error) = sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(&mut *tx)
+            .await
+        {
+            let _ = tx.rollback().await;
+            tracing::warn!(%error, "PostgreSQL run-event maintenance timeout setup failed");
+            return;
+        }
+        if let Err(error) = self.lock_run_event_usage(&mut tx).await {
+            let _ = tx.rollback().await;
+            tracing::debug!(%error, "PostgreSQL run-event maintenance skipped on usage contention");
+            return;
+        }
+        if let Err(error) = self.prune_expired_run_events(&mut tx).await {
+            let _ = tx.rollback().await;
+            tracing::warn!(%error, "PostgreSQL run-event maintenance prune failed");
+            return;
+        }
+        if let Err(error) = tx.commit().await {
+            tracing::warn!(%error, "PostgreSQL run-event maintenance commit failed");
+        }
+    }
+
+    async fn evict_run_event_capacity(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        events_to_free: u64,
+        bytes_to_free: u64,
+    ) -> Result<RunEventPruneSummary> {
+        if events_to_free == 0 && bytes_to_free == 0 {
+            return Ok(RunEventPruneSummary::default());
+        }
+        let sql = format!(
+            "SELECT run_id, sequence, accounted_bytes AS payload_bytes FROM {} \
+             WHERE run_id = $1 ORDER BY sequence LIMIT $2 FOR UPDATE",
+            self.run_events_table
+        );
+        let batch_limit =
+            i64::try_from(self.run_event_journal_config.prune_batch).map_err(|_| {
+                IronCrewError::Validation("Run-event prune batch exceeds BIGINT".into())
+            })?;
+        let mut remaining_events = events_to_free;
+        let mut remaining_bytes = bytes_to_free;
+        let mut total_evicted = 0u64;
+        let mut summary = RunEventPruneSummary::default();
+        while remaining_events > 0 || remaining_bytes > 0 {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .bind(run_id)
+                .bind(batch_limit)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL per-run event eviction selection failed: {error}"
+                    ))
+                })?;
+            let mut candidates = Vec::new();
+            let mut freed_bytes = 0u64;
+            for row in rows {
+                let candidate = RunEventDeleteCandidate {
+                    run_id: row.try_get("run_id").map_err(|error| {
+                        IronCrewError::Validation(format!("Run-event run_id column: {error}"))
+                    })?,
+                    sequence: nonnegative_u64(
+                        "evicted sequence",
+                        row.try_get("sequence").map_err(|error| {
+                            IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                        })?,
+                    )?,
+                    payload_bytes: nonnegative_u64(
+                        "evicted payload byte count",
+                        row.try_get("payload_bytes").map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "Run-event payload_bytes column: {error}"
+                            ))
+                        })?,
+                    )?,
+                };
+                freed_bytes = freed_bytes.saturating_add(candidate.payload_bytes);
+                candidates.push(candidate);
+                if candidates.len() as u64 >= remaining_events && freed_bytes >= remaining_bytes {
+                    break;
+                }
+            }
+            if candidates.is_empty()
+                || total_evicted.saturating_add(candidates.len() as u64)
+                    > MAX_EVICTED_RUN_EVENTS_PER_APPEND
+            {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run-event per-run capacity for '{run_id}' cannot be reclaimed within the bounded {MAX_EVICTED_RUN_EVENTS_PER_APPEND}-row append budget"
+                )));
+            }
+            let freed_events = candidates.len() as u64;
+            summary.merge(
+                self.delete_run_event_candidates(
+                    tx,
+                    &candidates,
+                    RunEventGapReason::WriterBackpressure,
+                )
+                .await?,
+            );
+            total_evicted = total_evicted.saturating_add(freed_events);
+            remaining_events = remaining_events.saturating_sub(freed_events);
+            remaining_bytes = remaining_bytes.saturating_sub(freed_bytes);
+        }
+        Ok(summary)
+    }
+
+    async fn evict_global_run_event_capacity(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        events_to_free: u64,
+        bytes_to_free: u64,
+    ) -> Result<RunEventPruneSummary> {
+        if events_to_free == 0 && bytes_to_free == 0 {
+            return Ok(RunEventPruneSummary::default());
+        }
+        let sql = format!(
+            "SELECT run_id, sequence, accounted_bytes AS payload_bytes FROM {} \
+             ORDER BY created_at, run_id, sequence LIMIT $1 FOR UPDATE",
+            self.run_events_table
+        );
+        let batch_limit =
+            i64::try_from(self.run_event_journal_config.prune_batch).map_err(|_| {
+                IronCrewError::Validation("Run-event prune batch exceeds BIGINT".into())
+            })?;
+        let mut remaining_events = events_to_free;
+        let mut remaining_bytes = bytes_to_free;
+        let mut total_evicted = 0u64;
+        let mut summary = RunEventPruneSummary::default();
+        while remaining_events > 0 || remaining_bytes > 0 {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .bind(batch_limit)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL global event eviction selection failed: {error}"
+                    ))
+                })?;
+            let mut candidates = Vec::new();
+            let mut freed_bytes = 0u64;
+            for row in rows {
+                let candidate = RunEventDeleteCandidate {
+                    run_id: row.try_get("run_id").map_err(|error| {
+                        IronCrewError::Validation(format!("Run-event run_id column: {error}"))
+                    })?,
+                    sequence: nonnegative_u64(
+                        "globally evicted sequence",
+                        row.try_get("sequence").map_err(|error| {
+                            IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                        })?,
+                    )?,
+                    payload_bytes: nonnegative_u64(
+                        "globally evicted payload byte count",
+                        row.try_get("payload_bytes").map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "Run-event payload_bytes column: {error}"
+                            ))
+                        })?,
+                    )?,
+                };
+                freed_bytes = freed_bytes.saturating_add(candidate.payload_bytes);
+                candidates.push(candidate);
+                if candidates.len() as u64 >= remaining_events && freed_bytes >= remaining_bytes {
+                    break;
+                }
+            }
+            if candidates.is_empty()
+                || total_evicted.saturating_add(candidates.len() as u64)
+                    > MAX_EVICTED_RUN_EVENTS_PER_APPEND
+            {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run-event global capacity cannot be reclaimed within the bounded {MAX_EVICTED_RUN_EVENTS_PER_APPEND}-row append budget"
+                )));
+            }
+            let freed_events = candidates.len() as u64;
+            summary.merge(
+                self.delete_run_event_candidates(
+                    tx,
+                    &candidates,
+                    RunEventGapReason::GlobalCapacity,
+                )
+                .await?,
+            );
+            total_evicted = total_evicted.saturating_add(freed_events);
+            remaining_events = remaining_events.saturating_sub(freed_events);
+            remaining_bytes = remaining_bytes.saturating_sub(freed_bytes);
+        }
+        Ok(summary)
+    }
+
+    async fn run_event_bounds(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        state: &RunEventStateRow,
+    ) -> Result<RunEventBounds> {
+        let sql = format!(
+            "SELECT MIN(sequence) FROM {} WHERE run_id = $1",
+            self.run_events_table
+        );
+        let earliest: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(run_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event earliest-bound lookup failed: {error}"
+                ))
+            })?;
+        let bounds = RunEventBounds {
+            earliest_retained_sequence: earliest
+                .map(|value| nonnegative_u64("earliest retained sequence", value))
+                .transpose()?,
+            latest_sequence: state.latest_sequence,
+            dropped_through: state.dropped_through,
+            retained_events: state.retained_events,
+            retained_bytes: state.retained_bytes,
+            journal_complete: state.journal_complete,
+        };
+        bounds.validate()?;
+        Ok(bounds)
     }
 
     async fn idempotency_accounting_for_update(
@@ -1221,6 +2069,417 @@ impl PostgresStore {
                 ))
             })?;
 
+        // 8. Durable human-input mailbox. Question metadata and answers are
+        // application-encrypted before they enter SQL; only routing/fencing
+        // fields remain queryable. The run FK is both a safety net and the
+        // final cleanup path for explicit run deletion.
+        let hit = &self.human_inputs_table;
+        let human_inputs_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {hit} (
+                run_id                    TEXT NOT NULL,
+                question_id               TEXT NOT NULL,
+                flow                      TEXT NOT NULL,
+                owner_instance_id         TEXT NOT NULL,
+                key_hash                  TEXT NOT NULL,
+                attempt_id                TEXT NOT NULL,
+                question_digest           TEXT NOT NULL,
+                question_key_fingerprint  TEXT NOT NULL,
+                question_nonce            BYTEA NOT NULL,
+                question_ciphertext       BYTEA NOT NULL,
+                answer_key_fingerprint    TEXT,
+                answer_nonce              BYTEA,
+                answer_ciphertext         BYTEA,
+                state                     TEXT NOT NULL DEFAULT 'pending',
+                created_at                TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                expires_at                TIMESTAMPTZ NOT NULL,
+                answered_at               TIMESTAMPTZ,
+                PRIMARY KEY (run_id, question_id),
+                CONSTRAINT {hit}_run_fk FOREIGN KEY (run_id)
+                    REFERENCES {t} (run_id) ON DELETE CASCADE,
+                CONSTRAINT {hit}_state_ck CHECK (state IN ('pending', 'answered')),
+                CONSTRAINT {hit}_payload_ck CHECK (
+                    octet_length(question_nonce) > 0 AND
+                    octet_length(question_ciphertext) > 0 AND
+                    length(question_key_fingerprint) > 0 AND
+                    length(question_digest) = 64 AND
+                    question_digest !~ '[^0-9a-f]' AND
+                    ((state = 'pending' AND answer_key_fingerprint IS NULL AND
+                      answer_nonce IS NULL AND answer_ciphertext IS NULL AND
+                      answered_at IS NULL) OR
+                     (state = 'answered' AND answer_key_fingerprint IS NOT NULL AND
+                      answer_nonce IS NOT NULL AND answer_ciphertext IS NOT NULL AND
+                      answered_at IS NOT NULL))
+                ),
+                CONSTRAINT {hit}_expiry_ck CHECK (expires_at > created_at)
+            )"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(human_inputs_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL human-input mailbox table '{hit}': {error}"
+                ))
+            })?;
+        // Question AAD gained a semantic digest after the first mailbox
+        // rollout. Old rows cannot be authenticated under the new AAD and are
+        // intentionally discarded instead of being silently reinterpreted.
+        let add_question_digest =
+            format!("ALTER TABLE {hit} ADD COLUMN IF NOT EXISTS question_digest TEXT");
+        sqlx::query(sqlx::AssertSqlSafe(add_question_digest))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to add PostgreSQL human-input question digest: {error}"
+                ))
+            })?;
+        let discard_legacy_questions = format!("DELETE FROM {hit} WHERE question_digest IS NULL");
+        sqlx::query(sqlx::AssertSqlSafe(discard_legacy_questions))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to discard legacy PostgreSQL human-input rows: {error}"
+                ))
+            })?;
+        let require_question_digest =
+            format!("ALTER TABLE {hit} ALTER COLUMN question_digest SET NOT NULL");
+        sqlx::query(sqlx::AssertSqlSafe(require_question_digest))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to require PostgreSQL human-input question digest: {error}"
+                ))
+            })?;
+        let refresh_human_payload_constraint = format!(
+            "ALTER TABLE {hit} DROP CONSTRAINT IF EXISTS {hit}_payload_ck; \
+             ALTER TABLE {hit} ADD CONSTRAINT {hit}_payload_ck CHECK (\
+                 octet_length(question_nonce) > 0 AND \
+                 octet_length(question_ciphertext) > 0 AND \
+                 length(question_key_fingerprint) > 0 AND \
+                 length(question_digest) = 64 AND \
+                 question_digest !~ '[^0-9a-f]' AND \
+                 ((state = 'pending' AND answer_key_fingerprint IS NULL AND \
+                   answer_nonce IS NULL AND answer_ciphertext IS NULL AND \
+                   answered_at IS NULL) OR \
+                  (state = 'answered' AND answer_key_fingerprint IS NOT NULL AND \
+                   answer_nonce IS NOT NULL AND answer_ciphertext IS NOT NULL AND \
+                   answered_at IS NOT NULL))\
+             )"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(refresh_human_payload_constraint))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to refresh PostgreSQL human-input payload constraint: {error}"
+                ))
+            })?;
+        for sql in [
+            format!(
+                "CREATE INDEX IF NOT EXISTS {hit}_run_idx ON {hit} (run_id, expires_at) \
+                 WHERE state = 'pending'"
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {hit}_exp_idx ON {hit} (expires_at)"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to create PostgreSQL human-input mailbox index: {error}"
+                    ))
+                })?;
+        }
+
+        // 9. Durable bounded run-event journal. The event table owns payloads,
+        // the state table keeps exact per-run replay bounds, and one trigger-
+        // maintained singleton accounts global rows/bytes even during
+        // cascading run deletion.
+        let events = &self.run_events_table;
+        let event_state = &self.run_event_state_table;
+        let event_usage = &self.run_event_usage_table;
+        let run_events_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {events} (
+                run_id       TEXT NOT NULL,
+                sequence     BIGINT NOT NULL,
+                event_type   TEXT NOT NULL,
+                payload      JSONB NOT NULL,
+                payload_bytes BIGINT NOT NULL,
+                accounted_bytes BIGINT GENERATED ALWAYS AS (
+                    GREATEST(payload_bytes, octet_length(payload::text)::BIGINT,
+                             {MIN_ACCOUNTED_RUN_EVENT_BYTES})
+                ) STORED,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                expires_at   TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (run_id, sequence),
+                CONSTRAINT {events}_run_fk FOREIGN KEY (run_id)
+                    REFERENCES {t} (run_id) ON DELETE CASCADE,
+                CONSTRAINT {events}_payload_ck CHECK (
+                    sequence > 0 AND
+                    length(event_type) BETWEEN 1 AND 64 AND
+                    event_type !~ '[^a-z0-9_]' AND
+                    jsonb_typeof(payload) = 'object' AND
+                    payload ? 'event' AND payload->>'event' = event_type AND
+                    payload_bytes > 0 AND
+                    accounted_bytes > 0 AND
+                    accounted_bytes <= {HARD_MAX_EVENT_BYTES}
+                ),
+                CONSTRAINT {events}_expiry_ck CHECK (expires_at > created_at)
+            );
+            CREATE TABLE IF NOT EXISTS {event_state} (
+                run_id                  TEXT PRIMARY KEY,
+                flow                    TEXT NOT NULL,
+                owner_instance_id       TEXT NOT NULL,
+                latest_sequence         BIGINT NOT NULL DEFAULT 0,
+                dropped_through         BIGINT NOT NULL DEFAULT 0,
+                retained_events         BIGINT NOT NULL DEFAULT 0,
+                retained_bytes          BIGINT NOT NULL DEFAULT 0,
+                journal_complete        BOOLEAN NOT NULL DEFAULT TRUE,
+                eviction_reason         TEXT,
+                terminal_event_sequence BIGINT,
+                updated_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                CONSTRAINT {event_state}_run_fk FOREIGN KEY (run_id)
+                    REFERENCES {t} (run_id) ON DELETE CASCADE,
+                CONSTRAINT {event_state}_bounds_ck CHECK (
+                    latest_sequence >= 0 AND dropped_through >= 0 AND
+                    dropped_through <= latest_sequence AND
+                    retained_events >= 0 AND retained_bytes >= 0 AND
+                    ((retained_events = 0 AND retained_bytes = 0) OR
+                     (retained_events > 0 AND retained_bytes > 0)) AND
+                    (terminal_event_sequence IS NULL OR
+                     (terminal_event_sequence > 0 AND
+                      terminal_event_sequence <= latest_sequence))
+                ),
+                CONSTRAINT {event_state}_reason_ck CHECK (
+                    (dropped_through = 0 AND eviction_reason IS NULL) OR
+                    (dropped_through > 0 AND eviction_reason IN
+                        ('writer_backpressure', 'retention', 'global_capacity', 'owner_lost'))
+                )
+            );
+            CREATE TABLE IF NOT EXISTS {event_usage} (
+                singleton       BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                schema_version  INTEGER NOT NULL DEFAULT 0,
+                retained_events BIGINT NOT NULL DEFAULT 0,
+                retained_bytes  BIGINT NOT NULL DEFAULT 0,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                CONSTRAINT {event_usage}_usage_ck CHECK (
+                    schema_version >= 0 AND
+                    retained_events >= 0 AND retained_bytes >= 0 AND
+                    ((retained_events = 0 AND retained_bytes = 0) OR
+                     (retained_events > 0 AND retained_bytes > 0))
+                )
+            );
+            INSERT INTO {event_usage} (singleton) VALUES (TRUE)
+            ON CONFLICT (singleton) DO NOTHING"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(run_events_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL run-event journal tables: {error}"
+                ))
+            })?;
+        let run_event_usage_migration = format!(
+            "ALTER TABLE {event_usage} ADD COLUMN IF NOT EXISTS \
+                 schema_version INTEGER NOT NULL DEFAULT 0"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(run_event_usage_migration))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to migrate PostgreSQL run-event schema version: {error}"
+                ))
+            })?;
+
+        // `payload_bytes` is the storage-neutral compact JSON wire size used
+        // for duplicate and page semantics. PostgreSQL's JSONB rendering can
+        // be larger, so a generated conservative accounting size prevents a
+        // direct/buggy insert from understating memory/storage consumption.
+        // Refresh the constraint for databases created by an earlier binary.
+        let run_event_payload_accounting_sql = format!(
+            "ALTER TABLE {events} ADD COLUMN IF NOT EXISTS accounted_bytes BIGINT \
+                 GENERATED ALWAYS AS (\
+                     GREATEST(payload_bytes, octet_length(payload::text)::BIGINT, \
+                              {MIN_ACCOUNTED_RUN_EVENT_BYTES})\
+                 ) STORED; \
+             ALTER TABLE {events} DROP CONSTRAINT IF EXISTS {events}_payload_ck; \
+             ALTER TABLE {events} ADD CONSTRAINT {events}_payload_ck CHECK (\
+                 sequence > 0 AND \
+                 length(event_type) BETWEEN 1 AND 64 AND \
+                 event_type !~ '[^a-z0-9_]' AND \
+                 jsonb_typeof(payload) = 'object' AND \
+                 payload ? 'event' AND payload->>'event' = event_type AND \
+                 payload_bytes > 0 AND accounted_bytes > 0 AND \
+                 accounted_bytes <= {HARD_MAX_EVENT_BYTES}\
+             )"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(run_event_payload_accounting_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to harden PostgreSQL run-event payload accounting: {error}"
+                ))
+            })?;
+
+        for sql in [
+            format!(
+                "CREATE INDEX IF NOT EXISTS {events}_exp_idx ON {events} \
+                 (expires_at, run_id, sequence)"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {events}_old_idx ON {events} \
+                 (created_at, run_id, sequence)"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to create PostgreSQL run-event journal index: {error}"
+                    ))
+                })?;
+        }
+
+        let event_usage_function = format!("{events}_acct_fn");
+        let event_usage_trigger = format!("{events}_acct_trg");
+        let event_usage_function_sql = format!(
+            r#"CREATE OR REPLACE FUNCTION {event_usage_function}() RETURNS TRIGGER
+               LANGUAGE plpgsql AS $ironcrew$
+               BEGIN
+                   IF TG_OP = 'INSERT' THEN
+                       UPDATE {event_usage}
+                       SET retained_events = retained_events + 1,
+                           retained_bytes = retained_bytes + NEW.accounted_bytes,
+                           updated_at = clock_timestamp()
+                       WHERE singleton = TRUE;
+                       IF NOT FOUND THEN
+                           RAISE EXCEPTION 'global run-event accounting row is missing';
+                       END IF;
+                       RETURN NEW;
+                   END IF;
+
+                   UPDATE {event_usage}
+                   SET retained_events = retained_events - 1,
+                       retained_bytes = retained_bytes - OLD.accounted_bytes,
+                       updated_at = clock_timestamp()
+                   WHERE singleton = TRUE;
+                   IF NOT FOUND THEN
+                       RAISE EXCEPTION 'global run-event accounting row is missing';
+                   END IF;
+                   RETURN OLD;
+               END;
+               $ironcrew$"#
+        );
+        sqlx::query(sqlx::AssertSqlSafe(event_usage_function_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL run-event accounting function: {error}"
+                ))
+            })?;
+        let event_usage_trigger_sql = format!(
+            "DROP TRIGGER IF EXISTS {event_usage_trigger} ON {events}; \
+             CREATE TRIGGER {event_usage_trigger} \
+             AFTER INSERT OR DELETE ON {events} FOR EACH ROW \
+             EXECUTE FUNCTION {event_usage_function}()"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(event_usage_trigger_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL run-event accounting trigger: {error}"
+                ))
+            })?;
+
+        // Reconcile any journal created by a previous binary before releasing
+        // the bootstrap DDL locks. Existing dropped boundaries remain intact;
+        // retained counts and global usage are rebuilt from source rows.
+        let reconcile_run_events = format!(
+            "INSERT INTO {event_state} AS state (
+                 run_id, flow, owner_instance_id, latest_sequence,
+                 retained_events, retained_bytes, journal_complete,
+                 terminal_event_sequence, updated_at
+             )
+             SELECT event.run_id, run.flow, run.owner_instance_id,
+                    MAX(event.sequence), COUNT(*)::BIGINT,
+                    SUM(event.accounted_bytes)::BIGINT,
+                    MIN(event.sequence) = 1 AND COUNT(*)::BIGINT = MAX(event.sequence),
+                    MAX(event.sequence) FILTER (WHERE event.event_type = 'run_complete'),
+                    clock_timestamp()
+             FROM {events} AS event
+             JOIN {t} AS run ON run.run_id = event.run_id
+             GROUP BY event.run_id, run.flow, run.owner_instance_id
+             ON CONFLICT (run_id) DO UPDATE SET
+                 flow = EXCLUDED.flow,
+                 owner_instance_id = EXCLUDED.owner_instance_id,
+                 latest_sequence = GREATEST(state.latest_sequence, EXCLUDED.latest_sequence),
+                 retained_events = EXCLUDED.retained_events,
+                 retained_bytes = EXCLUDED.retained_bytes,
+                 journal_complete = state.journal_complete AND
+                     EXCLUDED.retained_events =
+                         EXCLUDED.latest_sequence - state.dropped_through AND
+                     (SELECT MIN(retained.sequence) = state.dropped_through + 1
+                      FROM {events} AS retained
+                      WHERE retained.run_id = state.run_id),
+                 terminal_event_sequence = COALESCE(
+                     state.terminal_event_sequence, EXCLUDED.terminal_event_sequence),
+                 updated_at = clock_timestamp();
+             UPDATE {event_usage}
+             SET retained_events = (SELECT COUNT(*)::BIGINT FROM {events}),
+                 retained_bytes = (SELECT COALESCE(SUM(accounted_bytes), 0)::BIGINT FROM {events}),
+                 updated_at = clock_timestamp()
+             WHERE singleton = TRUE"
+        );
+        let stored_run_event_schema_version: i32 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT schema_version FROM {event_usage} \
+                 WHERE singleton = TRUE FOR UPDATE"
+            )))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to read PostgreSQL run-event schema version: {error}"
+                ))
+            })?;
+        if stored_run_event_schema_version > RUN_EVENT_SCHEMA_VERSION {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL run-event schema version {stored_run_event_schema_version} is newer than supported version {RUN_EVENT_SCHEMA_VERSION}"
+            )));
+        }
+        if stored_run_event_schema_version < RUN_EVENT_SCHEMA_VERSION {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(reconcile_run_events))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to reconcile PostgreSQL run-event journal accounting: {error}"
+                    ))
+                })?;
+            let mark_version_sql = format!(
+                "UPDATE {event_usage} SET schema_version = $1, \
+                     updated_at = clock_timestamp() WHERE singleton = TRUE"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(mark_version_sql))
+                .bind(RUN_EVENT_SCHEMA_VERSION)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to mark PostgreSQL run-event schema version: {error}"
+                    ))
+                })?;
+        }
+
         for (column, data_type) in [
             ("owner_instance_id", "text"),
             ("lease_expires_at", "text"),
@@ -1257,13 +2516,17 @@ impl PostgresStore {
         self.verify_required_schema().await?;
 
         tracing::debug!(
-            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}', '{}', '{}'",
+            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'",
             self.table_name,
             self.conversations_table,
             self.dialogs_table,
             self.audit_events_table,
             self.idempotency_table,
-            self.idempotency_accounting_table
+            self.idempotency_accounting_table,
+            self.human_inputs_table,
+            self.run_events_table,
+            self.run_event_state_table,
+            self.run_event_usage_table
         );
         Ok(())
     }
@@ -1463,6 +2726,122 @@ impl PostgresStore {
             )));
         }
 
+        let human_input_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns AS c \
+             JOIN (VALUES \
+                 ('run_id', 'text'), \
+                 ('question_id', 'text'), \
+                 ('flow', 'text'), \
+                 ('owner_instance_id', 'text'), \
+                 ('key_hash', 'text'), \
+                 ('attempt_id', 'text'), \
+                 ('question_digest', 'text'), \
+                 ('question_key_fingerprint', 'text'), \
+                 ('question_nonce', 'bytea'), \
+                 ('question_ciphertext', 'bytea'), \
+                 ('answer_key_fingerprint', 'text'), \
+                 ('answer_nonce', 'bytea'), \
+                 ('answer_ciphertext', 'bytea'), \
+                 ('state', 'text'), \
+                 ('created_at', 'timestamp with time zone'), \
+                 ('expires_at', 'timestamp with time zone'), \
+                 ('answered_at', 'timestamp with time zone') \
+             ) AS required(column_name, data_type) \
+               ON required.column_name = c.column_name \
+              AND required.data_type = c.data_type \
+             WHERE c.table_schema = current_schema() AND c.table_name = $1",
+        )
+        .bind(&self.human_inputs_table)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL human-input mailbox columns: {error}"
+            ))
+        })?;
+        if human_input_columns != 17 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL schema for '{}' is missing one or more human-input mailbox columns",
+                self.human_inputs_table
+            )));
+        }
+
+        let human_input_constraints: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_constraint AS con \
+             JOIN pg_class AS tbl ON tbl.oid = con.conrelid \
+             JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace \
+             LEFT JOIN pg_class AS referenced ON referenced.oid = con.confrelid \
+             LEFT JOIN pg_namespace AS referenced_ns ON referenced_ns.oid = referenced.relnamespace \
+             WHERE ns.nspname = current_schema() AND tbl.relname = $1 AND (\
+                 (con.contype = 'p' AND cardinality(con.conkey) = 2 AND \
+                  (SELECT array_agg(attr.attname ORDER BY key.ordinality) \
+                   FROM unnest(con.conkey) WITH ORDINALITY AS key(attnum, ordinality) \
+                   JOIN pg_attribute AS attr ON attr.attrelid = tbl.oid \
+                                             AND attr.attnum = key.attnum) \
+                    = ARRAY['run_id', 'question_id']::name[]) OR \
+                 (con.contype = 'f' AND con.confdeltype = 'c' AND \
+                  cardinality(con.conkey) = 1 AND \
+                  (SELECT attr.attname FROM pg_attribute AS attr \
+                   WHERE attr.attrelid = tbl.oid AND attr.attnum = con.conkey[1]) = 'run_id' AND \
+                  referenced_ns.nspname = current_schema() AND referenced.relname = $5 AND \
+                  (SELECT attr.attname FROM pg_attribute AS attr \
+                   WHERE attr.attrelid = referenced.oid AND attr.attnum = con.confkey[1]) = 'run_id') OR \
+                 (con.contype = 'c' AND con.conname IN ($2, $3, $4))\
+             )",
+        )
+        .bind(&self.human_inputs_table)
+        .bind(format!("{}_state_ck", self.human_inputs_table))
+        .bind(format!("{}_payload_ck", self.human_inputs_table))
+        .bind(format!("{}_expiry_ck", self.human_inputs_table))
+        .bind(&self.table_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL human-input mailbox constraints: {error}"
+            ))
+        })?;
+        if human_input_constraints != 5 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL table '{}' is missing a required primary key, cascading run foreign key, or state/payload/expiry check",
+                self.human_inputs_table
+            )));
+        }
+
+        let human_run_index = format!("{}_run_idx", self.human_inputs_table);
+        let human_expiry_index = format!("{}_exp_idx", self.human_inputs_table);
+        let human_input_indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_index AS i \
+             JOIN pg_class AS idx ON idx.oid = i.indexrelid \
+             JOIN pg_class AS tbl ON tbl.oid = i.indrelid \
+             JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace \
+             WHERE ns.nspname = current_schema() AND tbl.relname = $1 AND (\
+                 (idx.relname = $2 AND i.indnkeyatts = 2 AND \
+                  pg_get_indexdef(i.indexrelid, 1, TRUE) = 'run_id' AND \
+                  pg_get_indexdef(i.indexrelid, 2, TRUE) = 'expires_at' AND \
+                  i.indpred IS NOT NULL AND \
+                  pg_get_expr(i.indpred, i.indrelid) LIKE '%pending%') OR \
+                 (idx.relname = $3 AND i.indnkeyatts = 1 AND \
+                  pg_get_indexdef(i.indexrelid, 1, TRUE) = 'expires_at')\
+             )",
+        )
+        .bind(&self.human_inputs_table)
+        .bind(&human_run_index)
+        .bind(&human_expiry_index)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL human-input mailbox indexes: {error}"
+            ))
+        })?;
+        if human_input_indexes != 2 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL table '{}' is missing one or more required human-input mailbox indexes",
+                self.human_inputs_table
+            )));
+        }
+
         let accounting_columns: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns AS c \
              JOIN (VALUES \
@@ -1532,6 +2911,178 @@ impl PostgresStore {
         if !global_accounting_valid {
             return Err(IronCrewError::Validation(
                 "PostgreSQL global idempotency accounting row is missing or invalid".into(),
+            ));
+        }
+
+        let run_event_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns AS column_info \
+             JOIN (VALUES \
+                 ($1::text, 'run_id', 'text'), \
+                 ($1::text, 'sequence', 'bigint'), \
+                 ($1::text, 'event_type', 'text'), \
+                 ($1::text, 'payload', 'jsonb'), \
+                 ($1::text, 'payload_bytes', 'bigint'), \
+                 ($1::text, 'accounted_bytes', 'bigint'), \
+                 ($1::text, 'created_at', 'timestamp with time zone'), \
+                 ($1::text, 'expires_at', 'timestamp with time zone'), \
+                 ($2::text, 'run_id', 'text'), \
+                 ($2::text, 'flow', 'text'), \
+                 ($2::text, 'owner_instance_id', 'text'), \
+                 ($2::text, 'latest_sequence', 'bigint'), \
+                 ($2::text, 'dropped_through', 'bigint'), \
+                 ($2::text, 'retained_events', 'bigint'), \
+                 ($2::text, 'retained_bytes', 'bigint'), \
+                 ($2::text, 'journal_complete', 'boolean'), \
+                 ($2::text, 'eviction_reason', 'text'), \
+                 ($2::text, 'terminal_event_sequence', 'bigint'), \
+                 ($2::text, 'updated_at', 'timestamp with time zone'), \
+                 ($3::text, 'singleton', 'boolean'), \
+                 ($3::text, 'schema_version', 'integer'), \
+                 ($3::text, 'retained_events', 'bigint'), \
+                 ($3::text, 'retained_bytes', 'bigint'), \
+                 ($3::text, 'updated_at', 'timestamp with time zone') \
+             ) AS required(table_name, column_name, data_type) \
+               ON required.table_name = column_info.table_name \
+              AND required.column_name = column_info.column_name \
+              AND required.data_type = column_info.data_type \
+             WHERE column_info.table_schema = current_schema()",
+        )
+        .bind(&self.run_events_table)
+        .bind(&self.run_event_state_table)
+        .bind(&self.run_event_usage_table)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL run-event journal columns: {error}"
+            ))
+        })?;
+        if run_event_columns != 24 {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event journal is missing one or more required typed columns".into(),
+            ));
+        }
+
+        let run_event_constraints: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_constraint AS con \
+             JOIN pg_class AS table_info ON table_info.oid = con.conrelid \
+             JOIN pg_namespace AS namespace ON namespace.oid = table_info.relnamespace \
+             LEFT JOIN pg_class AS referenced ON referenced.oid = con.confrelid \
+             LEFT JOIN pg_namespace AS referenced_namespace \
+                    ON referenced_namespace.oid = referenced.relnamespace \
+             WHERE namespace.nspname = current_schema() AND (\
+                 (table_info.relname = $1 AND con.contype = 'p' AND \
+                  cardinality(con.conkey) = 2) OR \
+                 (table_info.relname = $2 AND con.contype = 'p' AND \
+                  cardinality(con.conkey) = 1) OR \
+                 (table_info.relname = $3 AND con.contype = 'p' AND \
+                  cardinality(con.conkey) = 1) OR \
+                 (table_info.relname IN ($1, $2) AND con.contype = 'f' AND \
+                  con.confdeltype = 'c' AND referenced_namespace.nspname = current_schema() AND \
+                  referenced.relname = $4) OR \
+                 (con.contype = 'c' AND con.conname IN ($5, $6, $7, $8, $9))\
+             )",
+        )
+        .bind(&self.run_events_table)
+        .bind(&self.run_event_state_table)
+        .bind(&self.run_event_usage_table)
+        .bind(&self.table_name)
+        .bind(format!("{}_payload_ck", self.run_events_table))
+        .bind(format!("{}_expiry_ck", self.run_events_table))
+        .bind(format!("{}_bounds_ck", self.run_event_state_table))
+        .bind(format!("{}_reason_ck", self.run_event_state_table))
+        .bind(format!("{}_usage_ck", self.run_event_usage_table))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL run-event journal constraints: {error}"
+            ))
+        })?;
+        if run_event_constraints != 10 {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event journal is missing a primary key, cascading run foreign key, or bounded-data constraint"
+                    .into(),
+            ));
+        }
+
+        let run_event_expiry_index = format!("{}_exp_idx", self.run_events_table);
+        let run_event_oldest_index = format!("{}_old_idx", self.run_events_table);
+        let run_event_indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_index AS index_info \
+             JOIN pg_class AS index_class ON index_class.oid = index_info.indexrelid \
+             JOIN pg_class AS table_info ON table_info.oid = index_info.indrelid \
+             JOIN pg_namespace AS namespace ON namespace.oid = table_info.relnamespace \
+             WHERE namespace.nspname = current_schema() AND table_info.relname = $1 AND (\
+                 (index_class.relname = $2 AND index_info.indnkeyatts = 3 AND \
+                  pg_get_indexdef(index_info.indexrelid, 1, TRUE) = 'expires_at' AND \
+                  pg_get_indexdef(index_info.indexrelid, 2, TRUE) = 'run_id' AND \
+                  pg_get_indexdef(index_info.indexrelid, 3, TRUE) = 'sequence') OR \
+                 (index_class.relname = $3 AND index_info.indnkeyatts = 3 AND \
+                  pg_get_indexdef(index_info.indexrelid, 1, TRUE) = 'created_at' AND \
+                  pg_get_indexdef(index_info.indexrelid, 2, TRUE) = 'run_id' AND \
+                  pg_get_indexdef(index_info.indexrelid, 3, TRUE) = 'sequence')\
+             )",
+        )
+        .bind(&self.run_events_table)
+        .bind(&run_event_expiry_index)
+        .bind(&run_event_oldest_index)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL run-event journal indexes: {error}"
+            ))
+        })?;
+        if run_event_indexes != 2 {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event journal is missing a retention or global-pruning index"
+                    .into(),
+            ));
+        }
+
+        let run_event_trigger = format!("{}_acct_trg", self.run_events_table);
+        let run_event_trigger_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM pg_trigger AS trigger_info \
+                 JOIN pg_class AS table_info ON table_info.oid = trigger_info.tgrelid \
+                 JOIN pg_namespace AS namespace ON namespace.oid = table_info.relnamespace \
+                 WHERE namespace.nspname = current_schema() AND table_info.relname = $1 \
+                   AND trigger_info.tgname = $2 AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled <> 'D'\
+             )",
+        )
+        .bind(&self.run_events_table)
+        .bind(&run_event_trigger)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL run-event accounting trigger: {error}"
+            ))
+        })?;
+        if !run_event_trigger_exists {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event accounting trigger is missing or disabled".into(),
+            ));
+        }
+
+        let run_event_usage_valid: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE singleton = TRUE \
+                     AND schema_version = {RUN_EVENT_SCHEMA_VERSION} \
+                     AND retained_events >= 0 AND retained_bytes >= 0)",
+            self.run_event_usage_table
+        )))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL run-event global accounting: {error}"
+            ))
+        })?;
+        if !run_event_usage_valid {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event global accounting row is missing or invalid".into(),
             ));
         }
         Ok(())
@@ -1776,6 +3327,7 @@ impl StateStore for PostgresStore {
                     "PG run idempotency completion transition: {error}"
                 ))
             })?;
+        self.delete_human_inputs_for_run(&mut tx, run_id).await?;
         tx.commit().await.map_err(|error| {
             IronCrewError::Validation(format!("PG update completion commit: {error}"))
         })?;
@@ -1822,6 +3374,798 @@ impl StateStore for PostgresStore {
 
     fn run_lease_ttl(&self) -> Duration {
         self.lease.ttl()
+    }
+
+    fn supports_durable_human_input(&self) -> bool {
+        self.human_input_keyring.is_some()
+    }
+
+    fn event_journal_scope(&self) -> EventJournalScope {
+        EventJournalScope::SharedStore
+    }
+
+    fn event_journal_config(&self) -> RunEventJournalConfig {
+        self.run_event_journal_config.clone()
+    }
+
+    async fn append_run_events(
+        &self,
+        batch: &RunEventAppendBatch,
+    ) -> Result<RunEventAppendOutcome> {
+        batch.validate(&self.run_event_journal_config)?;
+        if batch.owner_instance_id != self.lease.instance_id() {
+            return Err(IronCrewError::Conflict(format!(
+                "Run-event batch owner '{}' does not match this store instance",
+                batch.owner_instance_id
+            )));
+        }
+        let sequence_values: Vec<i64> = batch
+            .entries
+            .iter()
+            .map(|entry| {
+                i64::try_from(entry.sequence).map_err(|_| {
+                    IronCrewError::Validation("Run-event sequence exceeds PostgreSQL BIGINT".into())
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL run-event append transaction failed: {error}"
+            ))
+        })?;
+        self.lock_run_event_usage(&mut tx).await?;
+        let run_sql = format!(
+            "SELECT flow, owner_instance_id, status, \
+                    CASE WHEN lease_expires_at = '' THEN FALSE ELSE \
+                        lease_expires_at::timestamptz > clock_timestamp() \
+                    END AS lease_active, \
+                    duration_ms, total_tokens \
+             FROM {} WHERE run_id = $1 FOR UPDATE",
+            self.table_name
+        );
+        let run: Option<(String, String, String, bool, i64, i32)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
+                .bind(&batch.run_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event run fence lookup failed: {error}"
+                    ))
+                })?;
+        let (run_flow, run_owner, run_status, lease_active, duration_ms, total_tokens) = run
+            .ok_or_else(|| {
+                IronCrewError::Validation(format!("Run '{}' not found", batch.run_id))
+            })?;
+        if run_flow != batch.flow {
+            return Err(IronCrewError::Conflict(format!(
+                "Run-event flow '{}' does not match run '{}'",
+                batch.flow, batch.run_id
+            )));
+        }
+        if run_owner != batch.owner_instance_id {
+            return Err(IronCrewError::Conflict(format!(
+                "Run '{}' is owned by instance '{}', not '{}'",
+                batch.run_id, run_owner, batch.owner_instance_id
+            )));
+        }
+
+        let mut pruned = self.prune_expired_run_events(&mut tx).await?;
+        let initialize_state_sql = format!(
+            "INSERT INTO {} (run_id, flow, owner_instance_id) \
+             VALUES ($1, $2, $3) ON CONFLICT (run_id) DO NOTHING",
+            self.run_event_state_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(initialize_state_sql))
+            .bind(&batch.run_id)
+            .bind(&batch.flow)
+            .bind(&batch.owner_instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event state initialization failed: {error}"
+                ))
+            })?;
+        let mut state = self
+            .run_event_state_for_update(&mut tx, &batch.run_id)
+            .await?
+            .ok_or_else(|| {
+                IronCrewError::Validation("PostgreSQL run-event state is missing".into())
+            })?;
+        if state.flow != batch.flow || state.owner_instance_id != batch.owner_instance_id {
+            return Err(IronCrewError::Conflict(format!(
+                "Run-event state fence for '{}' does not match the current run owner/flow",
+                batch.run_id
+            )));
+        }
+
+        let existing_sql = format!(
+            "SELECT sequence, event_type, payload::text AS payload, payload_bytes \
+             FROM {} WHERE run_id = $1 AND sequence = ANY($2::bigint[])",
+            self.run_events_table
+        );
+        let existing_rows = sqlx::query(sqlx::AssertSqlSafe(existing_sql))
+            .bind(&batch.run_id)
+            .bind(&sequence_values)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event duplicate lookup failed: {error}"
+                ))
+            })?;
+        let mut existing = HashMap::with_capacity(existing_rows.len());
+        for row in existing_rows {
+            let sequence = nonnegative_u64(
+                "stored sequence",
+                row.try_get("sequence").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                })?,
+            )?;
+            let event_type: String = row.try_get("event_type").map_err(|error| {
+                IronCrewError::Validation(format!("Run-event event_type column: {error}"))
+            })?;
+            let payload_raw: String = row.try_get("payload").map_err(|error| {
+                IronCrewError::Validation(format!("Run-event payload column: {error}"))
+            })?;
+            let payload: serde_json::Value =
+                decode_stored_json(&payload_raw, "run_events.payload")?;
+            let payload_bytes = nonnegative_u64(
+                "stored payload byte count",
+                row.try_get("payload_bytes").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event payload_bytes column: {error}"))
+                })?,
+            )?;
+            existing.insert(sequence, (event_type, payload, payload_bytes));
+        }
+
+        let mut duplicate_events = 0u64;
+        let mut new_entries = Vec::new();
+        for entry in &batch.entries {
+            match existing.get(&entry.sequence) {
+                Some((event_type, payload, payload_bytes)) => {
+                    if entry.sequence > state.latest_sequence {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Run-event sequence {} for '{}' exists beyond the journal state boundary",
+                            entry.sequence, batch.run_id
+                        )));
+                    }
+                    let expected_bytes = u64::try_from(entry.payload_bytes).map_err(|_| {
+                        IronCrewError::Validation(
+                            "Run-event payload byte count exceeds BIGINT".into(),
+                        )
+                    })?;
+                    if event_type != &entry.event_type
+                        || payload != &entry.payload
+                        || *payload_bytes != expected_bytes
+                    {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Run-event sequence {} for '{}' already contains different data",
+                            entry.sequence, batch.run_id
+                        )));
+                    }
+                    duplicate_events = duplicate_events.saturating_add(1);
+                }
+                None if entry.sequence <= state.latest_sequence => {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Run-event sequence {} for '{}' was already allocated and is no longer retained",
+                        entry.sequence, batch.run_id
+                    )));
+                }
+                None => new_entries.push(entry),
+            }
+        }
+
+        let run_status = run_status.parse::<RunStatus>()?;
+        if !new_entries.is_empty() {
+            if state.terminal_event_sequence.is_some() {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run-event journal for '{}' is sealed after run_complete",
+                    batch.run_id
+                )));
+            }
+            if run_status.is_in_flight() {
+                if !lease_active {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Run '{}' no longer has an active owner lease",
+                        batch.run_id
+                    )));
+                }
+                if new_entries
+                    .iter()
+                    .any(|entry| entry.event_type == "run_complete")
+                {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Run '{}' cannot append run_complete before its terminal record",
+                        batch.run_id
+                    )));
+                }
+            } else {
+                if matches!(&run_status, RunStatus::Abandoned) {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Abandoned run '{}' cannot append terminal journal events",
+                        batch.run_id
+                    )));
+                }
+                let [terminal_entry] = new_entries.as_slice() else {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Terminal run '{}' accepts exactly one new run_complete event",
+                        batch.run_id
+                    )));
+                };
+                if terminal_entry.event_type != "run_complete" {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Terminal run '{}' cannot append a nonterminal journal event",
+                        batch.run_id
+                    )));
+                }
+                let expected_duration_ms = nonnegative_u64("terminal duration", duration_ms)?;
+                let expected_total_tokens = u32::try_from(total_tokens).map_err(|_| {
+                    IronCrewError::Validation(
+                        "PostgreSQL run-event terminal token count is negative".into(),
+                    )
+                })?;
+                let expected_status = run_status.to_string();
+                let terminal_data = terminal_entry
+                    .payload
+                    .get("data")
+                    .and_then(serde_json::Value::as_object);
+                let terminal_matches = terminal_data.is_some_and(|data| {
+                    data.get("run_id").and_then(serde_json::Value::as_str)
+                        == Some(batch.run_id.as_str())
+                        && data.get("status").and_then(serde_json::Value::as_str)
+                            == Some(expected_status.as_str())
+                        && data.get("duration_ms").and_then(serde_json::Value::as_u64)
+                            == Some(expected_duration_ms)
+                        && data.get("total_tokens").and_then(serde_json::Value::as_u64)
+                            == Some(u64::from(expected_total_tokens))
+                });
+                if !terminal_matches {
+                    return Err(IronCrewError::Conflict(format!(
+                        "run_complete for '{}' does not match its terminal run record",
+                        batch.run_id
+                    )));
+                }
+            }
+        }
+
+        let new_event_count = u64::try_from(new_entries.len())
+            .map_err(|_| IronCrewError::Validation("Run-event append count exceeds u64".into()))?;
+        let serialized_new_payloads = new_entries
+            .iter()
+            .map(|entry| {
+                serde_json::to_string(&entry.payload).map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Run-event payload serialization failed: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let declared_new_bytes = new_entries
+            .iter()
+            .map(|entry| {
+                i64::try_from(entry.payload_bytes).map_err(|_| {
+                    IronCrewError::Validation(
+                        "Run-event payload byte count exceeds PostgreSQL BIGINT".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let accounted_new_bytes: Vec<i64> = if new_entries.is_empty() {
+            Vec::new()
+        } else {
+            let accounting_sql = format!(
+                "SELECT GREATEST(item.declared_bytes, \
+                         octet_length(item.payload::jsonb::text)::BIGINT, \
+                         {MIN_ACCOUNTED_RUN_EVENT_BYTES}::BIGINT) \
+                 FROM unnest($1::text[], $2::bigint[]) WITH ORDINALITY \
+                      AS item(payload, declared_bytes, ordinal) \
+                 ORDER BY item.ordinal"
+            );
+            sqlx::query_scalar(sqlx::AssertSqlSafe(accounting_sql))
+                .bind(&serialized_new_payloads)
+                .bind(&declared_new_bytes)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event payload accounting failed: {error}"
+                    ))
+                })?
+        };
+        if accounted_new_bytes.len() != new_entries.len() {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL run-event payload accounting returned an incomplete batch".into(),
+            ));
+        }
+        let new_byte_count = accounted_new_bytes.iter().try_fold(0u64, |total, bytes| {
+            let bytes = nonnegative_u64("accounted payload byte count", *bytes)?;
+            total.checked_add(bytes).ok_or_else(|| {
+                IronCrewError::Validation("Run-event append byte count overflow".into())
+            })
+        })?;
+        if new_byte_count > self.run_event_journal_config.max_bytes_per_run as u64
+            || new_byte_count > self.run_event_journal_config.max_total_bytes
+        {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL-accounted run-event append exceeds a configured byte limit".into(),
+            ));
+        }
+
+        if new_event_count > 0 {
+            let future_events = state
+                .retained_events
+                .checked_add(new_event_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event per-run count overflow".into())
+                })?;
+            let future_bytes = state
+                .retained_bytes
+                .checked_add(new_byte_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event per-run bytes overflow".into())
+                })?;
+            let events_to_free = future_events
+                .saturating_sub(self.run_event_journal_config.max_events_per_run as u64);
+            let bytes_to_free =
+                future_bytes.saturating_sub(self.run_event_journal_config.max_bytes_per_run as u64);
+            pruned.merge(
+                self.evict_run_event_capacity(
+                    &mut tx,
+                    &batch.run_id,
+                    events_to_free,
+                    bytes_to_free,
+                )
+                .await?,
+            );
+
+            let usage = self.lock_run_event_usage(&mut tx).await?;
+            let future_global_events = usage
+                .retained_events
+                .checked_add(new_event_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event global count overflow".into())
+                })?;
+            let future_global_bytes = usage
+                .retained_bytes
+                .checked_add(new_byte_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event global bytes overflow".into())
+                })?;
+            pruned.merge(
+                self.evict_global_run_event_capacity(
+                    &mut tx,
+                    future_global_events
+                        .saturating_sub(self.run_event_journal_config.max_total_events),
+                    future_global_bytes
+                        .saturating_sub(self.run_event_journal_config.max_total_bytes),
+                )
+                .await?,
+            );
+            state = self
+                .run_event_state_for_update(&mut tx, &batch.run_id)
+                .await?
+                .ok_or_else(|| {
+                    IronCrewError::Validation("PostgreSQL run-event state is missing".into())
+                })?;
+
+            let (created_at, expires_at) = self
+                .database_clock_with_deadline(
+                    &mut tx,
+                    self.run_event_journal_config.retention.as_secs(),
+                    "run-event retention",
+                )
+                .await?;
+            let insert_sql = format!(
+                "INSERT INTO {} (run_id, sequence, event_type, payload, payload_bytes, \
+                     created_at, expires_at) \
+                 VALUES ($1, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz)",
+                self.run_events_table
+            );
+            for (entry, payload) in new_entries.iter().zip(&serialized_new_payloads) {
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+                    .bind(&batch.run_id)
+                    .bind(i64::try_from(entry.sequence).map_err(|_| {
+                        IronCrewError::Validation(
+                            "Run-event sequence exceeds PostgreSQL BIGINT".into(),
+                        )
+                    })?)
+                    .bind(&entry.event_type)
+                    .bind(payload)
+                    .bind(i64::try_from(entry.payload_bytes).map_err(|_| {
+                        IronCrewError::Validation(
+                            "Run-event payload byte count exceeds PostgreSQL BIGINT".into(),
+                        )
+                    })?)
+                    .bind(&created_at)
+                    .bind(&expires_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL run-event append failed: {error}"
+                        ))
+                    })?;
+            }
+
+            let mut journal_complete = state.journal_complete;
+            let mut expected_sequence = state.latest_sequence.saturating_add(1);
+            let mut latest_sequence = state.latest_sequence;
+            let mut terminal_event_sequence = state.terminal_event_sequence;
+            for entry in &new_entries {
+                if entry.sequence != expected_sequence {
+                    journal_complete = false;
+                }
+                latest_sequence = latest_sequence.max(entry.sequence);
+                expected_sequence = entry.sequence.saturating_add(1);
+                if entry.event_type == "run_complete" {
+                    terminal_event_sequence = Some(
+                        terminal_event_sequence
+                            .unwrap_or_default()
+                            .max(entry.sequence),
+                    );
+                }
+            }
+            let retained_events = state
+                .retained_events
+                .checked_add(new_event_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event retained count overflow".into())
+                })?;
+            let retained_bytes = state
+                .retained_bytes
+                .checked_add(new_byte_count)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Run-event retained bytes overflow".into())
+                })?;
+            let update_sql = format!(
+                "UPDATE {} SET latest_sequence = $1, retained_events = $2, \
+                     retained_bytes = $3, journal_complete = $4, \
+                     terminal_event_sequence = $5, updated_at = clock_timestamp() \
+                 WHERE run_id = $6",
+                self.run_event_state_table
+            );
+            sqlx::query(sqlx::AssertSqlSafe(update_sql))
+                .bind(i64::try_from(latest_sequence).map_err(|_| {
+                    IronCrewError::Validation("Run-event latest sequence exceeds BIGINT".into())
+                })?)
+                .bind(i64::try_from(retained_events).map_err(|_| {
+                    IronCrewError::Validation("Run-event retained count exceeds BIGINT".into())
+                })?)
+                .bind(i64::try_from(retained_bytes).map_err(|_| {
+                    IronCrewError::Validation("Run-event retained bytes exceeds BIGINT".into())
+                })?)
+                .bind(journal_complete)
+                .bind(
+                    terminal_event_sequence
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            IronCrewError::Validation(
+                                "Run-event terminal sequence exceeds BIGINT".into(),
+                            )
+                        })?,
+                )
+                .bind(&batch.run_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event state append update failed: {error}"
+                    ))
+                })?;
+        }
+
+        state = self
+            .run_event_state_for_update(&mut tx, &batch.run_id)
+            .await?
+            .ok_or_else(|| {
+                IronCrewError::Validation("PostgreSQL run-event state is missing".into())
+            })?;
+        let bounds = self
+            .run_event_bounds(&mut tx, &batch.run_id, &state)
+            .await?;
+        let run_eviction = pruned.for_run(&batch.run_id);
+        let outcome = RunEventAppendOutcome {
+            appended_events: new_event_count,
+            duplicate_events,
+            evicted_events: run_eviction.events,
+            evicted_bytes: run_eviction.bytes,
+            eviction_gap: run_eviction.gap(),
+            bounds,
+        };
+        outcome.validate()?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL run-event append commit failed: {error}"
+            ))
+        })?;
+        Ok(outcome)
+    }
+
+    async fn read_run_events(
+        &self,
+        flow: &str,
+        run_id: &str,
+        after_sequence: u64,
+    ) -> Result<RunEventPage> {
+        validate_human_input_route("flow", flow, 255)?;
+        validate_human_input_route("run id", run_id, 128)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL run-event read transaction failed: {error}"
+            ))
+        })?;
+        let run_sql = format!(
+            "SELECT flow, status, duration_ms, total_tokens, \
+                    to_char(clock_timestamp() AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS snapshot_at \
+             FROM {} \
+             WHERE run_id = $1 FOR SHARE",
+            self.table_name
+        );
+        let run: Option<(String, String, i64, i32, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event run lookup failed: {error}"
+                    ))
+                })?;
+        let (stored_flow, status, duration_ms, total_tokens, snapshot_at) =
+            run.ok_or_else(|| IronCrewError::Validation(format!("Run '{run_id}' not found")))?;
+        if stored_flow != flow {
+            return Err(IronCrewError::Conflict(format!(
+                "Run-event flow '{flow}' does not match run '{run_id}'"
+            )));
+        }
+        // SSE polls are a high-frequency, multi-replica read path. A shared
+        // state lock yields a consistent per-run snapshot without taking the
+        // singleton accounting lock or doing retention writes. Logical
+        // retention is applied below against one captured database timestamp;
+        // append/reconciliation perform bounded physical cleanup.
+        let state = self.run_event_state_for_share(&mut tx, run_id).await?;
+        let (mut bounds, logical_gap_reason) = match &state {
+            Some(state) => {
+                let logical_bounds_sql = format!(
+                    "SELECT \
+                         MIN(sequence) FILTER (WHERE expires_at > $2::timestamptz), \
+                         COUNT(*) FILTER (WHERE expires_at > $2::timestamptz)::BIGINT, \
+                         COALESCE(SUM(accounted_bytes) FILTER (\
+                             WHERE expires_at > $2::timestamptz), 0)::BIGINT, \
+                         MAX(sequence) FILTER (WHERE expires_at <= $2::timestamptz) \
+                     FROM {} WHERE run_id = $1",
+                    self.run_events_table
+                );
+                let (earliest, retained_events, retained_bytes, latest_expired): (
+                    Option<i64>,
+                    i64,
+                    i64,
+                    Option<i64>,
+                ) = sqlx::query_as(sqlx::AssertSqlSafe(logical_bounds_sql))
+                    .bind(run_id)
+                    .bind(&snapshot_at)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL logical run-event bounds lookup failed: {error}"
+                        ))
+                    })?;
+                let retained_events =
+                    nonnegative_u64("logical per-run retained event count", retained_events)?;
+                let retained_bytes =
+                    nonnegative_u64("logical per-run retained byte count", retained_bytes)?;
+                let earliest_retained_sequence = earliest
+                    .map(|value| nonnegative_u64("earliest retained sequence", value))
+                    .transpose()?;
+                let latest_expired = latest_expired
+                    .map(|value| nonnegative_u64("latest expired sequence", value))
+                    .transpose()?;
+                let retention_boundary = match (latest_expired, earliest_retained_sequence) {
+                    (Some(expired), Some(earliest)) => expired.min(earliest.saturating_sub(1)),
+                    (Some(expired), None) => expired,
+                    (None, _) => state.dropped_through,
+                };
+                let dropped_through = state.dropped_through.max(retention_boundary);
+                let gap_reason = if dropped_through > state.dropped_through {
+                    Some(RunEventGapReason::Retention)
+                } else {
+                    state.eviction_reason
+                };
+                let bounds = RunEventBounds {
+                    earliest_retained_sequence,
+                    latest_sequence: state.latest_sequence,
+                    dropped_through,
+                    retained_events,
+                    retained_bytes,
+                    journal_complete: state.journal_complete,
+                };
+                bounds.validate()?;
+                (bounds, gap_reason)
+            }
+            None => (RunEventBounds::empty(), None),
+        };
+        if after_sequence > bounds.latest_sequence {
+            return Err(IronCrewError::Validation(format!(
+                "Run-event page starts ahead of latest sequence {}",
+                bounds.latest_sequence
+            )));
+        }
+
+        let effective_after = after_sequence.max(bounds.dropped_through);
+        let event_sql = format!(
+            "WITH candidate_sizes AS MATERIALIZED (\
+                 SELECT sequence, accounted_bytes \
+                 FROM {events} WHERE run_id = $1 AND sequence > $2 \
+                   AND expires_at > $3::timestamptz \
+                 ORDER BY sequence LIMIT $4\
+             ), bounded_sequences AS (\
+                 SELECT sequence, \
+                        ROW_NUMBER() OVER (ORDER BY sequence) AS page_row, \
+                        SUM(accounted_bytes) OVER (ORDER BY sequence \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS page_bytes \
+                 FROM candidate_sizes\
+             ) \
+             SELECT event.sequence, event.event_type, event.payload::text AS payload, \
+                    event.payload_bytes, \
+                    to_char(event.created_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
+             FROM bounded_sequences AS bounded \
+             JOIN {events} AS event ON event.run_id = $1 \
+                  AND event.sequence = bounded.sequence \
+             WHERE bounded.page_bytes <= $5 OR bounded.page_row = 1 \
+             ORDER BY event.sequence",
+            events = self.run_events_table,
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(event_sql))
+            .bind(run_id)
+            .bind(i64::try_from(effective_after).map_err(|_| {
+                IronCrewError::Validation("Run-event page boundary exceeds BIGINT".into())
+            })?)
+            .bind(&snapshot_at)
+            .bind(
+                i64::try_from(self.run_event_journal_config.page_max_events).map_err(|_| {
+                    IronCrewError::Validation("Run-event page limit exceeds BIGINT".into())
+                })?,
+            )
+            .bind(
+                i64::try_from(self.run_event_journal_config.page_max_bytes).map_err(|_| {
+                    IronCrewError::Validation("Run-event page byte limit exceeds BIGINT".into())
+                })?,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event page lookup failed: {error}"
+                ))
+            })?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload_bytes_i64: i64 = row.try_get("payload_bytes").map_err(|error| {
+                IronCrewError::Validation(format!("Run-event payload_bytes column: {error}"))
+            })?;
+            let payload_bytes_u64 =
+                nonnegative_u64("stored page payload byte count", payload_bytes_i64)?;
+            let payload_bytes = usize::try_from(payload_bytes_u64).map_err(|_| {
+                IronCrewError::Validation(
+                    "Run-event stored payload byte count exceeds usize".into(),
+                )
+            })?;
+            let payload_raw: String = row.try_get("payload").map_err(|error| {
+                IronCrewError::Validation(format!("Run-event payload column: {error}"))
+            })?;
+            events.push(RunEventEntry {
+                sequence: nonnegative_u64(
+                    "page sequence",
+                    row.try_get("sequence").map_err(|error| {
+                        IronCrewError::Validation(format!("Run-event sequence column: {error}"))
+                    })?,
+                )?,
+                event_type: row.try_get("event_type").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event event_type column: {error}"))
+                })?,
+                payload: decode_stored_json(&payload_raw, "run_events.payload")?,
+                payload_bytes,
+                created_at: row.try_get("created_at").map_err(|error| {
+                    IronCrewError::Validation(format!("Run-event created_at column: {error}"))
+                })?,
+            });
+        }
+
+        let mut gap = if after_sequence < bounds.dropped_through {
+            let reason = logical_gap_reason.ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL run-event dropped boundary has no reason".into(),
+                )
+            })?;
+            // `RunEventPage` can describe one gap. Return this prefix gap by
+            // itself so the caller advances to `dropped_through`; the next
+            // read can then report a distinct internal writer gap without
+            // emitting non-monotonic SSE ids.
+            events.clear();
+            Some(RunEventGap {
+                first_sequence: after_sequence.saturating_add(1),
+                last_sequence: bounds.dropped_through,
+                reason,
+            })
+        } else {
+            None
+        };
+        if gap.is_none() {
+            let mut expected = after_sequence.saturating_add(1);
+            let mut internal_gap = None;
+            for (index, event) in events.iter().enumerate() {
+                if event.sequence > expected {
+                    internal_gap = Some((index, expected, event.sequence.saturating_sub(1)));
+                    break;
+                }
+                expected = event.sequence.saturating_add(1);
+            }
+            if let Some((index, first_sequence, last_sequence)) = internal_gap {
+                if index == 0 {
+                    events.clear();
+                    gap = Some(RunEventGap {
+                        first_sequence,
+                        last_sequence,
+                        reason: RunEventGapReason::WriterBackpressure,
+                    });
+                } else {
+                    // Return only the contiguous prefix. The caller advances
+                    // through it and observes the internal gap on the next
+                    // read, preserving the single-gap page contract.
+                    events.truncate(index);
+                }
+            }
+            if gap.is_none() && events.is_empty() && after_sequence < bounds.latest_sequence {
+                gap = Some(RunEventGap {
+                    first_sequence: after_sequence.saturating_add(1),
+                    last_sequence: bounds.latest_sequence,
+                    reason: RunEventGapReason::WriterBackpressure,
+                });
+            }
+        }
+
+        let status = status.parse::<RunStatus>()?;
+        let terminal_event_sequence = state
+            .as_ref()
+            .and_then(|state| state.terminal_event_sequence);
+        if status.is_terminal() && terminal_event_sequence.is_none() {
+            bounds.journal_complete = false;
+        }
+        let terminal = if status.is_terminal() {
+            Some(RunEventTerminalState {
+                status,
+                duration_ms: nonnegative_u64("terminal duration", duration_ms)?,
+                total_tokens: u32::try_from(total_tokens).map_err(|_| {
+                    IronCrewError::Validation(
+                        "PostgreSQL run-event terminal token count is negative".into(),
+                    )
+                })?,
+                event_sequence: terminal_event_sequence,
+            })
+        } else {
+            None
+        };
+        let page = RunEventPage {
+            run_id: run_id.to_owned(),
+            after_sequence,
+            events,
+            bounds,
+            gap,
+            terminal,
+        };
+        page.validate(&self.run_event_journal_config)?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!("PostgreSQL run-event read commit failed: {error}"))
+        })?;
+        Ok(page)
     }
 
     async fn heartbeat_owned_runs(&self) -> Result<usize> {
@@ -1902,6 +4246,33 @@ impl StateStore for PostgresStore {
                     "PostgreSQL idempotency accounting health write probe: {error}"
                 ))
             })?;
+        let human_input_sql = format!(
+            "UPDATE {} SET expires_at = expires_at WHERE FALSE",
+            self.human_inputs_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(human_input_sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input mailbox health write probe: {error}"
+                ))
+            })?;
+        for (table, column) in [
+            (&self.run_events_table, "created_at"),
+            (&self.run_event_state_table, "updated_at"),
+            (&self.run_event_usage_table, "updated_at"),
+        ] {
+            let sql = format!("UPDATE {table} SET {column} = {column} WHERE FALSE");
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL run-event journal health write probe failed for '{table}': {error}"
+                    ))
+                })?;
+        }
         transaction
             .rollback()
             .await
@@ -1966,6 +4337,23 @@ impl StateStore for PostgresStore {
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG reconcile: {}", e)))?;
 
+        let journal_sql = format!(
+            "UPDATE {state} AS journal SET journal_complete = FALSE, \
+                 updated_at = clock_timestamp() \
+             FROM {runs} AS run \
+             WHERE journal.run_id = run.run_id AND run.status = 'abandoned'",
+            state = self.run_event_state_table,
+            runs = self.table_name,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(journal_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL abandoned run-event journal update failed: {error}"
+                ))
+            })?;
+
         let mapping_sql = format!(
             "UPDATE {idempotency} AS idem \
              SET state = 'completed', lease_expires_at = '', \
@@ -2017,10 +4405,34 @@ impl StateStore for PostgresStore {
                     "PG conversation idempotency reconciliation: {error}"
                 ))
             })?;
+        let human_input_cleanup = format!(
+            "DELETE FROM {human_inputs} AS human \
+             USING {runs} AS run \
+             WHERE human.run_id = run.run_id AND (\
+                 run.status NOT IN ('running', 'waiting_for_input') OR \
+                 (human.state = 'pending' AND human.expires_at <= $1::timestamptz)\
+             )",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(human_input_cleanup))
+            .bind(&database_now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL reconciled human-input mailbox cleanup failed: {error}"
+                ))
+            })?;
+        let reconciled = (inserted.rows_affected() + result.rows_affected()) as usize;
         tx.commit()
             .await
             .map_err(|error| IronCrewError::Validation(format!("PG reconcile commit: {error}")))?;
-        Ok((inserted.rows_affected() + result.rows_affected()) as usize)
+        // Keep journal cleanup outside the core reconciliation transaction so
+        // usage-row contention or malformed journal data cannot undo critical
+        // run/idempotency/HITL recovery.
+        self.prune_expired_run_events_best_effort().await;
+        Ok(reconciled)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -2101,10 +4513,16 @@ impl StateStore for PostgresStore {
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
         let sql = format!("DELETE FROM {} WHERE run_id = $1", self.table_name);
-
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!("PostgreSQL delete transaction: {error}"))
+        })?;
+        // Cascading event deletion fires the global accounting trigger. Take
+        // the same lock order as append/read to prevent a run-row/usage-row
+        // deadlock and keep exact counters observable throughout the delete.
+        self.lock_run_event_usage(&mut tx).await?;
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(run_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PostgreSQL delete error: {}", e)))?;
 
@@ -2114,6 +4532,9 @@ impl StateStore for PostgresStore {
                 run_id
             )));
         }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!("PostgreSQL delete commit: {error}"))
+        })?;
         Ok(())
     }
 
@@ -2845,6 +5266,7 @@ impl StateStore for PostgresStore {
             .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
             .parse::<RunStatus>()?;
         if status.is_terminal() {
+            self.delete_human_inputs_for_run(&mut tx, run_id).await?;
             tx.commit().await.map_err(|error| {
                 IronCrewError::Validation(format!(
                     "PostgreSQL terminal run fence heartbeat commit failed: {error}"
@@ -2989,6 +5411,7 @@ impl StateStore for PostgresStore {
             .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
             .parse::<RunStatus>()?;
         if status.is_terminal() {
+            self.delete_human_inputs_for_run(&mut tx, run_id).await?;
             tx.commit().await.map_err(|error| {
                 IronCrewError::Validation(format!(
                     "PostgreSQL terminal cancellation lookup commit failed: {error}"
@@ -3104,6 +5527,7 @@ impl StateStore for PostgresStore {
             })?;
             return Ok(RunCancellationRequest::NotDurable);
         }
+        self.delete_human_inputs_for_run(&mut tx, run_id).await?;
         tx.commit().await.map_err(|error| {
             IronCrewError::Validation(format!(
                 "PostgreSQL cancellation request commit failed: {error}"
@@ -3113,6 +5537,833 @@ impl StateStore for PostgresStore {
             owner_instance_id: run_owner,
             already_requested,
         })
+    }
+
+    async fn register_human_input(
+        &self,
+        registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputRegistrationOutcome> {
+        registration.validate()?;
+        let Some(keyring) = self.human_input_keyring.as_ref() else {
+            return Ok(HumanInputRegistrationOutcome::NotDurable);
+        };
+        let aad = registration.aad(self.lease.instance_id())?;
+        let encrypted = keyring.seal_question(&aad, &registration.question)?;
+
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input registration transaction failed: {error}"
+            ))
+        })?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", &registration.run_id)
+            .await?;
+        self.lock_idempotency_key(&mut tx, &registration.key_hash)
+            .await?;
+        let (database_now, expires_at) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                registration.question.timeout_s,
+                "human-input registration",
+            )
+            .await?;
+
+        let fence_sql = format!(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM {runs} AS run \
+                 JOIN {idempotency} AS idem \
+                   ON idem.operation = $1 AND idem.scope = run.flow \
+                  AND idem.resource_id = run.run_id \
+                 WHERE run.run_id = $2 AND run.flow = $3 \
+                   AND run.owner_instance_id = $4 \
+                   AND run.status IN ('running', 'waiting_for_input') \
+                   AND run.lease_expires_at <> '' \
+                   AND run.lease_expires_at::timestamptz > $5::timestamptz \
+                   AND idem.key_hash = $6 AND idem.attempt_id = $7 \
+                   AND idem.owner_instance_id = run.owner_instance_id \
+                   AND idem.state = 'running' \
+                   AND idem.lease_expires_at <> '' \
+                   AND idem.lease_expires_at::timestamptz > $5::timestamptz\
+             )",
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let owns_fence: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(fence_sql))
+            .bind(RUN_OPERATION)
+            .bind(&registration.run_id)
+            .bind(&registration.flow)
+            .bind(self.lease.instance_id())
+            .bind(&database_now)
+            .bind(&registration.key_hash)
+            .bind(&registration.attempt_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input registration fence lookup failed: {error}"
+                ))
+            })?;
+        if !owns_fence {
+            tx.rollback().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input registration rollback failed: {error}"
+                ))
+            })?;
+            return Err(IronCrewError::Conflict(format!(
+                "Run '{}' no longer owns the active keyed attempt for this human-input question",
+                registration.run_id
+            )));
+        }
+
+        // Resolve an idempotent retry before applying capacity so retrying an
+        // already-retained question never consumes (or appears to consume) a
+        // second slot. The per-run resource advisory lock serializes all
+        // conforming registrations for exact aggregate admission.
+        let existing_sql = format!(
+            "SELECT flow, owner_instance_id, key_hash, attempt_id, \
+                    question_digest, state, expires_at > $3::timestamptz \
+             FROM {} WHERE run_id = $1 AND question_id = $2 FOR UPDATE",
+            self.human_inputs_table
+        );
+        let existing: Option<(String, String, String, String, String, String, bool)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(existing_sql))
+                .bind(&registration.run_id)
+                .bind(&registration.question.question_id)
+                .bind(&database_now)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL human-input idempotent registration lookup failed: {error}"
+                    ))
+                })?;
+        if let Some((flow, owner, key_hash, attempt_id, digest, state, unexpired)) = existing {
+            if flow == registration.flow
+                && owner == self.lease.instance_id()
+                && key_hash == registration.key_hash
+                && attempt_id == registration.attempt_id
+                && digest == aad.question_digest
+                && state == "pending"
+                && unexpired
+            {
+                tx.commit().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL idempotent human-input registration commit failed: {error}"
+                    ))
+                })?;
+                return Ok(HumanInputRegistrationOutcome::Registered);
+            }
+            return Err(IronCrewError::Conflict(format!(
+                "Human-input question '{}' is already registered under another run attempt",
+                registration.question.question_id
+            )));
+        }
+
+        let capacity_sql = format!(
+            "SELECT COUNT(*)::BIGINT, \
+                    COALESCE(SUM(octet_length(question_nonce) + \
+                                 octet_length(question_ciphertext)), 0)::BIGINT \
+             FROM {} WHERE run_id = $1 AND flow = $2 AND state = 'pending' \
+               AND expires_at > $3::timestamptz",
+            self.human_inputs_table
+        );
+        let (pending_rows, pending_ciphertext_bytes): (i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(capacity_sql))
+                .bind(&registration.run_id)
+                .bind(&registration.flow)
+                .bind(&database_now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL human-input registration capacity lookup failed: {error}"
+                    ))
+                })?;
+        let pending_rows = usize::try_from(pending_rows).map_err(|_| {
+            IronCrewError::Validation("PostgreSQL human-input row accounting is invalid".into())
+        })?;
+        let pending_ciphertext_bytes = usize::try_from(pending_ciphertext_bytes).map_err(|_| {
+            IronCrewError::Validation(
+                "PostgreSQL human-input ciphertext accounting is invalid".into(),
+            )
+        })?;
+        let incoming_ciphertext_bytes = encrypted
+            .nonce
+            .len()
+            .checked_add(encrypted.ciphertext.len())
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL human-input ciphertext byte count overflow".into(),
+                )
+            })?;
+        let projected_ciphertext_bytes = pending_ciphertext_bytes
+            .checked_add(incoming_ciphertext_bytes)
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL human-input ciphertext accounting overflow".into(),
+                )
+            })?;
+        if pending_rows >= self.human_input_max_pending_rows
+            || projected_ciphertext_bytes > self.human_input_max_pending_ciphertext_bytes
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "PostgreSQL human-input mailbox reached its configured capacity ({} rows, {} ciphertext bytes)",
+                self.human_input_max_pending_rows, self.human_input_max_pending_ciphertext_bytes,
+            )));
+        }
+
+        let insert_sql = format!(
+            "INSERT INTO {} (\
+                 run_id, question_id, flow, owner_instance_id, key_hash, attempt_id, \
+                 question_digest, question_key_fingerprint, question_nonce, question_ciphertext, \
+                 state, created_at, expires_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', \
+                       $11::timestamptz, $12::timestamptz) \
+             ON CONFLICT (run_id, question_id) DO NOTHING",
+            self.human_inputs_table
+        );
+        let inserted = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+            .bind(&registration.run_id)
+            .bind(&registration.question.question_id)
+            .bind(&registration.flow)
+            .bind(self.lease.instance_id())
+            .bind(&registration.key_hash)
+            .bind(&registration.attempt_id)
+            .bind(&aad.question_digest)
+            .bind(&encrypted.key_fingerprint)
+            .bind(&encrypted.nonce)
+            .bind(&encrypted.ciphertext)
+            .bind(&database_now)
+            .bind(&expires_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input registration insert failed: {error}"
+                ))
+            })?;
+        if inserted.rows_affected() == 0 {
+            let existing_sql = format!(
+                "SELECT EXISTS (SELECT 1 FROM {} \
+                     WHERE run_id = $1 AND question_id = $2 AND flow = $3 \
+                       AND owner_instance_id = $4 AND key_hash = $5 AND attempt_id = $6 \
+                       AND question_digest = $7 AND state = 'pending' \
+                       AND expires_at > $8::timestamptz)",
+                self.human_inputs_table
+            );
+            let same_fence: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(existing_sql))
+                .bind(&registration.run_id)
+                .bind(&registration.question.question_id)
+                .bind(&registration.flow)
+                .bind(self.lease.instance_id())
+                .bind(&registration.key_hash)
+                .bind(&registration.attempt_id)
+                .bind(&aad.question_digest)
+                .bind(&database_now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL human-input registration collision lookup failed: {error}"
+                    ))
+                })?;
+            if !same_fence {
+                tx.rollback().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL human-input collision rollback failed: {error}"
+                    ))
+                })?;
+                return Err(IronCrewError::Conflict(format!(
+                    "Human-input question '{}' is already registered under another run attempt",
+                    registration.question.question_id
+                )));
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input registration commit failed: {error}"
+            ))
+        })?;
+        Ok(HumanInputRegistrationOutcome::Registered)
+    }
+
+    async fn list_human_inputs(&self, flow: &str, run_id: &str) -> Result<HumanInputListOutcome> {
+        validate_human_input_route("flow", flow, 255)?;
+        validate_human_input_route("run id", run_id, 128)?;
+        let Some(keyring) = self.human_input_keyring.as_ref() else {
+            return Ok(HumanInputListOutcome::NotDurable);
+        };
+        let _read_permit = self.human_input_read_slots.try_acquire().map_err(|_| {
+            IronCrewError::Conflict(format!(
+                "PostgreSQL human-input read concurrency is exhausted; raise \
+                 {HUMAN_INPUT_READ_CONCURRENCY_ENV} if the pod has sufficient memory"
+            ))
+        })?;
+
+        let owner_sql = format!(
+            "SELECT run.owner_instance_id FROM {runs} AS run \
+             JOIN {idempotency} AS idem \
+               ON idem.operation = $1 AND idem.scope = run.flow \
+              AND idem.resource_id = run.run_id \
+              AND idem.owner_instance_id = run.owner_instance_id \
+             WHERE run.run_id = $2 AND run.flow = $3 \
+               AND run.status IN ('running', 'waiting_for_input') \
+               AND run.lease_expires_at <> '' \
+               AND run.lease_expires_at::timestamptz > clock_timestamp() \
+               AND idem.state = 'running' \
+               AND idem.lease_expires_at <> '' \
+               AND idem.lease_expires_at::timestamptz > clock_timestamp() \
+             ORDER BY idem.created_at DESC LIMIT 2",
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let owners: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(owner_sql))
+            .bind(RUN_OPERATION)
+            .bind(run_id)
+            .bind(flow)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input owner lookup failed: {error}"
+                ))
+            })?;
+        let [owner_instance_id] = owners.as_slice() else {
+            if owners.len() > 1 {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run '{run_id}' has multiple active keyed attempts"
+                )));
+            }
+            return Ok(HumanInputListOutcome::NotDurable);
+        };
+
+        // Size metadata first so a corrupted or externally-written mailbox
+        // cannot force the process to materialize an unbounded encrypted row
+        // set. The subsequent query still fetches one sentinel row and
+        // re-checks cumulative bytes to fail closed across concurrent inserts.
+        let list_limits_sql = format!(
+            "SELECT COUNT(*)::BIGINT, \
+                    COALESCE(SUM(octet_length(human.question_nonce) + \
+                                 octet_length(human.question_ciphertext)), 0)::BIGINT \
+             FROM {human_inputs} AS human \
+             JOIN {runs} AS run ON run.run_id = human.run_id \
+             JOIN {idempotency} AS idem \
+               ON idem.key_hash = human.key_hash \
+              AND idem.attempt_id = human.attempt_id \
+              AND idem.owner_instance_id = human.owner_instance_id \
+              AND idem.operation = $1 AND idem.scope = human.flow \
+              AND idem.resource_id = human.run_id \
+             WHERE human.run_id = $2 AND human.flow = $3 \
+               AND human.state = 'pending' \
+               AND human.expires_at > clock_timestamp() \
+               AND run.status IN ('running', 'waiting_for_input') \
+               AND run.owner_instance_id = human.owner_instance_id \
+               AND run.lease_expires_at <> '' \
+               AND run.lease_expires_at::timestamptz > clock_timestamp() \
+               AND idem.state = 'running' \
+               AND idem.lease_expires_at <> '' \
+               AND idem.lease_expires_at::timestamptz > clock_timestamp()",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let (pending_rows, pending_ciphertext_bytes): (i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(list_limits_sql))
+                .bind(RUN_OPERATION)
+                .bind(run_id)
+                .bind(flow)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL human-input list bounds failed: {error}"
+                    ))
+                })?;
+        let pending_rows = usize::try_from(pending_rows).map_err(|_| {
+            IronCrewError::Validation("PostgreSQL human-input pending row count is invalid".into())
+        })?;
+        let pending_ciphertext_bytes = usize::try_from(pending_ciphertext_bytes).map_err(|_| {
+            IronCrewError::Validation(
+                "PostgreSQL human-input ciphertext accounting is invalid".into(),
+            )
+        })?;
+        if pending_rows > self.human_input_max_pending_rows
+            || pending_ciphertext_bytes > self.human_input_max_pending_ciphertext_bytes
+        {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL human-input mailbox exceeds its configured read bounds ({} rows, {} ciphertext bytes)",
+                self.human_input_max_pending_rows, self.human_input_max_pending_ciphertext_bytes,
+            )));
+        }
+
+        let list_sql = format!(
+            "SELECT human.question_id, human.owner_instance_id, human.key_hash, \
+                    human.attempt_id, human.question_digest, human.question_key_fingerprint, \
+                    human.question_nonce, human.question_ciphertext \
+             FROM {human_inputs} AS human \
+             JOIN {runs} AS run ON run.run_id = human.run_id \
+             JOIN {idempotency} AS idem \
+               ON idem.key_hash = human.key_hash \
+              AND idem.attempt_id = human.attempt_id \
+              AND idem.owner_instance_id = human.owner_instance_id \
+              AND idem.operation = $1 AND idem.scope = human.flow \
+              AND idem.resource_id = human.run_id \
+             WHERE human.run_id = $2 AND human.flow = $3 \
+               AND human.state = 'pending' \
+               AND human.expires_at > clock_timestamp() \
+               AND run.status IN ('running', 'waiting_for_input') \
+               AND run.owner_instance_id = human.owner_instance_id \
+               AND run.lease_expires_at <> '' \
+               AND run.lease_expires_at::timestamptz > clock_timestamp() \
+               AND idem.state = 'running' \
+               AND idem.lease_expires_at <> '' \
+               AND idem.lease_expires_at::timestamptz > clock_timestamp() \
+             ORDER BY human.created_at, human.question_id LIMIT {}",
+            self.human_input_max_pending_rows + 1,
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
+            .bind(RUN_OPERATION)
+            .bind(run_id)
+            .bind(flow)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PostgreSQL human-input list failed: {error}"))
+            })?;
+        if rows.len() > self.human_input_max_pending_rows {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL human-input mailbox exceeds its {}-row configured limit",
+                self.human_input_max_pending_rows,
+            )));
+        }
+        let mut questions = Vec::with_capacity(rows.len());
+        let mut read_ciphertext_bytes = 0usize;
+        for row in rows {
+            let question_id: String = row
+                .try_get("question_id")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let row_owner: String = row
+                .try_get("owner_instance_id")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let key_hash: String = row
+                .try_get("key_hash")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let attempt_id: String = row
+                .try_get("attempt_id")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let question_digest: String = row
+                .try_get("question_digest")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let fingerprint: String = row
+                .try_get("question_key_fingerprint")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let nonce: Vec<u8> = row
+                .try_get("question_nonce")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            let ciphertext: Vec<u8> = row
+                .try_get("question_ciphertext")
+                .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+            read_ciphertext_bytes = read_ciphertext_bytes
+                .checked_add(nonce.len())
+                .and_then(|bytes| bytes.checked_add(ciphertext.len()))
+                .ok_or_else(|| {
+                    IronCrewError::Validation(
+                        "PostgreSQL human-input ciphertext byte count overflow".into(),
+                    )
+                })?;
+            if read_ciphertext_bytes > self.human_input_max_pending_ciphertext_bytes {
+                return Err(IronCrewError::Validation(format!(
+                    "PostgreSQL human-input mailbox exceeds its {}-byte configured ciphertext limit",
+                    self.human_input_max_pending_ciphertext_bytes,
+                )));
+            }
+            let aad = HumanInputAad::new(
+                flow,
+                run_id,
+                &question_id,
+                &question_digest,
+                &row_owner,
+                &key_hash,
+                &attempt_id,
+            )?;
+            let info = keyring.open_question(&aad, &fingerprint, &nonce, &ciphertext)?;
+            if info.question_id != question_id || row_owner != *owner_instance_id {
+                return Err(IronCrewError::Conflict(
+                    "Durable human-input question metadata does not match its routing fence".into(),
+                ));
+            }
+            let question = DurableHumanInputQuestion {
+                info,
+                owner_instance_id: row_owner,
+            };
+            question.validate()?;
+            questions.push(question);
+        }
+        Ok(HumanInputListOutcome::Shared {
+            owner_instance_id: owner_instance_id.clone(),
+            questions,
+        })
+    }
+
+    async fn answer_human_input(
+        &self,
+        flow: &str,
+        run_id: &str,
+        question_id: &str,
+        answer: &serde_json::Value,
+    ) -> Result<HumanInputAnswerOutcome> {
+        validate_human_input_route("flow", flow, 255)?;
+        validate_human_input_route("run id", run_id, 128)?;
+        validate_human_input_route("question id", question_id, 128)?;
+        validate_durable_answer(answer)?;
+        let Some(keyring) = self.human_input_keyring.as_ref() else {
+            return Ok(HumanInputAnswerOutcome::NotDurable);
+        };
+
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input answer transaction failed: {error}"
+            ))
+        })?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", run_id)
+            .await?;
+        let row_sql = format!(
+            "SELECT owner_instance_id, key_hash, attempt_id, question_digest, state \
+             FROM {} WHERE run_id = $1 AND question_id = $2 AND flow = $3 \
+             FOR UPDATE",
+            self.human_inputs_table
+        );
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(row_sql))
+            .bind(run_id)
+            .bind(question_id)
+            .bind(flow)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input answer lookup failed: {error}"
+                ))
+            })?
+        else {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL missing human-input answer commit failed: {error}"
+                ))
+            })?;
+            return Ok(HumanInputAnswerOutcome::NotFound);
+        };
+        let owner_instance_id: String = row
+            .try_get("owner_instance_id")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        let key_hash: String = row
+            .try_get("key_hash")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        let attempt_id: String = row
+            .try_get("attempt_id")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        let question_digest: String = row
+            .try_get("question_digest")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        let state: String = row
+            .try_get("state")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        self.lock_idempotency_key(&mut tx, &key_hash).await?;
+        let (database_now, _) = self
+            .database_clock_with_deadline(&mut tx, 0, "human-input answer")
+            .await?;
+        let active_sql = format!(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM {human_inputs} AS human \
+                 JOIN {runs} AS run ON run.run_id = human.run_id \
+                 JOIN {idempotency} AS idem \
+                   ON idem.key_hash = human.key_hash \
+                  AND idem.attempt_id = human.attempt_id \
+                  AND idem.owner_instance_id = human.owner_instance_id \
+                  AND idem.operation = $1 AND idem.scope = human.flow \
+                  AND idem.resource_id = human.run_id \
+                 WHERE human.run_id = $2 AND human.question_id = $3 \
+                   AND human.flow = $4 \
+                   AND (human.state = 'answered' OR human.expires_at > $5::timestamptz) \
+                   AND run.status IN ('running', 'waiting_for_input') \
+                   AND run.owner_instance_id = human.owner_instance_id \
+                   AND run.lease_expires_at <> '' \
+                   AND run.lease_expires_at::timestamptz > $5::timestamptz \
+                   AND idem.state = 'running' \
+                   AND idem.lease_expires_at <> '' \
+                   AND idem.lease_expires_at::timestamptz > $5::timestamptz\
+             )",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let active: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(active_sql))
+            .bind(RUN_OPERATION)
+            .bind(run_id)
+            .bind(question_id)
+            .bind(flow)
+            .bind(&database_now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input answer fence check failed: {error}"
+                ))
+            })?;
+        if !active {
+            let delete_sql = format!(
+                "DELETE FROM {} WHERE run_id = $1 AND question_id = $2",
+                self.human_inputs_table
+            );
+            sqlx::query(sqlx::AssertSqlSafe(delete_sql))
+                .bind(run_id)
+                .bind(question_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL stale human-input cleanup failed: {error}"
+                    ))
+                })?;
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL stale human-input answer commit failed: {error}"
+                ))
+            })?;
+            return Ok(HumanInputAnswerOutcome::NotFound);
+        }
+        if state == "answered" {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL duplicate human-input answer commit failed: {error}"
+                ))
+            })?;
+            return Ok(HumanInputAnswerOutcome::AlreadyAnswered);
+        }
+        if state != "pending" {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL human-input row has invalid state '{state}'"
+            )));
+        }
+
+        let aad = HumanInputAad::new(
+            flow,
+            run_id,
+            question_id,
+            &question_digest,
+            &owner_instance_id,
+            &key_hash,
+            &attempt_id,
+        )?;
+        let encrypted = keyring.seal_json(&aad, answer)?;
+        let update_sql = format!(
+            "UPDATE {human_inputs} AS human SET \
+                 answer_key_fingerprint = $1, answer_nonce = $2, answer_ciphertext = $3, \
+                 state = 'answered', answered_at = $4::timestamptz \
+             WHERE human.run_id = $5 AND human.question_id = $6 AND human.flow = $7 \
+               AND human.owner_instance_id = $8 AND human.key_hash = $9 \
+               AND human.attempt_id = $10 AND human.question_digest = $11 \
+               AND human.state = 'pending' \
+               AND human.expires_at > $4::timestamptz \
+               AND EXISTS (SELECT 1 FROM {runs} AS run \
+                   WHERE run.run_id = human.run_id \
+                     AND run.owner_instance_id = human.owner_instance_id \
+                     AND run.status IN ('running', 'waiting_for_input') \
+                     AND run.lease_expires_at <> '' \
+                     AND run.lease_expires_at::timestamptz > $4::timestamptz) \
+               AND EXISTS (SELECT 1 FROM {idempotency} AS idem \
+                   WHERE idem.key_hash = human.key_hash \
+                     AND idem.attempt_id = human.attempt_id \
+                     AND idem.owner_instance_id = human.owner_instance_id \
+                     AND idem.operation = $12 AND idem.scope = human.flow \
+                     AND idem.resource_id = human.run_id AND idem.state = 'running' \
+                     AND idem.lease_expires_at <> '' \
+                     AND idem.lease_expires_at::timestamptz > $4::timestamptz)",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let updated = sqlx::query(sqlx::AssertSqlSafe(update_sql))
+            .bind(&encrypted.key_fingerprint)
+            .bind(&encrypted.nonce)
+            .bind(&encrypted.ciphertext)
+            .bind(&database_now)
+            .bind(run_id)
+            .bind(question_id)
+            .bind(flow)
+            .bind(&owner_instance_id)
+            .bind(&key_hash)
+            .bind(&attempt_id)
+            .bind(&question_digest)
+            .bind(RUN_OPERATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input answer update failed: {error}"
+                ))
+            })?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL human-input answer race rollback failed: {error}"
+                ))
+            })?;
+            return Ok(HumanInputAnswerOutcome::NotFound);
+        }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input answer commit failed: {error}"
+            ))
+        })?;
+        Ok(HumanInputAnswerOutcome::Queued { owner_instance_id })
+    }
+
+    async fn read_human_input(
+        &self,
+        registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputReadOutcome> {
+        registration.validate()?;
+        let Some(keyring) = self.human_input_keyring.as_ref() else {
+            return Ok(HumanInputReadOutcome::NotDurable);
+        };
+        let aad = registration.aad(self.lease.instance_id())?;
+        let sql = format!(
+            "SELECT human.state, human.answer_key_fingerprint, human.answer_nonce, \
+                    human.answer_ciphertext, human.question_digest \
+             FROM {human_inputs} AS human \
+             JOIN {runs} AS run ON run.run_id = human.run_id \
+             JOIN {idempotency} AS idem \
+               ON idem.key_hash = human.key_hash \
+              AND idem.attempt_id = human.attempt_id \
+              AND idem.owner_instance_id = human.owner_instance_id \
+              AND idem.operation = $1 AND idem.scope = human.flow \
+              AND idem.resource_id = human.run_id \
+             WHERE human.run_id = $2 AND human.question_id = $3 \
+               AND human.flow = $4 AND human.owner_instance_id = $5 \
+               AND human.key_hash = $6 AND human.attempt_id = $7 \
+               AND human.question_digest = $8 \
+               AND (human.state = 'answered' OR human.expires_at > clock_timestamp()) \
+               AND run.owner_instance_id = human.owner_instance_id \
+               AND run.status IN ('running', 'waiting_for_input') \
+               AND run.lease_expires_at <> '' \
+               AND run.lease_expires_at::timestamptz > clock_timestamp() \
+               AND idem.state = 'running' \
+               AND idem.lease_expires_at <> '' \
+               AND idem.lease_expires_at::timestamptz > clock_timestamp()",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(RUN_OPERATION)
+            .bind(&registration.run_id)
+            .bind(&registration.question.question_id)
+            .bind(&registration.flow)
+            .bind(self.lease.instance_id())
+            .bind(&registration.key_hash)
+            .bind(&registration.attempt_id)
+            .bind(&aad.question_digest)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| {
+                IronCrewError::Io(std::io::Error::other(format!(
+                    "PostgreSQL human-input owner read failed: {error}"
+                )))
+            })?
+        else {
+            return Ok(HumanInputReadOutcome::NotFound);
+        };
+        let question_digest: String = row
+            .try_get("question_digest")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        if question_digest != aad.question_digest {
+            return Err(IronCrewError::Conflict(
+                "Durable human-input question digest does not match its registration".into(),
+            ));
+        }
+        let state: String = row
+            .try_get("state")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        if state == "pending" {
+            return Ok(HumanInputReadOutcome::Pending);
+        }
+        if state != "answered" {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL human-input row has invalid state '{state}'"
+            )));
+        }
+        let fingerprint: String = row
+            .try_get::<Option<String>, _>("answer_key_fingerprint")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "Answered PostgreSQL human-input row has no key fingerprint".into(),
+                )
+            })?;
+        let nonce: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("answer_nonce")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
+            .ok_or_else(|| {
+                IronCrewError::Validation("Answered PostgreSQL human-input row has no nonce".into())
+            })?;
+        let ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("answer_ciphertext")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "Answered PostgreSQL human-input row has no ciphertext".into(),
+                )
+            })?;
+        let answer = keyring.open_json(&aad, &fingerprint, &nonce, &ciphertext)?;
+        Ok(HumanInputReadOutcome::Answered(answer))
+    }
+
+    async fn close_human_input(
+        &self,
+        registration: &DurableHumanInputRegistration,
+    ) -> Result<bool> {
+        registration.validate()?;
+        if self.human_input_keyring.is_none() {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input close transaction failed: {error}"
+            ))
+        })?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", &registration.run_id)
+            .await?;
+        let expected_question_digest = question_digest(&registration.question)?;
+        let sql = format!(
+            "DELETE FROM {} WHERE run_id = $1 AND question_id = $2 AND flow = $3 \
+               AND owner_instance_id = $4 AND key_hash = $5 AND attempt_id = $6 \
+               AND question_digest = $7",
+            self.human_inputs_table
+        );
+        let deleted = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&registration.run_id)
+            .bind(&registration.question.question_id)
+            .bind(&registration.flow)
+            .bind(self.lease.instance_id())
+            .bind(&registration.key_hash)
+            .bind(&registration.attempt_id)
+            .bind(&expected_question_digest)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PostgreSQL human-input close failed: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL human-input close commit failed: {error}"
+            ))
+        })?;
+        Ok(deleted.rows_affected() == 1)
     }
 
     async fn complete_idempotency_with_limits(

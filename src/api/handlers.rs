@@ -1,8 +1,8 @@
 use axum::{
     extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::Json,
-    response::sse::{Event, Sse},
+    response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Json, Response},
 };
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -10,13 +10,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::eventbus::{CrewEvent, DurableEventPersistence, EventBus};
+use crate::engine::human_input::{HumanInputAnswerOutcome, HumanInputListOutcome};
 use crate::engine::idempotency::{
     IdempotencyClaim, IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup,
     IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyRecord, PrincipalId, RUN_OPERATION,
     RunCancellationRequest, RunFenceHeartbeat, RunIntentSignal,
 };
-use crate::engine::input_bridge::AnswerError;
+use crate::engine::input_bridge::{AnswerError, validate_http_answer_size};
+use crate::engine::run_events::{
+    EventJournalScope, RunEventCursor, RunEventCursorError, RunEventPage,
+};
 use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
 use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
@@ -377,6 +381,15 @@ pub async fn capabilities(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
     );
+    let human_input_scope = if state.store.supports_durable_human_input() {
+        "shared_store_for_keyed_runs"
+    } else {
+        "process"
+    };
+    let sse_replay_scope = match state.store.event_journal_scope() {
+        EventJournalScope::SharedStore => "shared_store",
+        EventJournalScope::ProcessLocal => "process",
+    };
     (
         headers,
         Json(serde_json::json!({
@@ -390,8 +403,8 @@ pub async fn capabilities(
                     "local": "process",
                     "cross_instance": "keyed_store_if_supported",
                 },
-                "human_input": "process",
-                "sse_replay": "process",
+                "human_input": human_input_scope,
+                "sse_replay": sse_replay_scope,
                 "conversations": "process",
             },
         })),
@@ -1176,15 +1189,24 @@ pub async fn run_flow(
     } else {
         None
     };
-    let eventbus = EventBus::new(256);
+    let eventbus =
+        EventBus::new_durable(256, state.store.clone(), flow_slug.clone(), run_id.clone());
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
 
     // Per-run human-input transport: crew:ask_human() parks on this, the
     // questions/answer endpoints reach it through ActiveRun.
-    let input_bridge = Arc::new(crate::engine::input_bridge::InputBridge::new(
-        crate::engine::input_bridge::BridgeMode::Http,
-    ));
+    let input_bridge = Arc::new(if let Some(attempt) = idempotency_attempt.as_ref() {
+        crate::engine::input_bridge::InputBridge::new_durable_http(
+            state.store.clone(),
+            flow_slug.clone(),
+            run_id.clone(),
+            attempt.key_hash.clone(),
+            attempt.attempt_id.clone(),
+        )
+    } else {
+        crate::engine::input_bridge::InputBridge::new(crate::engine::input_bridge::BridgeMode::Http)
+    });
     // Retained by both the worker and its monitor. If outer Lua is aborted or
     // times out after `crew:run()` completed, the monitor can still preserve
     // those task results while applying the authoritative terminal status.
@@ -1467,6 +1489,25 @@ pub async fn run_flow(
             });
         }
 
+        // Preserve journal ordering at the terminal fence. PostgreSQL rejects
+        // ordinary event appends after the durable run record becomes
+        // terminal, so drain every event emitted by the worker before writing
+        // that record. This remains bounded: a degraded journal must never
+        // prevent authoritative run finalization indefinitely.
+        let event_flush = eventbus.flush_durable().await;
+        if matches!(
+            event_flush,
+            DurableEventPersistence::Dropped
+                | DurableEventPersistence::Failed
+                | DurableEventPersistence::TimedOut
+        ) {
+            tracing::warn!(
+                run_id = %run_id_clone,
+                ?event_flush,
+                "Run events were not fully durable before terminal persistence"
+            );
+        }
+
         let mut persistence_degraded = false;
         let mut retry_delay = std::time::Duration::from_millis(250);
         let terminal_status = loop {
@@ -1533,12 +1574,26 @@ pub async fn run_flow(
         }
         drop(run_heartbeat);
 
-        eventbus.emit(CrewEvent::RunComplete {
-            run_id: run_id_clone.clone(),
-            status: terminal_status.to_string(),
-            duration_ms,
-            total_tokens,
-        });
+        let event_persistence = eventbus
+            .emit_terminal(CrewEvent::RunComplete {
+                run_id: run_id_clone.clone(),
+                status: terminal_status.to_string(),
+                duration_ms,
+                total_tokens,
+            })
+            .await;
+        if matches!(
+            event_persistence,
+            DurableEventPersistence::Dropped
+                | DurableEventPersistence::Failed
+                | DurableEventPersistence::TimedOut
+        ) {
+            tracing::warn!(
+                run_id = %run_id_clone,
+                ?event_persistence,
+                "Terminal run record is durable but its replay-journal event was not confirmed"
+            );
+        }
         let _ = terminal_tx.send(true);
         drop(admission_permit);
 
@@ -1896,6 +1951,17 @@ pub async fn abort_run(
 // Human-in-the-loop: pending questions + answers (crew:ask_human)
 // ---------------------------------------------------------------------------
 
+type HumanInputHttpResponse = (StatusCode, HeaderMap, Json<serde_json::Value>);
+
+fn human_input_response(status: StatusCode, value: serde_json::Value) -> HumanInputHttpResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    (status, headers, Json(value))
+}
+
 /// `GET /flows/{flow}/questions/{run_id}` — pending `ask_human` questions for
 /// a live run. Lets a UI that missed the SSE `human_input_requested` event
 /// (or a poll-only client) recover state. Flow-scoped like `abort_run`.
@@ -1904,10 +1970,10 @@ pub async fn list_questions(
     Path((flow, run_id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<HumanInputHttpResponse, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
         .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> = async {
+    let result: Result<HumanInputHttpResponse, (StatusCode, Json<serde_json::Value>)> = async {
         let path = resolve_flow_path(&state, &flow)
             .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
         let flow_slug = path
@@ -1944,22 +2010,65 @@ pub async fn list_questions(
             } else {
                 "waiting_for_input"
             };
-            return Ok(Json(serde_json::json!({
-                "run_id": run_id,
-                "status": status,
-                "questions": questions,
-            })));
+            let control_scope = if bridge.supports_shared_human_input() {
+                "shared_store"
+            } else {
+                "process"
+            };
+            return Ok(human_input_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "status": status,
+                    "owner_instance_id": state.store.instance_id(),
+                    "control_scope": control_scope,
+                    "questions": questions,
+                }),
+            ));
         };
 
-        let location = durable_run_location(&state, &flow_slug, &run_id)
+        match state
+            .store
+            .list_human_inputs(&flow_slug, &run_id)
             .await
-            .map_err(run_location_store_error)?;
-        Err(run_location_error(&state, &run_id, location))
+            .map_err(run_location_store_error)?
+        {
+            HumanInputListOutcome::Shared {
+                owner_instance_id,
+                questions,
+            } => {
+                let questions = questions
+                    .into_iter()
+                    .map(|question| question.info)
+                    .collect::<Vec<_>>();
+                let status = if questions.is_empty() {
+                    "running"
+                } else {
+                    "waiting_for_input"
+                };
+                Ok(human_input_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "status": status,
+                        "owner_instance_id": owner_instance_id,
+                        "control_scope": "shared_store",
+                        "questions": questions,
+                    }),
+                ))
+            }
+            HumanInputListOutcome::NotDurable => {
+                let location = durable_run_location(&state, &flow_slug, &run_id)
+                    .await
+                    .map_err(run_location_store_error)?;
+                Err(run_location_error(&state, &run_id, location))
+            }
+        }
     }
     .await;
 
     let (success, status_code) = match &result {
-        Ok(_) => (true, 200u16),
+        Ok((status, _, _)) => (true, status.as_u16()),
         Err((sc, _)) => (false, sc.as_u16()),
     };
     crate::api::audit::record(
@@ -1995,11 +2104,11 @@ pub async fn answer_question(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<AnswerRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<HumanInputHttpResponse, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
         .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let question_id = body.question_id.clone();
-    let result: Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> = async {
+    let result: Result<HumanInputHttpResponse, (StatusCode, Json<serde_json::Value>)> = async {
         let path = resolve_flow_path(&state, &flow)
             .map_err(|error| structured_error(flow_status(&error), sanitize_error(&error)))?;
         let flow_slug = path
@@ -2007,6 +2116,32 @@ pub async fn answer_question(
             .and_then(|segment| segment.to_str())
             .unwrap_or("")
             .to_string();
+
+        if question_id.is_empty()
+            || question_id.len() > 128
+            || question_id.chars().any(char::is_control)
+        {
+            return Err(structured_error(
+                StatusCode::BAD_REQUEST,
+                "Question id must be 1-128 printable characters",
+            ));
+        }
+
+        match validate_http_answer_size(&body.answer) {
+            Ok(()) => {}
+            Err(AnswerError::TooLarge { max_bytes }) => {
+                return Err(structured_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Question answer exceeds the {max_bytes}-byte limit"),
+                ));
+            }
+            Err(AnswerError::Invalid(message)) => {
+                return Err(structured_error(StatusCode::BAD_REQUEST, message));
+            }
+            Err(AnswerError::Unavailable(_) | AnswerError::UnknownOrExpired { .. }) => {
+                unreachable!("answer preflight only validates serialized size")
+            }
+        }
 
         let local_bridge = {
             let active_runs = state.active_runs.read().await;
@@ -2024,18 +2159,56 @@ pub async fn answer_question(
             }
         };
         if let Some(bridge) = local_bridge {
-            return match bridge.answer(&question_id, body.answer) {
-                Ok(()) => Ok(Json(serde_json::json!({
-                    "run_id": run_id,
-                    "question_id": question_id,
-                    "status": "delivered",
-                }))),
+            return match bridge.answer_http(&question_id, body.answer).await {
+                Ok(HumanInputAnswerOutcome::Queued { owner_instance_id }) => {
+                    Ok(human_input_response(
+                        StatusCode::ACCEPTED,
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "question_id": question_id,
+                            "status": "queued",
+                            "owner_instance_id": owner_instance_id,
+                            "control_scope": "shared_store",
+                        }),
+                    ))
+                }
+                Ok(HumanInputAnswerOutcome::NotDurable) => Ok(human_input_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "question_id": question_id,
+                        "status": "delivered",
+                        "owner_instance_id": state.store.instance_id(),
+                        "control_scope": "process",
+                    }),
+                )),
+                Ok(HumanInputAnswerOutcome::AlreadyAnswered) => Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Question '{}' not found or expired on run '{}'",
+                        question_id, run_id
+                    ),
+                )),
+                Ok(HumanInputAnswerOutcome::NotFound) => Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Question '{}' not found or expired on run '{}'",
+                        question_id, run_id
+                    ),
+                )),
                 Err(AnswerError::TooLarge { max_bytes }) => Err(structured_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!("Question answer exceeds the {max_bytes}-byte limit"),
                 )),
                 Err(AnswerError::Invalid(message)) => {
                     Err(structured_error(StatusCode::BAD_REQUEST, message))
+                }
+                Err(AnswerError::Unavailable(message)) => {
+                    tracing::warn!(%message, "Durable human-input answer transport unavailable");
+                    Err(structured_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Durable human-input transport is temporarily unavailable",
+                    ))
                 }
                 Err(AnswerError::UnknownOrExpired { .. }) => Err(structured_error(
                     StatusCode::NOT_FOUND,
@@ -2047,15 +2220,54 @@ pub async fn answer_question(
             };
         };
 
-        let location = durable_run_location(&state, &flow_slug, &run_id)
+        match state
+            .store
+            .answer_human_input(&flow_slug, &run_id, &question_id, &body.answer)
             .await
-            .map_err(run_location_store_error)?;
-        Err(run_location_error(&state, &run_id, location))
+        {
+            Ok(HumanInputAnswerOutcome::Queued { owner_instance_id }) => Ok(human_input_response(
+                StatusCode::ACCEPTED,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "question_id": question_id,
+                    "status": "queued",
+                    "owner_instance_id": owner_instance_id,
+                    "control_scope": "shared_store",
+                }),
+            )),
+            Ok(HumanInputAnswerOutcome::AlreadyAnswered) => Err(structured_error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Question '{}' not found or expired on run '{}'",
+                    question_id, run_id
+                ),
+            )),
+            Ok(HumanInputAnswerOutcome::NotFound) => Err(structured_error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Question '{}' not found or expired on run '{}'",
+                    question_id, run_id
+                ),
+            )),
+            Ok(HumanInputAnswerOutcome::NotDurable) => {
+                let location = durable_run_location(&state, &flow_slug, &run_id)
+                    .await
+                    .map_err(run_location_store_error)?;
+                Err(run_location_error(&state, &run_id, location))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Durable human-input answer enqueue failed");
+                Err(structured_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Durable human-input transport is temporarily unavailable",
+                ))
+            }
+        }
     }
     .await;
 
     let (success, status_code) = match &result {
-        Ok(_) => (true, 200u16),
+        Ok((status, _, _)) => (true, status.as_u16()),
         Err((sc, _)) => (false, sc.as_u16()),
     };
     crate::api::audit::record(
@@ -2077,37 +2289,6 @@ pub async fn answer_question(
 // ---------------------------------------------------------------------------
 // SSE event stream
 // ---------------------------------------------------------------------------
-
-fn event_type_str(event: &CrewEvent) -> &'static str {
-    match event {
-        CrewEvent::CrewStarted { .. } => "crew_started",
-        CrewEvent::PhaseStart { .. } => "phase_start",
-        CrewEvent::TaskAssigned { .. } => "task_assigned",
-        CrewEvent::TaskCompleted { .. } => "task_completed",
-        CrewEvent::TaskFailed { .. } => "task_failed",
-        CrewEvent::TaskSkipped { .. } => "task_skipped",
-        CrewEvent::TaskThinking { .. } => "task_thinking",
-        CrewEvent::TaskRetry { .. } => "task_retry",
-        CrewEvent::ToolCall { .. } => "tool_call",
-        CrewEvent::ToolResult { .. } => "tool_result",
-        CrewEvent::AgentToolStarted { .. } => "agent_tool_started",
-        CrewEvent::AgentToolCompleted { .. } => "agent_tool_completed",
-        CrewEvent::MessageSent { .. } => "message_sent",
-        CrewEvent::CollaborationTurn { .. } => "collaboration_turn",
-        CrewEvent::ConversationStarted { .. } => "conversation_started",
-        CrewEvent::ConversationTurn { .. } => "conversation_turn",
-        CrewEvent::ConversationThinking { .. } => "conversation_thinking",
-        CrewEvent::DialogStarted { .. } => "dialog_started",
-        CrewEvent::DialogTurn { .. } => "dialog_turn",
-        CrewEvent::DialogThinking { .. } => "dialog_thinking",
-        CrewEvent::DialogCompleted { .. } => "dialog_completed",
-        CrewEvent::MemorySet { .. } => "memory_set",
-        CrewEvent::HumanInputRequested { .. } => "human_input_requested",
-        CrewEvent::HumanInputReceived { .. } => "human_input_received",
-        CrewEvent::Log { .. } => "log",
-        CrewEvent::RunComplete { .. } => "run_complete",
-    }
-}
 
 /// Truncate a string at the nearest UTF-8 char boundary at or below `max` bytes.
 /// Returns a slice that is never in the middle of a multi-byte codepoint.
@@ -2165,13 +2346,84 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
     }
 }
 
+fn cursor_error_response(error: RunEventCursorError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code) = match &error {
+        RunEventCursorError::Ahead { .. } => (StatusCode::CONFLICT, "cursor_ahead"),
+        RunEventCursorError::Expired { .. } => (StatusCode::CONFLICT, "cursor_expired"),
+        RunEventCursorError::CrossRun => (StatusCode::BAD_REQUEST, "cursor_cross_run"),
+        _ => (StatusCode::BAD_REQUEST, "invalid_cursor"),
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": error.to_string(),
+            "code": code,
+        })),
+    )
+}
+
+fn hardened_sse_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-transform"),
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
+}
+
+enum JournalPageReadError {
+    TimedOut,
+    Store(IronCrewError),
+}
+
+async fn read_journal_page(
+    state: &AppState,
+    flow: &str,
+    run_id: &str,
+    after_sequence: u64,
+) -> std::result::Result<RunEventPage, JournalPageReadError> {
+    match tokio::time::timeout(
+        state.store.event_journal_config().read_timeout,
+        state.store.read_run_events(flow, run_id, after_sequence),
+    )
+    .await
+    {
+        Ok(Ok(page)) => Ok(page),
+        Ok(Err(error)) => Err(JournalPageReadError::Store(error)),
+        Err(_) => Err(JournalPageReadError::TimedOut),
+    }
+}
+
+fn journal_read_http_error(
+    run_id: &str,
+    error: JournalPageReadError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        JournalPageReadError::TimedOut => {
+            tracing::warn!(run_id, "Initial durable run-event read timed out");
+        }
+        JournalPageReadError::Store(error) => {
+            tracing::warn!(run_id, %error, "Initial durable run-event read failed");
+        }
+    }
+    structured_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Run-event replay is temporarily unavailable",
+    )
+}
+
+fn cursor_acknowledges_terminal(acknowledged_through: Option<u64>, sequence: u64) -> bool {
+    acknowledged_through.is_some_and(|cursor_sequence| cursor_sequence >= sequence)
+}
+
 pub async fn flow_events(
     State(state): State<Arc<AppState>>,
     Path((flow, run_id)): Path<(String, String)>,
-) -> Result<
-    Sse<impl futures::stream::Stream<Item = std::result::Result<Event, Infallible>>>,
-    (StatusCode, Json<serde_json::Value>),
-> {
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     validate_run_id(&run_id)
         .map_err(|error| structured_error(StatusCode::BAD_REQUEST, sanitize_error(&error)))?;
     let flow_path = resolve_flow_path(&state, &flow)
@@ -2179,7 +2431,23 @@ pub async fn flow_events(
     let flow_slug = flow_path
         .file_name()
         .and_then(|segment| segment.to_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+
+    let raw_cursor = headers
+        .get(axum::http::HeaderName::from_static("last-event-id"))
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| cursor_error_response(RunEventCursorError::NonAscii))
+        })
+        .transpose()?;
+    let cursor = raw_cursor
+        .as_deref()
+        .map(|value| RunEventCursor::parse_for_run(value, &run_id))
+        .transpose()
+        .map_err(cursor_error_response)?;
 
     let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
         structured_error(
@@ -2190,6 +2458,219 @@ pub async fn flow_events(
             ),
         )
     })?;
+
+    if state.store.event_journal_scope() == EventJournalScope::SharedStore {
+        match durable_run_location(&state, &flow_slug, &run_id)
+            .await
+            .map_err(run_location_store_error)?
+        {
+            DurableRunLocation::Missing => {
+                return Err(structured_error(
+                    StatusCode::NOT_FOUND,
+                    format!("Run '{}' not found or already completed", run_id),
+                ));
+            }
+            DurableRunLocation::ActiveOnThisInstance
+            | DurableRunLocation::ActiveOnOtherInstance(_)
+            | DurableRunLocation::ActiveOwnerUnknown
+            | DurableRunLocation::Terminal(_) => {}
+        }
+
+        let bounds_page = read_journal_page(&state, &flow_slug, &run_id, 0)
+            .await
+            .map_err(|error| journal_read_http_error(&run_id, error))?;
+        let mut after_sequence = 0;
+        let first_page = if let Some(cursor) = cursor.as_ref() {
+            cursor
+                .validate_against(&bounds_page.bounds)
+                .map_err(cursor_error_response)?;
+            after_sequence = cursor.sequence();
+            let page = read_journal_page(&state, &flow_slug, &run_id, after_sequence)
+                .await
+                .map_err(|error| journal_read_http_error(&run_id, error))?;
+            cursor
+                .validate_against(&page.bounds)
+                .map_err(cursor_error_response)?;
+            page
+        } else {
+            bounds_page
+        };
+
+        let store = state.store.clone();
+        let config = store.event_journal_config();
+        let run_id_for_stream = run_id.clone();
+        let flow_for_stream = flow_slug.clone();
+        let acknowledged_through = cursor.as_ref().map(RunEventCursor::sequence);
+        let stream = async_stream::stream! {
+            let _sse_permit = sse_permit;
+            let mut pending_page = Some(first_page);
+            let mut consecutive_failures = 0u32;
+
+            loop {
+                let page = if let Some(page) = pending_page.take() {
+                    page
+                } else {
+                    match tokio::time::timeout(
+                        config.read_timeout,
+                        store.read_run_events(
+                            &flow_for_stream,
+                            &run_id_for_stream,
+                            after_sequence,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(page)) => {
+                            consecutive_failures = 0;
+                            page
+                        }
+                        Ok(Err(error)) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
+                                tracing::warn!(
+                                    run_id = %run_id_for_stream,
+                                    consecutive_failures,
+                                    %error,
+                                    "Durable SSE journal read failed"
+                                );
+                            }
+                            if consecutive_failures >= 5 {
+                                yield Ok::<Event, Infallible>(Event::default().event("error").data(
+                                    r#"{"event":"error","data":{"message":"run-event replay is temporarily unavailable; reconnect with Last-Event-ID"}}"#,
+                                ));
+                                return;
+                            }
+                            let factor = 1u32 << consecutive_failures.min(3);
+                            tokio::time::sleep(config.poll_interval.saturating_mul(factor)).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
+                                tracing::warn!(
+                                    run_id = %run_id_for_stream,
+                                    consecutive_failures,
+                                    timeout_ms = config.read_timeout.as_millis(),
+                                    "Durable SSE journal read timed out"
+                                );
+                            }
+                            if consecutive_failures >= 5 {
+                                yield Ok::<Event, Infallible>(Event::default().event("error").data(
+                                    r#"{"event":"error","data":{"message":"run-event replay timed out; reconnect with Last-Event-ID"}}"#,
+                                ));
+                                return;
+                            }
+                            let factor = 1u32 << consecutive_failures.min(3);
+                            tokio::time::sleep(config.poll_interval.saturating_mul(factor)).await;
+                            continue;
+                        }
+                    }
+                };
+
+                if let Some(gap) = page.gap.as_ref() {
+                    after_sequence = after_sequence.max(gap.last_sequence);
+                    let cursor_id = RunEventCursor::new(
+                        run_id_for_stream.clone(),
+                        gap.last_sequence,
+                    )
+                    .expect("validated journal gap must have a valid cursor")
+                    .to_string();
+                    let data = serde_json::json!({
+                        "event": "journal_gap",
+                        "data": gap,
+                    });
+                    yield Ok::<Event, Infallible>(Event::default()
+                        .id(cursor_id)
+                        .event("journal_gap")
+                        .data(data.to_string()));
+                }
+
+                let mut delivered_terminal = false;
+                for entry in &page.events {
+                    after_sequence = entry.sequence;
+                    let cursor_id = RunEventCursor::new(
+                        run_id_for_stream.clone(),
+                        entry.sequence,
+                    )
+                    .expect("validated journal event must have a valid cursor")
+                    .to_string();
+                    yield Ok::<Event, Infallible>(Event::default()
+                        .id(cursor_id)
+                        .event(entry.event_type.clone())
+                        .data(entry.payload.to_string()));
+                    if entry.event_type == "run_complete" {
+                        delivered_terminal = true;
+                        break;
+                    }
+                }
+                if delivered_terminal {
+                    return;
+                }
+
+                if let Some(terminal) = page.terminal.as_ref() {
+                    match terminal.event_sequence {
+                        Some(sequence) if after_sequence < sequence => {
+                            // The bounded page has more retained events.
+                            continue;
+                        }
+                        Some(sequence)
+                            if cursor_acknowledges_terminal(acknowledged_through, sequence) =>
+                        {
+                            // The cursor supplied by this client explicitly
+                            // acknowledged the terminal event (or a later
+                            // sequence), so an empty closing replay is correct.
+                            // Do not use the advancing server-side cursor here:
+                            // a retention gap may have moved it past an event
+                            // the client never actually received.
+                            return;
+                        }
+                        Some(_) | None => {
+                            // Physical retention or a best-effort writer
+                            // failure removed/omitted run_complete. The durable
+                            // run record is authoritative and explicitly marks
+                            // this synthetic fallback as an incomplete journal.
+                            let data = serde_json::json!({
+                                "event": "run_complete",
+                                "data": {
+                                    "run_id": run_id_for_stream.clone(),
+                                    "status": terminal.status.to_string(),
+                                    "duration_ms": terminal.duration_ms,
+                                    "total_tokens": terminal.total_tokens,
+                                    "journal_complete": false,
+                                    "synthesized_from_run_record": true,
+                                }
+                            });
+                            yield Ok::<Event, Infallible>(Event::default()
+                                .event("run_complete")
+                                .data(data.to_string()));
+                            return;
+                        }
+                    }
+                }
+
+                if after_sequence < page.bounds.latest_sequence {
+                    continue;
+                }
+                tokio::time::sleep(config.poll_interval).await;
+            }
+        };
+
+        let response = Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(15))
+                    .text("keep-alive"),
+            )
+            .into_response();
+        return Ok(hardened_sse_response(response));
+    }
+
+    if cursor.is_some() {
+        return Err(structured_error(
+            StatusCode::CONFLICT,
+            "Last-Event-ID replay requires a shared run-event journal",
+        ));
+    }
 
     // Subscribe and snapshot under one EventBus critical section so an event
     // cannot land in the replay/subscription gap.
@@ -2210,7 +2691,7 @@ pub async fn flow_events(
     };
     let (replay, rx) = match local_subscription {
         Some((replay, rx)) => (replay, Some(rx)),
-        None => match durable_run_location(&state, flow_slug, &run_id)
+        None => match durable_run_location(&state, &flow_slug, &run_id)
             .await
             .map_err(run_location_store_error)?
         {
@@ -2239,9 +2720,8 @@ pub async fn flow_events(
         for event in replay {
             let effective = maybe_truncate_event(&event, sse_max_chars);
             let ev = effective.as_ref().unwrap_or(&event);
-            let event_type = event_type_str(ev);
             let data = serde_json::to_string(ev).unwrap_or_default();
-            yield Ok(Event::default().event(event_type).data(data));
+            yield Ok::<Event, Infallible>(Event::default().event(ev.event_type()).data(data));
 
             if matches!(ev, CrewEvent::RunComplete { .. }) {
                 return; // Run already finished, no need for live stream
@@ -2258,9 +2738,8 @@ pub async fn flow_events(
                 Ok(event) => {
                     let effective = maybe_truncate_event(&event, sse_max_chars);
                     let ev = effective.as_ref().unwrap_or(&event);
-                    let event_type = event_type_str(ev);
                     let data = serde_json::to_string(ev).unwrap_or_default();
-                    yield Ok(Event::default().event(event_type).data(data));
+                    yield Ok::<Event, Infallible>(Event::default().event(ev.event_type()).data(data));
 
                     if matches!(ev, CrewEvent::RunComplete { .. }) {
                         break;
@@ -2270,7 +2749,7 @@ pub async fn flow_events(
                     let sse_event = Event::default()
                         .event("warning")
                         .data(format!("{{\"message\":\"missed {} events\"}}", n));
-                    yield Ok(sse_event);
+                    yield Ok::<Event, Infallible>(sse_event);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;
@@ -2279,7 +2758,14 @@ pub async fn flow_events(
         }
     };
 
-    Ok(Sse::new(stream))
+    let response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    Ok(hardened_sse_response(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,12 +3113,14 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
 mod truncate_tests {
     use super::{
         RunWorkResult, TERMINAL_RESULT_RETRY_RETAINED_BYTES, TerminalPersistence,
-        TerminalResultRetention, classify_work_result, persist_terminal_outcome, replay_run,
-        truncate_utf8, validate_run_id, validate_run_tags,
+        TerminalResultRetention, classify_work_result, cursor_acknowledges_terminal,
+        cursor_error_response, persist_terminal_outcome, replay_run, truncate_utf8,
+        validate_run_id, validate_run_tags,
     };
     use crate::engine::idempotency::{
         IdempotencyRecord, IdempotencyState, PrincipalId, RUN_OPERATION,
     };
+    use crate::engine::run_events::RunEventCursorError;
     use crate::engine::run_history::{JsonFileStore, RunCompletion, RunStatus};
     use crate::engine::store::StateStore;
     use crate::engine::task::TaskResult;
@@ -2642,6 +3130,21 @@ mod truncate_tests {
     #[test]
     fn ascii_under_limit_returns_full() {
         assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[test]
+    fn only_the_client_supplied_cursor_acknowledges_terminal_replay() {
+        assert!(!cursor_acknowledges_terminal(None, 7));
+        assert!(!cursor_acknowledges_terminal(Some(6), 7));
+        assert!(cursor_acknowledges_terminal(Some(7), 7));
+        assert!(cursor_acknowledges_terminal(Some(8), 7));
+    }
+
+    #[test]
+    fn non_ascii_cursor_uses_the_structured_invalid_cursor_contract() {
+        let (status, body) = cursor_error_response(RunEventCursorError::NonAscii);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], "invalid_cursor");
     }
 
     #[test]

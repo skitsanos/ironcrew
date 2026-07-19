@@ -5,8 +5,9 @@ metadata:
   labels:
     app.kubernetes.io/name: ironcrew
 spec:
-  # Active run/session control is process-local. Keep one replica and stop the
-  # old pod before creating its replacement until distributed control exists.
+  # Conservative general-purpose baseline: PostgreSQL run SSE and keyed
+  # cancellation/HITL are shared, but execution and conversations remain
+  # process-owned. Stop the old pod before creating its replacement.
   replicas: 1
   strategy:
     type: Recreate
@@ -70,6 +71,10 @@ spec:
               value: "120"
             - name: IRONCREW_ADMISSION_CONTROL_BURST
               value: "20"
+            - name: IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE
+              value: "600"
+            - name: IRONCREW_ADMISSION_OBSERVATION_BURST
+              value: "20"
             - name: IRONCREW_MAX_CONVERSATION_TURN_SECS
               value: "300"
             - name: IRONCREW_MAX_SSE_CONNECTIONS
@@ -106,6 +111,8 @@ spec:
               value: "8388608"
             - name: IRONCREW_ASK_HUMAN_MAX_PENDING
               value: "8"
+            - name: IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES
+              value: "524288"
             - name: IRONCREW_ASK_HUMAN_MAX_TIMEOUT
               value: "900"
             - name: IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES
@@ -116,6 +123,14 @@ spec:
               value: "32768"
             - name: IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES
               value: "32768"
+            - name: IRONCREW_HITL_POLL_INTERVAL_MS
+              value: "1000"
+            - name: IRONCREW_HITL_READ_TIMEOUT_MS
+              value: "2000"
+            # Match durable question-list read concurrency to this pod's small
+            # PostgreSQL pool; owner answer polling is separately bounded.
+            - name: IRONCREW_HITL_PG_MAX_CONCURRENT_READS
+              value: "2"
             - name: IRONCREW_TOOL_TIMEOUT
               value: "60"
             - name: IRONCREW_DEFAULT_MAX_CONCURRENT
@@ -260,6 +275,22 @@ spec:
               value: "1048576"
             - name: IRONCREW_EVENT_CHANNEL_CAPACITY
               value: "8"
+            # These are logical PostgreSQL journal caps, not physical disk/WAL
+            # quotas. The page size stays above the 128 KiB event maximum.
+            - name: IRONCREW_EVENT_JOURNAL_RETENTION_SECS
+              value: "3600"
+            - name: IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS
+              value: "10000"
+            - name: IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES
+              value: "67108864"
+            - name: IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES
+              value: "262144"
+            - name: IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS
+              value: "1000"
+            - name: IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS
+              value: "2000"
+            - name: IRONCREW_EVENT_JOURNAL_PRUNE_BATCH
+              value: "500"
             - name: IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES
               value: "32768"
             - name: IRONCREW_MESSAGEBUS_QUEUE_DEPTH
@@ -325,6 +356,20 @@ spec:
                 secretKeyRef:
                   name: ironcrew-secrets
                   key: api-token
+            # Optional as a pair. If either key is supplied, both must exist
+            # and every replica must receive the same staged keyring.
+            - name: IRONCREW_HITL_ENCRYPTION_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: hitl-encryption-keys
+                  optional: true
+            - name: IRONCREW_HITL_ACTIVE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: hitl-active-key-id
+                  optional: true
           resources:
             requests:
               cpu: 250m

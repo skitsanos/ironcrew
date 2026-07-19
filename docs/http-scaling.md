@@ -38,15 +38,15 @@ Related knobs:
 | `IRONCREW_API_MAX_IMAGES_PER_CONVERSATION` | `16` | Max retained image references per conversation |
 | `IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION` | `33554432` | Max decoded image bytes retained per conversation |
 | `IRONCREW_LUA_MAX_MEMORY_BYTES` | `33554432` | Allocator cap for each live conversation VM |
-| `IRONCREW_MAX_EVENTS` | `1000` | Replay event count cap per event bus |
-| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` | Replay event byte budget |
-| `IRONCREW_EVENT_MAX_BYTES` | `262144` | Individual live/replay event cap |
+| `IRONCREW_MAX_EVENTS` | `1000` | Per-run replay count cap; also applies to each in-memory conversation bus |
+| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` | Per-run replay byte budget; in-memory for conversations/JSON/SQLite and logical PostgreSQL journal accounting for runs |
+| `IRONCREW_EVENT_MAX_BYTES` | `262144` | Individual live/durable event cap |
 
 ---
 
 ## What actually consumes memory
 
-For HTTP traffic, memory pressure usually comes from six places:
+For HTTP traffic, memory pressure usually comes from seven places:
 
 1. Active chat sessions
 2. SSE replay buffers
@@ -54,6 +54,7 @@ For HTTP traffic, memory pressure usually comes from six places:
 4. Concurrent in-flight requests
 5. Temporary idempotency-response serialization buffers
 6. Per-conversation lifecycle gates
+7. PostgreSQL event-journal producer queues and reader pages
 
 ### Active chat sessions
 
@@ -64,10 +65,13 @@ history caps, memory usage grows linearly with session count.
 
 ### SSE replay buffers
 
-IronCrew replays past events to late SSE subscribers. This is useful for
-frontend reconnects, but it means events remain resident in memory for the life
-of the event bus. Chat-heavy and tool-heavy workloads can produce large event
-payloads.
+IronCrew replays past events to late SSE subscribers. Conversation SSE and
+JSON/SQLite run SSE keep that replay in memory for the life of the event bus.
+PostgreSQL run HTTP replay uses a bounded database journal, but its active
+EventBus still retains the normal bounded local replay alongside a bounded
+producer queue; each subscriber also reads one bounded page at a time.
+Chat-heavy and tool-heavy workloads can therefore produce large event payloads
+in both pod RAM and PostgreSQL.
 
 Cap replay aggressively in Cloud environments:
 
@@ -76,6 +80,24 @@ IRONCREW_MAX_EVENTS=200
 IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
 IRONCREW_EVENT_MAX_BYTES=131072
 ```
+
+For PostgreSQL, also cap the transient read page and global logical retention:
+
+```bash
+IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS=10000
+IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES=67108864
+IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES=262144
+IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS=1000
+IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS=2000
+IRONCREW_EVENT_JOURNAL_PRUNE_BATCH=500
+```
+
+The producer queue is at most 64 events and defaults to a 1 MiB byte budget,
+enlarged only enough for the configured single-event maximum without exceeding
+the per-run budget. Global journal bytes are logical accounting with at least
+1 KiB charged per event; they exclude PostgreSQL row/page/index overhead, WAL,
+replicas/backups, and dead tuples. Monitor real database storage and autovacuum
+separately from pod RSS.
 
 ### Large outputs
 
@@ -260,45 +282,61 @@ For the status-labeled boundary between shared PostgreSQL coordination and
 process-local live control, including the two-replica release gate, see the
 [Multi-Replica Deployment Contract](multi-replica.md).
 
-### One HTTP instance (required today)
+The shared PostgreSQL run journal and HITL mailbox are committed but not yet in
+a published release. A published `2.22.0` image does not contain them.
+
+### One HTTP instance (general-purpose baseline)
 
 Use this when:
 
-- live runs, conversations, questions, cancellation, and SSE are handled by the
-  HTTP API
+- live runs, conversations, unkeyed questions, or process-local SSE are handled
+  by the HTTP API
 - you need deterministic ownership during deploys and restarts
 - you can scale vertically and limit admission to fit one process
 
-This is the supported production shape. Use PostgreSQL for durable production
-records, but keep exactly one `serve` replica. On OpenShift/Kubernetes use
-`replicas: 1` with the `Recreate` strategy. On Railway keep `numReplicas: 1`
-and `overlapSeconds: 0` as configured in `railway.json`.
+This is the safest general-purpose production shape while execution,
+conversation handles/SSE, and JSON/SQLite run SSE are owner-local. PostgreSQL
+run SSE is shared, but it does not move the Lua execution. The checked-in
+OpenShift/Kubernetes and Railway baselines therefore keep exactly one `serve`
+replica with non-overlapping replacement.
 
 Railway Pro allows ample vertical headroom, but its account-wide resource
 ceiling is not a safe application setting. Set explicit service CPU/RAM limits,
 then raise IronCrew concurrency only from measured container workloads.
 
-### Multiple HTTP instances (not yet supported)
+### Multiple HTTP instances (bounded PostgreSQL slice)
 
-PostgreSQL shares persistent records and run leases, but these live control
-objects remain process-local:
+PostgreSQL shares persistent records and run leases. It also coordinates
+idempotency-keyed cancellation and, when every replica has the same
+`IRONCREW_HITL_ENCRYPTION_KEYS` keyring and active id, encrypted pending
+questions/answers. These objects remain process-local:
 
-- active run handles and cancellation
-- pending human questions and answers
+- active run handles and unkeyed-run cancellation
+- unkeyed/non-PostgreSQL human questions and answers
 - conversation Lua VMs and per-session locks
-- SSE broadcast/replay state
+- every conversation SSE bus and JSON/SQLite run SSE bus
 
-The PostgreSQL idempotency ledger does coordinate duplicate run/message claims
-across processes, but it does not move any of those live objects to the pod
-that receives a replay or follow-up request.
+PostgreSQL's bounded plaintext run-event journal is shared: any replica can
+serve retained run events, and clients reconnect with
+`Last-Event-ID: <run_id>:<sequence>`. The journal can contain explicit gaps and
+a synthesized terminal event can be marked incomplete; it is not an execution
+checkpoint or a complete audit log.
 
-Another replica can therefore return `404` for a live object that exists in the
-first process. Sticky sessions reduce routing mistakes but do not provide
-ownership transfer or failover, so they are not sufficient production safety.
+The shared HITL mailbox only queues an encrypted answer for the owner to poll;
+it does not move the suspended Lua VM. The PostgreSQL idempotency ledger
+coordinates duplicate run/message claims but does not move the remaining live
+objects to the pod that receives a replay or follow-up request.
 
-Do not configure an HPA or Railway replicas yet. Horizontal serving requires a
-distributed live-control design or deterministic resume-on-request semantics
-for every stateful endpoint.
+Another replica can therefore return `404` for a conversation or other local
+object that exists in the first process. Sticky sessions reduce routing
+mistakes but do not provide ownership transfer or failover, so they are not a
+correctness mechanism for those surfaces.
+
+Do not configure an HPA or Railway replicas for applications that require
+arbitrary-routed conversations, unkeyed controls, or execution failover.
+Horizontal serving is within contract only for PostgreSQL run SSE and the
+explicitly documented shared keyed-run surfaces; execution takeover still
+requires a checkpoint/resume design.
 
 ### Storage backend guidance
 
@@ -306,7 +344,7 @@ for every stateful endpoint.
 |---|---|
 | JSON | Single instance only |
 | SQLite | Single instance only |
-| PostgreSQL | Recommended for durable production storage; does not make the HTTP control plane horizontally scalable |
+| PostgreSQL | Shared bounded run SSE plus documented keyed-run controls; execution and conversations remain process-owned |
 
 ---
 
@@ -317,20 +355,25 @@ SSE is long-lived HTTP. Proxies and load balancers need explicit tuning.
 Recommendations:
 
 - disable or raise proxy read timeouts for SSE routes
-- avoid response buffering on SSE paths
-- keep a single backend replica for stateful IronCrew endpoints
+- preserve `Last-Event-ID` and do not cache or transform event streams
+- honor IronCrew's `Cache-Control: no-store, no-transform` and
+  `X-Accel-Buffering: no` response headers
+- keep a single backend replica for conversation SSE and JSON/SQLite run SSE
 - prefer HTTP/1.1 or verified HTTP/2 behavior for your proxy stack
 
 Common issues:
 
 - proxy closes idle SSE streams too early
 - buffering delays event delivery
-- an accidentally configured second replica receives the reconnect and cannot
-  find the process-local handle
+- a conversation or JSON/SQLite run reconnect reaches a different replica and
+  cannot find the process-local handle
+- a PostgreSQL run cursor is malformed/cross-run (`400`) or ahead/expired
+  (`409`)
 
-If a future deployment deliberately introduces more than one process, both
-`POST /messages` and `GET /events` must be routed to the owner; that routing
-mechanism does not exist in IronCrew today.
+In a multi-process deployment, conversation `POST /messages` and conversation
+`GET /events` must still reach the owner; IronCrew has no conversation routing
+mechanism today. PostgreSQL run `GET /events/{run_id}` is the exception and can
+be served by any replica.
 
 ---
 
@@ -363,12 +406,17 @@ Response:
 
 Symptom:
 
-- SSE consumers reconnect successfully, but memory stays high
+- SSE consumers reconnect successfully, but memory or PostgreSQL storage stays
+  high
 
 Response:
 
 - lower `IRONCREW_MAX_EVENTS`
 - set `IRONCREW_EVENT_REPLAY_MAX_BYTES`
+- lower the PostgreSQL journal page/global logical caps and retention when that
+  backend is enabled
+- inspect WAL, dead tuples, autovacuum, and indexes; logical bytes are not a
+  physical database quota
 - cap output-heavy events where possible
 
 ### Bursty request traffic
@@ -394,7 +442,8 @@ Before raising the conversation cap:
 1. Measure RSS with representative chat sessions open but idle
 2. Measure RSS under active turn traffic
 3. Measure p95 turn latency under burst load
-4. Verify SSE reconnect behavior through your proxy
+4. Verify local and PostgreSQL `Last-Event-ID` reconnect behavior through your
+   proxy, including documented gaps and `400`/`409` failures
 5. Verify provider quotas and backoff behavior
 6. Verify idle eviction actually reduces resident memory
 
@@ -404,6 +453,8 @@ Track at minimum:
 - active conversation count
 - request rate
 - p95 and p99 latency for `start`, `messages`, and SSE connect
+- PostgreSQL journal row/logical-byte usage, query latency/timeouts, physical
+  table/index/WAL growth, and autovacuum health
 - provider error rate and timeout rate
 
 ---
