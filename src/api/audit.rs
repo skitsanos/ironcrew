@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 
 use crate::engine::audit::AuditEvent;
 use crate::engine::store::StateStore;
@@ -18,6 +18,29 @@ const METADATA_MAX_BYTES: usize = 2 * 1024;
 
 /// Maximum length of the `X-Audit-Actor` value after trimming.
 const ACTOR_MAX_LEN: usize = 256;
+
+/// Retain only headers that can contribute to an audit event. Detached work
+/// must not keep bearer tokens or raw idempotency capabilities alive merely
+/// so it can record completion later.
+pub(crate) fn background_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut retained = HeaderMap::new();
+    if let Some(actor) = extract_actor(headers)
+        && let Ok(value) = HeaderValue::from_str(&actor)
+    {
+        retained.insert("x-audit-actor", value);
+    }
+    if let Some(forwarded_ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        && let Ok(value) = HeaderValue::from_str(&forwarded_ip.to_string())
+    {
+        retained.insert("x-forwarded-for", value);
+    }
+    retained
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
@@ -98,6 +121,10 @@ fn clamp_metadata(value: serde_json::Value) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::engine::audit::{AuditEvent, AuditFilter};
+    use crate::engine::idempotency::{
+        ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
+        IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLookup,
+    };
     use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary, RunTransition};
     use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
     use crate::utils::error::{IronCrewError, Result};
@@ -181,6 +208,59 @@ mod tests {
         async fn delete_run(&self, _: &str) -> Result<()> {
             unimplemented!()
         }
+        async fn lookup_idempotency(&self, _: &str, _: &str, _: &str) -> Result<IdempotencyLookup> {
+            Ok(IdempotencyLookup::Miss)
+        }
+        async fn claim_idempotency(
+            &self,
+            _: IdempotencyClaim,
+            _: usize,
+            _: usize,
+        ) -> Result<IdempotencyClaimOutcome> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn heartbeat_idempotency(&self, _: &str, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn heartbeat_idempotent_run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::engine::idempotency::RunFenceHeartbeat> {
+            Ok(crate::engine::idempotency::RunFenceHeartbeat::Lost)
+        }
+        async fn complete_idempotency(
+            &self,
+            _: IdempotencyCompletion,
+            _: usize,
+        ) -> Result<IdempotencyCompletionOutcome> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn commit_conversation_idempotency(
+            &self,
+            _: IdempotencyCompletion,
+            _: &ConversationRecord,
+            _: usize,
+        ) -> Result<ConversationIdempotencyCommit> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn mark_idempotency_indeterminate(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+        async fn release_idempotency(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn prune_idempotency(&self, _: &str, _: usize) -> Result<usize> {
+            Ok(0)
+        }
         async fn save_conversation(&self, _: &ConversationRecord) -> Result<u64> {
             unimplemented!()
         }
@@ -258,6 +338,27 @@ mod tests {
         let long = "a".repeat(257);
         h.insert("X-Audit-Actor", long.parse().unwrap());
         assert_eq!(extract_actor(&h), None);
+    }
+
+    #[test]
+    fn background_headers_drop_credentials_and_idempotency_capabilities() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("idempotency-key", "raw-operation-key".parse().unwrap());
+        headers.insert(
+            "idempotency-recovery-key",
+            "raw-recovery-key".parse().unwrap(),
+        );
+        headers.insert("x-audit-actor", "alice".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+
+        let retained = background_headers(&headers);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained["x-audit-actor"], "alice");
+        assert_eq!(retained["x-forwarded-for"], "203.0.113.9");
+        assert!(!retained.contains_key("authorization"));
+        assert!(!retained.contains_key("idempotency-key"));
+        assert!(!retained.contains_key("idempotency-recovery-key"));
     }
 
     #[test]

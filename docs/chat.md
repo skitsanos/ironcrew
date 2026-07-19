@@ -139,8 +139,9 @@ Body:
 ```
 
 Blocks until the full turn (including any tool-call rounds) completes.
-Concurrent requests for the same `(flow, id)` queue under the session's
-turn mutex rather than racing.
+Only one mutating request may run for a `(flow, id)`. An overlapping request
+returns `409 Conflict` immediately rather than being retained in a server-side
+queue.
 
 Returns:
 
@@ -156,6 +157,15 @@ Returns:
 
 Returns `404` if no session is active. **`POST /messages` never creates a
 session implicitly — call `/start` first.**
+
+For retry-safe production clients, send one stable `Idempotency-Key` for the
+logical message and reuse it only for the exact same body. A completed retry
+replays the stored response with `Idempotency-Replayed: true`; an executing,
+conflicting, or crash-indeterminate request returns `409` and never launches a
+duplicate turn. Set `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true` in production. See
+[REST API safe retries](rest-api.md#safe-retries-with-idempotency-key) for the
+full contract, the explicit `Idempotency-Recovery-Key` procedure after an
+inspected indeterminate turn, and the external-tool boundary.
 
 Paths are project-relative; remote `https://` image URLs are also accepted and
 use the protected public-network client. A remote image must return a successful
@@ -279,6 +289,9 @@ throughout.
 | `IRONCREW_API_MAX_IMAGE_BYTES_PER_MESSAGE` | 20971520 | Decoded image-byte cap per message (hard ceiling 100 MiB) |
 | `IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION` | 33554432 | Cumulative decoded image-byte cap (hard ceiling 512 MiB) |
 | `IRONCREW_API_MAX_IMAGE_LOCATOR_BYTES` | 2048    | Path/URL/data-URL locator cap (hard ceiling 16 KiB)            |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY`      | false   | Require a valid key for run and message mutations; recommended `true` in production |
+| `IRONCREW_IDEMPOTENCY_TTL_SECONDS`      | 86400   | Completed/indeterminate replay retention (60–2592000; must exceed max run lifetime by one hour) |
+| `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | 8388608 | Maximum compact response retained for one key (hard ceiling 64 MiB) |
 
 ## Live curl session
 
@@ -293,6 +306,7 @@ curl -sX POST "$BASE/flows/chat-http/conversations/demo/start" \
 
 curl -sX POST "$BASE/flows/chat-http/conversations/demo/messages" \
      -H "Authorization: Bearer $IRONCREW_API_TOKEN" \
+     -H 'Idempotency-Key: demo-message-1' \
      -H 'Content-Type: application/json' \
      -d '{ "content": "Hi!" }'
 

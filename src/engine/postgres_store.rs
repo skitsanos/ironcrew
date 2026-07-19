@@ -15,6 +15,10 @@ const MAX_DB_POOL_SIZE: u32 = 128;
 const MAX_CONNECT_RETRIES: u32 = 100;
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
 const MAX_TABLE_PREFIX_BYTES: usize = 37;
+const IDEMPOTENCY_COLUMNS: &str = "key_hash, request_fingerprint, operation, scope, \
+    resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, state, \
+    response_status, response_body, lease_expires_at, created_at, updated_at, completed_at, \
+    expires_at, ttl_seconds";
 
 fn validate_table_prefix(table_prefix: &str) -> Result<()> {
     if table_prefix.len() > MAX_TABLE_PREFIX_BYTES
@@ -53,6 +57,18 @@ where
     }
 }
 
+fn parse_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            IronCrewError::Validation(format!("{label} is not valid RFC3339: {error}"))
+        })
+}
+
+fn canonical_timestamp(label: &str, value: &str) -> Result<String> {
+    Ok(parse_timestamp(label, value)?.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
+
 /// Exponential backoff delay before the next connection retry.
 ///
 /// `attempt` is 1-based (1 = delay before the first retry). The delay doubles
@@ -65,6 +81,12 @@ fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
     Duration::from_millis(base_ms.saturating_mul(factor).min(cap_ms))
 }
 
+use super::idempotency::{
+    CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
+    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+    validate_digest,
+};
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
 };
@@ -94,6 +116,7 @@ pub struct PostgresStore {
     conversations_table: String,
     dialogs_table: String,
     audit_events_table: String,
+    idempotency_table: String,
     lease: RunLeaseConfig,
 }
 
@@ -179,6 +202,7 @@ impl PostgresStore {
         let conversations_table = format!("{}conversations", table_prefix);
         let dialogs_table = format!("{}dialogs", table_prefix);
         let audit_events_table = format!("{}audit_events", table_prefix);
+        let idempotency_table = format!("{}idempotency", table_prefix);
 
         let store = Self {
             pool,
@@ -186,12 +210,129 @@ impl PostgresStore {
             conversations_table,
             dialogs_table,
             audit_events_table,
+            idempotency_table,
             lease,
         };
         store.bootstrap().await?;
 
         tracing::info!("PostgreSQL store ready (table: {})", table_name);
         Ok(store)
+    }
+
+    async fn lock_idempotency_table(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<()> {
+        let sql = format!(
+            "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to lock PostgreSQL idempotency table: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn get_idempotency_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key_hash: &str,
+    ) -> Result<Option<IdempotencyRecord>> {
+        let sql = format!(
+            "SELECT {IDEMPOTENCY_COLUMNS} FROM {} WHERE key_hash = $1 FOR UPDATE",
+            self.idempotency_table
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(key_hash)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PostgreSQL idempotency lookup failed: {error}"))
+            })?;
+        row.as_ref().map(row_to_idempotency_record).transpose()
+    }
+
+    async fn database_clock_with_deadline(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        seconds: u64,
+        context: &str,
+    ) -> Result<(String, String)> {
+        let seconds = i64::try_from(seconds).map_err(|_| {
+            IronCrewError::Validation(format!("PostgreSQL {context} duration is out of range"))
+        })?;
+        sqlx::query_as::<_, (String, String)>(
+            "WITH db_clock AS (SELECT clock_timestamp() AS now) \
+             SELECT \
+                 to_char(now AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
+                 to_char(\
+                     (now + $1::bigint * interval '1 second') AT TIME ZONE 'UTC', \
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+                 ) \
+             FROM db_clock",
+        )
+        .bind(seconds)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to read PostgreSQL clock for {context}: {error}"
+            ))
+        })
+    }
+
+    async fn mark_record_indeterminate_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        mut record: IdempotencyRecord,
+    ) -> Result<IdempotencyRecord> {
+        let (completed_at, expires_at) = self
+            .database_clock_with_deadline(
+                tx,
+                record.ttl_seconds,
+                "idempotency indeterminate transition",
+            )
+            .await?;
+        let sql = format!(
+            "UPDATE {} SET state = 'indeterminate', response_status = NULL, \
+             response_body = NULL, lease_expires_at = '', updated_at = $1, \
+             completed_at = $1, expires_at = $2 \
+             WHERE key_hash = $3 AND attempt_id = $4 \
+               AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&completed_at)
+            .bind(&expires_at)
+            .bind(&record.key_hash)
+            .bind(&record.attempt_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency indeterminate transition failed: {error}"
+                ))
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' changed before it could be fenced",
+                record.key_hash
+            )));
+        }
+        record.state = IdempotencyState::Indeterminate;
+        record.response_status = None;
+        record.response_body = None;
+        record.lease_expires_at.clear();
+        record.updated_at = completed_at.clone();
+        record.completed_at = Some(completed_at);
+        record.expires_at = Some(expires_at);
+        record.validate()?;
+        Ok(record)
     }
 
     /// Bootstrap the database: create table, add missing columns, fix types, create indexes.
@@ -577,6 +718,69 @@ impl PostgresStore {
                 })?;
         }
 
+        // 7. Durable request idempotency. Keep identifiers derived solely
+        // from the validated table prefix; the compact suffixes also keep
+        // every index name below PostgreSQL's 63-byte identifier limit at
+        // the maximum supported prefix length.
+        let it = &self.idempotency_table;
+        let idempotency_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {it} (
+                key_hash            TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                operation           TEXT NOT NULL,
+                scope               TEXT NOT NULL,
+                resource_id         TEXT NOT NULL,
+                exclusive_scope     TEXT,
+                attempt_id          TEXT NOT NULL,
+                owner_instance_id   TEXT NOT NULL,
+                base_revision       BIGINT,
+                state               TEXT NOT NULL,
+                response_status     INTEGER,
+                response_body       TEXT,
+                lease_expires_at    TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                completed_at        TEXT,
+                expires_at          TEXT,
+                ttl_seconds         BIGINT NOT NULL,
+                CHECK (state IN ('claimed', 'running', 'completed', 'indeterminate')),
+                CHECK (response_status IS NULL OR response_status BETWEEN 100 AND 599),
+                CHECK (ttl_seconds > 0)
+            )"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(idempotency_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL idempotency table '{it}': {e}"
+                ))
+            })?;
+
+        let idempotency_indexes = [
+            format!("CREATE INDEX IF NOT EXISTS {it}_exp_idx ON {it} (expires_at)"),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {it}_res_idx \
+                 ON {it} (operation, scope, resource_id)"
+            ),
+            format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {it}_scope_uidx \
+                 ON {it} (exclusive_scope) \
+                 WHERE exclusive_scope IS NOT NULL \
+                   AND state IN ('claimed', 'running')"
+            ),
+        ];
+        for sql in &idempotency_indexes {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    IronCrewError::Validation(format!(
+                        "Failed to create PostgreSQL idempotency index: {e}"
+                    ))
+                })?;
+        }
+
         for (column, data_type) in [
             ("owner_instance_id", "text"),
             ("lease_expires_at", "text"),
@@ -613,11 +817,12 @@ impl PostgresStore {
         self.verify_required_schema().await?;
 
         tracing::debug!(
-            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}'",
+            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}', '{}'",
             self.table_name,
             self.conversations_table,
             self.dialogs_table,
-            self.audit_events_table
+            self.audit_events_table,
+            self.idempotency_table
         );
         Ok(())
     }
@@ -699,6 +904,121 @@ impl PostgresStore {
                 "PostgreSQL session tables are missing required BIGINT revision columns".into(),
             ));
         }
+
+        let idempotency_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM information_schema.columns AS c \
+             JOIN (VALUES \
+                 ('key_hash', 'text'), \
+                 ('request_fingerprint', 'text'), \
+                 ('operation', 'text'), \
+                 ('scope', 'text'), \
+                 ('resource_id', 'text'), \
+                 ('exclusive_scope', 'text'), \
+                 ('attempt_id', 'text'), \
+                 ('owner_instance_id', 'text'), \
+                 ('base_revision', 'bigint'), \
+                 ('state', 'text'), \
+                 ('response_status', 'integer'), \
+                 ('response_body', 'text'), \
+                 ('lease_expires_at', 'text'), \
+                 ('created_at', 'text'), \
+                 ('updated_at', 'text'), \
+                 ('completed_at', 'text'), \
+                 ('expires_at', 'text'), \
+                 ('ttl_seconds', 'bigint') \
+             ) AS required(column_name, data_type) \
+               ON required.column_name = c.column_name \
+              AND required.data_type = c.data_type \
+             WHERE c.table_schema = current_schema() AND c.table_name = $1",
+        )
+        .bind(&self.idempotency_table)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL idempotency columns: {e}"
+            ))
+        })?;
+        if idempotency_columns != 18 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL schema for '{}' is missing one or more required typed columns",
+                self.idempotency_table
+            )));
+        }
+
+        let idempotency_primary_key: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 \
+                 FROM pg_constraint con \
+                 JOIN pg_class tbl ON tbl.oid = con.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
+                 JOIN pg_attribute attr \
+                   ON attr.attrelid = tbl.oid AND attr.attnum = con.conkey[1] \
+                 WHERE ns.nspname = current_schema() AND tbl.relname = $1 \
+                   AND con.contype = 'p' AND cardinality(con.conkey) = 1 \
+                   AND attr.attname = 'key_hash'\
+             )",
+        )
+        .bind(&self.idempotency_table)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL idempotency primary key: {e}"
+            ))
+        })?;
+        if !idempotency_primary_key {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL table '{}' must have key_hash as its primary key",
+                self.idempotency_table
+            )));
+        }
+
+        let expires_index = format!("{}_exp_idx", self.idempotency_table);
+        let resource_index = format!("{}_res_idx", self.idempotency_table);
+        let scope_index = format!("{}_scope_uidx", self.idempotency_table);
+        let valid_idempotency_indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM pg_index i \
+             JOIN pg_class idx ON idx.oid = i.indexrelid \
+             JOIN pg_class tbl ON tbl.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
+             WHERE ns.nspname = current_schema() AND tbl.relname = $1 \
+               AND (\
+                 (idx.relname = $2 AND i.indnkeyatts = 1 \
+                   AND pg_get_indexdef(i.indexrelid, 1, TRUE) = 'expires_at') \
+                 OR \
+                 (idx.relname = $3 AND i.indnkeyatts = 3 \
+                   AND pg_get_indexdef(i.indexrelid, 1, TRUE) = 'operation' \
+                   AND pg_get_indexdef(i.indexrelid, 2, TRUE) = 'scope' \
+                   AND pg_get_indexdef(i.indexrelid, 3, TRUE) = 'resource_id') \
+                 OR \
+                 (idx.relname = $4 AND i.indisunique AND i.indnkeyatts = 1 \
+                   AND pg_get_indexdef(i.indexrelid, 1, TRUE) = 'exclusive_scope' \
+                   AND i.indpred IS NOT NULL \
+                   AND pg_get_expr(i.indpred, i.indrelid) LIKE '%exclusive_scope IS NOT NULL%' \
+                   AND pg_get_expr(i.indpred, i.indrelid) LIKE '%claimed%' \
+                   AND pg_get_expr(i.indpred, i.indrelid) LIKE '%running%')\
+               )",
+        )
+        .bind(&self.idempotency_table)
+        .bind(&expires_index)
+        .bind(&resource_index)
+        .bind(&scope_index)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL idempotency indexes: {e}"
+            ))
+        })?;
+        if valid_idempotency_indexes != 3 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL table '{}' is missing one or more required idempotency indexes",
+                self.idempotency_table
+            )));
+        }
         Ok(())
     }
 }
@@ -745,13 +1065,20 @@ impl StateStore for PostgresStore {
             .map_err(|e| IronCrewError::Validation(format!("Tags serialize: {}", e)))?;
         let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
             .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
-        let lease_expires_at = self.lease.deadline_now();
         let sql = format!(
             "INSERT INTO {} (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
-             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, 0, 0, $8::jsonb, $9, $10)",
+             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, 0, 0, $8::jsonb, $9, $10)
+             ON CONFLICT (run_id) DO NOTHING",
             self.table_name
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG insert intent transaction: {error}"))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, lease_expires_at) = self
+            .database_clock_with_deadline(&mut tx, self.lease.ttl().as_secs(), "run intent lease")
+            .await?;
+        let inserted = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&run_id)
             .bind(&intent.flow_name)
             .bind(&intent.flow)
@@ -762,9 +1089,71 @@ impl StateStore for PostgresStore {
             .bind(&tags_json)
             .bind(self.lease.instance_id())
             .bind(&lease_expires_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG insert intent: {}", e)))?;
+        if inserted.rows_affected() == 0 {
+            let hydrate_sql = format!(
+                "UPDATE {runs} AS run SET \
+                     flow_name = $1, agent_count = $2, task_count = $3, \
+                     tags = $4::jsonb, lease_expires_at = $5 \
+                 WHERE run.run_id = $6 AND run.flow = $7 \
+                   AND run.owner_instance_id = $8 \
+                   AND run.status IN ('running', 'waiting_for_input') \
+                   AND EXISTS (\
+                       SELECT 1 FROM {idempotency} AS idem \
+                       WHERE idem.operation = $9 AND idem.scope = $7 \
+                         AND idem.resource_id = $6 \
+                         AND idem.owner_instance_id = $8 \
+                         AND idem.state IN ('running', 'completed')\
+                   )",
+                runs = self.table_name,
+                idempotency = self.idempotency_table
+            );
+            let hydrated = sqlx::query(sqlx::AssertSqlSafe(hydrate_sql))
+                .bind(&intent.flow_name)
+                .bind(intent.agent_count as i64)
+                .bind(intent.task_count as i64)
+                .bind(&tags_json)
+                .bind(&lease_expires_at)
+                .bind(&run_id)
+                .bind(&intent.flow)
+                .bind(self.lease.instance_id())
+                .bind(RUN_OPERATION)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PG idempotent provisional run hydration: {error}"
+                    ))
+                })?;
+            if hydrated.rows_affected() != 1 {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run '{run_id}' already exists without a matching idempotent provisional intent"
+                )));
+            }
+        }
+        let mapping_sql = format!(
+            "UPDATE {} SET state = 'running', lease_expires_at = $1, updated_at = $2 \
+             WHERE operation = $3 AND scope = $4 AND resource_id = $5 \
+               AND owner_instance_id = $6 AND state = 'claimed'",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
+            .bind(&lease_expires_at)
+            .bind(&database_now)
+            .bind(RUN_OPERATION)
+            .bind(&intent.flow)
+            .bind(&run_id)
+            .bind(self.lease.instance_id())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PG run idempotency mapping transition: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG insert intent commit: {error}"))
+        })?;
         tracing::debug!("Run intent saved: {}", run_id);
         Ok(run_id)
     }
@@ -777,6 +1166,13 @@ impl StateStore for PostgresStore {
         completion.validate()?;
         let task_results_json = serde_json::to_string(&completion.task_results)
             .map_err(|e| IronCrewError::Validation(format!("task_results serialize: {}", e)))?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG update completion transaction: {error}"))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, _) = self
+            .database_clock_with_deadline(&mut tx, 0, "run completion")
+            .await?;
         let sql = format!(
             "UPDATE {}
              SET status = $1, finished_at = $2, duration_ms = $3,
@@ -795,18 +1191,18 @@ impl StateStore for PostgresStore {
             .bind(completion.cached_tokens as i32)
             .bind(run_id)
             .bind(self.lease.instance_id())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG update completion: {}", e)))?;
 
-        if result.rows_affected() == 0 {
+        let transition = if result.rows_affected() == 0 {
             let sql = format!(
-                "SELECT status, owner_instance_id FROM {} WHERE run_id = $1",
+                "SELECT status, owner_instance_id, finished_at FROM {} WHERE run_id = $1 FOR UPDATE",
                 self.table_name
             );
             let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
                 .bind(run_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| {
                     IronCrewError::Validation(format!("PG completion state query: {}", e))
@@ -822,20 +1218,49 @@ impl StateStore for PostgresStore {
                 .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
             let parsed = status.parse::<RunStatus>()?;
             if parsed.is_terminal() {
-                return Ok(RunTransition::AlreadyTerminal(parsed));
+                RunTransition::AlreadyTerminal(parsed)
+            } else {
+                let owner: String = row
+                    .try_get("owner_instance_id")
+                    .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
+                return Err(IronCrewError::Validation(format!(
+                    "Run '{}' is owned by instance '{}', not '{}'",
+                    run_id,
+                    owner,
+                    self.lease.instance_id()
+                )));
             }
-            let owner: String = row
-                .try_get("owner_instance_id")
-                .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' is owned by instance '{}', not '{}'",
-                run_id,
-                owner,
-                self.lease.instance_id()
-            )));
-        }
+        } else {
+            RunTransition::Applied
+        };
+
+        let mapping_sql = format!(
+            "UPDATE {} SET state = 'completed', lease_expires_at = '', \
+             updated_at = $1, completed_at = $1, \
+             expires_at = to_char(\
+                 ($1::timestamptz + ttl_seconds * interval '1 second') AT TIME ZONE 'UTC', \
+                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+             ) \
+             WHERE operation = $2 AND resource_id = $3 \
+               AND state IN ('claimed', 'running', 'indeterminate')",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
+            .bind(&database_now)
+            .bind(RUN_OPERATION)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PG run idempotency completion transition: {error}"
+                ))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG update completion commit: {error}"))
+        })?;
         tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
-        Ok(RunTransition::Applied)
+        Ok(transition)
     }
 
     async fn update_run_status(
@@ -880,19 +1305,38 @@ impl StateStore for PostgresStore {
     }
 
     async fn heartbeat_owned_runs(&self) -> Result<usize> {
-        let deadline = self.lease.deadline_now();
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG heartbeat transaction: {error}"))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (_, deadline) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                self.lease.ttl().as_secs(),
+                "run heartbeat lease",
+            )
+            .await?;
         let sql = format!(
-            "UPDATE {} SET lease_expires_at = $1
-             WHERE owner_instance_id = $2
-               AND status IN ('running', 'waiting_for_input')",
-            self.table_name
+            "UPDATE {runs} AS run SET lease_expires_at = $1
+             WHERE run.owner_instance_id = $2
+               AND run.status IN ('running', 'waiting_for_input')
+               AND NOT EXISTS (
+                   SELECT 1 FROM {idempotency} AS idem
+                   WHERE idem.operation = $3 AND idem.resource_id = run.run_id
+               )",
+            runs = self.table_name,
+            idempotency = self.idempotency_table
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(&deadline)
             .bind(self.lease.instance_id())
-            .execute(&self.pool)
+            .bind(RUN_OPERATION)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG heartbeat: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|error| IronCrewError::Validation(format!("PG heartbeat commit: {error}")))?;
         Ok(result.rows_affected() as usize)
     }
 
@@ -914,6 +1358,18 @@ impl StateStore for PostgresStore {
             .map_err(|e| {
                 IronCrewError::Validation(format!("PostgreSQL health write probe: {e}"))
             })?;
+        let idempotency_sql = format!(
+            "UPDATE {} SET updated_at = updated_at WHERE FALSE",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(idempotency_sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency health write probe: {error}"
+                ))
+            })?;
         transaction
             .rollback()
             .await
@@ -922,26 +1378,116 @@ impl StateStore for PostgresStore {
     }
 
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
-        let normalized_now = chrono::DateTime::parse_from_rfc3339(now)
-            .map_err(|e| {
-                IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
-            })?
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339();
+        parse_timestamp("reconciliation timestamp", now)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!("PG reconcile transaction: {error}"))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, _) = self
+            .database_clock_with_deadline(&mut tx, 0, "run reconciliation")
+            .await?;
+
+        // A process may die after durably allocating/replying with a run id
+        // but before publishing the normal run intent. Materialize a minimal
+        // terminal run so retries can replay that id without re-executing and
+        // callers can observe an explicit Abandoned outcome instead of 404.
+        let fallback_sql = format!(
+            "INSERT INTO {runs} (\
+                 run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
+                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
+                 owner_instance_id, lease_expires_at\
+             ) \
+             SELECT idem.resource_id, idem.scope, idem.scope, 'abandoned', \
+                    idem.created_at, $1, 0, '[]'::jsonb, 0, 0, 0, 0, '[]'::jsonb, \
+                    idem.owner_instance_id, '' \
+             FROM {idempotency} AS idem \
+             WHERE idem.operation = $2 AND idem.state = 'claimed' \
+               AND idem.lease_expires_at::timestamptz <= $3::timestamptz \
+               AND NOT EXISTS (SELECT 1 FROM {runs} AS run WHERE run.run_id = idem.resource_id) \
+             ON CONFLICT (run_id) DO NOTHING",
+            runs = self.table_name,
+            idempotency = self.idempotency_table
+        );
+        let inserted = sqlx::query(sqlx::AssertSqlSafe(fallback_sql))
+            .bind(&database_now)
+            .bind(RUN_OPERATION)
+            .bind(&database_now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PG idempotent run fallback: {error}"))
+            })?;
+
         let sql = format!(
             "UPDATE {}
              SET status = 'abandoned', finished_at = $1, lease_expires_at = ''
              WHERE status IN ('running', 'waiting_for_input')
-               AND (lease_expires_at = '' OR lease_expires_at <= $2)",
+               AND (lease_expires_at = '' \
+                    OR lease_expires_at::timestamptz <= $2::timestamptz)",
             self.table_name
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(now)
-            .bind(&normalized_now)
-            .execute(&self.pool)
+            .bind(&database_now)
+            .bind(&database_now)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG reconcile: {}", e)))?;
-        Ok(result.rows_affected() as usize)
+
+        let mapping_sql = format!(
+            "UPDATE {idempotency} AS idem \
+             SET state = 'completed', lease_expires_at = '', \
+                 updated_at = $2, completed_at = $2, \
+                 expires_at = to_char(\
+                     ($2::timestamptz + idem.ttl_seconds * interval '1 second') \
+                         AT TIME ZONE 'UTC', \
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+                 ) \
+             FROM {runs} AS run \
+             WHERE idem.operation = $1 AND idem.resource_id = run.run_id \
+               AND idem.state IN ('claimed', 'running', 'indeterminate') \
+               AND run.status NOT IN ('running', 'waiting_for_input')",
+            idempotency = self.idempotency_table,
+            runs = self.table_name
+        );
+        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
+            .bind(RUN_OPERATION)
+            .bind(&database_now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PG reconciled run idempotency transition: {error}"
+                ))
+            })?;
+
+        // Conversation effects cannot be reconstructed after their exclusive
+        // lease expires. Preserve a terminal tombstone so the same request is
+        // never executed a second time.
+        let conversation_sql = format!(
+            "UPDATE {} SET state = 'indeterminate', response_status = NULL, \
+             response_body = NULL, lease_expires_at = '', updated_at = $1, \
+             completed_at = $1, expires_at = to_char(\
+                 ($1::timestamptz + ttl_seconds * interval '1 second') AT TIME ZONE 'UTC', \
+                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+             ) \
+             WHERE operation = $2 AND state IN ('claimed', 'running') \
+               AND lease_expires_at::timestamptz <= $1::timestamptz",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(conversation_sql))
+            .bind(&database_now)
+            .bind(CONVERSATION_MESSAGE_OPERATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PG conversation idempotency reconciliation: {error}"
+                ))
+            })?;
+        tx.commit()
+            .await
+            .map_err(|error| IronCrewError::Validation(format!("PG reconcile commit: {error}")))?;
+        Ok((inserted.rows_affected() + result.rows_affected()) as usize)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -1038,6 +1584,1195 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup> {
+        validate_digest("idempotency key hash", key_hash)?;
+        validate_digest("request fingerprint", request_fingerprint)?;
+        parse_timestamp("idempotency lookup time", now)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency lookup transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, _) = self
+            .database_clock_with_deadline(&mut tx, 0, "idempotency lookup")
+            .await?;
+        let now_timestamp = parse_timestamp("PostgreSQL idempotency clock", &database_now)?;
+
+        let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, key_hash)
+            .await?
+        else {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency lookup commit failed: {error}"
+                ))
+            })?;
+            return Ok(IdempotencyLookup::Miss);
+        };
+
+        let outcome = if record.request_fingerprint != request_fingerprint {
+            IdempotencyLookup::Conflict
+        } else if record.state.is_terminal()
+            && record
+                .expires_at
+                .as_deref()
+                .map(|expires_at| {
+                    parse_timestamp("stored idempotency retention expiry", expires_at)
+                        .map(|expires_at| expires_at <= now_timestamp)
+                })
+                .transpose()?
+                .unwrap_or(false)
+        {
+            IdempotencyLookup::Miss
+        } else if record.state == IdempotencyState::Indeterminate {
+            IdempotencyLookup::Indeterminate(record)
+        } else if record.replayable() {
+            IdempotencyLookup::Replay(record)
+        } else {
+            match record.state {
+                IdempotencyState::Claimed | IdempotencyState::Running => {
+                    let lease = parse_timestamp(
+                        "stored idempotency lease expiry",
+                        &record.lease_expires_at,
+                    )?;
+                    if lease > now_timestamp {
+                        IdempotencyLookup::InProgress(record)
+                    } else {
+                        IdempotencyLookup::Indeterminate(record)
+                    }
+                }
+                IdempotencyState::Completed | IdempotencyState::Indeterminate => {
+                    IdempotencyLookup::Indeterminate(record)
+                }
+            }
+        };
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency lookup commit failed: {error}"
+            ))
+        })?;
+        Ok(outcome)
+    }
+
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome> {
+        claim.validate()?;
+        if max_records == 0 {
+            return Err(IronCrewError::Validation(
+                "Idempotency record capacity must be positive".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency claim transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, lease_expires_at) = self
+            .database_clock_with_deadline(&mut tx, self.lease.ttl().as_secs(), "idempotency claim")
+            .await?;
+        let database_timestamp = parse_timestamp("PostgreSQL idempotency clock", &database_now)?;
+
+        if prune_batch > 0 {
+            let sql = format!(
+                "DELETE FROM {table} WHERE key_hash IN (\
+                     SELECT key_hash FROM {table} \
+                     WHERE state IN ('completed', 'indeterminate') \
+                       AND expires_at IS NOT NULL \
+                       AND expires_at::timestamptz <= $1::timestamptz \
+                     ORDER BY expires_at::timestamptz, key_hash LIMIT $2\
+                 )",
+                table = self.idempotency_table
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&database_now)
+                .bind(i64::try_from(prune_batch).unwrap_or(i64::MAX))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL idempotency claim pruning failed: {error}"
+                    ))
+                })?;
+        }
+
+        if let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, &claim.key_hash)
+            .await?
+        {
+            let expired_terminal = record.state.is_terminal()
+                && record
+                    .expires_at
+                    .as_deref()
+                    .map(|expires_at| {
+                        parse_timestamp("stored idempotency retention expiry", expires_at)
+                            .map(|expires_at| expires_at <= database_timestamp)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+            if expired_terminal {
+                let sql = format!("DELETE FROM {} WHERE key_hash = $1", self.idempotency_table);
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&claim.key_hash)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL expired idempotency delete failed: {error}"
+                        ))
+                    })?;
+            } else {
+                let outcome = if record.request_fingerprint != claim.request_fingerprint {
+                    IdempotencyClaimOutcome::Conflict
+                } else if record.state == IdempotencyState::Indeterminate {
+                    IdempotencyClaimOutcome::Indeterminate(record)
+                } else if record.replayable() {
+                    IdempotencyClaimOutcome::Replay(record)
+                } else if record.state.is_in_flight()
+                    && parse_timestamp("stored idempotency lease expiry", &record.lease_expires_at)?
+                        <= database_timestamp
+                {
+                    let record = self
+                        .mark_record_indeterminate_in_transaction(&mut tx, record)
+                        .await?;
+                    IdempotencyClaimOutcome::Indeterminate(record)
+                } else if record.state.is_in_flight() {
+                    IdempotencyClaimOutcome::InProgress(record)
+                } else {
+                    IdempotencyClaimOutcome::Indeterminate(record)
+                };
+                tx.commit().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL idempotency claim commit failed: {error}"
+                    ))
+                })?;
+                return Ok(outcome);
+            }
+        }
+
+        if claim.operation == CONVERSATION_MESSAGE_OPERATION {
+            let expected_revision = claim.base_revision.ok_or_else(|| {
+                IronCrewError::Validation(
+                    "Conversation idempotency claim has no base revision".into(),
+                )
+            })?;
+            let revision_sql = format!(
+                "SELECT revision FROM {} \
+                 WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 FOR UPDATE",
+                self.conversations_table
+            );
+            let current_revision: Option<i64> =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(revision_sql))
+                    .bind(&claim.resource_id)
+                    .bind(&claim.scope)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL conversation idempotency revision query failed: {error}"
+                        ))
+                    })?;
+            let current_revision = current_revision
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    IronCrewError::Validation("PostgreSQL conversation revision is negative".into())
+                })?
+                .unwrap_or(0);
+            if current_revision != expected_revision {
+                tx.commit().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL conversation idempotency conflict commit failed: {error}"
+                    ))
+                })?;
+                return Ok(IdempotencyClaimOutcome::Conflict);
+            }
+        }
+
+        if let Some(exclusive_scope) = claim.exclusive_scope.as_deref() {
+            let sql = format!(
+                "SELECT {IDEMPOTENCY_COLUMNS} FROM {} \
+                 WHERE exclusive_scope = $1 AND key_hash <> $2 \
+                   AND state IN ('claimed', 'running') FOR UPDATE",
+                self.idempotency_table
+            );
+            if let Some(row) = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(exclusive_scope)
+                .bind(&claim.key_hash)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL idempotency exclusive-scope lookup failed: {error}"
+                    ))
+                })?
+            {
+                let record = row_to_idempotency_record(&row)?;
+                let lease =
+                    parse_timestamp("stored idempotency lease expiry", &record.lease_expires_at)?;
+                if lease > database_timestamp {
+                    tx.commit().await.map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL idempotency busy commit failed: {error}"
+                        ))
+                    })?;
+                    return Ok(IdempotencyClaimOutcome::Busy);
+                }
+                self.mark_record_indeterminate_in_transaction(&mut tx, record)
+                    .await?;
+                tx.commit().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL expired idempotency barrier commit failed: {error}"
+                    ))
+                })?;
+                return Ok(IdempotencyClaimOutcome::Busy);
+            }
+
+            let hazard_sql = format!(
+                "SELECT key_hash, completed_at FROM {} \
+                 WHERE exclusive_scope = $1 AND key_hash <> $2 \
+                   AND state = 'indeterminate' \
+                 ORDER BY completed_at, key_hash LIMIT 2 FOR UPDATE",
+                self.idempotency_table
+            );
+            let hazard_rows = sqlx::query(sqlx::AssertSqlSafe(hazard_sql))
+                .bind(exclusive_scope)
+                .bind(&claim.key_hash)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL indeterminate exclusive-scope lookup failed: {error}"
+                    ))
+                })?;
+            if !hazard_rows.is_empty() {
+                let hazard = if hazard_rows.len() == 1 {
+                    let key_hash =
+                        hazard_rows[0]
+                            .try_get::<String, _>("key_hash")
+                            .map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "PostgreSQL idempotency hazard key decode failed: {error}"
+                                ))
+                            })?;
+                    let completed_at = hazard_rows[0]
+                        .try_get::<Option<String>, _>("completed_at")
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "PostgreSQL idempotency hazard timestamp decode failed: {error}"
+                            ))
+                        })?;
+                    Some((key_hash, completed_at))
+                } else {
+                    None
+                };
+                let grace = chrono::Duration::from_std(self.lease.ttl()).map_err(|_| {
+                    IronCrewError::Validation(
+                        "PostgreSQL idempotency recovery grace is out of range".into(),
+                    )
+                })?;
+                let grace_elapsed = hazard
+                    .as_ref()
+                    .and_then(|(_, completed_at)| completed_at.as_deref())
+                    .map(|completed_at| {
+                        parse_timestamp("stored idempotency hazard completion", completed_at)
+                    })
+                    .transpose()?
+                    .and_then(|completed_at| completed_at.checked_add_signed(grace))
+                    .is_some_and(|recovery_at| recovery_at <= database_timestamp);
+                let recoverable = hazard.as_ref().is_some_and(|(key_hash, _)| {
+                    claim.recovery_key_hash.as_deref() == Some(key_hash.as_str())
+                }) && grace_elapsed;
+                if !recoverable {
+                    tx.commit().await.map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL idempotency hazard commit failed: {error}"
+                        ))
+                    })?;
+                    return Ok(IdempotencyClaimOutcome::Busy);
+                }
+                let recovery_key_hash = claim.recovery_key_hash.as_deref().ok_or_else(|| {
+                    IronCrewError::Validation("Missing idempotency recovery key".into())
+                })?;
+                let clear_sql = format!(
+                    "UPDATE {} SET exclusive_scope = NULL \
+                     WHERE key_hash = $1 AND exclusive_scope = $2 \
+                       AND state = 'indeterminate'",
+                    self.idempotency_table
+                );
+                let cleared = sqlx::query(sqlx::AssertSqlSafe(clear_sql))
+                    .bind(recovery_key_hash)
+                    .bind(exclusive_scope)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL idempotency hazard recovery failed: {error}"
+                        ))
+                    })?;
+                if cleared.rows_affected() != 1 {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency recovery hazard changed during claim".into(),
+                    ));
+                }
+            }
+        }
+
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {}",
+            self.idempotency_table
+        )))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency capacity check failed: {error}"
+            ))
+        })?;
+        if usize::try_from(count).unwrap_or(usize::MAX) >= max_records {
+            return Err(IronCrewError::Validation(format!(
+                "Idempotency record capacity ({max_records}) is exhausted; retry after retained records expire"
+            )));
+        }
+
+        let mut record = claim.to_record();
+        record.lease_expires_at = lease_expires_at;
+        record.created_at = database_now.clone();
+        record.updated_at = database_now;
+        if let Some(response_body) = record.response_body.as_ref() {
+            let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT FROM {}",
+                self.idempotency_table
+            )))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency claim response capacity check failed: {error}"
+                ))
+            })?;
+            let response_fits = usize::try_from(retained_bytes)
+                .ok()
+                .and_then(|retained| retained.checked_add(response_body.len()))
+                .is_some_and(|total| total <= claim.max_total_response_bytes);
+            if !response_fits {
+                record.response_body = None;
+            }
+        }
+        record.validate()?;
+        let base_revision = record
+            .base_revision
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                IronCrewError::Validation(
+                    "Idempotency base revision is out of PostgreSQL range".into(),
+                )
+            })?;
+        let sql = format!(
+            "INSERT INTO {} ({IDEMPOTENCY_COLUMNS}) VALUES (\
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'claimed', \
+                 $10, $11, $12, $13, $13, NULL, NULL, $14\
+             )",
+            self.idempotency_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&record.key_hash)
+            .bind(&record.request_fingerprint)
+            .bind(&record.operation)
+            .bind(&record.scope)
+            .bind(&record.resource_id)
+            .bind(&record.exclusive_scope)
+            .bind(&record.attempt_id)
+            .bind(&record.owner_instance_id)
+            .bind(base_revision)
+            .bind(record.response_status.map(i32::from))
+            .bind(&record.response_body)
+            .bind(&record.lease_expires_at)
+            .bind(&record.created_at)
+            .bind(i64::try_from(record.ttl_seconds).map_err(|_| {
+                IronCrewError::Validation("Idempotency TTL is out of PostgreSQL range".into())
+            })?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency claim insert failed: {error}"
+                ))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency claim commit failed: {error}"
+            ))
+        })?;
+        Ok(IdempotencyClaimOutcome::Claimed(record))
+    }
+
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        if attempt_id.is_empty() || attempt_id.len() > 128 {
+            return Err(IronCrewError::Validation(
+                "Idempotency attempt id must be 1..=128 bytes".into(),
+            ));
+        }
+        parse_timestamp("idempotency heartbeat lease expiry", new_lease_expires_at)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency heartbeat transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, database_deadline) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                self.lease.ttl().as_secs(),
+                "idempotency heartbeat",
+            )
+            .await?;
+        let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, key_hash)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before heartbeat".into(),
+            ));
+        }
+        if !record.state.is_in_flight() {
+            return Ok(record.state == IdempotencyState::Completed);
+        }
+        let sql = format!(
+            "UPDATE {} SET lease_expires_at = $1, updated_at = $2 \
+             WHERE key_hash = $3 AND attempt_id = $4 \
+               AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&database_deadline)
+            .bind(&database_now)
+            .bind(key_hash)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency heartbeat failed: {error}"
+                ))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency heartbeat commit failed: {error}"
+            ))
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat> {
+        validate_digest("idempotency key hash", key_hash)?;
+        if run_id.is_empty() || run_id.len() > 128 {
+            return Err(IronCrewError::Validation(
+                "Idempotent run id must be 1..=128 bytes".into(),
+            ));
+        }
+        if attempt_id.is_empty() || attempt_id.len() > 128 {
+            return Err(IronCrewError::Validation(
+                "Idempotency attempt id must be 1..=128 bytes".into(),
+            ));
+        }
+        // The absolute caller deadline remains part of the shared backend
+        // contract, but PostgreSQL uses only its own clock for lease ordering.
+        parse_timestamp(
+            "idempotent run heartbeat lease expiry",
+            new_lease_expires_at,
+        )?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotent run heartbeat transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, database_deadline) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                self.lease.ttl().as_secs(),
+                "idempotent run heartbeat",
+            )
+            .await?;
+        let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, key_hash)
+            .await?
+        else {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL missing run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Lost);
+        };
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before run heartbeat".into(),
+            ));
+        }
+        if record.operation != RUN_OPERATION
+            || record.resource_id != run_id
+            || record.owner_instance_id != self.lease.instance_id()
+        {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL mismatched run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+
+        let run_sql = format!(
+            "SELECT status, owner_instance_id, flow FROM {} WHERE run_id = $1 FOR UPDATE",
+            self.table_name
+        );
+        let run = sqlx::query(sqlx::AssertSqlSafe(run_sql))
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotent heartbeat run lookup failed: {error}"
+                ))
+            })?;
+
+        let Some(run) = run else {
+            if record.state != IdempotencyState::Claimed {
+                tx.commit().await.map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL lost run fence heartbeat commit failed: {error}"
+                    ))
+                })?;
+                return Ok(RunFenceHeartbeat::Lost);
+            }
+            let ledger_sql = format!(
+                "UPDATE {} SET lease_expires_at = $1, updated_at = $2 \
+                 WHERE key_hash = $3 AND operation = $4 AND resource_id = $5 \
+                   AND attempt_id = $6 AND owner_instance_id = $7 \
+                   AND state = 'claimed'",
+                self.idempotency_table
+            );
+            let renewed = sqlx::query(sqlx::AssertSqlSafe(ledger_sql))
+                .bind(&database_deadline)
+                .bind(&database_now)
+                .bind(key_hash)
+                .bind(RUN_OPERATION)
+                .bind(run_id)
+                .bind(attempt_id)
+                .bind(self.lease.instance_id())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL claimed run fence heartbeat failed: {error}"
+                    ))
+                })?;
+            let outcome = if renewed.rows_affected() == 1 {
+                RunFenceHeartbeat::Owned
+            } else {
+                RunFenceHeartbeat::Lost
+            };
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL claimed run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(outcome);
+        };
+
+        let run_owner: String = run
+            .try_get("owner_instance_id")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        let run_flow: String = run
+            .try_get("flow")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+        if run_owner != self.lease.instance_id() || run_flow != record.scope {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL unowned run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+        let status = run
+            .try_get::<String, _>("status")
+            .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?
+            .parse::<RunStatus>()?;
+        if status.is_terminal() {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL terminal run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Terminal(status));
+        }
+        if record.state != IdempotencyState::Running || !status.is_in_flight() {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL lost run fence heartbeat commit failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+
+        let run_update_sql = format!(
+            "UPDATE {} SET lease_expires_at = $1 \
+             WHERE run_id = $2 AND owner_instance_id = $3 \
+               AND status IN ('running', 'waiting_for_input')",
+            self.table_name
+        );
+        let run_renewed = sqlx::query(sqlx::AssertSqlSafe(run_update_sql))
+            .bind(&database_deadline)
+            .bind(run_id)
+            .bind(self.lease.instance_id())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotent run lease heartbeat failed: {error}"
+                ))
+            })?;
+        let ledger_update_sql = format!(
+            "UPDATE {} SET lease_expires_at = $1, updated_at = $2 \
+             WHERE key_hash = $3 AND operation = $4 AND resource_id = $5 \
+               AND attempt_id = $6 AND owner_instance_id = $7 \
+               AND state = 'running'",
+            self.idempotency_table
+        );
+        let ledger_renewed = sqlx::query(sqlx::AssertSqlSafe(ledger_update_sql))
+            .bind(&database_deadline)
+            .bind(&database_now)
+            .bind(key_hash)
+            .bind(RUN_OPERATION)
+            .bind(run_id)
+            .bind(attempt_id)
+            .bind(self.lease.instance_id())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotent run ledger heartbeat failed: {error}"
+                ))
+            })?;
+        if run_renewed.rows_affected() != 1 || ledger_renewed.rows_affected() != 1 {
+            tx.rollback().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL lost run fence heartbeat rollback failed: {error}"
+                ))
+            })?;
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotent run heartbeat commit failed: {error}"
+            ))
+        })?;
+        Ok(RunFenceHeartbeat::Owned)
+    }
+
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome> {
+        completion.validate()?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency completion transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let record = self
+            .get_idempotency_in_transaction(&mut tx, &completion.key_hash)
+            .await?
+            .ok_or_else(|| {
+                IronCrewError::Validation("Idempotency claim not found during completion".into())
+            })?;
+        if record.request_fingerprint != completion.request_fingerprint
+            || record.attempt_id != completion.attempt_id
+            || record.owner_instance_id != completion.owner_instance_id
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' is fenced by a different attempt",
+                completion.key_hash
+            )));
+        }
+        if record.state == IdempotencyState::Completed {
+            let outcome = IdempotencyCompletionOutcome {
+                replayable: record.replayable(),
+                already_completed: true,
+            };
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency completion commit failed: {error}"
+                ))
+            })?;
+            return Ok(outcome);
+        }
+        if record.state == IdempotencyState::Indeterminate {
+            return Err(IronCrewError::Conflict(
+                "Indeterminate idempotency outcomes cannot be completed".into(),
+            ));
+        }
+        let (database_completed_at, database_expires_at) = self
+            .database_clock_with_deadline(&mut tx, record.ttl_seconds, "idempotency completion")
+            .await?;
+
+        let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
+             FROM {} WHERE key_hash <> $1",
+            self.idempotency_table
+        )))
+        .bind(&completion.key_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency response capacity check failed: {error}"
+            ))
+        })?;
+        let response_body = completion.response_body.as_ref().filter(|body| {
+            usize::try_from(retained_bytes)
+                .unwrap_or(usize::MAX)
+                .saturating_add(body.len())
+                <= max_total_response_bytes
+        });
+        let sql = format!(
+            "UPDATE {} SET state = 'completed', response_status = $1, \
+             response_body = $2, lease_expires_at = '', updated_at = $3, \
+             completed_at = $3, expires_at = $4 \
+             WHERE key_hash = $5 AND request_fingerprint = $6 \
+               AND attempt_id = $7 AND owner_instance_id = $8 \
+               AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(i32::from(completion.response_status))
+            .bind(response_body)
+            .bind(&database_completed_at)
+            .bind(&database_expires_at)
+            .bind(&completion.key_hash)
+            .bind(&completion.request_fingerprint)
+            .bind(&completion.attempt_id)
+            .bind(&completion.owner_instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency completion update failed: {error}"
+                ))
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' changed before completion",
+                completion.key_hash
+            )));
+        }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency completion commit failed: {error}"
+            ))
+        })?;
+        Ok(IdempotencyCompletionOutcome {
+            replayable: response_body.is_some(),
+            already_completed: false,
+        })
+    }
+
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit> {
+        completion.validate()?;
+        let messages_json = serde_json::to_string(&conversation.messages).map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to serialize idempotent conversation messages: {error}"
+            ))
+        })?;
+        let expected_revision = i64::try_from(conversation.revision).map_err(|_| {
+            IronCrewError::Validation("Conversation revision is out of range".into())
+        })?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotent conversation transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let record = self
+            .get_idempotency_in_transaction(&mut tx, &completion.key_hash)
+            .await?
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "Idempotency claim not found during conversation commit".into(),
+                )
+            })?;
+        if record.request_fingerprint != completion.request_fingerprint
+            || record.attempt_id != completion.attempt_id
+            || record.owner_instance_id != completion.owner_instance_id
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' is fenced by a different attempt",
+                completion.key_hash
+            )));
+        }
+        if record.operation != CONVERSATION_MESSAGE_OPERATION
+            || record.resource_id != conversation.id
+            || record.scope != conversation.flow_path.as_deref().unwrap_or("")
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' does not match the conversation scope",
+                completion.key_hash
+            )));
+        }
+        let base_revision = record.base_revision.ok_or_else(|| {
+            IronCrewError::Validation("Conversation idempotency claim has no base revision".into())
+        })?;
+        if base_revision != conversation.revision {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' changed before idempotent commit",
+                conversation.id
+            )));
+        }
+        if record.state == IdempotencyState::Completed {
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL completed conversation commit failed: {error}"
+                ))
+            })?;
+            return Ok(ConversationIdempotencyCommit {
+                revision: base_revision.saturating_add(1),
+                replayable: record.replayable(),
+                already_completed: true,
+            });
+        }
+        if record.state == IdempotencyState::Indeterminate {
+            return Err(IronCrewError::Conflict(
+                "Indeterminate conversation outcomes cannot be committed".into(),
+            ));
+        }
+        let (database_completed_at, database_expires_at) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                record.ttl_seconds,
+                "conversation idempotency completion",
+            )
+            .await?;
+
+        let select_sql = format!(
+            "SELECT revision FROM {} \
+             WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 FOR UPDATE",
+            self.conversations_table
+        );
+        let current: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(select_sql))
+            .bind(&conversation.id)
+            .bind(&conversation.flow_path)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotent conversation revision read failed: {error}"
+                ))
+            })?;
+        let revision: Option<i64> = match current {
+            None if expected_revision == 0 => {
+                let insert_sql = format!(
+                    "INSERT INTO {} \
+                     (id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 1) \
+                     ON CONFLICT (flow_path, id) DO NOTHING RETURNING revision",
+                    self.conversations_table
+                );
+                sqlx::query_scalar(sqlx::AssertSqlSafe(insert_sql))
+                    .bind(&conversation.id)
+                    .bind(&conversation.flow_name)
+                    .bind(&conversation.flow_path)
+                    .bind(&conversation.agent_name)
+                    .bind(&messages_json)
+                    .bind(&conversation.created_at)
+                    .bind(&conversation.updated_at)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL idempotent conversation insert failed: {error}"
+                        ))
+                    })?
+            }
+            Some(current) if current == expected_revision => {
+                let update_sql = format!(
+                    "UPDATE {} SET flow_name = $3, agent_name = $4, \
+                     messages = $5::jsonb, created_at = $6, updated_at = $7, \
+                     revision = revision + 1 \
+                     WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $8 \
+                     RETURNING revision",
+                    self.conversations_table
+                );
+                sqlx::query_scalar(sqlx::AssertSqlSafe(update_sql))
+                    .bind(&conversation.id)
+                    .bind(&conversation.flow_path)
+                    .bind(&conversation.flow_name)
+                    .bind(&conversation.agent_name)
+                    .bind(&messages_json)
+                    .bind(&conversation.created_at)
+                    .bind(&conversation.updated_at)
+                    .bind(expected_revision)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "PostgreSQL idempotent conversation update failed: {error}"
+                        ))
+                    })?
+            }
+            _ => None,
+        };
+        let revision = revision.ok_or_else(|| {
+            IronCrewError::Conflict(format!(
+                "Conversation '{}' changed since revision {}; reopen it before saving",
+                conversation.id, conversation.revision
+            ))
+        })?;
+
+        let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
+             FROM {} WHERE key_hash <> $1",
+            self.idempotency_table
+        )))
+        .bind(&completion.key_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency response capacity check failed: {error}"
+            ))
+        })?;
+        let response_body = completion.response_body.as_ref().filter(|body| {
+            usize::try_from(retained_bytes)
+                .unwrap_or(usize::MAX)
+                .saturating_add(body.len())
+                <= max_total_response_bytes
+        });
+        let update_idempotency = format!(
+            "UPDATE {} SET state = 'completed', response_status = $1, \
+             response_body = $2, lease_expires_at = '', updated_at = $3, \
+             completed_at = $3, expires_at = $4 \
+             WHERE key_hash = $5 AND request_fingerprint = $6 \
+               AND attempt_id = $7 AND owner_instance_id = $8 \
+               AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let updated = sqlx::query(sqlx::AssertSqlSafe(update_idempotency))
+            .bind(i32::from(completion.response_status))
+            .bind(response_body)
+            .bind(&database_completed_at)
+            .bind(&database_expires_at)
+            .bind(&completion.key_hash)
+            .bind(&completion.request_fingerprint)
+            .bind(&completion.attempt_id)
+            .bind(&completion.owner_instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotent conversation completion failed: {error}"
+                ))
+            })?;
+        if updated.rows_affected() != 1 {
+            return Err(IronCrewError::Conflict(format!(
+                "Idempotency claim '{}' changed before conversation commit",
+                completion.key_hash
+            )));
+        }
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotent conversation commit failed: {error}"
+            ))
+        })?;
+        Ok(ConversationIdempotencyCommit {
+            revision: u64::try_from(revision)
+                .map_err(|_| IronCrewError::Validation("Invalid conversation revision".into()))?,
+            replayable: response_body.is_some(),
+            already_completed: false,
+        })
+    }
+
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        parse_timestamp("idempotency completion time", completed_at)?;
+        parse_timestamp("idempotency retention expiry", expires_at)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency indeterminate transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, key_hash)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before indeterminate transition".into(),
+            ));
+        }
+        if record.state.is_terminal() {
+            return Ok(false);
+        }
+        let (database_completed_at, database_expires_at) = self
+            .database_clock_with_deadline(
+                &mut tx,
+                record.ttl_seconds,
+                "idempotency indeterminate completion",
+            )
+            .await?;
+        let sql = format!(
+            "UPDATE {} SET state = 'indeterminate', response_status = NULL, \
+             response_body = NULL, lease_expires_at = '', updated_at = $1, \
+             completed_at = $1, expires_at = $2 \
+             WHERE key_hash = $3 AND attempt_id = $4 \
+               AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&database_completed_at)
+            .bind(&database_expires_at)
+            .bind(key_hash)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency indeterminate update failed: {error}"
+                ))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency indeterminate commit failed: {error}"
+            ))
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency release transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let Some(record) = self
+            .get_idempotency_in_transaction(&mut tx, key_hash)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before release".into(),
+            ));
+        }
+        if !record.state.is_in_flight() {
+            return Ok(false);
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE key_hash = $1 AND attempt_id = $2 \
+             AND state IN ('claimed', 'running')",
+            self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(key_hash)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PostgreSQL idempotency release failed: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency release commit failed: {error}"
+            ))
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize> {
+        parse_timestamp("idempotency prune time", now)?;
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency prune transaction failed: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let (database_now, _) = self
+            .database_clock_with_deadline(&mut tx, 0, "idempotency pruning")
+            .await?;
+        let sql = format!(
+            "DELETE FROM {table} WHERE key_hash IN (\
+                 SELECT key_hash FROM {table} \
+                 WHERE state IN ('completed', 'indeterminate') \
+                   AND expires_at IS NOT NULL \
+                   AND expires_at::timestamptz <= $1::timestamptz \
+                 ORDER BY expires_at::timestamptz, key_hash LIMIT $2\
+             )",
+            table = self.idempotency_table
+        );
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&database_now)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PostgreSQL idempotency prune failed: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL idempotency prune commit failed: {error}"
+            ))
+        })?;
+        Ok(result.rows_affected() as usize)
+    }
+
     // ─── Persistent sessions ────────────────────────────────────────────────
 
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
@@ -1052,6 +2787,30 @@ impl StateStore for PostgresStore {
                 "PostgreSQL save_conversation transaction error: {e}"
             ))
         })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let guard_sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {} \
+             WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
+               AND state IN ('claimed', 'running'))",
+            self.idempotency_table
+        );
+        let active: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(guard_sql))
+            .bind(CONVERSATION_MESSAGE_OPERATION)
+            .bind(record.flow_path.as_deref().unwrap_or(""))
+            .bind(&record.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL conversation idempotency guard failed: {error}"
+                ))
+            })?;
+        if active {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' has an active idempotent message operation",
+                record.id
+            )));
+        }
         let select_sql = format!(
             "SELECT revision FROM {} \
              WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 FOR UPDATE",
@@ -1189,6 +2948,34 @@ impl StateStore for PostgresStore {
     }
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL delete_conversation transaction error: {error}"
+            ))
+        })?;
+        self.lock_idempotency_table(&mut tx).await?;
+        let guard_sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {} \
+             WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
+               AND state IN ('claimed', 'running'))",
+            self.idempotency_table
+        );
+        let active: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(guard_sql))
+            .bind(CONVERSATION_MESSAGE_OPERATION)
+            .bind(flow_path.unwrap_or(""))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL conversation delete idempotency guard failed: {error}"
+                ))
+            })?;
+        if active {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{id}' has an active idempotent message operation"
+            )));
+        }
         let sql = format!(
             "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.conversations_table
@@ -1196,11 +2983,16 @@ impl StateStore for PostgresStore {
         sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(id)
             .bind(flow_path)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 IronCrewError::Validation(format!("PostgreSQL delete_conversation error: {}", e))
             })?;
+        tx.commit().await.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "PostgreSQL delete_conversation commit error: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1699,6 +3491,107 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
         cached_tokens: cached_tokens as u32,
         tags: decode_stored_json(&tags_str, "runs.tags")?,
     })
+}
+
+fn row_to_idempotency_record(row: &sqlx::postgres::PgRow) -> Result<IdempotencyRecord> {
+    let base_revision = row
+        .try_get::<Option<i64>, _>("base_revision")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| {
+            IronCrewError::Validation("PostgreSQL idempotency base_revision is negative".into())
+        })?;
+    let response_status = row
+        .try_get::<Option<i32>, _>("response_status")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| {
+            IronCrewError::Validation(
+                "PostgreSQL idempotency response_status is out of range".into(),
+            )
+        })?;
+    let ttl_seconds = u64::try_from(
+        row.try_get::<i64, _>("ttl_seconds")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+    )
+    .map_err(|_| {
+        IronCrewError::Validation("PostgreSQL idempotency ttl_seconds is negative".into())
+    })?;
+    let state = row
+        .try_get::<String, _>("state")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
+        .parse::<IdempotencyState>()?;
+    let lease_expires_at: String = row
+        .try_get("lease_expires_at")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?;
+    let lease_expires_at = if lease_expires_at.is_empty() {
+        lease_expires_at
+    } else {
+        canonical_timestamp("stored idempotency lease expiry", &lease_expires_at)?
+    };
+    let created_at = canonical_timestamp(
+        "stored idempotency creation time",
+        &row.try_get::<String, _>("created_at")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+    )?;
+    let updated_at = canonical_timestamp(
+        "stored idempotency update time",
+        &row.try_get::<String, _>("updated_at")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+    )?;
+    let completed_at = row
+        .try_get::<Option<String>, _>("completed_at")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
+        .map(|value| canonical_timestamp("stored idempotency completion time", &value))
+        .transpose()?;
+    let expires_at = row
+        .try_get::<Option<String>, _>("expires_at")
+        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
+        .map(|value| canonical_timestamp("stored idempotency retention expiry", &value))
+        .transpose()?;
+
+    let record = IdempotencyRecord {
+        key_hash: row
+            .try_get("key_hash")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        request_fingerprint: row
+            .try_get("request_fingerprint")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        operation: row
+            .try_get("operation")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        scope: row
+            .try_get("scope")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        resource_id: row
+            .try_get("resource_id")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        exclusive_scope: row
+            .try_get("exclusive_scope")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        attempt_id: row
+            .try_get("attempt_id")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        owner_instance_id: row
+            .try_get("owner_instance_id")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        base_revision,
+        state,
+        response_status,
+        response_body: row
+            .try_get("response_body")
+            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        lease_expires_at,
+        created_at,
+        updated_at,
+        completed_at,
+        expires_at,
+        ttl_seconds,
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 #[cfg(test)]

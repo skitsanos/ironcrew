@@ -80,6 +80,7 @@ async fn spawn_test_server() -> (SocketAddr, PathBuf) {
         terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
         store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
         readiness_cache: tokio::sync::Mutex::new(None),
+        idempotency: Default::default(),
         store,
     });
 

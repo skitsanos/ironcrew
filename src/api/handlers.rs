@@ -7,9 +7,14 @@ use axum::{
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::idempotency::{
+    IdempotencyClaim, IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup,
+    IdempotencyRecord, RUN_OPERATION, RunFenceHeartbeat, RunIntentSignal,
+};
 use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
 use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
@@ -18,6 +23,180 @@ use super::{
     AppState, ErrorResponse, ListRunsQuery, ListRunsResponse, RunCrewResponse, TaskResultResponse,
     error_response, resolve_flow_path,
 };
+
+#[derive(Clone)]
+struct RunIdempotencyAttempt {
+    key_hash: String,
+    request_fingerprint: String,
+    attempt_id: String,
+    response_body: String,
+}
+
+type RunFlowResult =
+    Result<(HeaderMap, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)>;
+
+fn replay_run(record: &IdempotencyRecord) -> RunFlowResult {
+    let (Some(status), Some(body)) = (record.response_status, record.response_body.as_deref())
+    else {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "The prior request cannot be replayed; use a new Idempotency-Key after verifying its outcome"
+                .into(),
+        ));
+    };
+    if status != StatusCode::OK.as_u16() {
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response has an invalid status".into(),
+        ));
+    }
+    let body = serde_json::from_str(body).map_err(|error| {
+        tracing::error!(%error, "Stored run idempotency response is corrupt");
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response is corrupt".into(),
+        )
+    })?;
+    Ok((super::idempotency::replay_headers(), Json(body)))
+}
+
+fn idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%error, "Idempotency storage operation failed");
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Idempotency storage is temporarily unavailable".into(),
+    )
+}
+
+async fn release_run_idempotency(state: &AppState, attempt: Option<&RunIdempotencyAttempt>) {
+    let Some(attempt) = attempt else {
+        return;
+    };
+    if let Err(error) = state
+        .store
+        .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
+        .await
+    {
+        tracing::error!(%error, "Failed to release an unstarted run idempotency claim");
+    }
+}
+
+async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotencyAttempt) {
+    let completed_at = chrono::Utc::now();
+    let completion = IdempotencyCompletion {
+        key_hash: attempt.key_hash,
+        request_fingerprint: attempt.request_fingerprint,
+        attempt_id: attempt.attempt_id,
+        owner_instance_id: state.store.instance_id().to_string(),
+        response_status: StatusCode::OK.as_u16(),
+        response_body: Some(attempt.response_body),
+        completed_at: completed_at.to_rfc3339(),
+        expires_at: state.idempotency.retention_expiry(completed_at),
+    };
+    let mut persistence_degraded = false;
+    let mut retry_delay = std::time::Duration::from_millis(250);
+    loop {
+        match state
+            .store
+            .complete_idempotency(
+                completion.clone(),
+                state.idempotency.max_total_response_bytes,
+            )
+            .await
+        {
+            Ok(_) => {
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error @ IronCrewError::Conflict(_)) => {
+                tracing::warn!(%error, "Run idempotency completion was fenced");
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error) => {
+                if !persistence_degraded {
+                    persistence_degraded = true;
+                    state
+                        .terminal_persistence_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                tracing::error!(
+                    %error,
+                    retry_ms = retry_delay.as_millis(),
+                    "Run idempotency completion failed; retaining admission and retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn mark_run_idempotency_indeterminate(
+    state: &Arc<AppState>,
+    attempt: &RunIdempotencyAttempt,
+) {
+    let completed_at = chrono::Utc::now();
+    let completed_at_text = completed_at.to_rfc3339();
+    let expires_at = state.idempotency.retention_expiry(completed_at);
+    let mut persistence_degraded = false;
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match state
+            .store
+            .mark_idempotency_indeterminate(
+                &attempt.key_hash,
+                &attempt.attempt_id,
+                &completed_at_text,
+                &expires_at,
+            )
+            .await
+        {
+            Ok(_) => {
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error @ IronCrewError::Conflict(_)) => {
+                tracing::warn!(%error, "Indeterminate run finalization was fenced");
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error) => {
+                if !persistence_degraded {
+                    persistence_degraded = true;
+                    state
+                        .terminal_persistence_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                tracing::error!(
+                    %error,
+                    retry_ms = retry_delay.as_millis(),
+                    "Failed to preserve an indeterminate run outcome; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
 
 const HARD_API_MAX_TAGS: usize = 256;
 const HARD_API_MAX_TAG_BYTES: usize = 4 * 1024;
@@ -361,6 +540,31 @@ struct WorkOutcome {
     error_message: Option<String>,
 }
 
+/// Tokio detaches a task when its `JoinHandle` is dropped. The run monitor is
+/// the task's safety owner, so a monitor panic/cancellation must abort Lua
+/// instead of leaving untracked provider or tool calls running.
+struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortTaskOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        &mut self.0
+    }
+
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn classify_work_result(
     join_result: std::result::Result<
         std::result::Result<RunCrewResponse, IronCrewError>,
@@ -411,8 +615,47 @@ pub async fn run_flow(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<serde_json::Value>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> RunFlowResult {
     let input = body.map(|Json(v)| v);
+    let request_key = super::idempotency::request_key(&headers, state.idempotency.require_key)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let request_fingerprint = super::idempotency::run_fingerprint(&flow, input.as_ref());
+
+    // Look up before flow resolution and admission so a completed request can
+    // still be recovered after a rolling restart (or after the flow source is
+    // temporarily unavailable). Only digests, never the raw client key, reach
+    // the persistence layer or logs.
+    if let Some(key) = request_key.as_ref() {
+        let now = chrono::Utc::now().to_rfc3339();
+        match state
+            .store
+            .lookup_idempotency(&key.key_hash, &request_fingerprint, &now)
+            .await
+            .map_err(idempotency_store_error)?
+        {
+            IdempotencyLookup::Miss => {}
+            IdempotencyLookup::Replay(record) => return replay_run(&record),
+            IdempotencyLookup::InProgress(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "This idempotent run is not durably accepted yet; retry shortly".into(),
+                ));
+            }
+            IdempotencyLookup::Indeterminate(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "The prior request has an indeterminate outcome; inspect its run before using a new Idempotency-Key"
+                        .into(),
+                ));
+            }
+            IdempotencyLookup::Conflict => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency-Key was already used for a different request".into(),
+                ));
+            }
+        }
+    }
 
     // Extract tags up front so the audit metadata can be populated even
     // when flow resolution fails. Tags are user-controlled and bounded by
@@ -482,6 +725,100 @@ pub async fn run_flow(
         .to_string();
 
     let run_id = uuid::Uuid::new_v4().to_string();
+    let response_value = serde_json::json!({
+        "run_id": run_id,
+        "status": "started",
+        "events_url": format!("/flows/{}/events/{}", flow, run_id),
+    });
+
+    // The acceptance response and its run id are claimed durably before Lua
+    // starts. Concurrent pods therefore converge on one run id and never
+    // launch duplicate work for the same key.
+    let idempotency_attempt = if let Some(key) = request_key.as_ref() {
+        let response_body = super::idempotency::bounded_response_json(
+            &response_value,
+            state.idempotency.max_response_bytes,
+        )
+        .map_err(idempotency_store_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Run acceptance response exceeded the idempotency response limit".into(),
+            )
+        })?;
+        let now = chrono::Utc::now();
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let lease_expires_at = now
+            .checked_add_signed(
+                chrono::Duration::from_std(state.store.run_lease_ttl())
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
+            )
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            .to_rfc3339();
+        let claim = IdempotencyClaim {
+            key_hash: key.key_hash.clone(),
+            recovery_key_hash: None,
+            request_fingerprint: request_fingerprint.clone(),
+            operation: RUN_OPERATION.into(),
+            scope: super::idempotency::run_scope(&flow_slug),
+            resource_id: run_id.clone(),
+            exclusive_scope: None,
+            attempt_id: attempt_id.clone(),
+            owner_instance_id: state.store.instance_id().to_string(),
+            base_revision: None,
+            response_status: Some(StatusCode::OK.as_u16()),
+            response_body: Some(response_body.clone()),
+            max_total_response_bytes: state.idempotency.max_total_response_bytes,
+            lease_expires_at,
+            created_at: now.to_rfc3339(),
+            ttl_seconds: state.idempotency.ttl_seconds,
+        };
+        match state
+            .store
+            .claim_idempotency(
+                claim,
+                state.idempotency.max_records,
+                state.idempotency.prune_batch,
+            )
+            .await
+            .map_err(idempotency_store_error)?
+        {
+            IdempotencyClaimOutcome::Claimed(_) => Some(RunIdempotencyAttempt {
+                key_hash: key.key_hash.clone(),
+                request_fingerprint: request_fingerprint.clone(),
+                attempt_id,
+                response_body,
+            }),
+            IdempotencyClaimOutcome::Replay(record) => return replay_run(&record),
+            IdempotencyClaimOutcome::InProgress(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "This idempotent run is not durably accepted yet; retry shortly".into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Indeterminate(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "The prior request has an indeterminate outcome; inspect its run before using a new Idempotency-Key"
+                        .into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Conflict => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency-Key was already used for a different request".into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Busy => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "An idempotent operation is already in progress".into(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let eventbus = EventBus::new(256);
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
@@ -499,12 +836,25 @@ pub async fn run_flow(
     let run_id_for_work = run_id.clone();
     let store_for_work = state.store.clone();
     let bridge_for_work = input_bridge.clone();
+    let (run_intent_signal, mut run_intent_ready) =
+        if let Some(attempt) = idempotency_attempt.as_ref() {
+            let (signal, receiver) = RunIntentSignal::channel(
+                attempt.key_hash.clone(),
+                attempt.request_fingerprint.clone(),
+                attempt.attempt_id.clone(),
+            );
+            (Some(signal), Some(receiver))
+        } else {
+            (None, None)
+        };
     let (work_handle, terminal_tx) = {
         let mut active_runs = state.active_runs.write().await;
         if !state
             .accepting_traffic
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            drop(active_runs);
+            release_run_idempotency(&state, idempotency_attempt.as_ref()).await;
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Server is shutting down".into(),
@@ -517,6 +867,8 @@ pub async fn run_flow(
         // bound used for active-run admission.
         active_runs.retain(|_, active| !*active.terminal.borrow());
         if active_runs.len() >= state.max_active_runs {
+            drop(active_runs);
+            release_run_idempotency(&state, idempotency_attempt.as_ref()).await;
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Active run registry is at capacity; retry shortly".into(),
@@ -531,6 +883,7 @@ pub async fn run_flow(
                 input.as_ref(),
                 Some(store_for_work),
                 Some(bridge_for_work),
+                run_intent_signal,
             )
             .await
         });
@@ -552,9 +905,43 @@ pub async fn run_flow(
 
     let run_id_clone = run_id.clone();
     let state_clone = state.clone();
-    let flow_clone = flow.clone();
     let flow_slug_for_monitor = flow_slug.clone();
     let tags_for_terminal = tags_for_audit.clone();
+    let idempotency_for_monitor = idempotency_attempt.clone();
+
+    // The request future may be cancelled as soon as the client disconnects,
+    // but keyed work deliberately continues under server ownership. Give the
+    // start audit the same detached ownership so every accepted durable run
+    // has a corresponding event. No request body or raw idempotency key is
+    // included in audit metadata.
+    let mut audit_ready = run_intent_ready.clone();
+    let audit_store = state.store.clone();
+    let audit_flow = flow.clone();
+    let audit_run_id = run_id.clone();
+    let audit_headers = crate::api::audit::background_headers(&headers);
+    let audit_metadata = if tags_for_audit.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "tags": tags_for_audit }))
+    };
+    tokio::spawn(async move {
+        let accepted = match audit_ready.as_mut() {
+            Some(ready) => ready.wait_for(|is_ready| *is_ready).await.is_ok(),
+            None => true,
+        };
+        crate::api::audit::record(
+            &audit_store,
+            "flow.run.start",
+            Some(&audit_flow),
+            Some(&audit_run_id),
+            &audit_headers,
+            Some(addr),
+            accepted,
+            if accepted { 200 } else { 503 },
+            audit_metadata,
+        )
+        .await;
+    });
 
     // Monitor the work handle. It is the single API-level finalizer for
     // errors, cancellation, panic, timeout, and server shutdown. Store
@@ -562,10 +949,25 @@ pub async fn run_flow(
     // that wins first remains authoritative.
     tokio::spawn(async move {
         let max_lifetime = state_clone.max_run_lifetime;
-        let mut work_handle = work_handle;
+        let mut work_handle = AbortTaskOnDrop::new(work_handle);
 
-        let (requested_status, duration_ms, total_tokens, error_message) = tokio::select! {
-            join_result = &mut work_handle => {
+        // Keep the operation claim live independently of the client
+        // connection. Losing the fence actively aborts Lua: continuing tools
+        // or provider calls after another attempt owns the claim is unsafe.
+        let run_heartbeat = idempotency_for_monitor.as_ref().map(|attempt| {
+            super::idempotency::RunLeaseHeartbeat::spawn(
+                state_clone.store.clone(),
+                run_id_clone.clone(),
+                attempt.key_hash.clone(),
+                attempt.attempt_id.clone(),
+            )
+        });
+        let mut fence_outcome = run_heartbeat
+            .as_ref()
+            .map(super::idempotency::RunLeaseHeartbeat::outcome_receiver);
+
+        let (requested_status, duration_ms, total_tokens, error_message, fence_result) = tokio::select! {
+            join_result = work_handle.handle_mut() => {
                 let outcome = classify_work_result(
                     join_result,
                     started.elapsed().as_millis() as u64,
@@ -575,23 +977,81 @@ pub async fn run_flow(
                     outcome.duration_ms,
                     outcome.total_tokens,
                     outcome.error_message,
+                    None,
                 )
             }
             _ = tokio::time::sleep(max_lifetime) => {
                 work_handle.abort();
                 // Wait until cancellation has completed before touching the
                 // record, so Lua cannot race a later completion write.
-                let _ = work_handle.await;
+                let _ = work_handle.handle_mut().await;
                 tracing::warn!("Run {} timed out after {}s", run_id_clone, max_lifetime.as_secs());
                 (
                     RunStatus::TimedOut,
                     started.elapsed().as_millis() as u64,
                     0,
                     None,
+                    None,
                 )
             }
+            outcome = async {
+                match fence_outcome.as_mut() {
+                    Some(outcome) => super::idempotency::wait_for_run_fence_outcome(outcome).await,
+                    None => std::future::pending::<RunFenceHeartbeat>().await,
+                }
+            } => {
+                work_handle.abort();
+                let _ = work_handle.handle_mut().await;
+                match outcome {
+                    RunFenceHeartbeat::Terminal(status) => {
+                        tracing::debug!(run_id = %run_id_clone, %status, "Run worker stopped after its durable record became terminal");
+                        let terminal_result = RunFenceHeartbeat::Terminal(status.clone());
+                        let (duration_ms, total_tokens) = match state_clone
+                            .store
+                            .get_run(&run_id_clone)
+                            .await
+                        {
+                            Ok(record) if record.status.is_terminal() => {
+                                (record.duration_ms, record.total_tokens)
+                            }
+                            Ok(record) => {
+                                tracing::warn!(
+                                    run_id = %run_id_clone,
+                                    durable_status = %record.status,
+                                    "Run-fence heartbeat reported a terminal status but the follow-up read was in-flight"
+                                );
+                                (started.elapsed().as_millis() as u64, 0)
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    run_id = %run_id_clone,
+                                    %error,
+                                    "Failed to read terminal run metrics after a run-fence heartbeat"
+                                );
+                                (started.elapsed().as_millis() as u64, 0)
+                            }
+                        };
+                        (
+                            status,
+                            duration_ms,
+                            total_tokens,
+                            None,
+                            Some(terminal_result),
+                        )
+                    }
+                    RunFenceHeartbeat::Lost | RunFenceHeartbeat::Owned => {
+                        tracing::warn!(run_id = %run_id_clone, "Run stopped after losing its durable execution fence");
+                        (
+                            RunStatus::Abandoned,
+                            started.elapsed().as_millis() as u64,
+                            0,
+                            Some("Run stopped after its durable execution fence was lost".into()),
+                            Some(RunFenceHeartbeat::Lost),
+                        )
+                    }
+                }
+            }
         };
-
         if let Some(message) = error_message {
             eventbus.emit(CrewEvent::Log {
                 level: "error".into(),
@@ -646,6 +1106,15 @@ pub async fn run_flow(
             }
         };
 
+        if let Some(attempt) = idempotency_for_monitor {
+            if matches!(fence_result, Some(RunFenceHeartbeat::Lost)) {
+                mark_run_idempotency_indeterminate(&state_clone, &attempt).await;
+            } else {
+                complete_run_idempotency(&state_clone, attempt).await;
+            }
+        }
+        drop(run_heartbeat);
+
         eventbus.emit(CrewEvent::RunComplete {
             run_id: run_id_clone.clone(),
             status: terminal_status.to_string(),
@@ -662,31 +1131,24 @@ pub async fn run_flow(
         state_clone.active_runs.write().await.remove(&run_id_clone);
     });
 
-    let response = Json(serde_json::json!({
-        "run_id": run_id,
-        "status": "started",
-        "events_url": format!("/flows/{}/events/{}", flow_clone, run_id),
-    }));
+    // A claimed row deliberately contains the eventual response but is not
+    // replayable. Wait until `crew:run()` has persisted the matching run
+    // intent and advanced the claim to `running` before acknowledging it.
+    // The monitor owns execution, admission, and finalization, so dropping
+    // this client connection cannot orphan the task while we wait.
+    if let Some(ready) = run_intent_ready.as_mut()
+        && ready.wait_for(|is_ready| *is_ready).await.is_err()
+    {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Run failed before its acceptance could be persisted; retry with the same Idempotency-Key"
+                .into(),
+        ));
+    }
 
-    let metadata = if !tags_for_audit.is_empty() {
-        Some(serde_json::json!({ "tags": tags_for_audit }))
-    } else {
-        None
-    };
-    crate::api::audit::record(
-        &state.store,
-        "flow.run.start",
-        Some(&flow),
-        Some(&run_id),
-        &headers,
-        Some(addr),
-        true,
-        200,
-        metadata,
-    )
-    .await;
+    let response = Json(response_value);
 
-    Ok(response)
+    Ok((HeaderMap::new(), response))
 }
 
 /// Execute a crew from a flow path, injecting an EventBus, run_id, and optional input context.
@@ -697,9 +1159,54 @@ async fn execute_crew_from_path_with_events(
     input: Option<&serde_json::Value>,
     shared_store: Option<Arc<dyn crate::engine::store::StateStore>>,
     input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
+    run_intent_signal: Option<RunIntentSignal>,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
+
+    // A Lua entrypoint may perform asynchronous setup (including
+    // `ask_human`) before it reaches `crew:run()`. For keyed HTTP work, create
+    // the provisional run intent first so neither the initial 200 nor a replay
+    // can ever reference a run that is still only process-local.
+    if let Some(signal) = run_intent_signal.as_ref() {
+        let store = shared_store.as_ref().ok_or_else(|| {
+            IronCrewError::Validation(
+                "A keyed HTTP run requires the server's shared state store".into(),
+            )
+        })?;
+        let flow_slug = flow_path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("")
+            .to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+        store
+            .save_run_intent(RunIntent {
+                suggested_id: Some(run_id.to_string()),
+                flow_name: flow_slug.clone(),
+                flow: flow_slug,
+                started_at: started_at.clone(),
+                agent_count: 0,
+                task_count: 0,
+                tags: validate_run_tags(input)?,
+            })
+            .await?;
+
+        let (key_hash, request_fingerprint) = signal.lookup_identity();
+        let lookup = store
+            .lookup_idempotency(key_hash, request_fingerprint, &started_at)
+            .await?;
+        match lookup {
+            IdempotencyLookup::Replay(record) if signal.matches_running(&record, run_id) => {
+                signal.notify();
+            }
+            _ => {
+                return Err(IronCrewError::Conflict(
+                    "Run idempotency claim was not linked to its durable run intent".into(),
+                ));
+            }
+        }
+    }
 
     let loader = load_project(flow_path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;

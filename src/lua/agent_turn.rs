@@ -33,22 +33,31 @@ use crate::utils::error::{IronCrewError, Result};
 /// awaits makes Tokio timeout and shutdown cancellation history-safe.
 pub(crate) struct ActiveTurnGuard<'a> {
     history: &'a mut Vec<ChatMessage>,
-    active_user_present: bool,
+    /// Exact transcript that existed before the active user message. History
+    /// limiting can drain old turn groups while a provider/tool request is in
+    /// flight, so remembering only the active user's index is not sufficient:
+    /// cancellation would otherwise keep the drain and silently lose older
+    /// persisted context.
+    rollback_snapshot: Option<Vec<ChatMessage>>,
     committed: bool,
 }
 
 impl<'a> ActiveTurnGuard<'a> {
     pub(crate) fn new(history: &'a mut Vec<ChatMessage>) -> Self {
-        let active_user_present = history.last().is_some_and(|message| message.role == "user");
+        let rollback_snapshot = history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .map(|active_start| history[..active_start].to_vec());
         Self {
             history,
-            active_user_present,
+            rollback_snapshot,
             committed: false,
         }
     }
 
     pub(crate) fn commit(&mut self) {
         self.committed = true;
+        self.rollback_snapshot = None;
     }
 }
 
@@ -68,8 +77,10 @@ impl DerefMut for ActiveTurnGuard<'_> {
 
 impl Drop for ActiveTurnGuard<'_> {
     fn drop(&mut self) {
-        if !self.committed && self.active_user_present {
-            rollback_active_turn(self.history);
+        if !self.committed
+            && let Some(snapshot) = self.rollback_snapshot.take()
+        {
+            *self.history = snapshot;
         }
     }
 }
@@ -287,12 +298,6 @@ pub async fn run_single_agent_turn(
     }
 }
 
-fn rollback_active_turn(history: &mut Vec<ChatMessage>) {
-    if let Some(active_start) = history.iter().rposition(|message| message.role == "user") {
-        history.truncate(active_start);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +314,42 @@ mod tests {
     use crate::tools::registry::ToolRegistry;
     use crate::tools::{Tool, ToolCallContext};
     use crate::utils::error::Result;
+
+    #[test]
+    fn cancelled_turn_restores_history_removed_by_limit_enforcement() {
+        let original = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant(Some("old answer".into()), None),
+        ];
+        let mut history = original.clone();
+        history.push(ChatMessage::user("active question"));
+
+        {
+            let mut guard = ActiveTurnGuard::new(&mut history);
+            // Simulate history-limit enforcement draining the oldest complete
+            // turn while the active request is still cancellable.
+            guard.drain(1..3);
+            guard.push(ChatMessage::assistant(Some("partial".into()), None));
+        }
+
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn committed_turn_keeps_history_mutations() {
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("question")];
+        {
+            let mut guard = ActiveTurnGuard::new(&mut history);
+            guard.push(ChatMessage::assistant(Some("answer".into()), None));
+            guard.commit();
+        }
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].content.as_deref(), Some("answer"));
+    }
 
     // ── Stub provider ────────────────────────────────────────────────────────
 

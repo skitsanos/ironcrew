@@ -434,6 +434,12 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10 MiB; range: 1–67108864) |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | Whole conversation-turn deadline, including provider and tool rounds (default: `300`; hard ceiling: `3600`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min; hard ceiling: `86400`) |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP run and conversation-message mutations (default: `false`; recommended: `true` in production) |
+| `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Completed/indeterminate ledger retention (default: `86400`; range: 60–2592000; must be at least `IRONCREW_MAX_RUN_LIFETIME + 3600`) |
+| `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum in-flight plus retained terminal request records (default: `10000`; hard ceiling: `100000`) |
+| `IRONCREW_IDEMPOTENCY_PRUNE_BATCH` | Maximum expired terminal records removed in one bounded pass (default: `1000`; hard ceiling: `10000`) |
+| `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | Maximum compact JSON response retained per key (default: `8388608` = 8 MiB; hard ceiling: 64 MiB) |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | Aggregate retained response-body budget (default: `268435456` = 256 MiB; hard ceiling: 8 GiB); excess responses become non-replayable tombstones |
 | `IRONCREW_MAX_SSE_CONNECTIONS` | Global cap on live run and conversation SSE connections (default: `16`; hard ceiling: `1024`) |
 | `IRONCREW_READINESS_CACHE_MS` | Storage-aware readiness result cache/coalescing interval (default: `1000`; hard ceiling: `10000`) |
 | `IRONCREW_RUN_SSE_RETENTION_SECS` | Time a completed run's event bus remains available for a late subscriber (default: `5`; hard ceiling: `300`) |
@@ -525,7 +531,7 @@ individual ranges stated in their descriptions.
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (default: `1000`; range: 1–30000) |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (default: `30`; range: 1–120 seconds) |
 | `IRONCREW_INSTANCE_ID` | Optional unique process/pod identity stored as the owner of live runs. Generated once per process when unset |
-| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Seconds before an unrefreshed run lease is eligible for abandoned-run reconciliation (default: `60`, range: 1–86400) |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Seconds before an unrefreshed run lease is eligible for abandoned-run reconciliation; also the mandatory grace before explicit recovery of an indeterminate conversation turn (default: `60`, range: 1–86400) |
 | `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum bytes read/written for one JSON run record (default: `67108864` = 64 MiB; hard ceiling: `134217728`) |
 | `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON-store list/count/clean scan (default: `10000`; hard ceiling: `100000`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` when `limit` is not provided. Default: `20` |

@@ -13,6 +13,10 @@
 #![cfg(feature = "postgres")]
 
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+use ironcrew::engine::idempotency::{
+    CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
+    IdempotencyCompletion, IdempotencyLookup, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+};
 use ironcrew::engine::postgres_store::PostgresStore;
 use ironcrew::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunStatus, RunTransition,
@@ -34,7 +38,13 @@ fn pg_url() -> Option<String> {
 /// the database is reused across runs.
 async fn reset(url: &str, prefix: &str) {
     let pool = sqlx::PgPool::connect(url).await.expect("connect for reset");
-    for t in ["runs", "conversations", "dialogs", "audit_events"] {
+    for t in [
+        "runs",
+        "conversations",
+        "dialogs",
+        "audit_events",
+        "idempotency",
+    ] {
         let sql = format!("DROP TABLE IF EXISTS {prefix}{t} CASCADE");
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&pool)
@@ -42,6 +52,101 @@ async fn reset(url: &str, prefix: &str) {
             .expect("drop table");
     }
     pool.close().await;
+}
+
+async fn expire_run_lease(url: &str, prefix: &str, run_id: &str) {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to expire run");
+    let sql = format!(
+        "UPDATE {prefix}runs SET lease_expires_at = to_char(\
+             (clock_timestamp() - interval '1 second') AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         ) WHERE run_id = $1"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("expire run lease");
+    pool.close().await;
+}
+
+async fn expire_idempotency_lease(url: &str, prefix: &str, key_hash: &str) {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to expire idempotency lease");
+    let sql = format!(
+        "UPDATE {prefix}idempotency SET lease_expires_at = to_char(\
+             (clock_timestamp() - interval '1 second') AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         ) WHERE key_hash = $1"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(key_hash)
+        .execute(&pool)
+        .await
+        .expect("expire idempotency lease");
+    pool.close().await;
+}
+
+async fn expire_idempotency_retention(url: &str, prefix: &str, key_hash: &str) {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to expire idempotency retention");
+    let sql = format!(
+        "UPDATE {prefix}idempotency SET expires_at = to_char(\
+             (clock_timestamp() - interval '1 second') AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         ) WHERE key_hash = $1"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(key_hash)
+        .execute(&pool)
+        .await
+        .expect("expire idempotency retention");
+    pool.close().await;
+}
+
+async fn age_idempotency_completion(url: &str, prefix: &str, key_hash: &str, age_seconds: u64) {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to age idempotency completion");
+    let sql = format!(
+        "UPDATE {prefix}idempotency SET completed_at = to_char(\
+             (clock_timestamp() - $2::bigint * interval '1 second') AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         ), updated_at = to_char(\
+             (clock_timestamp() - $2::bigint * interval '1 second') AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         ) WHERE key_hash = $1"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(key_hash)
+        .bind(i64::try_from(age_seconds).expect("completion age fits PostgreSQL"))
+        .execute(&pool)
+        .await
+        .expect("age idempotency completion");
+    pool.close().await;
+}
+
+async fn postgres_now(url: &str) -> chrono::DateTime<chrono::Utc> {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to read PostgreSQL clock");
+    let now: String = sqlx::query_scalar(
+        "SELECT to_char(\
+             clock_timestamp() AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read PostgreSQL clock");
+    pool.close().await;
+    chrono::DateTime::parse_from_rfc3339(&now)
+        .expect("parse PostgreSQL clock")
+        .with_timezone(&chrono::Utc)
 }
 
 fn intent(id: &str, flow: &str, started_at: &str, tags: Vec<String>) -> RunIntent {
@@ -53,6 +158,52 @@ fn intent(id: &str, flow: &str, started_at: &str, tags: Vec<String>) -> RunInten
         agent_count: 1,
         task_count: 1,
         tags,
+    }
+}
+
+fn digest(byte: char) -> String {
+    byte.to_string().repeat(64)
+}
+
+fn idempotency_claim(
+    key: char,
+    fingerprint: char,
+    operation: &str,
+    resource_id: &str,
+    exclusive_scope: Option<&str>,
+    base_revision: Option<u64>,
+    lease_expires_at: &str,
+) -> IdempotencyClaim {
+    IdempotencyClaim {
+        key_hash: digest(key),
+        recovery_key_hash: None,
+        request_fingerprint: digest(fingerprint),
+        operation: operation.into(),
+        scope: "flow-a".into(),
+        resource_id: resource_id.into(),
+        exclusive_scope: exclusive_scope.map(str::to_string),
+        attempt_id: format!("attempt-{key}"),
+        owner_instance_id: "owner-a".into(),
+        base_revision,
+        response_status: None,
+        response_body: None,
+        max_total_response_bytes: usize::MAX,
+        lease_expires_at: lease_expires_at.into(),
+        created_at: "2026-07-19T12:00:00Z".into(),
+        ttl_seconds: 86_400,
+    }
+}
+
+fn idempotency_completion(claim: &IdempotencyClaim, body: Option<&str>) -> IdempotencyCompletion {
+    IdempotencyCompletion {
+        key_hash: claim.key_hash.clone(),
+        request_fingerprint: claim.request_fingerprint.clone(),
+        attempt_id: claim.attempt_id.clone(),
+        owner_instance_id: claim.owner_instance_id.clone(),
+        response_status: 200,
+        response_body: body.map(str::to_string),
+        completed_at: "2026-07-19T12:01:00Z".into(),
+        expires_at: "2026-07-20T12:01:00Z".into(),
     }
 }
 
@@ -416,9 +567,11 @@ async fn pg_reconcile_abandoned() {
         .save_run_intent(intent("r2", "f", "2026-04-23T10:01:00Z", vec![]))
         .await
         .unwrap();
+    expire_run_lease(&url, prefix, "r1").await;
+    expire_run_lease(&url, prefix, "r2").await;
 
     let n = store
-        .reconcile_abandoned_runs("9999-04-23T10:05:00Z")
+        .reconcile_abandoned_runs("1900-04-23T10:05:00Z")
         .await
         .unwrap();
     assert_eq!(n, 2);
@@ -426,10 +579,9 @@ async fn pg_reconcile_abandoned() {
         store.get_run("r1").await.unwrap().status,
         RunStatus::Abandoned
     );
-    assert_eq!(
-        store.get_run("r1").await.unwrap().finished_at,
-        "9999-04-23T10:05:00Z"
-    );
+    let finished_at = store.get_run("r1").await.unwrap().finished_at;
+    assert!(chrono::DateTime::parse_from_rfc3339(&finished_at).is_ok());
+    assert_ne!(finished_at, "1900-04-23T10:05:00Z");
 
     // Idempotent — nothing left in Running.
     assert_eq!(
@@ -574,6 +726,29 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     assert_eq!(rows[0].run_id, "new-1");
     // The pre-migration legacy row is not visible under a real flow scope.
     assert_eq!(store.count_runs(&scoped).await.unwrap(), 1);
+
+    // A deployment upgraded from before request idempotency also receives the
+    // complete ledger schema and compact, non-truncated indexes atomically.
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let idempotency_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(format!("{prefix}idempotency"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(idempotency_columns, 18);
+    let idempotency_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = $1",
+    )
+    .bind(format!("{prefix}idempotency"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(idempotency_indexes, 4, "primary key plus three indexes");
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -650,15 +825,17 @@ async fn pg_reconcile_sweeps_waiting_for_input() {
         .update_run_status("wfi-2", RunStatus::WaitingForInput)
         .await
         .unwrap();
+    expire_run_lease(&url, prefix, "wfi-2").await;
 
     let count = store
-        .reconcile_abandoned_runs("9999-07-07T11:00:00Z")
+        .reconcile_abandoned_runs("1900-07-07T11:00:00Z")
         .await
         .unwrap();
     assert_eq!(count, 1);
     let r = store.get_run("wfi-2").await.unwrap();
     assert_eq!(r.status, RunStatus::Abandoned);
-    assert_eq!(r.finished_at, "9999-07-07T11:00:00Z");
+    assert!(chrono::DateTime::parse_from_rfc3339(&r.finished_at).is_ok());
+    assert_ne!(r.finished_at, "1900-07-07T11:00:00Z");
 }
 
 #[tokio::test]
@@ -696,11 +873,9 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
 
     let fresh = owner_a.get_run("owned-run").await.unwrap();
     assert_eq!(fresh.owner_instance_id, "owner-a");
-    let deadline = chrono::DateTime::parse_from_rfc3339(&fresh.lease_expires_at).unwrap();
-    let before_deadline = (deadline - chrono::Duration::seconds(1)).to_rfc3339();
     assert_eq!(
         owner_b
-            .reconcile_abandoned_runs(&before_deadline)
+            .reconcile_abandoned_runs("9999-07-18T10:00:00Z")
             .await
             .unwrap(),
         0
@@ -710,10 +885,10 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
         RunStatus::Running
     );
 
-    let after_deadline = (deadline + chrono::Duration::seconds(1)).to_rfc3339();
+    expire_run_lease(&url, prefix, "owned-run").await;
     assert_eq!(
         owner_b
-            .reconcile_abandoned_runs(&after_deadline)
+            .reconcile_abandoned_runs("1900-07-18T10:00:00Z")
             .await
             .unwrap(),
         1
@@ -728,7 +903,7 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
             "owned-run",
             RunCompletion {
                 status: RunStatus::Success,
-                finished_at: (deadline + chrono::Duration::seconds(2)).to_rfc3339(),
+                finished_at: "9999-07-18T10:00:00Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
                 total_tokens: 0,
@@ -744,5 +919,1372 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
     assert_eq!(
         owner_a.get_run("owned-run").await.unwrap().status,
         RunStatus::Abandoned
+    );
+}
+
+#[tokio::test]
+async fn pg_two_stores_claim_once_and_fence_stale_attempts() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_two_stores_claim_once_and_fence_stale_attempts: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_claim_";
+    reset(&url, prefix).await;
+    let store_a = PostgresStore::new(&url, prefix).await.unwrap();
+    let store_b = PostgresStore::new(&url, prefix).await.unwrap();
+    let claim = idempotency_claim(
+        'a',
+        'b',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-1",
+        Some("conversation:flow-a:chat-1"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+
+    let (left, right) = tokio::join!(
+        store_a.claim_idempotency(claim.clone(), 100, 10),
+        store_b.claim_idempotency(claim.clone(), 100, 10)
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, IdempotencyClaimOutcome::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, IdempotencyClaimOutcome::InProgress(_)))
+            .count(),
+        1
+    );
+
+    assert!(matches!(
+        store_b
+            .heartbeat_idempotency(&claim.key_hash, "stale-attempt", "2026-07-19T12:11:00Z")
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    let mut stale_completion = idempotency_completion(&claim, Some("{\"ok\":true}"));
+    stale_completion.attempt_id = "stale-attempt".into();
+    assert!(matches!(
+        store_b.complete_idempotency(stale_completion, 1024).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    let completion = idempotency_completion(&claim, Some("{\"ok\":true}"));
+    let completed = store_a
+        .complete_idempotency(completion.clone(), 1024)
+        .await
+        .unwrap();
+    assert!(completed.replayable);
+    assert!(!completed.already_completed);
+    let repeated = store_b
+        .complete_idempotency(completion, 1024)
+        .await
+        .unwrap();
+    assert!(repeated.replayable);
+    assert!(repeated.already_completed);
+    match store_b
+        .lookup_idempotency(
+            &claim.key_hash,
+            &claim.request_fingerprint,
+            "2026-07-19T12:02:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => {
+            assert_eq!(record.response_body.as_deref(), Some("{\"ok\":true}"));
+        }
+        other => panic!("expected replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pg_idempotency_uses_database_clock_despite_client_skew() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_idempotency_uses_database_clock_despite_client_skew: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_skew_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("skew-owner", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let before_claim = postgres_now(&url).await;
+    let mut claim = idempotency_claim(
+        '4',
+        '5',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-skew",
+        Some("conversation:flow-a:chat-skew"),
+        Some(0),
+        "1900-01-01T00:01:00Z",
+    );
+    claim.created_at = "1900-01-01T00:00:00Z".into();
+    let stored = match store
+        .claim_idempotency(claim.clone(), 100, 10)
+        .await
+        .unwrap()
+    {
+        IdempotencyClaimOutcome::Claimed(record) => record,
+        other => panic!("expected database-timed claim, got {other:?}"),
+    };
+    let after_claim = postgres_now(&url).await;
+    let stored_created = chrono::DateTime::parse_from_rfc3339(&stored.created_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let stored_deadline = chrono::DateTime::parse_from_rfc3339(&stored.lease_expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(stored.created_at.ends_with('Z'));
+    assert!(stored.lease_expires_at.ends_with('Z'));
+    assert!(stored_created >= before_claim && stored_created <= after_claim);
+    assert_eq!(
+        stored_deadline - stored_created,
+        chrono::Duration::seconds(60)
+    );
+
+    let mut future_competitor = idempotency_claim(
+        '5',
+        '6',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-skew",
+        Some("conversation:flow-a:chat-skew"),
+        Some(0),
+        "9999-01-01T00:01:00Z",
+    );
+    future_competitor.created_at = "9999-01-01T00:00:00Z".into();
+    assert!(matches!(
+        store
+            .claim_idempotency(future_competitor, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &claim.key_hash,
+                &claim.request_fingerprint,
+                "9999-12-31T23:59:59Z",
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::InProgress(_)
+    ));
+
+    assert!(
+        store
+            .heartbeat_idempotency(&claim.key_hash, &claim.attempt_id, "9999-12-31T23:59:59Z",)
+            .await
+            .unwrap()
+    );
+    let heartbeat_now = postgres_now(&url).await;
+    let heartbeat_record = match store
+        .lookup_idempotency(
+            &claim.key_hash,
+            &claim.request_fingerprint,
+            "1900-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::InProgress(record) => record,
+        other => panic!("expected live claim after skewed heartbeat, got {other:?}"),
+    };
+    let heartbeat_deadline =
+        chrono::DateTime::parse_from_rfc3339(&heartbeat_record.lease_expires_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+    assert!(heartbeat_deadline > heartbeat_now + chrono::Duration::seconds(55));
+    assert!(heartbeat_deadline <= heartbeat_now + chrono::Duration::seconds(60));
+    assert!(
+        store
+            .heartbeat_idempotency(&claim.key_hash, &claim.attempt_id, "1900-01-01T00:00:01Z",)
+            .await
+            .unwrap()
+    );
+
+    let completion = idempotency_completion(&claim, Some("{}"));
+    store.complete_idempotency(completion, 1024).await.unwrap();
+    assert!(
+        store
+            .heartbeat_idempotency(&claim.key_hash, &claim.attempt_id, "1900-01-01T00:00:01Z",)
+            .await
+            .unwrap()
+    );
+
+    let indeterminate = idempotency_claim(
+        '6',
+        '7',
+        RUN_OPERATION,
+        "indeterminate-skew",
+        None,
+        None,
+        "9999-01-01T00:01:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(indeterminate.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    assert!(
+        store
+            .mark_idempotency_indeterminate(
+                &indeterminate.key_hash,
+                &indeterminate.attempt_id,
+                "1900-01-01T00:00:00Z",
+                "9999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .heartbeat_idempotency(
+                &indeterminate.key_hash,
+                &indeterminate.attempt_id,
+                "9999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_indeterminate_exclusive_scope_requires_recovery_after_grace: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_hazard_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("hazard-owner", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let scope = "conversation:flow-a:chat-hazard";
+    let first = idempotency_claim(
+        '8',
+        '9',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-hazard",
+        Some(scope),
+        Some(0),
+        "9999-01-01T00:00:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(first.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    expire_idempotency_lease(&url, prefix, &first.key_hash).await;
+
+    let second = idempotency_claim(
+        '9',
+        'a',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-hazard",
+        Some(scope),
+        Some(0),
+        "1900-01-01T00:00:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(second.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &first.key_hash,
+                &first.request_fingerprint,
+                "9999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Indeterminate(_)
+    ));
+    assert!(matches!(
+        store
+            .claim_idempotency(second.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+
+    let mut wrong_recovery = second.clone();
+    wrong_recovery.recovery_key_hash = Some(digest('b'));
+    assert!(matches!(
+        store
+            .claim_idempotency(wrong_recovery, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+    let mut acknowledged = second.clone();
+    acknowledged.recovery_key_hash = Some(first.key_hash.clone());
+    assert!(matches!(
+        store
+            .claim_idempotency(acknowledged.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+    match store
+        .lookup_idempotency(
+            &first.key_hash,
+            &first.request_fingerprint,
+            "1900-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Indeterminate(record) => {
+            assert_eq!(record.exclusive_scope.as_deref(), Some(scope));
+        }
+        other => panic!("expected unacknowledged hazard tombstone, got {other:?}"),
+    }
+
+    age_idempotency_completion(&url, prefix, &first.key_hash, 61).await;
+    assert!(matches!(
+        store
+            .claim_idempotency(acknowledged, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    match store
+        .lookup_idempotency(
+            &first.key_hash,
+            &first.request_fingerprint,
+            "1900-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Indeterminate(record) => assert!(record.exclusive_scope.is_none()),
+        other => panic!("expected acknowledged hazard tombstone, got {other:?}"),
+    }
+
+    store
+        .complete_idempotency(idempotency_completion(&second, Some("{}")), 1024)
+        .await
+        .unwrap();
+    let completed_is_ignored = idempotency_claim(
+        'a',
+        'b',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-hazard",
+        Some(scope),
+        Some(0),
+        "1900-01-01T00:00:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(completed_is_ignored, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+}
+
+#[tokio::test]
+async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_conversation_commit_is_atomic_and_blocks_unguarded_writes: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_chat_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let claim = idempotency_claim(
+        'b',
+        'c',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-atomic",
+        Some("conversation:flow-a:chat-atomic"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(claim.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    let conversation = ConversationRecord {
+        id: "chat-atomic".into(),
+        flow_name: "chat".into(),
+        flow_path: Some("flow-a".into()),
+        agent_name: "assistant".into(),
+        messages: vec![ChatMessage::user("hello")],
+        created_at: "2026-07-19T12:00:00Z".into(),
+        updated_at: "2026-07-19T12:01:00Z".into(),
+        revision: 0,
+    };
+    assert!(matches!(
+        store.save_conversation(&conversation).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .delete_conversation(Some("flow-a"), "chat-atomic")
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    let completion = idempotency_completion(&claim, Some("{\"reply\":\"hi\"}"));
+    let committed = store
+        .commit_conversation_idempotency(completion.clone(), &conversation, 1024)
+        .await
+        .unwrap();
+    assert_eq!(committed.revision, 1);
+    assert!(committed.replayable);
+    assert!(!committed.already_completed);
+    let persisted = store
+        .get_conversation(Some("flow-a"), "chat-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.revision, 1);
+    assert_eq!(persisted.messages.len(), 1);
+    assert_eq!(persisted.messages[0].role, "user");
+    assert_eq!(persisted.messages[0].content.as_deref(), Some("hello"));
+
+    let repeated = store
+        .commit_conversation_idempotency(completion, &conversation, 1024)
+        .await
+        .unwrap();
+    assert_eq!(repeated.revision, 1);
+    assert!(repeated.already_completed);
+}
+
+#[tokio::test]
+async fn pg_conversation_claim_checks_durable_revision_before_insert() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_conversation_claim_checks_durable_revision_before_insert: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_rev_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let conversation = ConversationRecord {
+        id: "chat-revision".into(),
+        flow_name: "chat".into(),
+        flow_path: Some("flow-a".into()),
+        agent_name: "assistant".into(),
+        messages: vec![ChatMessage::user("existing")],
+        created_at: "2026-07-19T12:00:00Z".into(),
+        updated_at: "2026-07-19T12:01:00Z".into(),
+        revision: 0,
+    };
+    assert_eq!(store.save_conversation(&conversation).await.unwrap(), 1);
+
+    let stale = idempotency_claim(
+        'e',
+        'f',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-revision",
+        Some("conversation:flow-a:chat-revision"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(stale.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Conflict
+    ));
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &stale.key_hash,
+                &stale.request_fingerprint,
+                "2026-07-19T12:02:00Z",
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Miss
+    ));
+
+    let current = idempotency_claim(
+        'f',
+        'e',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-revision",
+        Some("conversation:flow-a:chat-revision"),
+        Some(1),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store.claim_idempotency(current, 100, 10).await.unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let missing_stale = idempotency_claim(
+        '0',
+        '1',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-missing",
+        Some("conversation:flow-a:chat-missing"),
+        Some(1),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(missing_stale, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Conflict
+    ));
+    let missing_zero = idempotency_claim(
+        '1',
+        '0',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-missing",
+        Some("conversation:flow-a:chat-missing"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(missing_zero, 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+}
+
+#[tokio::test]
+async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_indeterminate_records_cannot_be_completed_or_committed: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_ind_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let claim = idempotency_claim(
+        '2',
+        '3',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-indeterminate",
+        Some("conversation:flow-a:chat-indeterminate"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency(claim.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    assert!(
+        store
+            .mark_idempotency_indeterminate(
+                &claim.key_hash,
+                &claim.attempt_id,
+                "2026-07-19T12:01:00Z",
+                "2026-07-20T12:01:00Z",
+            )
+            .await
+            .unwrap()
+    );
+
+    let completion = idempotency_completion(&claim, Some("{\"reply\":\"unsafe\"}"));
+    assert!(matches!(
+        store.complete_idempotency(completion.clone(), 1024).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    let conversation = ConversationRecord {
+        id: "chat-indeterminate".into(),
+        flow_name: "chat".into(),
+        flow_path: Some("flow-a".into()),
+        agent_name: "assistant".into(),
+        messages: vec![ChatMessage::user("must not persist")],
+        created_at: "2026-07-19T12:00:00Z".into(),
+        updated_at: "2026-07-19T12:01:00Z".into(),
+        revision: 0,
+    };
+    assert!(matches!(
+        store
+            .commit_conversation_idempotency(completion, &conversation, 1024)
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    assert!(
+        store
+            .get_conversation(Some("flow-a"), "chat-indeterminate")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &claim.key_hash,
+                &claim.request_fingerprint,
+                "2026-07-19T12:02:00Z",
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Indeterminate(_)
+    ));
+}
+
+#[tokio::test]
+async fn pg_idempotency_retention_prunes_only_terminal_records() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_idempotency_retention_prunes_only_terminal_records: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_ret_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let expired = idempotency_claim(
+        'c',
+        'd',
+        CONVERSATION_MESSAGE_OPERATION,
+        "expired",
+        Some("conversation:flow-a:expired"),
+        Some(0),
+        "2026-07-19T12:10:00Z",
+    );
+    let live = idempotency_claim(
+        'd',
+        'e',
+        RUN_OPERATION,
+        "live-run",
+        None,
+        None,
+        "2026-07-19T12:10:00Z",
+    );
+    store
+        .claim_idempotency(expired.clone(), 100, 10)
+        .await
+        .unwrap();
+    store
+        .claim_idempotency(live.clone(), 100, 10)
+        .await
+        .unwrap();
+    let mut completion = idempotency_completion(&expired, Some("{}"));
+    completion.expires_at = "2026-07-19T12:02:00Z".into();
+    store.complete_idempotency(completion, 1024).await.unwrap();
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &expired.key_hash,
+                &expired.request_fingerprint,
+                "9999-07-19T12:03:00Z"
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Replay(_)
+    ));
+    expire_idempotency_retention(&url, prefix, &expired.key_hash).await;
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &expired.key_hash,
+                &expired.request_fingerprint,
+                "1900-07-19T12:03:00Z"
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Miss
+    ));
+    assert_eq!(
+        store
+            .prune_idempotency("1900-07-19T12:03:00Z", 1)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        store
+            .lookup_idempotency(
+                &live.key_hash,
+                &live.request_fingerprint,
+                "9999-07-19T12:03:00Z"
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::InProgress(_)
+    ));
+
+    let replacement = idempotency_claim(
+        'c',
+        'f',
+        RUN_OPERATION,
+        "replacement-run",
+        None,
+        None,
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store.claim_idempotency(replacement, 2, 0).await.unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+}
+
+#[tokio::test]
+async fn pg_run_claim_enforces_aggregate_response_budget_before_terminalization() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_claim_enforces_aggregate_response_budget_before_terminalization: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_budget_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let first_body = "{\"run_id\":\"budget-run-a\"}";
+    let second_body = "{\"run_id\":\"budget-run-b\"}";
+    let aggregate_cap = first_body.len();
+
+    let mut first = idempotency_claim(
+        '2',
+        '3',
+        RUN_OPERATION,
+        "budget-run-a",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    first.response_status = Some(202);
+    first.response_body = Some(first_body.into());
+    first.max_total_response_bytes = aggregate_cap;
+    let mut second = idempotency_claim(
+        '3',
+        '4',
+        RUN_OPERATION,
+        "budget-run-b",
+        None,
+        None,
+        "1900-01-01T00:00:00Z",
+    );
+    second.response_status = Some(202);
+    second.response_body = Some(second_body.into());
+    second.max_total_response_bytes = aggregate_cap;
+
+    match store
+        .claim_idempotency(first.clone(), 100, 10)
+        .await
+        .unwrap()
+    {
+        IdempotencyClaimOutcome::Claimed(record) => {
+            assert_eq!(record.response_status, Some(202));
+            assert_eq!(record.response_body.as_deref(), Some(first_body));
+        }
+        other => panic!("expected first budgeted claim, got {other:?}"),
+    }
+    match store
+        .claim_idempotency(second.clone(), 100, 10)
+        .await
+        .unwrap()
+    {
+        IdempotencyClaimOutcome::Claimed(record) => {
+            assert_eq!(record.response_status, Some(202));
+            assert!(record.response_body.is_none());
+        }
+        other => panic!("expected tombstoned second claim, got {other:?}"),
+    }
+
+    for (run_id, finished_at) in [
+        ("budget-run-a", "2026-07-19T12:01:00Z"),
+        ("budget-run-b", "2026-07-19T12:02:00Z"),
+    ] {
+        store
+            .save_run_intent(intent(run_id, "flow-a", "2026-07-19T12:00:00Z", vec![]))
+            .await
+            .unwrap();
+        store
+            .update_run_completion(
+                run_id,
+                RunCompletion {
+                    status: RunStatus::Success,
+                    finished_at: finished_at.into(),
+                    duration_ms: 1,
+                    task_results: vec![],
+                    total_tokens: 0,
+                    cached_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    match store
+        .lookup_idempotency(
+            &first.key_hash,
+            &first.request_fingerprint,
+            "9999-12-31T23:59:59Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => {
+            assert_eq!(record.state, IdempotencyState::Completed);
+            assert_eq!(record.response_body.as_deref(), Some(first_body));
+        }
+        other => panic!("expected retained run replay, got {other:?}"),
+    }
+    match store
+        .lookup_idempotency(
+            &second.key_hash,
+            &second.request_fingerprint,
+            "1900-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Indeterminate(record) => {
+            assert_eq!(record.state, IdempotencyState::Completed);
+            assert_eq!(record.response_status, Some(202));
+            assert!(record.response_body.is_none());
+        }
+        other => panic!("expected non-replayable run tombstone, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_run_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut live = idempotency_claim(
+        'e',
+        'a',
+        RUN_OPERATION,
+        "mapped-run",
+        None,
+        None,
+        "2026-07-19T12:10:00Z",
+    );
+    live.response_status = Some(202);
+    live.response_body = Some("{\"run_id\":\"mapped-run\"}".into());
+    store
+        .claim_idempotency(live.clone(), 100, 10)
+        .await
+        .unwrap();
+    store
+        .save_run_intent(intent(
+            "mapped-run",
+            "flow-a",
+            "2026-07-19T12:00:01Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    match store
+        .lookup_idempotency(
+            &live.key_hash,
+            &live.request_fingerprint,
+            "2026-07-19T12:00:02Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => assert_eq!(record.state, IdempotencyState::Running),
+        other => panic!("expected running replay, got {other:?}"),
+    }
+    store
+        .update_run_completion(
+            "mapped-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-07-19T12:01:00Z".into(),
+                duration_ms: 59_000,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    match store
+        .lookup_idempotency(
+            &live.key_hash,
+            &live.request_fingerprint,
+            "2026-07-19T12:02:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => assert_eq!(record.state, IdempotencyState::Completed),
+        other => panic!("expected completed replay, got {other:?}"),
+    }
+
+    let mut orphan = idempotency_claim(
+        'f',
+        'b',
+        RUN_OPERATION,
+        "orphan-run",
+        None,
+        None,
+        "2026-07-19T11:59:00Z",
+    );
+    orphan.response_status = Some(202);
+    orphan.response_body = Some("{\"run_id\":\"orphan-run\"}".into());
+    store
+        .claim_idempotency(orphan.clone(), 100, 10)
+        .await
+        .unwrap();
+    expire_idempotency_lease(&url, prefix, &orphan.key_hash).await;
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("1900-07-19T12:05:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_run("orphan-run").await.unwrap().status,
+        RunStatus::Abandoned
+    );
+    match store
+        .lookup_idempotency(
+            &orphan.key_hash,
+            &orphan.request_fingerprint,
+            "9999-07-19T12:06:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => assert_eq!(record.state, IdempotencyState::Completed),
+        other => panic!("expected orphan replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pg_run_intent_hydrates_only_linked_provisional_row() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_intent_hydrates_only_linked_provisional_row: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_hydrate_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut claim = idempotency_claim(
+        'c',
+        'd',
+        RUN_OPERATION,
+        "provisional-run",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    claim.response_status = Some(202);
+    claim.response_body = Some("{\"run_id\":\"provisional-run\"}".into());
+    assert!(matches!(
+        store
+            .claim_idempotency(claim.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let provisional = RunIntent {
+        suggested_id: Some("provisional-run".into()),
+        flow_name: "provisional".into(),
+        flow: "flow-a".into(),
+        started_at: "1900-01-01T00:00:00Z".into(),
+        agent_count: 0,
+        task_count: 0,
+        tags: vec!["provisional".into()],
+    };
+    assert_eq!(
+        store.save_run_intent(provisional).await.unwrap(),
+        "provisional-run"
+    );
+    let hydrated = RunIntent {
+        suggested_id: Some("provisional-run".into()),
+        flow_name: "hydrated".into(),
+        flow: "flow-a".into(),
+        started_at: "9999-01-01T00:00:00Z".into(),
+        agent_count: 3,
+        task_count: 4,
+        tags: vec!["hydrated".into()],
+    };
+    assert_eq!(
+        store.save_run_intent(hydrated).await.unwrap(),
+        "provisional-run"
+    );
+    let run = store.get_run("provisional-run").await.unwrap();
+    assert_eq!(run.flow_name, "hydrated");
+    assert_eq!(run.agent_count, 3);
+    assert_eq!(run.task_count, 4);
+    assert_eq!(run.tags, vec!["hydrated"]);
+    assert_eq!(run.started_at, "1900-01-01T00:00:00Z");
+
+    store
+        .complete_idempotency(idempotency_completion(&claim, Some("{}")), 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .save_run_intent(RunIntent {
+                suggested_id: Some("provisional-run".into()),
+                flow_name: "hydrated-completed".into(),
+                flow: "flow-a".into(),
+                started_at: "9999-01-01T00:00:00Z".into(),
+                agent_count: 5,
+                task_count: 6,
+                tags: vec!["completed-ledger".into()],
+            })
+            .await
+            .unwrap(),
+        "provisional-run"
+    );
+    let run = store.get_run("provisional-run").await.unwrap();
+    assert_eq!(run.flow_name, "hydrated-completed");
+    assert_eq!(run.agent_count, 5);
+    assert_eq!(run.task_count, 6);
+
+    let other_owner = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        other_owner
+            .save_run_intent(intent(
+                "provisional-run",
+                "flow-a",
+                "2026-07-19T12:00:00Z",
+                vec![],
+            ))
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    store
+        .save_run_intent(intent(
+            "ordinary-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec!["first".into()],
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .save_run_intent(intent(
+                "ordinary-run",
+                "flow-a",
+                "2026-07-19T12:00:01Z",
+                vec!["duplicate".into()],
+            ))
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_run("ordinary-run").await.unwrap().tags,
+        vec!["first"]
+    );
+}
+
+#[tokio::test]
+async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_idempotent_run_heartbeat_renews_both_fences_only: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_fence_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut claim = idempotency_claim(
+        'd',
+        'e',
+        RUN_OPERATION,
+        "fenced-run",
+        None,
+        None,
+        "1900-01-01T00:00:01Z",
+    );
+    claim.response_status = Some(202);
+    claim.response_body = Some("{\"run_id\":\"fenced-run\"}".into());
+    assert!(matches!(
+        store
+            .claim_idempotency(claim.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    assert_eq!(
+        store
+            .heartbeat_idempotent_run(
+                "fenced-run",
+                &claim.key_hash,
+                &claim.attempt_id,
+                "9999-12-31T23:59:59Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Owned
+    );
+    let database_now = postgres_now(&url).await;
+    let claimed_record = match store
+        .lookup_idempotency(
+            &claim.key_hash,
+            &claim.request_fingerprint,
+            "9999-12-31T23:59:59Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::InProgress(record) => record,
+        other => panic!("expected claimed fence after heartbeat, got {other:?}"),
+    };
+    let claimed_deadline = chrono::DateTime::parse_from_rfc3339(&claimed_record.lease_expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(claimed_deadline > database_now + chrono::Duration::seconds(55));
+    assert!(claimed_deadline <= database_now + chrono::Duration::seconds(60));
+
+    store
+        .save_run_intent(intent(
+            "fenced-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    store
+        .save_run_intent(intent(
+            "ordinary-heartbeat-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "fenced-run").await;
+    expire_idempotency_lease(&url, prefix, &claim.key_hash).await;
+    expire_run_lease(&url, prefix, "ordinary-heartbeat-run").await;
+
+    assert_eq!(store.heartbeat_owned_runs().await.unwrap(), 1);
+    let linked_run_before = store.get_run("fenced-run").await.unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&linked_run_before.lease_expires_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            <= postgres_now(&url).await
+    );
+    let ordinary_run = store.get_run("ordinary-heartbeat-run").await.unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&ordinary_run.lease_expires_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            > postgres_now(&url).await
+    );
+
+    assert!(matches!(
+        store
+            .heartbeat_idempotent_run(
+                "fenced-run",
+                &claim.key_hash,
+                "wrong-attempt",
+                "1900-01-01T00:00:00Z",
+            )
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    let other_owner = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        other_owner
+            .heartbeat_idempotent_run(
+                "fenced-run",
+                &claim.key_hash,
+                &claim.attempt_id,
+                "9999-12-31T23:59:59Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Lost
+    );
+
+    assert_eq!(
+        store
+            .heartbeat_idempotent_run(
+                "fenced-run",
+                &claim.key_hash,
+                &claim.attempt_id,
+                "1900-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Owned
+    );
+    let linked_run = store.get_run("fenced-run").await.unwrap();
+    let linked_ledger = match store
+        .lookup_idempotency(
+            &claim.key_hash,
+            &claim.request_fingerprint,
+            "9999-12-31T23:59:59Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => record,
+        other => panic!("expected running replay after coupled heartbeat, got {other:?}"),
+    };
+    assert_eq!(linked_ledger.state, IdempotencyState::Running);
+    assert_eq!(linked_run.lease_expires_at, linked_ledger.lease_expires_at);
+
+    store
+        .update_run_completion(
+            "fenced-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "9999-01-01T00:00:00Z".into(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .heartbeat_idempotent_run(
+                "fenced-run",
+                &claim.key_hash,
+                &claim.attempt_id,
+                "1900-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Terminal(RunStatus::Success)
+    );
+
+    let mut completed_without_run = idempotency_claim(
+        'e',
+        'f',
+        RUN_OPERATION,
+        "no-run",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    completed_without_run.response_status = Some(202);
+    completed_without_run.response_body = Some("{\"run_id\":\"no-run\"}".into());
+    store
+        .claim_idempotency(completed_without_run.clone(), 100, 10)
+        .await
+        .unwrap();
+    store
+        .complete_idempotency(
+            idempotency_completion(&completed_without_run, Some("{}")),
+            1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .heartbeat_idempotent_run(
+                "no-run",
+                &completed_without_run.key_hash,
+                &completed_without_run.attempt_id,
+                "1900-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Lost
+    );
+    assert_eq!(
+        store
+            .heartbeat_idempotent_run(
+                "missing-run",
+                &digest('f'),
+                "missing-attempt",
+                "9999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        RunFenceHeartbeat::Lost
     );
 }

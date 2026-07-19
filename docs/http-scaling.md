@@ -45,12 +45,13 @@ Related knobs:
 
 ## What actually consumes memory
 
-For HTTP traffic, memory pressure usually comes from four places:
+For HTTP traffic, memory pressure usually comes from five places:
 
 1. Active chat sessions
 2. SSE replay buffers
 3. Large tool/model outputs held in memory
 4. Concurrent in-flight requests
+5. Temporary idempotency-response serialization buffers
 
 ### Active chat sessions
 
@@ -85,6 +86,18 @@ sensitive, lower the relevant caps from the cloud defaults.
 `IRONCREW_MAX_ACTIVE_CONVERSATIONS` does not limit simultaneous LLM calls. Ten
 active sessions can still overload CPU or provider quotas if all ten send
 messages at once. Treat residency and concurrency as separate control planes.
+
+### Idempotency response buffers
+
+Keyed run responses are tiny, but a completed chat response can approach the
+provider output limit. IronCrew serializes at most
+`IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` for one completion and stores at most
+`IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` across retained records. The
+aggregate is database/disk payload rather than permanently resident Rust heap;
+the per-response value is the relevant transient RAM ceiling. For the 1 GiB
+Railway/OpenShift baseline, use 4 MiB per response and 64 MiB aggregate, and
+keep the provider output cap no larger than the per-response cap if every reply
+must be replayable.
 
 ---
 
@@ -139,6 +152,8 @@ IRONCREW_EVENT_CHANNEL_CAPACITY=8
 IRONCREW_MAX_SSE_CONNECTIONS=8
 IRONCREW_DEFAULT_MAX_CONCURRENT=1
 IRONCREW_MAX_CONCURRENT_TASKS=2
+IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=2097152
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=33554432
 ```
 
 ### Medium instance
@@ -163,6 +178,8 @@ IRONCREW_EVENT_CHANNEL_CAPACITY=8
 IRONCREW_MAX_SSE_CONNECTIONS=16
 IRONCREW_DEFAULT_MAX_CONCURRENT=2
 IRONCREW_MAX_CONCURRENT_TASKS=4
+IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=4194304
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=67108864
 ```
 
 ### Large instance
@@ -187,6 +204,8 @@ IRONCREW_EVENT_CHANNEL_CAPACITY=16
 IRONCREW_MAX_SSE_CONNECTIONS=32
 IRONCREW_DEFAULT_MAX_CONCURRENT=4
 IRONCREW_MAX_CONCURRENT_TASKS=8
+IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=8388608
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=268435456
 ```
 
 Do not treat the large profile as validated capacity. Raise it only after a
@@ -244,6 +263,10 @@ objects remain process-local:
 - pending human questions and answers
 - conversation Lua VMs and per-session locks
 - SSE broadcast/replay state
+
+The PostgreSQL idempotency ledger does coordinate duplicate run/message claims
+across processes, but it does not move any of those live objects to the pod
+that receives a replay or follow-up request.
 
 Another replica can therefore return `404` for a live object that exists in the
 first process. Sticky sessions reduce routing mistakes but do not provide

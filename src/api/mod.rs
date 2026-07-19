@@ -2,6 +2,7 @@ pub mod audit;
 pub mod auth;
 pub mod conversations;
 pub mod handlers;
+pub mod idempotency;
 
 use axum::{
     Router,
@@ -86,6 +87,9 @@ pub struct AppState {
     /// Coalesces unauthenticated readiness probes and caches the expensive
     /// storage/schema result for a short interval.
     pub readiness_cache: tokio::sync::Mutex<Option<CachedReadiness>>,
+    /// Immutable, boot-validated limits for the durable HTTP idempotency
+    /// ledger. Keeping these in state avoids environment reads per request.
+    pub idempotency: idempotency::IdempotencyConfig,
     /// Server-wide persistence singleton. Bootstrapped once at
     /// `cmd_serve` startup and reused across every handler so Postgres
     /// migrations / table checks don't re-run per request, and so every
@@ -139,7 +143,7 @@ pub struct ListRunsResponse {
 }
 
 /// Error response
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }

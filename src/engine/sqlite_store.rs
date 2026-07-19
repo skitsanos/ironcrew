@@ -4,10 +4,19 @@ use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::idempotency::{
+    CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
+    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+    validate_digest,
+};
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
+    validate_run_id,
 };
-use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
+use super::sessions::{
+    ConversationRecord, ConversationSummary, DialogStateRecord, validate_session_id,
+};
 use super::store::{RunLeaseConfig, StateStore};
 use super::store_sql::{self, Dialect, SqlParam};
 use crate::utils::error::{IronCrewError, Result};
@@ -115,7 +124,41 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp_desc
                 ON audit_events (timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_events_flow_path
-                ON audit_events (flow_path);",
+                ON audit_events (flow_path);
+
+            CREATE TABLE IF NOT EXISTS idempotency (
+                key_hash            TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                operation           TEXT NOT NULL,
+                scope               TEXT NOT NULL,
+                resource_id         TEXT NOT NULL,
+                exclusive_scope     TEXT,
+                attempt_id          TEXT NOT NULL,
+                owner_instance_id   TEXT NOT NULL,
+                base_revision       INTEGER,
+                state               TEXT NOT NULL,
+                response_status     INTEGER,
+                response_body       TEXT,
+                lease_expires_at    TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                completed_at        TEXT,
+                expires_at          TEXT,
+                ttl_seconds         INTEGER NOT NULL,
+                CHECK (state IN ('claimed', 'running', 'completed', 'indeterminate')),
+                CHECK (response_status IS NULL OR response_status BETWEEN 100 AND 599),
+                CHECK (ttl_seconds > 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_idempotency_expires_at
+                ON idempotency (expires_at);
+            CREATE INDEX IF NOT EXISTS idx_idempotency_resource
+                ON idempotency (operation, scope, resource_id);
+            CREATE INDEX IF NOT EXISTS idx_idempotency_exclusive_scope
+                ON idempotency (exclusive_scope);
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_idempotency_active_exclusive_scope
+                ON idempotency (exclusive_scope)
+                WHERE exclusive_scope IS NOT NULL
+                  AND state IN ('claimed', 'running');",
         )
         .map_err(|e| IronCrewError::Validation(format!("Failed to create SQLite tables: {}", e)))?;
 
@@ -316,41 +359,713 @@ fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError
     }
 }
 
+const IDEMPOTENCY_SELECT_COLUMNS: &str = "key_hash, request_fingerprint, operation, scope, resource_id, exclusive_scope, \
+     attempt_id, owner_instance_id, base_revision, state, response_status, response_body, \
+     lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds";
+
+fn sqlite_idempotency_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdempotencyRecord> {
+    let state_raw: String = row.get(9)?;
+    let state = state_raw.parse::<IdempotencyState>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let base_revision = row
+        .get::<_, Option<i64>>(8)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, i64::MIN))?;
+    let response_status = row
+        .get::<_, Option<i64>>(10)?
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, i64::MIN))?;
+    let ttl_seconds = u64::try_from(row.get::<_, i64>(17)?)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, i64::MIN))?;
+    Ok(IdempotencyRecord {
+        key_hash: row.get(0)?,
+        request_fingerprint: row.get(1)?,
+        operation: row.get(2)?,
+        scope: row.get(3)?,
+        resource_id: row.get(4)?,
+        exclusive_scope: row.get(5)?,
+        attempt_id: row.get(6)?,
+        owner_instance_id: row.get(7)?,
+        base_revision,
+        state,
+        response_status,
+        response_body: row.get(11)?,
+        lease_expires_at: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        completed_at: row.get(15)?,
+        expires_at: row.get(16)?,
+        ttl_seconds,
+    })
+}
+
+fn sqlite_idempotency_record(
+    conn: &rusqlite::Connection,
+    key_hash: &str,
+) -> Result<Option<IdempotencyRecord>> {
+    let sql = format!("SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency WHERE key_hash = ?1");
+    match conn.query_row(&sql, rusqlite::params![key_hash], sqlite_idempotency_row) {
+        Ok(record) => {
+            record.validate()?;
+            Ok(Some(record))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(IronCrewError::Validation(format!(
+            "SQLite idempotency query error: {error}"
+        ))),
+    }
+}
+
+fn sqlite_active_exclusive_record(
+    conn: &rusqlite::Connection,
+    exclusive_scope: &str,
+) -> Result<Option<IdempotencyRecord>> {
+    let sql = format!(
+        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+         WHERE exclusive_scope = ?1 AND state IN ('claimed', 'running')"
+    );
+    match conn.query_row(
+        &sql,
+        rusqlite::params![exclusive_scope],
+        sqlite_idempotency_row,
+    ) {
+        Ok(record) => {
+            record.validate()?;
+            Ok(Some(record))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(IronCrewError::Validation(format!(
+            "SQLite active idempotency query error: {error}"
+        ))),
+    }
+}
+
+fn sqlite_indeterminate_exclusive_records(
+    conn: &rusqlite::Connection,
+    exclusive_scope: &str,
+) -> Result<Vec<IdempotencyRecord>> {
+    let sql = format!(
+        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+         WHERE exclusive_scope = ?1 AND state = 'indeterminate'"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "SQLite indeterminate idempotency hazard prepare error: {error}"
+        ))
+    })?;
+    let rows = statement
+        .query_map(rusqlite::params![exclusive_scope], sqlite_idempotency_row)
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite indeterminate idempotency hazard query error: {error}"
+            ))
+        })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let record = row.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite indeterminate idempotency hazard row error: {error}"
+            ))
+        })?;
+        record.validate()?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn sqlite_parse_idempotency_time(
+    label: &str,
+    value: &str,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|error| IronCrewError::Validation(format!("{label} is not RFC3339: {error}")))
+}
+
+fn sqlite_deadline_passed(deadline: &str, now: &str) -> Result<bool> {
+    Ok(
+        sqlite_parse_idempotency_time("idempotency deadline", deadline)?
+            <= sqlite_parse_idempotency_time("idempotency current time", now)?,
+    )
+}
+
+fn sqlite_recovery_grace_elapsed(
+    hazard: &IdempotencyRecord,
+    claim_time: &str,
+    ttl: std::time::Duration,
+) -> Result<bool> {
+    let marked_at = hazard
+        .completed_at
+        .as_deref()
+        .unwrap_or(hazard.updated_at.as_str());
+    let marked_at = sqlite_parse_idempotency_time("idempotency hazard time", marked_at)?;
+    let claim_time = sqlite_parse_idempotency_time("idempotency recovery claim time", claim_time)?;
+    let grace = chrono::Duration::from_std(ttl).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Idempotency recovery grace is out of range: {error}"
+        ))
+    })?;
+    let recovery_at = marked_at.checked_add_signed(grace).ok_or_else(|| {
+        IronCrewError::Validation("Idempotency recovery grace deadline overflow".into())
+    })?;
+    Ok(claim_time >= recovery_at)
+}
+
+fn sqlite_later_lease(existing: &str, proposed: &str) -> Result<String> {
+    if existing.is_empty() {
+        return Ok(proposed.to_string());
+    }
+    let existing_time = sqlite_parse_idempotency_time("existing run lease expiry", existing)?;
+    let proposed_time = sqlite_parse_idempotency_time("proposed run lease expiry", proposed)?;
+    Ok(if existing_time >= proposed_time {
+        existing.to_string()
+    } else {
+        proposed.to_string()
+    })
+}
+
+fn sqlite_retention_expiry(now: &str, ttl_seconds: u64) -> Result<String> {
+    let now = sqlite_parse_idempotency_time("idempotency current time", now)?;
+    let ttl = i64::try_from(ttl_seconds)
+        .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?;
+    now.checked_add_signed(chrono::Duration::seconds(ttl))
+        .ok_or_else(|| IronCrewError::Validation("Idempotency retention expiry overflow".into()))
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn sqlite_prune_idempotency(conn: &rusqlite::Connection, now: &str, limit: usize) -> Result<usize> {
+    sqlite_parse_idempotency_time("idempotency prune time", now)?;
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT key_hash, expires_at FROM idempotency \
+             WHERE state IN ('completed', 'indeterminate') AND expires_at IS NOT NULL",
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!("SQLite idempotency prune prepare error: {error}"))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            IronCrewError::Validation(format!("SQLite idempotency prune query error: {error}"))
+        })?;
+    let mut expired = Vec::new();
+    for row in rows {
+        let (key_hash, expires_at) = row.map_err(|error| {
+            IronCrewError::Validation(format!("SQLite idempotency prune row error: {error}"))
+        })?;
+        if sqlite_deadline_passed(&expires_at, now)? {
+            expired.push((expires_at, key_hash));
+        }
+    }
+    drop(statement);
+    expired.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut removed = 0usize;
+    for (_, key_hash) in expired.into_iter().take(limit) {
+        removed += conn
+            .execute(
+                "DELETE FROM idempotency WHERE key_hash = ?1",
+                rusqlite::params![key_hash],
+            )
+            .map_err(|error| {
+                IronCrewError::Validation(format!("SQLite idempotency prune error: {error}"))
+            })?;
+    }
+    Ok(removed)
+}
+
+fn sqlite_response_bytes(conn: &rusqlite::Connection, except_key_hash: &str) -> Result<usize> {
+    let total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
+             FROM idempotency WHERE key_hash != ?1 AND response_body IS NOT NULL",
+            rusqlite::params![except_key_hash],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite idempotency response byte query error: {error}"
+            ))
+        })?;
+    usize::try_from(total).map_err(|_| {
+        IronCrewError::Validation("Idempotency response byte total is out of range".into())
+    })
+}
+
+fn sqlite_completion_fence(
+    record: &IdempotencyRecord,
+    completion: &IdempotencyCompletion,
+) -> Result<()> {
+    if record.request_fingerprint != completion.request_fingerprint
+        || record.attempt_id != completion.attempt_id
+        || record.owner_instance_id != completion.owner_instance_id
+    {
+        return Err(IronCrewError::Conflict(
+            "Idempotency operation changed before completion".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_write_indeterminate(
+    conn: &rusqlite::Connection,
+    record: &mut IdempotencyRecord,
+    completed_at: &str,
+    expires_at: &str,
+) -> Result<()> {
+    record.state = IdempotencyState::Indeterminate;
+    record.response_status = None;
+    record.response_body = None;
+    record.updated_at = completed_at.to_string();
+    record.completed_at = Some(completed_at.to_string());
+    record.expires_at = Some(expires_at.to_string());
+    record.validate()?;
+    let changed = conn
+        .execute(
+            "UPDATE idempotency SET state = 'indeterminate', response_status = NULL, \
+             response_body = NULL, updated_at = ?1, completed_at = ?1, expires_at = ?2 \
+             WHERE key_hash = ?3 AND attempt_id = ?4 \
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![
+                completed_at,
+                expires_at,
+                &record.key_hash,
+                &record.attempt_id
+            ],
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite idempotency indeterminate update error: {error}"
+            ))
+        })?;
+    if changed != 1 {
+        return Err(IronCrewError::Conflict(
+            "Idempotency operation changed during indeterminate transition".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_active_conversation_idempotency(
+    conn: &rusqlite::Connection,
+    flow_path: Option<&str>,
+    resource_id: &str,
+    any_scope_when_none: bool,
+) -> Result<bool> {
+    let count: i64 = if flow_path.is_none() && any_scope_when_none {
+        conn.query_row(
+            "SELECT COUNT(*) FROM idempotency \
+             WHERE operation = ?1 AND resource_id = ?2 \
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![CONVERSATION_MESSAGE_OPERATION, resource_id],
+            |row| row.get(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM idempotency \
+             WHERE operation = ?1 AND scope = ?2 AND resource_id = ?3 \
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![
+                CONVERSATION_MESSAGE_OPERATION,
+                flow_path.unwrap_or(""),
+                resource_id
+            ],
+            |row| row.get(0),
+        )
+    }
+    .map_err(|error| {
+        IronCrewError::Validation(format!(
+            "SQLite active conversation idempotency query error: {error}"
+        ))
+    })?;
+    Ok(count > 0)
+}
+
+fn sqlite_complete_run_idempotency(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    completed_at: &str,
+) -> Result<usize> {
+    sqlite_parse_idempotency_time("run idempotency completion time", completed_at)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT key_hash, ttl_seconds FROM idempotency \
+             WHERE operation = ?1 AND resource_id = ?2 \
+               AND state IN ('claimed', 'running', 'indeterminate')",
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite run idempotency completion prepare error: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(rusqlite::params![RUN_OPERATION, run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite run idempotency completion query error: {error}"
+            ))
+        })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (key_hash, ttl) = row.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite run idempotency completion row error: {error}"
+            ))
+        })?;
+        records.push((
+            key_hash,
+            u64::try_from(ttl)
+                .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?,
+        ));
+    }
+    drop(statement);
+
+    let mut changed = 0usize;
+    for (key_hash, ttl_seconds) in records {
+        let expires_at = sqlite_retention_expiry(completed_at, ttl_seconds)?;
+        changed = changed.saturating_add(
+            conn.execute(
+                "UPDATE idempotency SET state = 'completed', lease_expires_at = '', \
+                 updated_at = ?1, completed_at = ?1, expires_at = ?2 \
+                 WHERE key_hash = ?3 \
+                   AND state IN ('claimed', 'running', 'indeterminate')",
+                rusqlite::params![completed_at, expires_at, key_hash],
+            )
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "SQLite run idempotency completion update error: {error}"
+                ))
+            })?,
+        );
+    }
+    Ok(changed)
+}
+
+fn sqlite_complete_terminal_run_idempotency(conn: &rusqlite::Connection) -> Result<usize> {
+    let mut statement = conn
+        .prepare(
+            "SELECT idem.key_hash, idem.ttl_seconds, run.finished_at \
+             FROM idempotency AS idem \
+             JOIN runs AS run ON run.run_id = idem.resource_id \
+             WHERE idem.operation = ?1 \
+               AND idem.state IN ('claimed', 'running', 'indeterminate') \
+               AND run.status NOT IN ('running', 'waiting_for_input')",
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite reconciled run idempotency prepare error: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(rusqlite::params![RUN_OPERATION], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite reconciled run idempotency query error: {error}"
+            ))
+        })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (key_hash, ttl, finished_at) = row.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite reconciled run idempotency row error: {error}"
+            ))
+        })?;
+        records.push((
+            key_hash,
+            u64::try_from(ttl)
+                .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?,
+            finished_at,
+        ));
+    }
+    drop(statement);
+
+    let mut changed = 0usize;
+    for (key_hash, ttl_seconds, finished_at) in records {
+        let expires_at = sqlite_retention_expiry(&finished_at, ttl_seconds)?;
+        changed = changed.saturating_add(
+            conn.execute(
+                "UPDATE idempotency SET state = 'completed', lease_expires_at = '', \
+                 updated_at = ?1, completed_at = ?1, expires_at = ?2 \
+                 WHERE key_hash = ?3 \
+                   AND state IN ('claimed', 'running', 'indeterminate')",
+                rusqlite::params![finished_at, expires_at, key_hash],
+            )
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "SQLite reconciled run idempotency update error: {error}"
+                ))
+            })?,
+        );
+    }
+    Ok(changed)
+}
+
+fn sqlite_reconcile_expired_conversation_idempotency(
+    conn: &rusqlite::Connection,
+    now: &str,
+) -> Result<usize> {
+    let sql = format!(
+        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+         WHERE operation = ?1 AND state IN ('claimed', 'running')"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "SQLite conversation idempotency reconciliation prepare error: {error}"
+        ))
+    })?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![CONVERSATION_MESSAGE_OPERATION],
+            sqlite_idempotency_row,
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite conversation idempotency reconciliation query error: {error}"
+            ))
+        })?;
+    let mut expired = Vec::new();
+    for row in rows {
+        let record = row.map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite conversation idempotency reconciliation row error: {error}"
+            ))
+        })?;
+        record.validate()?;
+        if sqlite_deadline_passed(&record.lease_expires_at, now)? {
+            expired.push(record);
+        }
+    }
+    drop(statement);
+
+    let mut changed = 0usize;
+    for mut record in expired {
+        let expires_at = sqlite_retention_expiry(now, record.ttl_seconds)?;
+        sqlite_write_indeterminate(conn, &mut record, now, &expires_at)?;
+        changed = changed.saturating_add(1);
+    }
+    Ok(changed)
+}
+
 #[async_trait]
 impl StateStore for SqliteStore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
         let conn = Arc::clone(&self.conn);
         let owner_instance_id = self.lease.instance_id().to_string();
         let lease_expires_at = self.lease.deadline_now();
+        let may_hydrate = intent.suggested_id.is_some();
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
                 let run_id = intent
                     .suggested_id
+                    .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let tags_json = serde_json::to_string(&intent.tags).map_err(|e| {
                     IronCrewError::Validation(format!("Failed to serialize tags: {}", e))
                 })?;
+                let agent_count = i64::try_from(intent.agent_count).map_err(|_| {
+                    IronCrewError::Validation("Agent count is out of range".into())
+                })?;
+                let task_count = i64::try_from(intent.task_count).map_err(|_| {
+                    IronCrewError::Validation("Task count is out of range".into())
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite insert intent transaction error: {error}"
+                        ))
+                    })?;
 
-                conn.execute(
+                let existing = match tx.query_row(
+                    "SELECT status, flow, owner_instance_id, lease_expires_at \
+                     FROM runs WHERE run_id = ?1",
+                    rusqlite::params![&run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                ) {
+                    Ok(existing) => Some(existing),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => {
+                        return Err(IronCrewError::Validation(format!(
+                            "SQLite existing run intent query error: {error}"
+                        )));
+                    }
+                };
+
+                if let Some((status, flow, owner, existing_lease)) = existing {
+                    let duplicate_error = || {
+                        IronCrewError::Validation(format!("Run '{run_id}' already exists"))
+                    };
+                    if !may_hydrate
+                        || !status.parse::<RunStatus>()?.is_in_flight()
+                        || owner != owner_instance_id
+                        || flow != intent.flow
+                    {
+                        return Err(duplicate_error());
+                    }
+
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT key_hash, state, lease_expires_at FROM idempotency \
+                             WHERE operation = ?1 AND scope = ?2 AND resource_id = ?3 \
+                               AND owner_instance_id = ?4 AND state IN ('running', 'completed')",
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite run hydration ledger prepare error: {error}"
+                            ))
+                        })?;
+                    let rows = statement
+                        .query_map(
+                            rusqlite::params![
+                                RUN_OPERATION,
+                                &intent.flow,
+                                &run_id,
+                                &owner_instance_id,
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                ))
+                            },
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite run hydration ledger query error: {error}"
+                            ))
+                        })?;
+                    let mut ledgers = Vec::new();
+                    for row in rows {
+                        ledgers.push(row.map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite run hydration ledger row error: {error}"
+                            ))
+                        })?);
+                    }
+                    drop(statement);
+                    if ledgers.len() != 1 {
+                        return Err(duplicate_error());
+                    }
+                    let (ledger_key, ledger_state, ledger_lease) =
+                        ledgers.pop().ok_or_else(duplicate_error)?;
+                    let ledger_state = ledger_state.parse::<IdempotencyState>()?;
+                    let mut hydrated_lease =
+                        sqlite_later_lease(&existing_lease, &lease_expires_at)?;
+                    if ledger_state == IdempotencyState::Running {
+                        hydrated_lease = sqlite_later_lease(&hydrated_lease, &ledger_lease)?;
+                        tx.execute(
+                            "UPDATE idempotency SET lease_expires_at = ?1 \
+                             WHERE key_hash = ?2 AND state = 'running'",
+                            rusqlite::params![&hydrated_lease, &ledger_key],
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite run hydration ledger update error: {error}"
+                            ))
+                        })?;
+                    }
+                    let changed = tx
+                        .execute(
+                            "UPDATE runs SET flow_name = ?1, agent_count = ?2, task_count = ?3, \
+                             tags = ?4, lease_expires_at = ?5 \
+                             WHERE run_id = ?6 AND owner_instance_id = ?7 \
+                               AND status IN ('running', 'waiting_for_input')",
+                            rusqlite::params![
+                                &intent.flow_name,
+                                agent_count,
+                                task_count,
+                                &tags_json,
+                                &hydrated_lease,
+                                &run_id,
+                                &owner_instance_id,
+                            ],
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite provisional run hydration error: {error}"
+                            ))
+                        })?;
+                    if changed != 1 {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Run '{run_id}' changed during provisional hydration"
+                        )));
+                    }
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite provisional run hydration commit error: {error}"
+                        ))
+                    })?;
+                    tracing::debug!("Provisional run intent hydrated: {run_id}");
+                    return Ok(run_id);
+                }
+
+                tx.execute(
                     "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
                      VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, 0, 0, ?7, ?8, ?9)",
                     rusqlite::params![
-                        run_id,
-                        intent.flow_name,
-                        intent.flow,
-                        intent.started_at,
-                        intent.agent_count as i64,
-                        intent.task_count as i64,
-                        tags_json,
-                        owner_instance_id,
-                        lease_expires_at,
+                        &run_id,
+                        &intent.flow_name,
+                        &intent.flow,
+                        &intent.started_at,
+                        agent_count,
+                        task_count,
+                        &tags_json,
+                        &owner_instance_id,
+                        &lease_expires_at,
                     ],
                 )
                 .map_err(|e| IronCrewError::Validation(format!("SQLite insert intent: {}", e)))?;
+                tx.execute(
+                    "UPDATE idempotency SET state = 'running', lease_expires_at = ?1, \
+                     updated_at = ?2 \
+                     WHERE operation = ?3 AND scope = ?4 AND resource_id = ?5 \
+                       AND owner_instance_id = ?6 AND state = 'claimed'",
+                    rusqlite::params![
+                        &lease_expires_at,
+                        &intent.started_at,
+                        RUN_OPERATION,
+                        &intent.flow,
+                        &run_id,
+                        &owner_instance_id,
+                    ],
+                )
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite run idempotency mapping transition error: {error}"
+                    ))
+                })?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite insert intent commit error: {error}"
+                    ))
+                })?;
                 tracing::debug!("Run intent saved: {}", run_id);
                 Ok(run_id)
             })
@@ -370,7 +1085,7 @@ impl StateStore for SqliteStore {
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
                 let task_results_json =
@@ -380,8 +1095,14 @@ impl StateStore for SqliteStore {
                             e
                         ))
                     })?;
-
-                let rows = conn
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite update completion transaction error: {error}"
+                        ))
+                    })?;
+                let rows = tx
                     .execute(
                         "UPDATE runs
                          SET status = ?1, finished_at = ?2, duration_ms = ?3,
@@ -391,44 +1112,71 @@ impl StateStore for SqliteStore {
                            AND owner_instance_id = ?8",
                         rusqlite::params![
                             completion.status.to_string(),
-                            completion.finished_at,
-                            completion.duration_ms as i64,
-                            task_results_json,
-                            completion.total_tokens as i64,
-                            completion.cached_tokens as i64,
-                            run_id,
-                            owner_instance_id,
+                            &completion.finished_at,
+                            i64::try_from(completion.duration_ms).map_err(|_| {
+                                IronCrewError::Validation("Run duration is out of range".into())
+                            })?,
+                            &task_results_json,
+                            i64::from(completion.total_tokens),
+                            i64::from(completion.cached_tokens),
+                            &run_id,
+                            &owner_instance_id,
                         ],
                     )
                     .map_err(|e| {
                         IronCrewError::Validation(format!("SQLite update completion: {}", e))
                     })?;
 
-                if rows == 0 {
-                    let state = conn.query_row(
-                        "SELECT status, owner_instance_id FROM runs WHERE run_id = ?1",
-                        rusqlite::params![run_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                let (transition, finished_at) = if rows == 0 {
+                    let state = tx.query_row(
+                        "SELECT status, owner_instance_id, finished_at FROM runs WHERE run_id = ?1",
+                        rusqlite::params![&run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
                     );
-                    return match state {
-                        Ok((status, _)) if status.parse::<RunStatus>()?.is_terminal() => {
-                            Ok(RunTransition::AlreadyTerminal(status.parse()?))
+                    match state {
+                        Ok((status, _, stored_finished_at))
+                            if status.parse::<RunStatus>()?.is_terminal() =>
+                        {
+                            (
+                                RunTransition::AlreadyTerminal(status.parse()?),
+                                stored_finished_at,
+                            )
                         }
-                        Ok((_, owner)) => Err(IronCrewError::Validation(format!(
-                            "Run '{}' is owned by instance '{}', not '{}'",
-                            run_id, owner, owner_instance_id
-                        ))),
-                        Err(rusqlite::Error::QueryReturnedNoRows) => Err(
-                            IronCrewError::Validation(format!("Run '{}' not found", run_id)),
-                        ),
-                        Err(e) => Err(IronCrewError::Validation(format!(
-                            "SQLite completion state query: {}",
-                            e
-                        ))),
-                    };
-                }
+                        Ok((_, owner, _)) => {
+                            return Err(IronCrewError::Validation(format!(
+                                "Run '{}' is owned by instance '{}', not '{}'",
+                                run_id, owner, owner_instance_id
+                            )));
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            return Err(IronCrewError::Validation(format!(
+                                "Run '{}' not found",
+                                run_id
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(IronCrewError::Validation(format!(
+                                "SQLite completion state query: {error}"
+                            )));
+                        }
+                    }
+                } else {
+                    (RunTransition::Applied, completion.finished_at.clone())
+                };
+                sqlite_complete_run_idempotency(&tx, &run_id, &finished_at)?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite update completion commit error: {error}"
+                    ))
+                })?;
                 tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
-                Ok(RunTransition::Applied)
+                Ok(transition)
             })
             .await,
         )
@@ -491,16 +1239,32 @@ impl StateStore for SqliteStore {
         let lease_expires_at = self.lease.deadline_now();
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-                conn.execute(
-                    "UPDATE runs SET lease_expires_at = ?1
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite heartbeat transaction error: {error}"
+                        ))
+                    })?;
+                let changed = tx
+                    .execute(
+                        "UPDATE runs SET lease_expires_at = ?1
                      WHERE owner_instance_id = ?2
-                       AND status IN ('running', 'waiting_for_input')",
-                    rusqlite::params![lease_expires_at, owner_instance_id],
-                )
-                .map_err(|e| IronCrewError::Validation(format!("SQLite heartbeat: {}", e)))
+                       AND status IN ('running', 'waiting_for_input')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM idempotency AS idem
+                           WHERE idem.operation = ?3 AND idem.resource_id = runs.run_id
+                       )",
+                        rusqlite::params![&lease_expires_at, &owner_instance_id, RUN_OPERATION],
+                    )
+                    .map_err(|e| IronCrewError::Validation(format!("SQLite heartbeat: {}", e)))?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite heartbeat commit error: {error}"))
+                })?;
+                Ok(changed)
             })
             .await,
         )
@@ -541,19 +1305,51 @@ impl StateStore for SqliteStore {
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-                let rows = conn
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite reconcile transaction error: {error}"
+                        ))
+                    })?;
+                let inserted = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO runs (run_id, flow_name, flow, status, started_at, \
+                         finished_at, duration_ms, task_results, agent_count, task_count, \
+                         total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at) \
+                         SELECT resource_id, scope, scope, 'abandoned', created_at, ?1, 0, '[]', \
+                                0, 0, 0, 0, '[]', owner_instance_id, '' \
+                         FROM idempotency AS idem \
+                         WHERE operation = ?2 AND state = 'claimed' \
+                           AND julianday(lease_expires_at) <= julianday(?3) \
+                           AND NOT EXISTS (SELECT 1 FROM runs WHERE run_id = idem.resource_id)",
+                        rusqlite::params![&now, RUN_OPERATION, &normalized_now],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotent run fallback error: {error}"
+                        ))
+                    })?;
+                let rows = tx
                     .execute(
                         "UPDATE runs
                          SET status = 'abandoned', finished_at = ?1, lease_expires_at = ''
                          WHERE status IN ('running', 'waiting_for_input')
-                           AND (lease_expires_at = '' OR lease_expires_at <= ?2)",
-                        rusqlite::params![now, normalized_now],
+                           AND (lease_expires_at = '' \
+                                OR julianday(lease_expires_at) IS NULL \
+                                OR julianday(lease_expires_at) <= julianday(?2))",
+                        rusqlite::params![&now, &normalized_now],
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite reconcile: {}", e)))?;
-                Ok(rows)
+                sqlite_complete_terminal_run_idempotency(&tx)?;
+                sqlite_reconcile_expired_conversation_idempotency(&tx, &normalized_now)?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite reconcile commit error: {error}"))
+                })?;
+                Ok(inserted.saturating_add(rows))
             })
             .await,
         )
@@ -754,7 +1550,948 @@ impl StateStore for SqliteStore {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup> {
+        validate_digest("idempotency key hash", key_hash)?;
+        validate_digest("request fingerprint", request_fingerprint)?;
+        sqlite_parse_idempotency_time("idempotency current time", now)?;
+        let conn = Arc::clone(&self.conn);
+        let key_hash = key_hash.to_string();
+        let fingerprint = request_fingerprint.to_string();
+        let now = now.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let Some(record) = sqlite_idempotency_record(&conn, &key_hash)? else {
+                    return Ok(IdempotencyLookup::Miss);
+                };
+                if record.request_fingerprint != fingerprint {
+                    return Ok(IdempotencyLookup::Conflict);
+                }
+                if record.state.is_terminal()
+                    && match record.expires_at.as_deref() {
+                        Some(expires) => sqlite_deadline_passed(expires, &now)?,
+                        None => false,
+                    }
+                {
+                    return Ok(IdempotencyLookup::Miss);
+                }
+                if record.state == IdempotencyState::Indeterminate {
+                    return Ok(IdempotencyLookup::Indeterminate(record));
+                }
+                if record.replayable() {
+                    return Ok(IdempotencyLookup::Replay(record));
+                }
+                if record.state.is_in_flight()
+                    && sqlite_deadline_passed(&record.lease_expires_at, &now)?
+                {
+                    return Ok(IdempotencyLookup::Indeterminate(record));
+                }
+                if record.state.is_in_flight() {
+                    return Ok(IdempotencyLookup::InProgress(record));
+                }
+                Ok(IdempotencyLookup::Indeterminate(record))
+            })
+            .await,
+        )
+    }
+
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome> {
+        claim.validate()?;
+        if max_records == 0 {
+            return Err(IronCrewError::Validation(
+                "Idempotency record limit must be positive".into(),
+            ));
+        }
+        let recovery_grace_ttl = self.lease.ttl();
+        let conn = Arc::clone(&self.conn);
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency claim transaction error: {error}"
+                        ))
+                    })?;
+                sqlite_prune_idempotency(&tx, &claim.created_at, prune_batch)?;
+
+                if let Some(mut existing) = sqlite_idempotency_record(&tx, &claim.key_hash)? {
+                    let expired_terminal = existing.state.is_terminal()
+                        && match existing.expires_at.as_deref() {
+                            Some(expires) => sqlite_deadline_passed(expires, &claim.created_at)?,
+                            None => false,
+                        };
+                    if expired_terminal {
+                        tx.execute(
+                            "DELETE FROM idempotency WHERE key_hash = ?1",
+                            rusqlite::params![&claim.key_hash],
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite expired idempotency delete error: {error}"
+                            ))
+                        })?;
+                    } else {
+                        let outcome = if existing.request_fingerprint != claim.request_fingerprint {
+                            IdempotencyClaimOutcome::Conflict
+                        } else if existing.state == IdempotencyState::Indeterminate {
+                            IdempotencyClaimOutcome::Indeterminate(existing)
+                        } else if existing.replayable() {
+                            IdempotencyClaimOutcome::Replay(existing)
+                        } else if existing.state.is_in_flight()
+                            && sqlite_deadline_passed(
+                                &existing.lease_expires_at,
+                                &claim.created_at,
+                            )?
+                        {
+                            let expires_at =
+                                sqlite_retention_expiry(&claim.created_at, existing.ttl_seconds)?;
+                            sqlite_write_indeterminate(
+                                &tx,
+                                &mut existing,
+                                &claim.created_at,
+                                &expires_at,
+                            )?;
+                            IdempotencyClaimOutcome::Indeterminate(existing)
+                        } else if existing.state.is_in_flight() {
+                            IdempotencyClaimOutcome::InProgress(existing)
+                        } else {
+                            IdempotencyClaimOutcome::Indeterminate(existing)
+                        };
+                        tx.commit().map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite idempotency claim commit error: {error}"
+                            ))
+                        })?;
+                        return Ok(outcome);
+                    }
+                }
+
+                let mut recovery_hazard_key = None;
+                if let Some(exclusive_scope) = claim.exclusive_scope.as_deref() {
+                    if let Some(mut existing) =
+                        sqlite_active_exclusive_record(&tx, exclusive_scope)?
+                    {
+                        if sqlite_deadline_passed(&existing.lease_expires_at, &claim.created_at)? {
+                            let expires_at =
+                                sqlite_retention_expiry(&claim.created_at, existing.ttl_seconds)?;
+                            sqlite_write_indeterminate(
+                                &tx,
+                                &mut existing,
+                                &claim.created_at,
+                                &expires_at,
+                            )?;
+                            tx.commit().map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite expired idempotency barrier commit error: {error}"
+                                ))
+                            })?;
+                            return Ok(IdempotencyClaimOutcome::Busy);
+                        }
+                        tx.commit().map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite idempotency busy commit error: {error}"
+                            ))
+                        })?;
+                        return Ok(IdempotencyClaimOutcome::Busy);
+                    }
+
+                    let hazards = sqlite_indeterminate_exclusive_records(&tx, exclusive_scope)?;
+                    if !hazards.is_empty() {
+                        let acknowledged = hazards.len() == 1
+                            && claim.recovery_key_hash.as_deref()
+                                == Some(hazards[0].key_hash.as_str());
+                        if !acknowledged
+                            || !sqlite_recovery_grace_elapsed(
+                                &hazards[0],
+                                &claim.created_at,
+                                recovery_grace_ttl,
+                            )?
+                        {
+                            tx.commit().map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite idempotency hazard barrier commit error: {error}"
+                                ))
+                            })?;
+                            return Ok(IdempotencyClaimOutcome::Busy);
+                        }
+                        recovery_hazard_key = Some(hazards[0].key_hash.clone());
+                    }
+                }
+
+                if claim.operation == CONVERSATION_MESSAGE_OPERATION {
+                    validate_session_id(&claim.resource_id)?;
+                    let expected_revision = claim.base_revision.ok_or_else(|| {
+                        IronCrewError::Validation(
+                            "Conversation idempotency claim has no base revision".into(),
+                        )
+                    })?;
+                    let current_revision = match tx.query_row(
+                        "SELECT revision FROM conversations \
+                         WHERE id = ?1 AND flow_path IS ?2",
+                        rusqlite::params![&claim.resource_id, &claim.scope],
+                        |row| row.get::<_, i64>(0),
+                    ) {
+                        Ok(revision) => u64::try_from(revision).map_err(|_| {
+                            IronCrewError::Validation(
+                                "SQLite conversation revision is negative".into(),
+                            )
+                        })?,
+                        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+                        Err(error) => {
+                            return Err(IronCrewError::Validation(format!(
+                                "SQLite conversation idempotency revision query error: {error}"
+                            )));
+                        }
+                    };
+                    if current_revision != expected_revision {
+                        return Ok(IdempotencyClaimOutcome::Conflict);
+                    }
+                }
+
+                let (count, stored_response_bytes): (i64, i64) = tx
+                    .query_row(
+                        "SELECT COUNT(*), \
+                                COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
+                         FROM idempotency",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency claim aggregate error: {error}"
+                        ))
+                    })?;
+                if usize::try_from(count).unwrap_or(usize::MAX) >= max_records {
+                    return Err(IronCrewError::Validation(format!(
+                        "Idempotency record limit reached ({max_records})"
+                    )));
+                }
+
+                let stored_response_bytes =
+                    usize::try_from(stored_response_bytes).map_err(|_| {
+                        IronCrewError::Validation(
+                            "Idempotency response byte total is out of range".into(),
+                        )
+                    })?;
+                let mut record = claim.to_record();
+                record.response_body = record.response_body.filter(|body| {
+                    stored_response_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= claim.max_total_response_bytes)
+                });
+                record.validate()?;
+                if let Some(hazard_key) = recovery_hazard_key.as_deref() {
+                    let changed = tx
+                        .execute(
+                            "UPDATE idempotency SET exclusive_scope = NULL, updated_at = ?1 \
+                             WHERE key_hash = ?2 AND exclusive_scope = ?3 \
+                               AND state = 'indeterminate'",
+                            rusqlite::params![
+                                &claim.created_at,
+                                hazard_key,
+                                claim.exclusive_scope.as_deref(),
+                            ],
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite idempotency hazard recovery error: {error}"
+                            ))
+                        })?;
+                    if changed != 1 {
+                        return Err(IronCrewError::Conflict(
+                            "Idempotency recovery hazard changed before claim insertion".into(),
+                        ));
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO idempotency (key_hash, request_fingerprint, operation, scope, \
+                     resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, \
+                     state, response_status, response_body, lease_expires_at, created_at, \
+                     updated_at, completed_at, expires_at, ttl_seconds) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                             ?15, ?16, ?17, ?18)",
+                    rusqlite::params![
+                        &record.key_hash,
+                        &record.request_fingerprint,
+                        &record.operation,
+                        &record.scope,
+                        &record.resource_id,
+                        &record.exclusive_scope,
+                        &record.attempt_id,
+                        &record.owner_instance_id,
+                        record
+                            .base_revision
+                            .map(i64::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                IronCrewError::Validation(
+                                    "Idempotency base revision is out of range".into(),
+                                )
+                            })?,
+                        record.state.to_string(),
+                        record.response_status.map(i64::from),
+                        &record.response_body,
+                        &record.lease_expires_at,
+                        &record.created_at,
+                        &record.updated_at,
+                        &record.completed_at,
+                        &record.expires_at,
+                        i64::try_from(record.ttl_seconds).map_err(|_| {
+                            IronCrewError::Validation("Idempotency TTL is out of range".into())
+                        })?,
+                    ],
+                )
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency claim insert error: {error}"
+                    ))
+                })?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency claim commit error: {error}"
+                    ))
+                })?;
+                Ok(IdempotencyClaimOutcome::Claimed(record))
+            })
+            .await,
+        )
+    }
+
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        sqlite_parse_idempotency_time("idempotency lease expiry", new_lease_expires_at)?;
+        let conn = Arc::clone(&self.conn);
+        let key_hash = key_hash.to_string();
+        let attempt_id = attempt_id.to_string();
+        let lease = new_lease_expires_at.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let Some(record) = sqlite_idempotency_record(&conn, &key_hash)? else {
+                    return Ok(false);
+                };
+                if record.attempt_id != attempt_id {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency attempt changed before heartbeat".into(),
+                    ));
+                }
+                if !record.state.is_in_flight() {
+                    return Ok(record.state == IdempotencyState::Completed);
+                }
+                let changed = conn
+                    .execute(
+                        "UPDATE idempotency SET lease_expires_at = ?1 \
+                         WHERE key_hash = ?2 AND attempt_id = ?3 \
+                           AND state IN ('claimed', 'running')",
+                        rusqlite::params![lease, key_hash, attempt_id],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency heartbeat error: {error}"
+                        ))
+                    })?;
+                Ok(changed == 1)
+            })
+            .await,
+        )
+    }
+
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat> {
+        validate_run_id(run_id)?;
+        validate_digest("idempotency key hash", key_hash)?;
+        sqlite_parse_idempotency_time("idempotency run lease expiry", new_lease_expires_at)?;
+        let conn = Arc::clone(&self.conn);
+        let run_id = run_id.to_string();
+        let key_hash = key_hash.to_string();
+        let attempt_id = attempt_id.to_string();
+        let owner_instance_id = self.lease.instance_id().to_string();
+        let lease_expires_at = new_lease_expires_at.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotent run heartbeat transaction error: {error}"
+                        ))
+                    })?;
+                let Some(ledger) = sqlite_idempotency_record(&tx, &key_hash)? else {
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite missing run heartbeat commit error: {error}"
+                        ))
+                    })?;
+                    return Ok(RunFenceHeartbeat::Lost);
+                };
+                if ledger.attempt_id != attempt_id {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency attempt changed before run heartbeat".into(),
+                    ));
+                }
+                if ledger.operation != RUN_OPERATION
+                    || ledger.resource_id != run_id
+                    || ledger.owner_instance_id != owner_instance_id
+                {
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite mismatched run heartbeat commit error: {error}"
+                        ))
+                    })?;
+                    return Ok(RunFenceHeartbeat::Lost);
+                }
+
+                let run = match tx.query_row(
+                    "SELECT status, owner_instance_id FROM runs WHERE run_id = ?1",
+                    rusqlite::params![&run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ) {
+                    Ok((status, owner)) => Some((status.parse::<RunStatus>()?, owner)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => {
+                        return Err(IronCrewError::Validation(format!(
+                            "SQLite idempotent run heartbeat query error: {error}"
+                        )));
+                    }
+                };
+
+                let outcome = match run {
+                    None if ledger.state == IdempotencyState::Claimed => {
+                        let changed = tx
+                            .execute(
+                                "UPDATE idempotency SET lease_expires_at = ?1 \
+                                 WHERE key_hash = ?2 AND operation = ?3 AND resource_id = ?4 \
+                                   AND owner_instance_id = ?5 AND attempt_id = ?6 \
+                                   AND state = 'claimed'",
+                                rusqlite::params![
+                                    &lease_expires_at,
+                                    &key_hash,
+                                    RUN_OPERATION,
+                                    &run_id,
+                                    &owner_instance_id,
+                                    &attempt_id,
+                                ],
+                            )
+                            .map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite claimed run heartbeat error: {error}"
+                                ))
+                            })?;
+                        if changed == 1 {
+                            RunFenceHeartbeat::Owned
+                        } else {
+                            RunFenceHeartbeat::Lost
+                        }
+                    }
+                    None => RunFenceHeartbeat::Lost,
+                    Some((_, run_owner)) if run_owner != ledger.owner_instance_id => {
+                        RunFenceHeartbeat::Lost
+                    }
+                    Some((status, _)) if status.is_terminal() => {
+                        if ledger.state == IdempotencyState::Indeterminate {
+                            RunFenceHeartbeat::Lost
+                        } else {
+                            RunFenceHeartbeat::Terminal(status)
+                        }
+                    }
+                    Some(_) if ledger.state != IdempotencyState::Running => RunFenceHeartbeat::Lost,
+                    Some(_) => {
+                        let run_changed = tx
+                            .execute(
+                                "UPDATE runs SET lease_expires_at = ?1 \
+                                 WHERE run_id = ?2 AND owner_instance_id = ?3 \
+                                   AND status IN ('running', 'waiting_for_input')",
+                                rusqlite::params![&lease_expires_at, &run_id, &owner_instance_id,],
+                            )
+                            .map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite idempotent run lease heartbeat error: {error}"
+                                ))
+                            })?;
+                        let ledger_changed = tx
+                            .execute(
+                                "UPDATE idempotency SET lease_expires_at = ?1 \
+                                 WHERE key_hash = ?2 AND operation = ?3 AND resource_id = ?4 \
+                                   AND owner_instance_id = ?5 AND attempt_id = ?6 \
+                                   AND state = 'running'",
+                                rusqlite::params![
+                                    &lease_expires_at,
+                                    &key_hash,
+                                    RUN_OPERATION,
+                                    &run_id,
+                                    &owner_instance_id,
+                                    &attempt_id,
+                                ],
+                            )
+                            .map_err(|error| {
+                                IronCrewError::Validation(format!(
+                                    "SQLite idempotent run ledger heartbeat error: {error}"
+                                ))
+                            })?;
+                        if run_changed == 1 && ledger_changed == 1 {
+                            RunFenceHeartbeat::Owned
+                        } else {
+                            return Err(IronCrewError::Conflict(
+                                "Run fence changed during idempotent heartbeat".into(),
+                            ));
+                        }
+                    }
+                };
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotent run heartbeat commit error: {error}"
+                    ))
+                })?;
+                Ok(outcome)
+            })
+            .await,
+        )
+    }
+
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome> {
+        completion.validate()?;
+        let conn = Arc::clone(&self.conn);
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency completion transaction error: {error}"
+                        ))
+                    })?;
+                let Some(record) = sqlite_idempotency_record(&tx, &completion.key_hash)? else {
+                    return Err(IronCrewError::Validation(
+                        "Idempotency claim not found during completion".into(),
+                    ));
+                };
+                sqlite_completion_fence(&record, &completion)?;
+                if record.state == IdempotencyState::Completed {
+                    return Ok(IdempotencyCompletionOutcome {
+                        replayable: record.replayable(),
+                        already_completed: true,
+                    });
+                }
+                if record.state == IdempotencyState::Indeterminate {
+                    return Err(IronCrewError::Conflict(
+                        "Indeterminate idempotency outcomes cannot be completed".into(),
+                    ));
+                }
+                let stored_bytes = sqlite_response_bytes(&tx, &completion.key_hash)?;
+                let response_body = completion.response_body.filter(|body| {
+                    stored_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= max_total_response_bytes)
+                });
+                let changed = tx
+                    .execute(
+                        "UPDATE idempotency SET state = 'completed', response_status = ?1, \
+                         response_body = ?2, updated_at = ?3, completed_at = ?3, expires_at = ?4 \
+                         WHERE key_hash = ?5 AND attempt_id = ?6 \
+                           AND state IN ('claimed', 'running')",
+                        rusqlite::params![
+                            i64::from(completion.response_status),
+                            &response_body,
+                            &completion.completed_at,
+                            &completion.expires_at,
+                            &completion.key_hash,
+                            &completion.attempt_id,
+                        ],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency completion update error: {error}"
+                        ))
+                    })?;
+                if changed != 1 {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency operation changed during completion".into(),
+                    ));
+                }
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency completion commit error: {error}"
+                    ))
+                })?;
+                Ok(IdempotencyCompletionOutcome {
+                    replayable: response_body.is_some(),
+                    already_completed: false,
+                })
+            })
+            .await,
+        )
+    }
+
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit> {
+        completion.validate()?;
+        validate_session_id(&conversation.id)?;
+        let conn = Arc::clone(&self.conn);
+        let conversation = conversation.clone();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn
+                    .lock()
+                    .map_err(|error| IronCrewError::Validation(format!("SQLite lock error: {error}")))?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite conversation idempotency transaction error: {error}"
+                        ))
+                    })?;
+                let Some(record) = sqlite_idempotency_record(&tx, &completion.key_hash)? else {
+                    return Err(IronCrewError::Validation(
+                        "Idempotency claim not found during conversation commit".into(),
+                    ));
+                };
+                sqlite_completion_fence(&record, &completion)?;
+                if record.operation != CONVERSATION_MESSAGE_OPERATION
+                    || record.resource_id != conversation.id
+                    || record.scope != conversation.flow_path.as_deref().unwrap_or("")
+                {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency claim does not match the conversation scope".into(),
+                    ));
+                }
+                let expected_revision = record.base_revision.ok_or_else(|| {
+                    IronCrewError::Validation(
+                        "Conversation idempotency claim has no base revision".into(),
+                    )
+                })?;
+                if expected_revision != conversation.revision {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Conversation '{}' changed before idempotent commit",
+                        conversation.id
+                    )));
+                }
+                if record.state == IdempotencyState::Completed {
+                    return Ok(ConversationIdempotencyCommit {
+                        revision: expected_revision.saturating_add(1),
+                        replayable: record.replayable(),
+                        already_completed: true,
+                    });
+                }
+                if record.state == IdempotencyState::Indeterminate {
+                    return Err(IronCrewError::Conflict(
+                        "Indeterminate conversation outcomes cannot be committed".into(),
+                    ));
+                }
+
+                let current_revision = match tx.query_row(
+                    "SELECT revision FROM conversations WHERE id = ?1 AND flow_path IS ?2",
+                    rusqlite::params![&conversation.id, &conversation.flow_path],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(value) => Some(u64::try_from(value).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite conversation revision is negative".into(),
+                        )
+                    })?),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => {
+                        return Err(IronCrewError::Validation(format!(
+                            "SQLite conversation revision query error: {error}"
+                        )));
+                    }
+                };
+                if current_revision.is_some() && current_revision != Some(expected_revision)
+                    || current_revision.is_none() && expected_revision != 0
+                {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Conversation '{}' changed since revision {expected_revision}",
+                        conversation.id
+                    )));
+                }
+                let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
+                    IronCrewError::Validation("Conversation revision overflow".into())
+                })?;
+                let messages = serde_json::to_string(&conversation.messages).map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to serialize conversation messages: {error}"
+                    ))
+                })?;
+                if current_revision.is_none() {
+                    tx.execute(
+                        "INSERT INTO conversations (id, flow_name, flow_path, agent_name, messages, \
+                         created_at, updated_at, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            &conversation.id,
+                            &conversation.flow_name,
+                            &conversation.flow_path,
+                            &conversation.agent_name,
+                            &messages,
+                            &conversation.created_at,
+                            &conversation.updated_at,
+                            i64::try_from(next_revision).map_err(|_| {
+                                IronCrewError::Validation(
+                                    "Conversation revision is out of range".into(),
+                                )
+                            })?,
+                        ],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite conversation idempotency insert error: {error}"
+                        ))
+                    })?;
+                } else {
+                    let changed = tx
+                        .execute(
+                            "UPDATE conversations SET flow_name = ?3, agent_name = ?4, messages = ?5, \
+                             created_at = ?6, updated_at = ?7, revision = ?8 \
+                             WHERE id = ?1 AND flow_path IS ?2 AND revision = ?9",
+                            rusqlite::params![
+                                &conversation.id,
+                                &conversation.flow_path,
+                                &conversation.flow_name,
+                                &conversation.agent_name,
+                                &messages,
+                                &conversation.created_at,
+                                &conversation.updated_at,
+                                i64::try_from(next_revision).map_err(|_| {
+                                    IronCrewError::Validation(
+                                        "Conversation revision is out of range".into(),
+                                    )
+                                })?,
+                                i64::try_from(expected_revision).map_err(|_| {
+                                    IronCrewError::Validation(
+                                        "Conversation revision is out of range".into(),
+                                    )
+                                })?,
+                            ],
+                        )
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite conversation idempotency update error: {error}"
+                            ))
+                        })?;
+                    if changed != 1 {
+                        return Err(IronCrewError::Conflict(format!(
+                            "Conversation '{}' changed during idempotent commit",
+                            conversation.id
+                        )));
+                    }
+                }
+
+                let stored_bytes = sqlite_response_bytes(&tx, &completion.key_hash)?;
+                let response_body = completion.response_body.filter(|body| {
+                    stored_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= max_total_response_bytes)
+                });
+                let changed = tx
+                    .execute(
+                        "UPDATE idempotency SET state = 'completed', response_status = ?1, \
+                         response_body = ?2, updated_at = ?3, completed_at = ?3, expires_at = ?4 \
+                         WHERE key_hash = ?5 AND attempt_id = ?6 \
+                           AND state IN ('claimed', 'running')",
+                        rusqlite::params![
+                            i64::from(completion.response_status),
+                            &response_body,
+                            &completion.completed_at,
+                            &completion.expires_at,
+                            &completion.key_hash,
+                            &completion.attempt_id,
+                        ],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite conversation idempotency completion error: {error}"
+                        ))
+                    })?;
+                if changed != 1 {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency operation changed during conversation commit".into(),
+                    ));
+                }
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite conversation idempotency commit error: {error}"
+                    ))
+                })?;
+                Ok(ConversationIdempotencyCommit {
+                    revision: next_revision,
+                    replayable: response_body.is_some(),
+                    already_completed: false,
+                })
+            })
+            .await,
+        )
+    }
+
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        sqlite_parse_idempotency_time("idempotency completion time", completed_at)?;
+        sqlite_parse_idempotency_time("idempotency retention expiry", expires_at)?;
+        let conn = Arc::clone(&self.conn);
+        let key_hash = key_hash.to_string();
+        let attempt_id = attempt_id.to_string();
+        let completed_at = completed_at.to_string();
+        let expires_at = expires_at.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency indeterminate transaction error: {error}"
+                        ))
+                    })?;
+                let Some(mut record) = sqlite_idempotency_record(&tx, &key_hash)? else {
+                    return Ok(false);
+                };
+                if record.attempt_id != attempt_id {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency attempt changed before indeterminate transition".into(),
+                    ));
+                }
+                if record.state.is_terminal() {
+                    return Ok(false);
+                }
+                sqlite_write_indeterminate(&tx, &mut record, &completed_at, &expires_at)?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency indeterminate commit error: {error}"
+                    ))
+                })?;
+                Ok(true)
+            })
+            .await,
+        )
+    }
+
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool> {
+        validate_digest("idempotency key hash", key_hash)?;
+        let conn = Arc::clone(&self.conn);
+        let key_hash = key_hash.to_string();
+        let attempt_id = attempt_id.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency release transaction error: {error}"
+                        ))
+                    })?;
+                let Some(record) = sqlite_idempotency_record(&tx, &key_hash)? else {
+                    return Ok(false);
+                };
+                if record.attempt_id != attempt_id {
+                    return Err(IronCrewError::Conflict(
+                        "Idempotency attempt changed before release".into(),
+                    ));
+                }
+                if !record.state.is_in_flight() {
+                    return Ok(false);
+                }
+                let changed = tx
+                    .execute(
+                        "DELETE FROM idempotency WHERE key_hash = ?1 AND attempt_id = ?2 \
+                         AND state IN ('claimed', 'running')",
+                        rusqlite::params![key_hash, attempt_id],
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency release error: {error}"
+                        ))
+                    })?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency release commit error: {error}"
+                    ))
+                })?;
+                Ok(changed == 1)
+            })
+            .await,
+        )
+    }
+
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize> {
+        sqlite_parse_idempotency_time("idempotency prune time", now)?;
+        let conn = Arc::clone(&self.conn);
+        let now = now.to_string();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency prune transaction error: {error}"
+                        ))
+                    })?;
+                let removed = sqlite_prune_idempotency(&tx, &now, limit)?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite idempotency prune commit error: {error}"
+                    ))
+                })?;
+                Ok(removed)
+            })
+            .await,
+        )
+    }
+
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
+        validate_session_id(&record.id)?;
         let conn = Arc::clone(&self.conn);
         let record = record.clone();
         let next_revision = record
@@ -774,6 +2511,18 @@ impl StateStore for SqliteStore {
                             "SQLite save_conversation transaction error: {e}"
                         ))
                     })?;
+
+                if sqlite_active_conversation_idempotency(
+                    &tx,
+                    record.flow_path.as_deref(),
+                    &record.id,
+                    false,
+                )? {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Conversation '{}' has an active idempotent message operation",
+                        record.id
+                    )));
+                }
 
                 let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
                     IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
@@ -925,21 +2674,39 @@ impl StateStore for SqliteStore {
     }
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
+        validate_session_id(id)?;
         let conn = Arc::clone(&self.conn);
         let flow_path = flow_path.map(|s| s.to_string());
         let id = id.to_string();
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
-                let conn = conn
+                let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-                conn.execute(
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite delete_conversation transaction error: {error}"
+                        ))
+                    })?;
+                if sqlite_active_conversation_idempotency(&tx, flow_path.as_deref(), &id, true)? {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Conversation '{id}' has an active idempotent message operation"
+                    )));
+                }
+                tx.execute(
                     "DELETE FROM conversations WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
-                    rusqlite::params![id, flow_path],
+                    rusqlite::params![&id, &flow_path],
                 )
                 .map_err(|e| {
                     IronCrewError::Validation(format!("SQLite delete_conversation error: {}", e))
+                })?;
+                tx.commit().map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "SQLite delete_conversation commit error: {error}"
+                    ))
                 })?;
                 Ok(())
             })

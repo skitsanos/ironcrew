@@ -187,6 +187,22 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let max_active_conversations = api::conversations::max_active_conversations();
     let max_active_runs = api::handlers::max_active_runs();
     let max_sse_connections = api::handlers::max_sse_connections();
+    let max_run_lifetime = api::handlers::max_run_lifetime();
+    let idempotency = api::idempotency::IdempotencyConfig::from_env(max_run_lifetime)?;
+    let pruned_idempotency_records = store
+        .prune_idempotency(&chrono::Utc::now().to_rfc3339(), idempotency.prune_batch)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to prune the idempotency ledger at startup: {error}"
+            ))
+        })?;
+    if pruned_idempotency_records > 0 {
+        tracing::info!(
+            count = pruned_idempotency_records,
+            "Pruned expired idempotency records"
+        );
+    }
     let state = Arc::new(api::AppState {
         flows_dir: flows_dir.clone(),
         accepting_traffic: std::sync::atomic::AtomicBool::new(true),
@@ -198,10 +214,11 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         run_permits: Arc::new(tokio::sync::Semaphore::new(max_active_runs)),
         max_sse_connections,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(max_sse_connections)),
-        max_run_lifetime: api::handlers::max_run_lifetime(),
+        max_run_lifetime,
         terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
         store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
         readiness_cache: tokio::sync::Mutex::new(None),
+        idempotency,
         store,
     });
 
@@ -281,7 +298,10 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
                 .allow_headers([
                     http::HeaderName::from_static("authorization"),
                     http::HeaderName::from_static("content-type"),
+                    api::idempotency::IDEMPOTENCY_KEY_HEADER,
+                    api::idempotency::IDEMPOTENCY_RECOVERY_KEY_HEADER,
                 ])
+                .expose_headers([api::idempotency::IDEMPOTENCY_REPLAYED_HEADER])
         }
         Err(_) => CorsLayer::new(), // no origins allowed by default
     };

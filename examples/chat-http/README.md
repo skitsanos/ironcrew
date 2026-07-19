@@ -47,6 +47,7 @@ curl -sX POST http://127.0.0.1:3000/flows/chat-http/conversations/demo/start \
 ```sh
 curl -sX POST http://127.0.0.1:3000/flows/chat-http/conversations/demo/messages \
      -H "Authorization: Bearer $IRONCREW_API_TOKEN" \
+     -H 'Idempotency-Key: demo-message-1' \
      -H 'Content-Type: application/json' \
      -d '{ "content": "Hi! What can you help me with?" }' | jq
 ```
@@ -83,9 +84,13 @@ curl -sX DELETE http://127.0.0.1:3000/flows/chat-http/conversations/demo \
 
 | Variable                                 | Default | Purpose                                         |
 | ---------------------------------------- | ------- | ----------------------------------------------- |
+| `OPENAI_API_KEY`                         | —       | OpenAI credential used by the coordinator and sub-crew |
+| `OPENAI_MODEL`                           | `gpt-4.1-mini` | Model used by both flows when allowlisted       |
+| `IRONCREW_ENV_ALLOWLIST`                 | —       | Include `OPENAI_MODEL` to expose that override to sandboxed Lua |
 | `IRONCREW_API_TOKEN`                     | —       | Bearer token required for the protected routes  |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS`      | 8       | Simultaneous in-memory session cap              |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS`        | 1800    | Idle eviction threshold                         |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT`   | 20      | Default page size for list                      |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT`       | 100     | Hard cap on `?limit=` parameter                 |
 | `IRONCREW_CONVERSATION_MAX_HISTORY`      | 50      | Default per-session message cap                 |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY`        | false   | Require retry-safe keys for run/message mutations; use `true` in production |

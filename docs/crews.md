@@ -288,8 +288,9 @@ for the persistence demo.
 
 The same `crew:conversation({})` primitive is exposed over HTTP by
 `ironcrew serve` as six endpoints. Sessions are created explicitly with
-`POST /start`, turns are serialized per-id, and state persists through the
-same `StateStore` used by `ironcrew chat`.
+`POST /start`; only one turn may mutate an id at a time (overlap returns
+`409`, never a queued request); and state persists through the same
+`StateStore` used by `ironcrew chat`.
 
 | Method | Path                                                | Purpose                           |
 | ------ | --------------------------------------------------- | --------------------------------- |
@@ -301,7 +302,8 @@ same `StateStore` used by `ironcrew chat`.
 | GET    | `/flows/{flow}/conversations`                       | Paginated list (filtered by flow) |
 
 See [REST API: Conversations](rest-api.md#conversations-phase-1-human-in-the-loop)
-for request/response shapes and a worked curl session.
+for request/response shapes and a worked curl session. Production clients
+should also follow the [Idempotency-Key retry contract](rest-api.md#safe-retries-with-idempotency-key).
 
 ### Chat & Conversation Env Vars
 

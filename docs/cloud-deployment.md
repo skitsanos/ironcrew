@@ -181,6 +181,10 @@ a supported transport path.
 | `IRONCREW_DIALOG_MAX_PARTICIPANTS` | `16` | Maximum accepted participants in one dialog (hard ceiling 64). |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
 | `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run/message retries cannot silently duplicate work. |
+| `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | `86400` | Replay/tombstone retention; must exceed max run lifetime by at least one hour. |
+| `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | `8388608` | Per-key transient serialization and stored-response cap. Lower to 4 MiB for the 1 GiB baseline. |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | `268435456` | Aggregate stored response budget. Lower to 64 MiB for the 1 GiB baseline. |
 | `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | `8388608` (8 MiB) | Aggregate retained transcript for one collaborative task (hard ceiling 32 MiB). |
 | `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | `1048576` (1 MiB) | Maximum one collaborative provider response may add (hard ceiling 8 MiB). |
 | `IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS` | `64` | Maximum participants multiplied by turns (hard ceiling 512). |
@@ -309,7 +313,7 @@ separated from the HTTP service.
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | `1000` | Base delay for exponential connection-retry backoff, in milliseconds (range 1–30000). |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
 | `IRONCREW_INSTANCE_ID` | generated per process | Optional stable runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
-| `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry used before another process may reconcile an unfinished run. Range: 1–86400. |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Range: 1–86400. |
 
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage
 features used by the runtime and the intended deployment target of
@@ -555,6 +559,12 @@ IRONCREW_LOG=info
 IRONCREW_API_TOKEN=<generated token>
 IRONCREW_CORS_ORIGINS=https://your-frontend.example.com
 IRONCREW_MAX_RUN_LIFETIME=300
+IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true
+IRONCREW_IDEMPOTENCY_TTL_SECONDS=86400
+IRONCREW_IDEMPOTENCY_MAX_RECORDS=10000
+IRONCREW_IDEMPOTENCY_PRUNE_BATCH=1000
+IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=4194304
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=67108864
 IRONCREW_MAX_ACTIVE_RUNS=2
 IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
 IRONCREW_CHAT_SESSION_IDLE_SECS=600
@@ -601,6 +611,12 @@ OPENAI_API_KEY=sk-...
 ```
 
 Railway's Postgres add-on auto-injects `DATABASE_URL`.
+
+With `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`, every caller of the run and
+conversation-message mutation endpoints must generate a stable 1–128 byte
+visible-ASCII key per logical operation. Keep the key across client/proxy
+timeouts and change it only for an intentional new operation. See
+[REST API safe retries](rest-api.md#safe-retries-with-idempotency-key).
 
 Railway Pro provides a much higher account resource ceiling than the smaller
 plans, but that ceiling includes replica multiplication and is not a sizing
@@ -726,6 +742,7 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [ ] `IRONCREW_MCP_ALLOWED_COMMANDS` whitelist set (if using MCP stdio)
 - [ ] `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` is `__disabled__` or lists only exact operator-trusted hosts
 - [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (active runs are aborted on SIGTERM, so this limit is independent of termination grace)
+- [ ] `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`; clients preserve keys across retries, and ledger byte/record caps fit the pod/database budget
 - [ ] `IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s` fits within platform termination grace
 - [ ] Exactly one HTTP replica configured (`numReplicas: 1` or `replicas: 1`)
 - [ ] Replacement strategy does not intentionally overlap active executors (`Recreate` on OpenShift; Railway overlap set to zero)

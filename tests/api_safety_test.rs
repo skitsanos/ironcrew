@@ -10,6 +10,7 @@ use std::time::Duration;
 use ironcrew::api::{AppState, create_router};
 use ironcrew::engine::run_history::{JsonFileStore, RunStatus};
 use ironcrew::engine::store::StateStore;
+use ironcrew::llm::provider::ChatMessage;
 
 const PARK_FLOW: &str = r#"
 local crew = Crew.new({
@@ -52,6 +53,21 @@ async fn spawn_server(
     max_conversations: usize,
     max_lifetime: Duration,
 ) -> TestServer {
+    spawn_server_with_idempotency(
+        max_runs,
+        max_conversations,
+        max_lifetime,
+        Default::default(),
+    )
+    .await
+}
+
+async fn spawn_server_with_idempotency(
+    max_runs: usize,
+    max_conversations: usize,
+    max_lifetime: Duration,
+    idempotency: ironcrew::api::idempotency::IdempotencyConfig,
+) -> TestServer {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     for (name, script) in [
@@ -82,6 +98,7 @@ async fn spawn_server(
         terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
         store_maintenance_healthy: AtomicBool::new(true),
         readiness_cache: tokio::sync::Mutex::new(None),
+        idempotency,
         store: store.clone(),
     });
 
@@ -176,6 +193,165 @@ async fn concurrent_run_admission_never_exceeds_cap() {
     assert_eq!(aborted.status(), reqwest::StatusCode::OK);
     wait_for_status(&server.store, &run_id, RunStatus::Aborted).await;
     assert_eq!(server.state.run_permits.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn idempotent_run_replays_one_acceptance_and_rejects_key_reuse() {
+    let server = spawn_server(1, 2, Duration::from_secs(60)).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/flows/flow-a/run", server.base);
+
+    let first = client
+        .post(&url)
+        .header("Idempotency-Key", "run-replay-key")
+        .json(&serde_json::json!({"input": "same"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(first.headers().get("Idempotency-Replayed").is_none());
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    let first_run_id = first_body["run_id"].as_str().unwrap();
+    assert!(
+        server.store.get_run(first_run_id).await.is_ok(),
+        "a keyed started response must never reference a run that is not durable"
+    );
+
+    let replay = client
+        .post(&url)
+        .header("Idempotency-Key", "run-replay-key")
+        .json(&serde_json::json!({"input": "same"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        replay
+            .headers()
+            .get("Idempotency-Replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let replay_body: serde_json::Value = replay.json().await.unwrap();
+    assert_eq!(replay_body, first_body);
+    assert_eq!(server.state.active_runs.read().await.len(), 1);
+
+    let conflict = client
+        .post(&url)
+        .header("Idempotency-Key", "run-replay-key")
+        .json(&serde_json::json!({"input": "different"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+
+    let run_id = first_run_id;
+    let aborted = client
+        .post(format!("{}/flows/flow-a/abort/{run_id}", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(aborted.status(), reqwest::StatusCode::OK);
+    wait_for_status(&server.store, run_id, RunStatus::Aborted).await;
+}
+
+#[tokio::test]
+async fn production_policy_can_require_a_well_formed_idempotency_key() {
+    let config = ironcrew::api::idempotency::IdempotencyConfig {
+        require_key: true,
+        ..Default::default()
+    };
+    let server = spawn_server_with_idempotency(1, 2, Duration::from_secs(60), config).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/flows/flow-a/run", server.base);
+
+    let missing = client.post(&url).send().await.unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+    let empty = client
+        .post(&url)
+        .header("Idempotency-Key", "")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let accepted = client
+        .post(&url)
+        .header("Idempotency-Key", "required-run-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = accepted.json().await.unwrap();
+    let run_id = body["run_id"].as_str().unwrap();
+    let aborted = client
+        .post(format!("{}/flows/flow-a/abort/{run_id}", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(aborted.status(), reqwest::StatusCode::OK);
+    wait_for_status(&server.store, run_id, RunStatus::Aborted).await;
+}
+
+#[tokio::test]
+async fn concurrent_same_idempotency_key_starts_exactly_one_run() {
+    let server = Arc::new(spawn_server(16, 2, Duration::from_secs(60)).await);
+    let client = reqwest::Client::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let mut requests = Vec::new();
+    for _ in 0..16 {
+        let server = server.clone();
+        let client = client.clone();
+        let barrier = barrier.clone();
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client
+                .post(format!("{}/flows/flow-a/run", server.base))
+                .header("Idempotency-Key", "concurrent-run-key")
+                .json(&serde_json::json!({"batch": 1}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    barrier.wait().await;
+
+    let mut run_ids = std::collections::HashSet::new();
+    let mut in_progress = 0;
+    for response in futures::future::join_all(requests).await {
+        let response = response.unwrap();
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let body: serde_json::Value = response.json().await.unwrap();
+                run_ids.insert(body["run_id"].as_str().unwrap().to_string());
+            }
+            reqwest::StatusCode::CONFLICT => in_progress += 1,
+            status => panic!("unexpected idempotent run status: {status}"),
+        }
+    }
+    assert!(in_progress < 16, "one request must own the durable claim");
+
+    let replay = client
+        .post(format!("{}/flows/flow-a/run", server.base))
+        .header("Idempotency-Key", "concurrent-run-key")
+        .json(&serde_json::json!({"batch": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::OK);
+    let replay_body: serde_json::Value = replay.json().await.unwrap();
+    run_ids.insert(replay_body["run_id"].as_str().unwrap().to_string());
+    assert_eq!(run_ids.len(), 1);
+    assert_eq!(server.state.active_runs.read().await.len(), 1);
+
+    let run_id = run_ids.into_iter().next().unwrap();
+    let aborted = client
+        .post(format!("{}/flows/flow-a/abort/{run_id}", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(aborted.status(), reqwest::StatusCode::OK);
+    wait_for_status(&server.store, &run_id, RunStatus::Aborted).await;
 }
 
 #[tokio::test]
@@ -284,6 +460,71 @@ async fn overlapping_conversation_message_fails_fast_instead_of_queueing() {
         body["error"],
         "Conversation is busy; retry after the active operation completes"
     );
+}
+
+#[tokio::test]
+async fn stale_durable_conversation_revision_invalidates_and_reloads_the_live_handle() {
+    let server = spawn_server(2, 1, Duration::from_secs(60)).await;
+    let client = reqwest::Client::new();
+    let started = client
+        .post(format!(
+            "{}/flows/chat/conversations/stale-revision/start",
+            server.base
+        ))
+        .json(&serde_json::json!({ "agent": "tutor" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::OK);
+
+    // Simulate a second pod committing a newer durable transcript while this
+    // pod still has the old Lua handle in memory.
+    let mut durable = server
+        .store
+        .get_conversation(Some("chat"), "stale-revision")
+        .await
+        .unwrap()
+        .unwrap();
+    durable
+        .messages
+        .push(ChatMessage::user("committed elsewhere"));
+    durable.messages.push(ChatMessage::assistant(
+        Some("committed by another pod".into()),
+        None,
+    ));
+    durable.updated_at = chrono::Utc::now().to_rfc3339();
+    server.store.save_conversation(&durable).await.unwrap();
+
+    let conflict = client
+        .post(format!(
+            "{}/flows/chat/conversations/stale-revision/messages",
+            server.base
+        ))
+        .header("Idempotency-Key", "stale-revision-message")
+        .json(&serde_json::json!({ "content": "must not call the provider" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        !server
+            .state
+            .active_conversations
+            .read()
+            .await
+            .contains_key(&("chat".to_string(), "stale-revision".to_string()))
+    );
+
+    let reopened = client
+        .post(format!(
+            "{}/flows/chat/conversations/stale-revision/start",
+            server.base
+        ))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reopened.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]

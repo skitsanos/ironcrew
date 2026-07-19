@@ -4,6 +4,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
+use crate::engine::idempotency::{
+    ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
+    IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLookup, RunFenceHeartbeat,
+};
 use crate::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
 };
@@ -184,6 +188,68 @@ pub trait StateStore: Send + Sync {
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
 
     async fn delete_run(&self, run_id: &str) -> Result<()>;
+
+    // Durable request idempotency.
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup>;
+
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome>;
+
+    /// Extend an in-flight claim. `true` means this attempt still owns the
+    /// claim or has already completed it. `false` means it is missing or
+    /// indeterminate; a different attempt is reported as `Conflict`.
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool>;
+
+    /// Atomically renew a keyed HTTP run's operation ledger and matching run
+    /// lease. `Owned` requires both in-flight fences to belong to this exact
+    /// attempt. A terminal run is returned separately so the API can preserve
+    /// the winning result while stopping any remaining Lua work.
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat>;
+
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome>;
+
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit>;
+
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool>;
+
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool>;
+
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize>;
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
