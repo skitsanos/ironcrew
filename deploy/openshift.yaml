@@ -130,6 +130,22 @@ spec:
               value: "32"
             - name: IRONCREW_MAX_RUN_LIFETIME
               value: "900"
+            - name: IRONCREW_RUN_LEASE_TTL_SECONDS
+              value: "60"
+            # Require retry-safe mutation requests in production. Clients must
+            # reuse one key only for an identical run/message request.
+            - name: IRONCREW_REQUIRE_IDEMPOTENCY_KEY
+              value: "true"
+            - name: IRONCREW_IDEMPOTENCY_TTL_SECONDS
+              value: "86400"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RECORDS
+              value: "10000"
+            - name: IRONCREW_IDEMPOTENCY_PRUNE_BATCH
+              value: "1000"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES
+              value: "4194304"
+            - name: IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES
+              value: "67108864"
             - name: IRONCREW_MAX_TASK_TIMEOUT_SECS
               value: "900"
             - name: IRONCREW_MAX_TASK_RETRIES

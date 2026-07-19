@@ -23,14 +23,61 @@ use axum::{
 };
 use mlua::AnyUserData;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, broadcast};
 
 use super::{AppState, ErrorResponse, error_response, resolve_flow_path};
 use crate::engine::eventbus::{CrewEvent, EventBus};
+use crate::engine::idempotency::{
+    CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup, IdempotencyRecord,
+};
 use crate::engine::sessions::validate_session_id;
 use crate::lua::api::{CHAT_CREW_REGISTRY_KEY, ChatMode, set_ironcrew_mode};
 use crate::lua::conversation::{LuaConversation, LuaConversationInner};
+use crate::tools::ToolCallContext;
 use crate::utils::error::IronCrewError;
+
+type MessageResult = Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
+
+#[derive(Clone)]
+struct MessageIdempotencyAttempt {
+    key_hash: String,
+    request_fingerprint: String,
+    attempt_id: String,
+}
+
+fn replay_message(record: &IdempotencyRecord) -> MessageResult {
+    let (Some(status), Some(body)) = (record.response_status, record.response_body.as_deref())
+    else {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "The prior message cannot be replayed; use a new Idempotency-Key after verifying the conversation history"
+                .into(),
+        ));
+    };
+    if status != StatusCode::OK.as_u16() {
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored message idempotency response has an invalid status".into(),
+        ));
+    }
+    let response = serde_json::from_str::<MessageResp>(body).map_err(|error| {
+        tracing::error!(%error, "Stored message idempotency response is corrupt");
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response is corrupt".into(),
+        )
+    })?;
+    Ok((super::idempotency::replay_headers(), Json(response)))
+}
+
+fn message_idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%error, "Conversation idempotency storage operation failed");
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Idempotency storage is temporarily unavailable".into(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Session handle
@@ -46,7 +93,7 @@ pub struct ConversationHandle {
     _lua: Arc<std::sync::Mutex<Option<mlua::Lua>>>,
     pub conv: Arc<LuaConversationInner>,
     pub eventbus: EventBus,
-    pub turn_lock: Mutex<()>,
+    pub turn_lock: Arc<Mutex<()>>,
     /// Shutdown cancellation for an in-flight provider/tool turn. Dropping the
     /// selected `run_turn` future invokes its rollback guards before the pod
     /// releases this handle.
@@ -214,14 +261,14 @@ pub struct StartResp {
     pub events_url: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct MessageReq {
     pub content: String,
     #[serde(default)]
     pub images: Option<Vec<String>>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct MessageResp {
     pub conversation_id: String,
     pub turn_index: usize,
@@ -612,7 +659,7 @@ async fn build_session(
         _lua: Arc::new(std::sync::Mutex::new(Some(lua))),
         conv,
         eventbus,
-        turn_lock: Mutex::new(()),
+        turn_lock: Arc::new(Mutex::new(())),
         shutdown,
         flow_path: flow_slug.to_string(),
         id: id.to_string(),
@@ -630,11 +677,305 @@ async fn build_session(
 // POST /flows/{flow}/conversations/{id}/messages
 // ---------------------------------------------------------------------------
 
+async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdempotencyAttempt) {
+    let completed_at = chrono::Utc::now();
+    let completed_at_text = completed_at.to_rfc3339();
+    let expires_at = state.idempotency.retention_expiry(completed_at);
+    let mut persistence_degraded = false;
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match state
+            .store
+            .mark_idempotency_indeterminate(
+                &attempt.key_hash,
+                &attempt.attempt_id,
+                &completed_at_text,
+                &expires_at,
+            )
+            .await
+        {
+            Ok(updated) => {
+                if !updated {
+                    tracing::warn!(
+                        "Conversation idempotency claim disappeared before indeterminate finalization"
+                    );
+                }
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error @ IronCrewError::Conflict(_)) => {
+                tracing::warn!(%error, "Indeterminate conversation finalization was fenced");
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return;
+            }
+            Err(error) => {
+                if !persistence_degraded {
+                    persistence_degraded = true;
+                    state
+                        .terminal_persistence_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                tracing::error!(
+                    %error,
+                    retry_ms = retry_delay.as_millis(),
+                    "Failed to preserve an indeterminate conversation outcome; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn commit_message_with_retry(
+    state: &Arc<AppState>,
+    completion: IdempotencyCompletion,
+    conversation: &crate::engine::sessions::ConversationRecord,
+) -> Result<ConversationIdempotencyCommit, IronCrewError> {
+    let mut persistence_degraded = false;
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match state
+            .store
+            .commit_conversation_idempotency(
+                completion.clone(),
+                conversation,
+                state.idempotency.max_total_response_bytes,
+            )
+            .await
+        {
+            Ok(committed) => {
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return Ok(committed);
+            }
+            Err(error @ IronCrewError::Conflict(_)) => {
+                if persistence_degraded {
+                    state
+                        .terminal_persistence_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                if !persistence_degraded {
+                    persistence_degraded = true;
+                    state
+                        .terminal_persistence_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                tracing::error!(
+                    %error,
+                    retry_ms = retry_delay.as_millis(),
+                    "Atomic conversation/idempotency commit failed; retaining the turn and retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_idempotent_message(
+    state: Arc<AppState>,
+    key: ConversationKey,
+    handle: Arc<ConversationHandle>,
+    id: String,
+    content: String,
+    images: Option<Vec<crate::llm::provider::ImageInput>>,
+    attempt: MessageIdempotencyAttempt,
+    _lifecycle_guard: OwnedMutexGuard<()>,
+    _turn_guard: OwnedMutexGuard<()>,
+) -> Result<MessageResp, (StatusCode, Json<ErrorResponse>)> {
+    let heartbeat = super::idempotency::LeaseHeartbeat::spawn(
+        state.store.clone(),
+        attempt.key_hash.clone(),
+        attempt.attempt_id.clone(),
+        CONVERSATION_MESSAGE_OPERATION,
+    );
+    let mut claim_loss = heartbeat.loss_receiver();
+    let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
+    let mut shutdown = handle.shutdown.subscribe();
+    let caller_context = ToolCallContext::default();
+    let turn = tokio::time::timeout(
+        turn_timeout,
+        handle
+            .conv
+            .prepare_turn_with_ctx(&content, images, &caller_context),
+    );
+    enum TurnOutcome {
+        Shutdown,
+        ClaimLost,
+        Finished(
+            Box<
+                std::result::Result<
+                    Result<crate::lua::conversation::PreparedConversationTurn, IronCrewError>,
+                    tokio::time::error::Elapsed,
+                >,
+            >,
+        ),
+    }
+    let already_stopping = *shutdown.borrow();
+    let outcome = if already_stopping {
+        TurnOutcome::Shutdown
+    } else {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => TurnOutcome::Shutdown,
+            _ = super::idempotency::wait_for_lease_loss(&mut claim_loss) => TurnOutcome::ClaimLost,
+            result = turn => TurnOutcome::Finished(Box::new(result)),
+        }
+    };
+    let prepared = match outcome {
+        TurnOutcome::Shutdown => {
+            drop(heartbeat);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation turn cancelled during server shutdown".into(),
+            ));
+        }
+        TurnOutcome::ClaimLost => {
+            drop(heartbeat);
+            state.active_conversations.write().await.remove(&key);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation turn stopped after its idempotency claim was lost; inspect history before retrying"
+                    .into(),
+            ));
+        }
+        TurnOutcome::Finished(result) => match *result {
+            Err(_) => {
+                drop(heartbeat);
+                mark_message_indeterminate(&state, &attempt).await;
+                return Err(error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "Conversation turn exceeded IRONCREW_MAX_CONVERSATION_TURN_SECS ({})",
+                        turn_timeout.as_secs()
+                    ),
+                ));
+            }
+            Ok(Err(error)) => {
+                drop(heartbeat);
+                mark_message_indeterminate(&state, &attempt).await;
+                return Err(map_err_to_response(&error));
+            }
+            Ok(Ok(prepared)) => prepared,
+        },
+    };
+
+    let response = MessageResp {
+        conversation_id: id,
+        turn_index: prepared.turn_index,
+        assistant: prepared.assistant.clone(),
+        reasoning: prepared.reasoning.clone(),
+        turn_count: prepared.turn_count,
+    };
+    let response_body = match super::idempotency::bounded_response_json(
+        &response,
+        state.idempotency.max_response_bytes,
+    ) {
+        Ok(body) => body,
+        Err(error) => {
+            drop(heartbeat);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(message_idempotency_store_error(error));
+        }
+    };
+    let completed_at = chrono::Utc::now();
+    let completion = IdempotencyCompletion {
+        key_hash: attempt.key_hash.clone(),
+        request_fingerprint: attempt.request_fingerprint.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        owner_instance_id: state.store.instance_id().to_string(),
+        response_status: StatusCode::OK.as_u16(),
+        response_body,
+        completed_at: completed_at.to_rfc3339(),
+        expires_at: state.idempotency.retention_expiry(completed_at),
+    };
+
+    let commit_result = {
+        let commit = commit_message_with_retry(&state, completion, &prepared.record);
+        tokio::pin!(commit);
+        tokio::select! {
+            biased;
+            result = &mut commit => result,
+            _ = super::idempotency::wait_for_lease_loss(&mut claim_loss) => {
+                drop(heartbeat);
+                state.active_conversations.write().await.remove(&key);
+                mark_message_indeterminate(&state, &attempt).await;
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Conversation commit stopped after its idempotency claim was lost; inspect history before retrying"
+                        .into(),
+                ));
+            }
+        }
+    };
+    let committed = match commit_result {
+        Ok(committed) => committed,
+        Err(error @ IronCrewError::Conflict(_)) => {
+            drop(heartbeat);
+            state.active_conversations.write().await.remove(&key);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(error_response(StatusCode::CONFLICT, error.to_string()));
+        }
+        Err(error) => {
+            drop(heartbeat);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(message_idempotency_store_error(error));
+        }
+    };
+    drop(heartbeat);
+
+    if committed.already_completed {
+        // A previous commit attempt reached durable storage but its reply was
+        // lost. Another pod may have advanced the conversation since then;
+        // never publish this older prepared snapshot into the live handle.
+        state.active_conversations.write().await.remove(&key);
+        return Ok(response);
+    }
+
+    if let Err(error) = handle
+        .conv
+        .publish_prepared_turn(prepared, committed.revision)
+        .await
+    {
+        // The durable transcript and replay response are authoritative. Drop
+        // a stale in-memory handle so the next /start reloads that revision.
+        state.active_conversations.write().await.remove(&key);
+        tracing::error!(%error, "Failed to publish a durably committed conversation turn");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Conversation committed but the live session must be restarted".into(),
+        ));
+    }
+
+    *handle.last_touched.write().await = Instant::now();
+    Ok(response)
+}
+
 pub async fn post_message(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<MessageReq>,
-) -> Result<Json<MessageResp>, (StatusCode, Json<ErrorResponse>)> {
+) -> MessageResult {
     if !state
         .accepting_traffic
         .load(std::sync::atomic::Ordering::Acquire)
@@ -665,9 +1006,72 @@ pub async fn post_message(
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
-    let key = (flow_segment(&flow_path_resolved), id.clone());
+    let request_key = super::idempotency::request_key(&headers, state.idempotency.require_key)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let recovery_key = super::idempotency::recovery_key(&headers)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    if recovery_key.is_some() && request_key.is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Recovery-Key requires a new Idempotency-Key".into(),
+        ));
+    }
+    if recovery_key.is_some()
+        && recovery_key.as_ref().map(|key| &key.key_hash)
+            == request_key.as_ref().map(|key| &key.key_hash)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Recovery-Key must name a different prior key".into(),
+        ));
+    }
+    let flow_slug = flow_segment(&flow_path_resolved);
+    let request_fingerprint = super::idempotency::conversation_message_fingerprint(
+        &flow_slug,
+        &id,
+        &req.content,
+        req.images.as_deref(),
+    );
+    if let Some(request_key) = request_key.as_ref() {
+        let now = chrono::Utc::now().to_rfc3339();
+        match state
+            .store
+            .lookup_idempotency(&request_key.key_hash, &request_fingerprint, &now)
+            .await
+            .map_err(message_idempotency_store_error)?
+        {
+            IdempotencyLookup::Miss => {}
+            IdempotencyLookup::Replay(record) => return replay_message(&record),
+            IdempotencyLookup::InProgress(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "This idempotent message is already in progress; retry shortly".into(),
+                ));
+            }
+            IdempotencyLookup::Indeterminate(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "The prior message has an indeterminate outcome; inspect history before using a new Idempotency-Key"
+                        .into(),
+                ));
+            }
+            IdempotencyLookup::Conflict => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency-Key was already used for a different request".into(),
+                ));
+            }
+        }
+    }
+
+    let key = (flow_slug, id.clone());
     let lifecycle = lifecycle_lock(&key);
-    let _lifecycle_guard = lifecycle.lock().await;
+    let lifecycle_guard = lifecycle.clone().try_lock_owned().map_err(|_| {
+        error_response(
+            StatusCode::CONFLICT,
+            "Conversation is busy; retry after the active operation completes".into(),
+        )
+    })?;
     let handle = {
         let map = state.active_conversations.read().await;
         map.get(&key).cloned().ok_or_else(|| {
@@ -681,7 +1085,7 @@ pub async fn post_message(
     // The lifecycle gate prevents delete/eviction/recreation from crossing
     // this turn. Fail fast if another path already owns the handle instead of
     // retaining parsed requests in an unbounded same-session queue.
-    let _guard = handle.turn_lock.try_lock().map_err(|_| {
+    let turn_guard = handle.turn_lock.clone().try_lock_owned().map_err(|_| {
         error_response(
             StatusCode::CONFLICT,
             "Conversation is busy; retry after the active operation completes".into(),
@@ -777,10 +1181,147 @@ pub async fn post_message(
         _ => None,
     };
 
-    {
-        let mut t = handle.last_touched.write().await;
-        *t = Instant::now();
+    if let Some(request_key) = request_key {
+        let scope = super::idempotency::conversation_scope(&key.0, &id);
+        let now = chrono::Utc::now();
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let lease_expires_at = now
+            .checked_add_signed(
+                chrono::Duration::from_std(state.store.run_lease_ttl())
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
+            )
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            .to_rfc3339();
+        let claim = IdempotencyClaim {
+            key_hash: request_key.key_hash.clone(),
+            recovery_key_hash: recovery_key.as_ref().map(|key| key.key_hash.clone()),
+            request_fingerprint: request_fingerprint.clone(),
+            operation: CONVERSATION_MESSAGE_OPERATION.into(),
+            // Stores use `scope` as the durable conversation flow_path and
+            // `exclusive_scope` as the full per-conversation mutation gate.
+            scope: key.0.clone(),
+            resource_id: id.clone(),
+            exclusive_scope: Some(scope),
+            attempt_id: attempt_id.clone(),
+            owner_instance_id: state.store.instance_id().to_string(),
+            base_revision: Some(handle.conv.revision().await),
+            response_status: None,
+            response_body: None,
+            max_total_response_bytes: state.idempotency.max_total_response_bytes,
+            lease_expires_at,
+            created_at: now.to_rfc3339(),
+            ttl_seconds: state.idempotency.ttl_seconds,
+        };
+        let attempt = MessageIdempotencyAttempt {
+            key_hash: request_key.key_hash,
+            request_fingerprint,
+            attempt_id,
+        };
+        match state
+            .store
+            .claim_idempotency(
+                claim,
+                state.idempotency.max_records,
+                state.idempotency.prune_batch,
+            )
+            .await
+            .map_err(message_idempotency_store_error)?
+        {
+            IdempotencyClaimOutcome::Claimed(_) => {}
+            IdempotencyClaimOutcome::Replay(record) => return replay_message(&record),
+            IdempotencyClaimOutcome::InProgress(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "This idempotent message is already in progress; retry shortly".into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Indeterminate(_) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "The prior message has an indeterminate outcome; inspect history before using a new Idempotency-Key"
+                        .into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Conflict => {
+                // The key may have raced another pod, or the durable
+                // conversation revision may be newer than this process-local
+                // Lua handle. In either case, invalidate it while holding the
+                // lifecycle gate so `/start` is forced to reload storage.
+                state.active_conversations.write().await.remove(&key);
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency claim conflicted with durable state; reopen the conversation and retry with the appropriate key"
+                        .into(),
+                ));
+            }
+            IdempotencyClaimOutcome::Busy => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Conversation is busy or has an unacknowledged indeterminate turn; inspect history, then retry with Idempotency-Recovery-Key when required"
+                        .into(),
+                ));
+            }
+        }
+
+        let task_state = state.clone();
+        let audit_state = state.clone();
+        let audit_flow = flow.clone();
+        let audit_id = id.clone();
+        let audit_headers = crate::api::audit::background_headers(&headers);
+        let task = tokio::spawn(async move {
+            let result = execute_idempotent_message(
+                task_state,
+                key,
+                handle,
+                id,
+                req.content,
+                images,
+                attempt,
+                lifecycle_guard,
+                turn_guard,
+            )
+            .await;
+            let (success, status_code, metadata) = match &result {
+                Ok(response) => (
+                    true,
+                    StatusCode::OK.as_u16(),
+                    Some(serde_json::json!({
+                        "idempotent": true,
+                        "turn_index": response.turn_index,
+                        "turn_count": response.turn_count,
+                    })),
+                ),
+                Err((status, _)) => (
+                    false,
+                    status.as_u16(),
+                    Some(serde_json::json!({ "idempotent": true })),
+                ),
+            };
+            crate::api::audit::record(
+                &audit_state.store,
+                "conversation.message",
+                Some(&audit_flow),
+                Some(&audit_id),
+                &audit_headers,
+                Some(addr),
+                success,
+                status_code,
+                metadata,
+            )
+            .await;
+            result
+        });
+        let response = task.await.map_err(|error| {
+            tracing::error!(%error, "Idempotent conversation task panicked");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Conversation task failed unexpectedly".into(),
+            )
+        })??;
+        return Ok((HeaderMap::new(), Json(response)));
     }
+
+    *handle.last_touched.write().await = Instant::now();
 
     let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
     let mut shutdown = handle.shutdown.subscribe();
@@ -810,13 +1351,33 @@ pub async fn post_message(
     let turn_count = handle.conv.turn_count().await;
     let turn_index = turn_count.saturating_sub(1);
 
-    Ok(Json(MessageResp {
-        conversation_id: id,
-        turn_index,
-        assistant,
-        reasoning,
-        turn_count,
-    }))
+    crate::api::audit::record(
+        &state.store,
+        "conversation.message",
+        Some(&flow),
+        Some(&id),
+        &headers,
+        Some(addr),
+        true,
+        StatusCode::OK.as_u16(),
+        Some(serde_json::json!({
+            "idempotent": false,
+            "turn_index": turn_index,
+            "turn_count": turn_count,
+        })),
+    )
+    .await;
+
+    Ok((
+        HeaderMap::new(),
+        Json(MessageResp {
+            conversation_id: id,
+            turn_index,
+            assistant,
+            reasoning,
+            turn_count,
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------

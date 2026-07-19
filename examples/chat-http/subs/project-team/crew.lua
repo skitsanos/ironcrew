@@ -10,8 +10,7 @@ local topic = (input and input.topic) or "small multi-agent teams"
 local crew = Crew.new({
     goal     = "Produce short research briefs on demand",
     provider = "openai",
-    model    = env("GEMINI_MODEL") or "gemini-2.5-flash",
-    base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
+    model    = env("OPENAI_MODEL") or "gpt-4.1-mini",
 })
 
 crew:add_agent(Agent.new({

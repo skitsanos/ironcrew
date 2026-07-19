@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::agent_turn::ActiveTurnGuard;
 use crate::engine::agent::Agent;
@@ -83,6 +83,13 @@ pub struct LuaConversationInner {
     /// Message history including the system prompt at index 0.
     pub messages: Mutex<Vec<ChatMessage>>,
 
+    /// Serializes complete turn transactions independently from the messages
+    /// snapshot. A turn executes against a private candidate history and only
+    /// publishes it after durable persistence succeeds, so provider timeout,
+    /// cancellation, or a lost database write leaves the visible transcript
+    /// byte-for-byte unchanged.
+    turn_execution_lock: Arc<Mutex<()>>,
+
     /// Optional cap on the number of stored messages (excluding system prompt).
     pub max_history: Option<usize>,
 
@@ -124,6 +131,20 @@ pub struct LuaConversationInner {
     /// Revision expected by the next durable save. Held across persistence so
     /// overlapping save calls cannot reuse the same optimistic revision.
     pub revision: Mutex<u64>,
+}
+
+/// Candidate result of one conversation turn. The public conversation history
+/// is intentionally untouched while this value exists. HTTP idempotency can
+/// atomically persist `record` with its operation ledger before publishing the
+/// candidate in memory.
+pub struct PreparedConversationTurn {
+    pub record: ConversationRecord,
+    pub user_message: String,
+    pub assistant: String,
+    pub reasoning: Option<String>,
+    pub turn_index: usize,
+    pub turn_count: usize,
+    _execution_guard: OwnedMutexGuard<()>,
 }
 
 impl LuaConversationInner {
@@ -217,6 +238,7 @@ impl LuaConversationInner {
             model,
             system_prompt,
             messages: Mutex::new(messages),
+            turn_execution_lock: Arc::new(Mutex::new(())),
             max_history: Some(max_history),
             history_max_bytes,
             stream,
@@ -236,6 +258,11 @@ impl LuaConversationInner {
     /// Persist the current state to the configured store. Safe to call even
     /// for non-persistent sessions — it simply no-ops.
     pub async fn persist(&self) -> Result<(), IronCrewError> {
+        let _execution_guard = self.turn_execution_lock.clone().lock_owned().await;
+        self.persist_current_snapshot().await
+    }
+
+    async fn persist_current_snapshot(&self) -> Result<(), IronCrewError> {
         let Some(ref store) = self.store else {
             return Ok(());
         };
@@ -267,6 +294,7 @@ impl LuaConversationInner {
 
     /// Reset history — clear all messages, keep the system prompt.
     pub async fn reset_history(&self) {
+        let _execution_guard = self.turn_execution_lock.clone().lock_owned().await;
         let mut history = self.messages.lock().await;
         history.clear();
         history.push(ChatMessage::system(&self.system_prompt));
@@ -290,6 +318,13 @@ impl LuaConversationInner {
             .iter()
             .filter(|m| m.role == "user")
             .count()
+    }
+
+    /// Durable revision currently represented by the published in-memory
+    /// transcript. HTTP idempotency claims fence their candidate turn against
+    /// this value before any provider or tool call begins.
+    pub async fn revision(&self) -> u64 {
+        *self.revision.lock().await
     }
 
     /// Run a single send/respond round (with tool-call loop) and return the
@@ -327,6 +362,34 @@ impl LuaConversationInner {
         images: Option<Vec<crate::llm::provider::ImageInput>>,
         caller_ctx: &ToolCallContext,
     ) -> Result<(String, Option<String>), IronCrewError> {
+        let prepared = self
+            .prepare_turn_with_ctx(user_message, images, caller_ctx)
+            .await?;
+        let new_revision = if self.autosave && self.persistent {
+            let Some(store) = self.store.as_ref() else {
+                return Err(IronCrewError::Validation(
+                    "Persistent conversation has no state store".into(),
+                ));
+            };
+            store.save_conversation(&prepared.record).await?
+        } else {
+            prepared.record.revision
+        };
+        self.publish_prepared_turn(prepared, new_revision).await
+    }
+
+    /// Execute a turn against a private transcript candidate. The visible
+    /// in-memory history and durable conversation row are not mutated here.
+    /// Callers must durably commit `prepared.record` and then invoke
+    /// [`Self::publish_prepared_turn`], or simply drop the value to roll back
+    /// without any transcript mutation.
+    pub async fn prepare_turn_with_ctx(
+        &self,
+        user_message: &str,
+        images: Option<Vec<crate::llm::provider::ImageInput>>,
+        caller_ctx: &ToolCallContext,
+    ) -> Result<PreparedConversationTurn, IronCrewError> {
+        let execution_guard = self.turn_execution_lock.clone().lock_owned().await;
         let has_tools = !self.agent.tools.is_empty();
         let helper_ctx = ToolCallContext {
             store: caller_ctx.store.clone().or_else(|| self.store.clone()),
@@ -353,11 +416,11 @@ impl LuaConversationInner {
             ask_human: caller_ctx.ask_human.clone(),
         };
 
-        // Acquire the history lock before publishing the active user message,
-        // then retain it until a cancellation-aware guard owns that turn. This
-        // closes the timeout window where an appended user message could
-        // otherwise survive without a provider response.
-        let mut history = self.messages.lock().await;
+        // Work on a bounded private candidate. Keeping the published history
+        // untouched is the transaction boundary for timeout/cancellation and
+        // for persistence failures after provider/tool execution.
+        let mut history = self.messages.lock().await.clone();
+        let base_revision = *self.revision.lock().await;
         if let Some(imgs) = images {
             history.push(ChatMessage::user_with_images(user_message, imgs));
         } else {
@@ -372,11 +435,7 @@ impl LuaConversationInner {
             self.run_turn_streaming_no_tools(&mut history).await?
         } else {
             // 3. Non-streaming (or tools-present) path: delegate to the
-            //    shared helper under the history lock. The lock is held
-            //    across the helper's awaits on purpose — `self.messages`
-            //    has a single writer per turn, and releasing it mid-turn
-            //    would let a concurrent caller interleave user messages.
-            //    `tokio::sync::Mutex` is await-safe so this is fine.
+            //    shared helper against the private candidate.
             crate::lua::agent_turn::run_single_agent_turn(
                 &self.agent,
                 &self.provider,
@@ -388,45 +447,67 @@ impl LuaConversationInner {
             )
             .await?
         };
-        drop(history);
 
-        // Persist before emitting success events. A persistence error is now
-        // visible to the request and cannot be mistaken for a durably committed
-        // turn by an SSE subscriber.
-        if self.autosave && self.persistent {
-            self.persist().await?;
-        }
-
-        // 4. Compute turn index and emit conversation lifecycle events.
-        //    `turn_index` is 0-based: the number of user messages already
-        //    in history (including the one we just pushed) minus 1.
-        let turn_index = {
-            let history = self.messages.lock().await;
-            history
-                .iter()
-                .filter(|m| m.role == "user")
-                .count()
-                .saturating_sub(1)
+        let turn_count = history.iter().filter(|m| m.role == "user").count();
+        let turn_index = turn_count.saturating_sub(1);
+        let record = ConversationRecord {
+            id: self.id.clone(),
+            flow_name: self.flow_name.clone(),
+            flow_path: self.flow_path.clone(),
+            agent_name: self.agent.name.clone(),
+            messages: history,
+            created_at: self.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            revision: base_revision,
         };
+
+        Ok(PreparedConversationTurn {
+            record,
+            user_message: user_message.to_string(),
+            assistant: content,
+            reasoning,
+            turn_index,
+            turn_count,
+            _execution_guard: execution_guard,
+        })
+    }
+
+    /// Publish a candidate only after the caller's durable commit succeeds.
+    /// `new_revision` is the revision returned by the same store transaction.
+    pub async fn publish_prepared_turn(
+        &self,
+        mut prepared: PreparedConversationTurn,
+        new_revision: u64,
+    ) -> Result<(String, Option<String>), IronCrewError> {
+        let mut revision = self.revision.lock().await;
+        if *revision != prepared.record.revision {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' changed while a prepared turn was pending",
+                self.id
+            )));
+        }
+        *self.messages.lock().await = std::mem::take(&mut prepared.record.messages);
+        *revision = new_revision;
+        drop(revision);
 
         self.eventbus.emit(CrewEvent::ConversationTurn {
             conversation_id: self.id.clone(),
             agent: self.agent.name.clone(),
-            turn_index,
-            user_message: user_message.to_string(),
-            assistant_message: content.clone(),
+            turn_index: prepared.turn_index,
+            user_message: prepared.user_message,
+            assistant_message: prepared.assistant.clone(),
         });
 
-        if let Some(ref r) = reasoning {
+        if let Some(ref reasoning) = prepared.reasoning {
             self.eventbus.emit(CrewEvent::ConversationThinking {
                 conversation_id: self.id.clone(),
                 agent: self.agent.name.clone(),
-                turn_index,
-                content: r.clone(),
+                turn_index: prepared.turn_index,
+                content: reasoning.clone(),
             });
         }
 
-        Ok((content, reasoning))
+        Ok((prepared.assistant, prepared.reasoning))
     }
 
     /// Streaming no-tools turn. The user message has already been pushed

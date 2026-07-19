@@ -88,6 +88,80 @@ Each run has a maximum lifetime (default: 30 minutes). If execution exceeds this
 limit, the run is aborted and a `run_complete` event is emitted with `status: "timeout"`.
 Configure via `IRONCREW_MAX_RUN_LIFETIME` env var (seconds).
 
+### Safe retries with `Idempotency-Key`
+
+`POST /flows/{flow}/run` and
+`POST /flows/{flow}/conversations/{id}/messages` accept one optional
+`Idempotency-Key` header. Production deployments should set
+`IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`, which makes the header mandatory on
+both endpoints. A key must contain 1–128 visible ASCII bytes with no
+whitespace. IronCrew hashes it before persistence; the raw key is never stored
+or written to the audit log. Use an unguessable value (for example, a UUIDv4
+or 128-bit random token), because retaining the prior raw key is also the
+capability used for explicit indeterminate-turn recovery.
+
+```bash
+curl -X POST http://localhost:3000/flows/research-crew/run \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: client-job-018f6c' \
+  -d '{"topic":"quantum computing"}'
+```
+
+The first request allocates its run id, but IronCrew does not return or replay
+the `started` response until the matching durable run intent exists and the
+exact fenced claim is `running`. A retry with the same key and the same
+canonical request returns the original status and JSON body, including the
+same `run_id`, with
+`Idempotency-Replayed: true`. Object-key order does not change a fingerprint;
+array order does. A missing run body is distinct from explicit JSON `null`.
+For messages, an absent, `null`, or empty `images` list is equivalent.
+
+- Reusing a key for another endpoint, flow, conversation, or request body
+  returns `409 Conflict`.
+- A matching message that is still executing returns `409`; it is not queued.
+- If another pod has already advanced the durable conversation revision, the
+  stale local handle is discarded and the request returns `409`; call
+  `/start` to reload before retrying.
+- If a pod dies after a message may have invoked a provider or tool, the key
+  becomes an indeterminate tombstone and returns `409` instead of executing
+  those effects again. A different key cannot silently bypass an expired
+  conversation claim: IronCrew first installs a scope hazard and returns
+  `409`. Inspect conversation history, then deliberately acknowledge the old
+  key while submitting a new key:
+
+  ```bash
+  curl -X POST http://localhost:3000/flows/chat/conversations/customer-42/messages \
+    -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: message-attempt-2' \
+    -H 'Idempotency-Recovery-Key: message-attempt-1' \
+    -d '{"content":"Continue after the inspected turn"}'
+  ```
+
+  The recovery header must contain the prior raw key; IronCrew hashes it and
+  atomically consumes only the matching conversation hazard. If the request
+  is the one that first discovers the expired worker, it returns one `409`
+  barrier. Even a correctly acknowledged replacement remains blocked for one
+  full `IRONCREW_RUN_LEASE_TTL_SECONDS` interval after that hazard is recorded,
+  preventing overlap with a stale worker that is still unwinding. Retry the
+  identical recovery request after that grace interval (60 seconds by
+  default); earlier retries continue to return `409`.
+  Re-open an evicted/restarted conversation with `/start` before recovery.
+- A crashed run claim is reconciled to an `abandoned` run with its original
+  `run_id`; retries continue to return that original acceptance response.
+- While a keyed run executes, one fenced heartbeat atomically renews both its
+  run lease and operation-ledger lease. Losing either fence stops further Lua,
+  provider, and tool work before terminal reconciliation proceeds.
+- Client disconnect does not cancel a keyed message. The server-owned task
+  finishes its atomic transcript/replay commit in the background.
+
+The guarantee is completed-response replay and no automatic duplicate
+execution during retention. It cannot make arbitrary external tools
+transactional. Keep tool operations independently idempotent when possible.
+Ledger rows expire after `IRONCREW_IDEMPOTENCY_TTL_SECONDS`; terminal responses
+are bounded by per-record and aggregate byte caps. See
+[Storage Backends](storage.md#idempotency-ledger) for all limits and backend
+semantics.
+
 ## Aborting a Run
 
 Cancel a running crew by calling the abort endpoint:
@@ -464,13 +538,18 @@ with pagination.
 | Param | Type | Notes |
 |---|---|---|
 | `flow` | string | Filter by `flow_path` (exact match). |
-| `action` | string | One of `flow.run.start`, `flow.run.abort`, `flow.run.delete`, `conversation.start`, `conversation.delete`. |
+| `action` | string | One of `flow.run.start`, `flow.run.abort`, `flow.run.delete`, `conversation.start`, `conversation.message`, `conversation.delete`. |
 | `actor` | string | Exact match against the `X-Audit-Actor` value at write time. |
 | `since` | RFC3339 timestamp | Inclusive lower bound. |
 | `until` | RFC3339 timestamp | Exclusive upper bound. |
 | `success` | `true` / `false` | Filter to only successful or only failed attempts. |
 | `limit` | int | Page size. Default `IRONCREW_AUDIT_DEFAULT_LIMIT` (50). Capped at `IRONCREW_AUDIT_MAX_LIMIT` (500). |
 | `offset` | int | Skip the first N rows. Default 0. |
+
+Server-owned keyed runs and message turns retain audit ownership after a
+client disconnect. `conversation.message` metadata contains only idempotency
+mode and turn indexes/counts; message content and raw idempotency/recovery keys
+are never copied into the audit event.
 
 ### Response
 
@@ -584,7 +663,10 @@ IRONCREW_CORS_ORIGINS=https://app.example.com,https://admin.example.com
 IRONCREW_CORS_ORIGINS=*
 ```
 
-Allowed methods: GET, POST, DELETE, OPTIONS. Allowed headers: `Authorization`, `Content-Type`.
+Allowed methods: GET, POST, DELETE, OPTIONS. Allowed request headers:
+`Authorization`, `Content-Type`, `Idempotency-Key`, and
+`Idempotency-Recovery-Key`. Browser clients may read the exposed
+`Idempotency-Replayed` response header.
 
 ## Request Size Limits
 

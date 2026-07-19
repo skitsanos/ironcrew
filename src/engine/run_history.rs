@@ -4,6 +4,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::engine::idempotency::{
+    CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
+    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+    validate_digest,
+};
 use crate::engine::sessions::{
     ConversationRecord, ConversationSummary, DialogStateRecord, validate_session_id,
 };
@@ -268,7 +274,7 @@ fn encode_flow_component(flow_path: &str) -> String {
     }
 }
 
-fn validate_run_id(run_id: &str) -> Result<()> {
+pub(super) fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty() || run_id.len() > 128 {
         return Err(IronCrewError::Validation(
             "run id must contain between 1 and 128 ASCII characters".into(),
@@ -727,15 +733,307 @@ fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
 /// JSON file-based store rooted at an `.ironcrew/` directory.
 ///
 /// Each record type gets its own subdirectory: `runs/`, `conversations/`,
-/// `dialogs/`, and `audit_events/`. All four are owner-only (0o700) on
-/// Unix since they may contain sensitive model output.
+/// `dialogs/`, `audit_events/`, and `idempotency/`. All five are owner-only
+/// (0o700) on Unix since they may contain sensitive model output or request
+/// fingerprints.
 pub struct JsonFileStore {
     runs_dir: PathBuf,
     conversations_dir: PathBuf,
     dialogs_dir: PathBuf,
     audit_events_dir: PathBuf,
+    /// Persistent request-idempotency records. These share `run_lock` with
+    /// conversations so a completed message response and its revised
+    /// conversation snapshot can be published as one process-local critical
+    /// section.
+    idempotency_dir: PathBuf,
     lease: super::store::RunLeaseConfig,
     run_lock: Arc<Mutex<()>>,
+}
+
+fn idempotency_path(dir: &Path, key_hash: &str) -> Result<PathBuf> {
+    validate_digest("idempotency key hash", key_hash)?;
+    Ok(dir.join(format!("{key_hash}.json")))
+}
+
+fn read_idempotency_record(path: &Path) -> Result<IdempotencyRecord> {
+    let data = read_json_record(path)?;
+    let record: IdempotencyRecord = serde_json::from_str(&data).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Failed to parse idempotency record '{}': {error}",
+            path.display()
+        ))
+    })?;
+    record.validate()?;
+    Ok(record)
+}
+
+fn parse_idempotency_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|error| IronCrewError::Validation(format!("{label} is not RFC3339: {error}")))
+}
+
+fn timestamp_has_passed(deadline: &str, now: &str) -> Result<bool> {
+    Ok(
+        parse_idempotency_timestamp("idempotency deadline", deadline)?
+            <= parse_idempotency_timestamp("idempotency current time", now)?,
+    )
+}
+
+fn json_recovery_grace_elapsed(
+    hazard: &IdempotencyRecord,
+    claim_time: &str,
+    ttl: std::time::Duration,
+) -> Result<bool> {
+    let marked_at = hazard
+        .completed_at
+        .as_deref()
+        .unwrap_or(hazard.updated_at.as_str());
+    let marked_at = parse_idempotency_timestamp("idempotency hazard time", marked_at)?;
+    let claim_time = parse_idempotency_timestamp("idempotency recovery claim time", claim_time)?;
+    let grace = chrono::Duration::from_std(ttl).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "Idempotency recovery grace is out of range: {error}"
+        ))
+    })?;
+    let recovery_at = marked_at.checked_add_signed(grace).ok_or_else(|| {
+        IronCrewError::Validation("Idempotency recovery grace deadline overflow".into())
+    })?;
+    Ok(claim_time >= recovery_at)
+}
+
+fn retention_expiry(now: &str, ttl_seconds: u64) -> Result<String> {
+    let now = parse_idempotency_timestamp("idempotency current time", now)?;
+    let ttl = i64::try_from(ttl_seconds)
+        .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?;
+    now.checked_add_signed(chrono::Duration::seconds(ttl))
+        .ok_or_else(|| IronCrewError::Validation("Idempotency retention expiry overflow".into()))
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn classify_idempotency_record(
+    record: &IdempotencyRecord,
+    request_fingerprint: &str,
+    now: &str,
+) -> Result<IdempotencyLookup> {
+    validate_digest("request fingerprint", request_fingerprint)?;
+    parse_idempotency_timestamp("idempotency current time", now)?;
+    if record.request_fingerprint != request_fingerprint {
+        return Ok(IdempotencyLookup::Conflict);
+    }
+    if record.state.is_terminal()
+        && record
+            .expires_at
+            .as_deref()
+            .is_some_and(|expires| timestamp_has_passed(expires, now).unwrap_or(false))
+    {
+        return Ok(IdempotencyLookup::Miss);
+    }
+    if record.state == IdempotencyState::Indeterminate {
+        return Ok(IdempotencyLookup::Indeterminate(record.clone()));
+    }
+    if record.replayable() {
+        return Ok(IdempotencyLookup::Replay(record.clone()));
+    }
+    if record.state.is_in_flight() && timestamp_has_passed(&record.lease_expires_at, now)? {
+        return Ok(IdempotencyLookup::Indeterminate(record.clone()));
+    }
+    if record.state.is_in_flight() {
+        return Ok(IdempotencyLookup::InProgress(record.clone()));
+    }
+    Ok(IdempotencyLookup::Indeterminate(record.clone()))
+}
+
+fn visit_idempotency_records(
+    dir: &Path,
+    mut visitor: impl FnMut(&Path, IdempotencyRecord) -> Result<()>,
+) -> Result<()> {
+    let mut scanned = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        consume_scan_entry(&mut scanned)?;
+        visitor(&path, read_idempotency_record(&path)?)?;
+    }
+    Ok(())
+}
+
+fn prune_json_idempotency_locked(dir: &Path, now: &str, limit: usize) -> Result<usize> {
+    parse_idempotency_timestamp("idempotency prune time", now)?;
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut expired = Vec::new();
+    visit_idempotency_records(dir, |path, record| {
+        if record.state.is_terminal()
+            && let Some(expires_at) = record.expires_at
+            && timestamp_has_passed(&expires_at, now)?
+        {
+            expired.push((expires_at, path.to_path_buf()));
+        }
+        Ok(())
+    })?;
+    expired.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut removed = 0usize;
+    for (_, path) in expired.into_iter().take(limit) {
+        std::fs::remove_file(path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn json_idempotency_response_bytes(dir: &Path, except_key: Option<&str>) -> Result<usize> {
+    let mut total = 0usize;
+    visit_idempotency_records(dir, |_, record| {
+        if except_key != Some(record.key_hash.as_str()) {
+            total = total
+                .checked_add(record.response_body.as_deref().map(str::len).unwrap_or(0))
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Idempotency response byte total overflow".into())
+                })?;
+        }
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+fn terminalize_json_idempotency_indeterminate(
+    dir: &Path,
+    path: &Path,
+    record: &mut IdempotencyRecord,
+    completed_at: &str,
+) -> Result<()> {
+    record.state = IdempotencyState::Indeterminate;
+    record.response_status = None;
+    record.response_body = None;
+    record.updated_at = completed_at.to_string();
+    record.completed_at = Some(completed_at.to_string());
+    record.expires_at = Some(retention_expiry(completed_at, record.ttl_seconds)?);
+    record.validate()?;
+    write_serialized_record_atomic(path, record, "idempotency record")?;
+    // Keep the parameter explicit so callers cannot accidentally update a
+    // record outside the store's idempotency directory.
+    debug_assert!(path.starts_with(dir));
+    Ok(())
+}
+
+fn active_conversation_idempotency_exists(
+    dir: &Path,
+    flow_path: Option<&str>,
+    conversation_id: &str,
+) -> Result<bool> {
+    let flow_scope = flow_path.unwrap_or("");
+    let mut found = false;
+    visit_idempotency_records(dir, |_, record| {
+        found |= record.operation == CONVERSATION_MESSAGE_OPERATION
+            && record.scope == flow_scope
+            && record.resource_id == conversation_id
+            && record.state.is_in_flight();
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn ensure_idempotency_completion_fence(
+    record: &IdempotencyRecord,
+    completion: &IdempotencyCompletion,
+) -> Result<()> {
+    if record.request_fingerprint != completion.request_fingerprint
+        || record.attempt_id != completion.attempt_id
+        || record.owner_instance_id != completion.owner_instance_id
+    {
+        return Err(IronCrewError::Conflict(
+            "Idempotency operation changed before completion".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn transition_json_run_idempotency_to_running(dir: &Path, run: &RunRecord) -> Result<()> {
+    visit_idempotency_records(dir, |path, mut record| {
+        if record.operation == RUN_OPERATION
+            && record.scope == run.flow
+            && record.resource_id == run.run_id
+            && record.owner_instance_id == run.owner_instance_id
+            && record.state == IdempotencyState::Claimed
+        {
+            record.state = IdempotencyState::Running;
+            record.lease_expires_at.clone_from(&run.lease_expires_at);
+            record.updated_at.clone_from(&run.started_at);
+            record.validate()?;
+            write_serialized_record_atomic(path, &record, "running idempotency record")?;
+        }
+        Ok(())
+    })
+}
+
+fn json_run_hydration_ledger(
+    dir: &Path,
+    run_id: &str,
+    flow: &str,
+    owner: &str,
+) -> Result<Option<(PathBuf, IdempotencyRecord)>> {
+    let mut matching = None;
+    visit_idempotency_records(dir, |path, record| {
+        if record.operation == RUN_OPERATION
+            && record.scope == flow
+            && record.resource_id == run_id
+            && record.owner_instance_id == owner
+            && matches!(
+                record.state,
+                IdempotencyState::Running | IdempotencyState::Completed
+            )
+        {
+            if matching.is_some() {
+                return Err(IronCrewError::Validation(format!(
+                    "Run '{run_id}' has multiple matching idempotency ledgers"
+                )));
+            }
+            matching = Some((path.to_path_buf(), record));
+        }
+        Ok(())
+    })?;
+    Ok(matching)
+}
+
+fn later_json_lease(existing: &str, proposed: &str) -> Result<String> {
+    if existing.is_empty() {
+        return Ok(proposed.to_string());
+    }
+    let existing_time = parse_idempotency_timestamp("existing run lease expiry", existing)?;
+    let proposed_time = parse_idempotency_timestamp("proposed run lease expiry", proposed)?;
+    Ok(if existing_time >= proposed_time {
+        existing.to_string()
+    } else {
+        proposed.to_string()
+    })
+}
+
+fn complete_json_run_idempotency(dir: &Path, run_id: &str, completed_at: &str) -> Result<()> {
+    parse_idempotency_timestamp("run idempotency completion time", completed_at)?;
+    visit_idempotency_records(dir, |path, mut record| {
+        if record.operation == RUN_OPERATION
+            && record.resource_id == run_id
+            && matches!(
+                record.state,
+                IdempotencyState::Claimed
+                    | IdempotencyState::Running
+                    | IdempotencyState::Indeterminate
+            )
+        {
+            record.state = IdempotencyState::Completed;
+            record.lease_expires_at.clear();
+            record.updated_at = completed_at.to_string();
+            record.completed_at = Some(completed_at.to_string());
+            record.expires_at = Some(retention_expiry(completed_at, record.ttl_seconds)?);
+            record.validate()?;
+            write_serialized_record_atomic(path, &record, "completed run idempotency record")?;
+        }
+        Ok(())
+    })
 }
 
 impl JsonFileStore {
@@ -754,12 +1052,14 @@ impl JsonFileStore {
         let conversations_dir = ironcrew_dir.join("conversations");
         let dialogs_dir = ironcrew_dir.join("dialogs");
         let audit_events_dir = ironcrew_dir.join("audit_events");
+        let idempotency_dir = ironcrew_dir.join("idempotency");
 
         for dir in [
             &runs_dir,
             &conversations_dir,
             &dialogs_dir,
             &audit_events_dir,
+            &idempotency_dir,
         ] {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
@@ -775,6 +1075,7 @@ impl JsonFileStore {
             conversations_dir,
             dialogs_dir,
             audit_events_dir,
+            idempotency_dir,
             lease,
             run_lock,
         })
@@ -787,13 +1088,66 @@ impl StateStore for JsonFileStore {
         if let Some(run_id) = intent.suggested_id.as_deref() {
             validate_run_id(run_id)?;
         }
+        let may_hydrate = intent.suggested_id.is_some();
         let _guard = self
             .run_lock
             .lock()
             .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let run_id = intent
             .suggested_id
+            .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let filename = format!("{run_id}.json");
+        let path = self.runs_dir.join(&filename);
+        let proposed_lease = self.lease.deadline_now();
+
+        if path.exists() {
+            let duplicate_error =
+                || IronCrewError::Validation(format!("Run '{run_id}' already exists"));
+            if !may_hydrate {
+                return Err(duplicate_error());
+            }
+            let data = read_json_record(&path)?;
+            let mut existing: RunRecord = serde_json::from_str(&data).map_err(|error| {
+                IronCrewError::Validation(format!("Failed to parse existing run: {error}"))
+            })?;
+            if !existing.status.is_in_flight()
+                || existing.owner_instance_id != self.lease.instance_id()
+                || existing.flow != intent.flow
+            {
+                return Err(duplicate_error());
+            }
+            let Some((ledger_path, mut ledger)) = json_run_hydration_ledger(
+                &self.idempotency_dir,
+                &run_id,
+                &intent.flow,
+                self.lease.instance_id(),
+            )?
+            else {
+                return Err(duplicate_error());
+            };
+            let mut lease_expires_at =
+                later_json_lease(&existing.lease_expires_at, &proposed_lease)?;
+            if ledger.state == IdempotencyState::Running {
+                lease_expires_at = later_json_lease(&lease_expires_at, &ledger.lease_expires_at)?;
+                ledger.lease_expires_at.clone_from(&lease_expires_at);
+                ledger.validate()?;
+                write_serialized_record_atomic(
+                    &ledger_path,
+                    &ledger,
+                    "hydrated run idempotency lease",
+                )?;
+            }
+            existing.flow_name = intent.flow_name;
+            existing.agent_count = intent.agent_count;
+            existing.task_count = intent.task_count;
+            existing.tags = intent.tags;
+            existing.lease_expires_at = lease_expires_at;
+            write_run_record_atomic(&path, &existing)?;
+            tracing::debug!("Provisional run intent hydrated: {run_id}");
+            return Ok(run_id);
+        }
+
         let record = RunRecord {
             run_id: run_id.clone(),
             flow_name: intent.flow_name,
@@ -809,10 +1163,8 @@ impl StateStore for JsonFileStore {
             cached_tokens: 0,
             tags: intent.tags,
             owner_instance_id: self.lease.instance_id().to_string(),
-            lease_expires_at: self.lease.deadline_now(),
+            lease_expires_at: proposed_lease,
         };
-        let filename = format!("{}.json", record.run_id);
-        let path = self.runs_dir.join(&filename);
         write_serialized_record_create_new(&path, &record, "run intent").map_err(|error| {
             if matches!(&error, IronCrewError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists)
             {
@@ -821,6 +1173,18 @@ impl StateStore for JsonFileStore {
                 error
             }
         })?;
+        if let Err(transition_error) =
+            transition_json_run_idempotency_to_running(&self.idempotency_dir, &record)
+        {
+            let rollback = std::fs::remove_file(&path)
+                .and_then(|()| std::fs::File::open(&self.runs_dir)?.sync_all());
+            if let Err(rollback_error) = rollback {
+                return Err(IronCrewError::Validation(format!(
+                    "JSON run idempotency transition failed: {transition_error}; run rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(transition_error);
+        }
         tracing::debug!("Run intent saved: {} -> {}", run_id, path.display());
         Ok(run_id)
     }
@@ -847,27 +1211,30 @@ impl StateStore for JsonFileStore {
         let data = read_json_record(&path)?;
         let mut record: RunRecord = serde_json::from_str(&data)
             .map_err(|e| IronCrewError::Validation(format!("Failed to parse run: {}", e)))?;
-        if record.status.is_terminal() {
-            return Ok(RunTransition::AlreadyTerminal(record.status));
-        }
-        if record.owner_instance_id != self.lease.instance_id() {
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' is owned by instance '{}', not '{}'",
-                run_id,
-                record.owner_instance_id,
-                self.lease.instance_id()
-            )));
-        }
-        record.status = completion.status;
-        record.finished_at = completion.finished_at;
-        record.duration_ms = completion.duration_ms;
-        record.task_results = completion.task_results;
-        record.total_tokens = completion.total_tokens;
-        record.cached_tokens = completion.cached_tokens;
-        record.lease_expires_at.clear();
-        write_run_record_atomic(&path, &record)?;
+        let transition = if record.status.is_terminal() {
+            RunTransition::AlreadyTerminal(record.status.clone())
+        } else {
+            if record.owner_instance_id != self.lease.instance_id() {
+                return Err(IronCrewError::Validation(format!(
+                    "Run '{}' is owned by instance '{}', not '{}'",
+                    run_id,
+                    record.owner_instance_id,
+                    self.lease.instance_id()
+                )));
+            }
+            record.status = completion.status;
+            record.finished_at = completion.finished_at;
+            record.duration_ms = completion.duration_ms;
+            record.task_results = completion.task_results;
+            record.total_tokens = completion.total_tokens;
+            record.cached_tokens = completion.cached_tokens;
+            record.lease_expires_at.clear();
+            write_run_record_atomic(&path, &record)?;
+            RunTransition::Applied
+        };
+        complete_json_run_idempotency(&self.idempotency_dir, run_id, &record.finished_at)?;
         tracing::info!("Run completion saved: {} ({})", run_id, record.status);
-        Ok(RunTransition::Applied)
+        Ok(transition)
     }
 
     async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()> {
@@ -926,7 +1293,9 @@ impl StateStore for JsonFileStore {
             .lock()
             .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let deadline = self.lease.deadline_now();
-        let mut count = 0;
+        // Keep only small run identifiers and paths in memory. Storing full
+        // records here could retain large task outputs for the entire scan.
+        let mut candidates = Vec::new();
         let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.runs_dir)? {
             let path = entry?.path();
@@ -935,13 +1304,36 @@ impl StateStore for JsonFileStore {
             }
             consume_scan_entry(&mut scanned)?;
             let data = read_json_record(&path)?;
-            let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
+            let Ok(record) = serde_json::from_str::<RunRecord>(&data) else {
                 continue;
             };
             if !record.status.is_in_flight() || record.owner_instance_id != self.lease.instance_id()
             {
                 continue;
             }
+            candidates.push((record.run_id, path, false));
+        }
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        visit_idempotency_records(&self.idempotency_dir, |_, record| {
+            if record.operation == RUN_OPERATION
+                && let Ok(index) = candidates.binary_search_by(|candidate| {
+                    candidate.0.as_str().cmp(record.resource_id.as_str())
+                })
+            {
+                candidates[index].2 = true;
+            }
+            Ok(())
+        })?;
+
+        let mut count = 0;
+        for (_, path, linked_to_ledger) in candidates {
+            if linked_to_ledger {
+                continue;
+            }
+            let data = read_json_record(&path)?;
+            let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
+                continue;
+            };
             record.lease_expires_at.clone_from(&deadline);
             write_run_record_atomic(&path, &record)?;
             count += 1;
@@ -980,6 +1372,62 @@ impl StateStore for JsonFileStore {
             .lock()
             .map_err(|e| IronCrewError::Validation(format!("JSON run lock poisoned: {}", e)))?;
         let mut count: usize = 0;
+
+        // The API persists the idempotency acceptance (including its run id)
+        // before publishing the run intent. If the process dies in that
+        // narrow window, materialize an observable Abandoned run instead of
+        // replaying an id that can only return 404. Conversation mutations
+        // cannot be reconstructed, so expired claims become indeterminate.
+        visit_idempotency_records(&self.idempotency_dir, |path, mut idempotency| {
+            if !idempotency.state.is_in_flight()
+                || !timestamp_has_passed(&idempotency.lease_expires_at, now)?
+            {
+                return Ok(());
+            }
+            if idempotency.operation == RUN_OPERATION
+                && idempotency.state == IdempotencyState::Claimed
+            {
+                validate_run_id(&idempotency.resource_id)?;
+                let run_path = self
+                    .runs_dir
+                    .join(format!("{}.json", idempotency.resource_id));
+                if !run_path.exists() {
+                    let fallback = RunRecord {
+                        run_id: idempotency.resource_id.clone(),
+                        flow_name: idempotency.scope.clone(),
+                        flow: idempotency.scope.clone(),
+                        status: RunStatus::Abandoned,
+                        started_at: idempotency.created_at.clone(),
+                        finished_at: now.to_string(),
+                        duration_ms: 0,
+                        task_results: Vec::new(),
+                        agent_count: 0,
+                        task_count: 0,
+                        total_tokens: 0,
+                        cached_tokens: 0,
+                        tags: Vec::new(),
+                        owner_instance_id: idempotency.owner_instance_id.clone(),
+                        lease_expires_at: String::new(),
+                    };
+                    write_serialized_record_create_new(
+                        &run_path,
+                        &fallback,
+                        "abandoned idempotent run fallback",
+                    )?;
+                    count = count.saturating_add(1);
+                }
+            } else if idempotency.operation == CONVERSATION_MESSAGE_OPERATION {
+                terminalize_json_idempotency_indeterminate(
+                    &self.idempotency_dir,
+                    path,
+                    &mut idempotency,
+                    now,
+                )?;
+            }
+            Ok(())
+        })?;
+
+        let mut terminal_runs = std::collections::HashMap::<String, String>::new();
         let mut scanned = 0usize;
         for entry in std::fs::read_dir(&self.runs_dir)? {
             let entry = entry?;
@@ -992,17 +1440,43 @@ impl StateStore for JsonFileStore {
             let Ok(mut record) = serde_json::from_str::<RunRecord>(&data) else {
                 continue;
             };
-            if !record.status.is_in_flight()
-                || !lease_is_expired(&record.lease_expires_at, now_parsed)
+            if record.status.is_in_flight()
+                && lease_is_expired(&record.lease_expires_at, now_parsed)
             {
-                continue;
+                record.status = RunStatus::Abandoned;
+                record.finished_at = now.to_string();
+                record.lease_expires_at.clear();
+                write_run_record_atomic(&path, &record)?;
+                count = count.saturating_add(1);
             }
-            record.status = RunStatus::Abandoned;
-            record.finished_at = now.to_string();
-            record.lease_expires_at.clear();
-            write_run_record_atomic(&path, &record)?;
-            count += 1;
+            if record.status.is_terminal() {
+                terminal_runs.insert(record.run_id, record.finished_at);
+            }
         }
+
+        visit_idempotency_records(&self.idempotency_dir, |path, mut idempotency| {
+            if idempotency.operation != RUN_OPERATION
+                || !matches!(
+                    idempotency.state,
+                    IdempotencyState::Claimed
+                        | IdempotencyState::Running
+                        | IdempotencyState::Indeterminate
+                )
+            {
+                return Ok(());
+            }
+            let Some(finished_at) = terminal_runs.get(&idempotency.resource_id) else {
+                return Ok(());
+            };
+            parse_idempotency_timestamp("run idempotency completion time", finished_at)?;
+            idempotency.state = IdempotencyState::Completed;
+            idempotency.lease_expires_at.clear();
+            idempotency.updated_at.clone_from(finished_at);
+            idempotency.completed_at = Some(finished_at.clone());
+            idempotency.expires_at = Some(retention_expiry(finished_at, idempotency.ttl_seconds)?);
+            idempotency.validate()?;
+            write_serialized_record_atomic(path, &idempotency, "reconciled run idempotency")
+        })?;
         Ok(count)
     }
 
@@ -1100,6 +1574,533 @@ impl StateStore for JsonFileStore {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
     //
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup> {
+        let path = idempotency_path(&self.idempotency_dir, key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !path.exists() {
+            return Ok(IdempotencyLookup::Miss);
+        }
+        classify_idempotency_record(&read_idempotency_record(&path)?, request_fingerprint, now)
+    }
+
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome> {
+        claim.validate()?;
+        if max_records == 0 {
+            return Err(IronCrewError::Validation(
+                "Idempotency record limit must be positive".into(),
+            ));
+        }
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        prune_json_idempotency_locked(&self.idempotency_dir, &claim.created_at, prune_batch)?;
+
+        let path = idempotency_path(&self.idempotency_dir, &claim.key_hash)?;
+        if path.exists() {
+            let mut existing = read_idempotency_record(&path)?;
+            let expired_terminal = existing.state.is_terminal()
+                && match existing.expires_at.as_deref() {
+                    Some(expires) => timestamp_has_passed(expires, &claim.created_at)?,
+                    None => false,
+                };
+            if expired_terminal {
+                std::fs::remove_file(&path)?;
+            } else if existing.request_fingerprint != claim.request_fingerprint {
+                return Ok(IdempotencyClaimOutcome::Conflict);
+            } else if existing.state == IdempotencyState::Indeterminate {
+                return Ok(IdempotencyClaimOutcome::Indeterminate(existing));
+            } else if existing.replayable() {
+                return Ok(IdempotencyClaimOutcome::Replay(existing));
+            } else if existing.state.is_in_flight()
+                && timestamp_has_passed(&existing.lease_expires_at, &claim.created_at)?
+            {
+                terminalize_json_idempotency_indeterminate(
+                    &self.idempotency_dir,
+                    &path,
+                    &mut existing,
+                    &claim.created_at,
+                )?;
+                return Ok(IdempotencyClaimOutcome::Indeterminate(existing));
+            } else if existing.state.is_in_flight() {
+                return Ok(IdempotencyClaimOutcome::InProgress(existing));
+            } else {
+                return Ok(IdempotencyClaimOutcome::Indeterminate(existing));
+            }
+        }
+
+        let mut recovery_hazard = None;
+        if let Some(exclusive_scope) = claim.exclusive_scope.as_deref() {
+            let mut busy = false;
+            visit_idempotency_records(&self.idempotency_dir, |existing_path, mut existing| {
+                if existing.exclusive_scope.as_deref() != Some(exclusive_scope)
+                    || !existing.state.is_in_flight()
+                {
+                    return Ok(());
+                }
+                if timestamp_has_passed(&existing.lease_expires_at, &claim.created_at)? {
+                    terminalize_json_idempotency_indeterminate(
+                        &self.idempotency_dir,
+                        existing_path,
+                        &mut existing,
+                        &claim.created_at,
+                    )?;
+                    // Do not launch a fresh turn in the same critical section
+                    // that discovers an expired predecessor. Its worker may
+                    // still be unwinding after losing the lease.
+                    busy = true;
+                } else {
+                    busy = true;
+                }
+                Ok(())
+            })?;
+            if busy {
+                return Ok(IdempotencyClaimOutcome::Busy);
+            }
+
+            let mut hazards = Vec::new();
+            visit_idempotency_records(&self.idempotency_dir, |existing_path, existing| {
+                if existing.exclusive_scope.as_deref() == Some(exclusive_scope)
+                    && existing.state == IdempotencyState::Indeterminate
+                {
+                    hazards.push((existing_path.to_path_buf(), existing));
+                }
+                Ok(())
+            })?;
+            if !hazards.is_empty() {
+                let acknowledged = hazards.len() == 1
+                    && claim.recovery_key_hash.as_deref() == Some(hazards[0].1.key_hash.as_str());
+                if !acknowledged
+                    || !json_recovery_grace_elapsed(
+                        &hazards[0].1,
+                        &claim.created_at,
+                        self.lease.ttl(),
+                    )?
+                {
+                    return Ok(IdempotencyClaimOutcome::Busy);
+                }
+                recovery_hazard = hazards.pop();
+            }
+        }
+
+        if claim.operation == CONVERSATION_MESSAGE_OPERATION {
+            validate_session_id(&claim.resource_id)?;
+            let expected_revision = claim.base_revision.ok_or_else(|| {
+                IronCrewError::Validation(
+                    "Conversation idempotency claim has no base revision".into(),
+                )
+            })?;
+            let conversation_path = conversation_file_path(
+                &self.conversations_dir,
+                Some(&claim.scope),
+                &claim.resource_id,
+            );
+            let current_revision = load_conversation_file(&conversation_path, &claim.resource_id)?
+                .map(|conversation| conversation.revision)
+                .unwrap_or(0);
+            if current_revision != expected_revision {
+                return Ok(IdempotencyClaimOutcome::Conflict);
+            }
+        }
+
+        let mut record_count = 0usize;
+        let mut stored_response_bytes = 0usize;
+        visit_idempotency_records(&self.idempotency_dir, |_, record| {
+            record_count = record_count.saturating_add(1);
+            stored_response_bytes = stored_response_bytes
+                .checked_add(record.response_body.as_deref().map(str::len).unwrap_or(0))
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Idempotency response byte total overflow".into())
+                })?;
+            Ok(())
+        })?;
+        if record_count >= max_records {
+            return Err(IronCrewError::Validation(format!(
+                "Idempotency record limit reached ({max_records})"
+            )));
+        }
+        let mut record = claim.to_record();
+        record.response_body = record.response_body.filter(|body| {
+            stored_response_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= claim.max_total_response_bytes)
+        });
+        record.validate()?;
+        write_serialized_record_create_new(&path, &record, "idempotency claim")?;
+        if let Some((hazard_path, mut hazard)) = recovery_hazard {
+            let original_hazard = hazard.clone();
+            hazard.exclusive_scope = None;
+            hazard.updated_at.clone_from(&claim.created_at);
+            hazard.validate()?;
+            if let Err(recovery_error) = write_serialized_record_atomic(
+                &hazard_path,
+                &hazard,
+                "recovered idempotency hazard",
+            ) {
+                let claim_rollback = std::fs::remove_file(&path)
+                    .and_then(|()| std::fs::File::open(&self.idempotency_dir)?.sync_all());
+                let hazard_rollback = write_serialized_record_atomic(
+                    &hazard_path,
+                    &original_hazard,
+                    "idempotency hazard recovery rollback",
+                );
+                if let Err(rollback_error) = claim_rollback {
+                    return Err(IronCrewError::Validation(format!(
+                        "JSON idempotency hazard recovery failed: {recovery_error}; claim rollback failed: {rollback_error}"
+                    )));
+                }
+                if let Err(rollback_error) = hazard_rollback {
+                    return Err(IronCrewError::Validation(format!(
+                        "JSON idempotency hazard recovery failed: {recovery_error}; hazard rollback failed: {rollback_error}"
+                    )));
+                }
+                return Err(recovery_error);
+            }
+        }
+        Ok(IdempotencyClaimOutcome::Claimed(record))
+    }
+
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool> {
+        parse_idempotency_timestamp("idempotency lease expiry", new_lease_expires_at)?;
+        let path = idempotency_path(&self.idempotency_dir, key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut record = read_idempotency_record(&path)?;
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before heartbeat".into(),
+            ));
+        }
+        if !record.state.is_in_flight() {
+            return Ok(record.state == IdempotencyState::Completed);
+        }
+        record.lease_expires_at = new_lease_expires_at.to_string();
+        record.validate()?;
+        write_serialized_record_atomic(&path, &record, "idempotency heartbeat")?;
+        Ok(true)
+    }
+
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat> {
+        validate_run_id(run_id)?;
+        parse_idempotency_timestamp("idempotency run lease expiry", new_lease_expires_at)?;
+        let ledger_path = idempotency_path(&self.idempotency_dir, key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !ledger_path.exists() {
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+        let mut ledger = read_idempotency_record(&ledger_path)?;
+        if ledger.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before run heartbeat".into(),
+            ));
+        }
+        if ledger.operation != RUN_OPERATION
+            || ledger.resource_id != run_id
+            || ledger.owner_instance_id != self.lease.instance_id()
+        {
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+
+        let run_path = self.runs_dir.join(format!("{run_id}.json"));
+        if !run_path.exists() {
+            if ledger.state != IdempotencyState::Claimed {
+                return Ok(RunFenceHeartbeat::Lost);
+            }
+            ledger.lease_expires_at = new_lease_expires_at.to_string();
+            ledger.validate()?;
+            write_serialized_record_atomic(
+                &ledger_path,
+                &ledger,
+                "claimed run idempotency heartbeat",
+            )?;
+            return Ok(RunFenceHeartbeat::Owned);
+        }
+
+        let data = read_json_record(&run_path)?;
+        let mut run: RunRecord = serde_json::from_str(&data).map_err(|error| {
+            IronCrewError::Validation(format!("Failed to parse heartbeat run: {error}"))
+        })?;
+        if run.owner_instance_id != ledger.owner_instance_id {
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+        if run.status.is_terminal() {
+            return if ledger.state == IdempotencyState::Indeterminate {
+                Ok(RunFenceHeartbeat::Lost)
+            } else {
+                Ok(RunFenceHeartbeat::Terminal(run.status))
+            };
+        }
+        if ledger.state != IdempotencyState::Running {
+            return Ok(RunFenceHeartbeat::Lost);
+        }
+
+        let original_run = run.clone();
+        run.lease_expires_at = new_lease_expires_at.to_string();
+        ledger.lease_expires_at = new_lease_expires_at.to_string();
+        ledger.validate()?;
+        write_run_record_atomic(&run_path, &run)?;
+        if let Err(heartbeat_error) = write_serialized_record_atomic(
+            &ledger_path,
+            &ledger,
+            "running run idempotency heartbeat",
+        ) {
+            if let Err(rollback_error) = write_run_record_atomic(&run_path, &original_run) {
+                return Err(IronCrewError::Validation(format!(
+                    "JSON idempotent run heartbeat failed: {heartbeat_error}; run rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(heartbeat_error);
+        }
+        Ok(RunFenceHeartbeat::Owned)
+    }
+
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome> {
+        completion.validate()?;
+        let path = idempotency_path(&self.idempotency_dir, &completion.key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !path.exists() {
+            return Err(IronCrewError::Validation(
+                "Idempotency claim not found during completion".into(),
+            ));
+        }
+        let mut record = read_idempotency_record(&path)?;
+        ensure_idempotency_completion_fence(&record, &completion)?;
+        if record.state == IdempotencyState::Completed {
+            return Ok(IdempotencyCompletionOutcome {
+                replayable: record.replayable(),
+                already_completed: true,
+            });
+        }
+        if record.state == IdempotencyState::Indeterminate {
+            return Err(IronCrewError::Conflict(
+                "Indeterminate idempotency outcomes cannot be completed".into(),
+            ));
+        }
+
+        let stored_bytes = json_idempotency_response_bytes(
+            &self.idempotency_dir,
+            Some(completion.key_hash.as_str()),
+        )?;
+        let response_body = completion.response_body.filter(|body| {
+            stored_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= max_total_response_bytes)
+        });
+        record.state = IdempotencyState::Completed;
+        record.response_status = Some(completion.response_status);
+        record.response_body = response_body;
+        record.updated_at = completion.completed_at.clone();
+        record.completed_at = Some(completion.completed_at);
+        record.expires_at = Some(completion.expires_at);
+        record.validate()?;
+        write_serialized_record_atomic(&path, &record, "idempotency completion")?;
+        Ok(IdempotencyCompletionOutcome {
+            replayable: record.replayable(),
+            already_completed: false,
+        })
+    }
+
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit> {
+        completion.validate()?;
+        validate_session_id(&conversation.id)?;
+        let ledger_path = idempotency_path(&self.idempotency_dir, &completion.key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !ledger_path.exists() {
+            return Err(IronCrewError::Validation(
+                "Idempotency claim not found during conversation commit".into(),
+            ));
+        }
+        let idempotency = read_idempotency_record(&ledger_path)?;
+        ensure_idempotency_completion_fence(&idempotency, &completion)?;
+        if idempotency.operation != CONVERSATION_MESSAGE_OPERATION
+            || idempotency.resource_id != conversation.id
+            || idempotency.scope != conversation.flow_path.as_deref().unwrap_or("")
+        {
+            return Err(IronCrewError::Conflict(
+                "Idempotency claim does not match the conversation scope".into(),
+            ));
+        }
+        let expected_revision = idempotency.base_revision.ok_or_else(|| {
+            IronCrewError::Validation("Conversation idempotency claim has no base revision".into())
+        })?;
+        if expected_revision != conversation.revision {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' changed before idempotent commit",
+                conversation.id
+            )));
+        }
+        if idempotency.state == IdempotencyState::Completed {
+            return Ok(ConversationIdempotencyCommit {
+                revision: expected_revision.saturating_add(1),
+                replayable: idempotency.replayable(),
+                already_completed: true,
+            });
+        }
+        if idempotency.state == IdempotencyState::Indeterminate {
+            return Err(IronCrewError::Conflict(
+                "Indeterminate conversation outcomes cannot be committed".into(),
+            ));
+        }
+
+        let conversation_path = conversation_file_path(
+            &self.conversations_dir,
+            conversation.flow_path.as_deref(),
+            &conversation.id,
+        );
+        let current = load_conversation_file(&conversation_path, &conversation.id)?;
+        let current_revision = current.as_ref().map(|saved| saved.revision).unwrap_or(0);
+        if current.is_some() && current_revision != expected_revision
+            || current.is_none() && expected_revision != 0
+        {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' changed since revision {expected_revision}",
+                conversation.id
+            )));
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| IronCrewError::Validation("Conversation revision overflow".into()))?;
+        let stored_bytes = json_idempotency_response_bytes(
+            &self.idempotency_dir,
+            Some(completion.key_hash.as_str()),
+        )?;
+        let response_body = completion.response_body.filter(|body| {
+            stored_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= max_total_response_bytes)
+        });
+
+        let mut conversation_to_write = conversation.clone();
+        conversation_to_write.revision = next_revision;
+        let mut idempotency_to_write = idempotency;
+        idempotency_to_write.state = IdempotencyState::Completed;
+        idempotency_to_write.response_status = Some(completion.response_status);
+        idempotency_to_write.response_body = response_body;
+        idempotency_to_write.updated_at = completion.completed_at.clone();
+        idempotency_to_write.completed_at = Some(completion.completed_at);
+        idempotency_to_write.expires_at = Some(completion.expires_at);
+        idempotency_to_write.validate()?;
+
+        // Both files share one process-wide critical section. JSON remains a
+        // single-process backend; SQL backends provide the crash-atomic form.
+        write_serialized_record_atomic(&conversation_path, &conversation_to_write, "conversation")?;
+        write_serialized_record_atomic(
+            &ledger_path,
+            &idempotency_to_write,
+            "idempotency completion",
+        )?;
+        Ok(ConversationIdempotencyCommit {
+            revision: next_revision,
+            replayable: idempotency_to_write.replayable(),
+            already_completed: false,
+        })
+    }
+
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        parse_idempotency_timestamp("idempotency completion time", completed_at)?;
+        parse_idempotency_timestamp("idempotency retention expiry", expires_at)?;
+        let path = idempotency_path(&self.idempotency_dir, key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut record = read_idempotency_record(&path)?;
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before indeterminate transition".into(),
+            ));
+        }
+        if record.state.is_terminal() {
+            return Ok(false);
+        }
+        record.state = IdempotencyState::Indeterminate;
+        record.response_status = None;
+        record.response_body = None;
+        record.updated_at = completed_at.to_string();
+        record.completed_at = Some(completed_at.to_string());
+        record.expires_at = Some(expires_at.to_string());
+        record.validate()?;
+        write_serialized_record_atomic(&path, &record, "indeterminate idempotency record")?;
+        Ok(true)
+    }
+
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool> {
+        let path = idempotency_path(&self.idempotency_dir, key_hash)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let record = read_idempotency_record(&path)?;
+        if record.attempt_id != attempt_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency attempt changed before release".into(),
+            ));
+        }
+        if !record.state.is_in_flight() {
+            return Ok(false);
+        }
+        std::fs::remove_file(path)?;
+        Ok(true)
+    }
+
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize> {
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        prune_json_idempotency_locked(&self.idempotency_dir, now, limit)
+    }
+
     // `get_*` returns Ok(None) when the file is missing so the caller can
     // tell "first time this id is used" apart from real I/O errors.
 
@@ -1108,6 +2109,16 @@ impl StateStore for JsonFileStore {
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
         })?;
+        if active_conversation_idempotency_exists(
+            &self.idempotency_dir,
+            record.flow_path.as_deref(),
+            &record.id,
+        )? {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{}' has an active idempotent message operation",
+                record.id
+            )));
+        }
         // Scope the on-disk filename by flow to prevent two flows sharing
         // the same `id` from clobbering each other. Legacy records
         // (flow_path = None) keep the old `<id>.json` layout.
@@ -1173,6 +2184,14 @@ impl StateStore for JsonFileStore {
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
         validate_session_id(id)?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        if active_conversation_idempotency_exists(&self.idempotency_dir, flow_path, id)? {
+            return Err(IronCrewError::Conflict(format!(
+                "Conversation '{id}' has an active idempotent message operation"
+            )));
+        }
         let path = conversation_file_path(&self.conversations_dir, flow_path, id);
         if !path.exists() {
             return Ok(());

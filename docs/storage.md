@@ -38,6 +38,12 @@ Environment variables control storage:
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (range 1–120 seconds) | `30` |
 | `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable process/pod owner identity; generated once per process when absent | generated |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (range 1–86400 seconds) | `60` |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require `Idempotency-Key` on run/message mutation endpoints | `false` |
+| `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Terminal ledger retention, 60–2592000 seconds; must be at least max run lifetime + 3600 | `86400` |
+| `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum retained in-flight and terminal ledger records (hard ceiling 100000) | `10000` |
+| `IRONCREW_IDEMPOTENCY_PRUNE_BATCH` | Maximum expired terminal records removed per claim/startup prune (hard ceiling 10000) | `1000` |
+| `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | Maximum compact response stored for one key (hard ceiling 64 MiB) | `8388608` (8 MiB) |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | Aggregate stored response-body budget; excess completions retain a non-replayable tombstone (hard ceiling 8 GiB) | `268435456` (256 MiB) |
 | `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum JSON run-record bytes; larger configured values clamp to 128 MiB | `67108864` (64 MiB) |
 | `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON list/count/clean scan; use PostgreSQL above this scale | `10000` (hard ceiling `100000`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` | `20` |
@@ -61,6 +67,66 @@ IRONCREW_STORE=sqlite ironcrew run .
 docker run -e IRONCREW_STORE=sqlite ...
 ```
 
+## Idempotency ledger
+
+The HTTP run and conversation-message endpoints persist a separate ledger from
+run history and conversation rows. Only SHA-256 key digests, versioned request
+fingerprints, fenced attempt/owner ids, bounded response JSON, leases, and
+retention timestamps are stored. Deleting a run does not delete its ledger
+entry, because doing so would make the same client key executable again during
+the retention window.
+
+Claims and terminal rows count toward `IRONCREW_IDEMPOTENCY_MAX_RECORDS`.
+Expired terminal rows are pruned in bounded batches at startup and while
+claiming new operations. In-flight rows are never pruned into a reusable key:
+expired message claims become `indeterminate`, while expired run claims are
+reconciled to an `abandoned` run with the preallocated run id. When the
+aggregate response budget is exhausted, the operation and its fingerprint are
+still retained, but replay returns `409` because no response body was stored.
+Run acceptance bodies are charged atomically when their claim is inserted, so
+later run reconciliation cannot bypass the aggregate cap. Conversation reply
+bodies are charged by the atomic transcript-and-ledger commit.
+An indeterminate message also retains its exclusive conversation scope. After
+inspecting durable history, a client can atomically consume that hazard by
+sending a new `Idempotency-Key` plus `Idempotency-Recovery-Key` containing the
+prior key; a mismatched or missing recovery key cannot bypass it. The matching
+replacement is still held for one full `IRONCREW_RUN_LEASE_TTL_SECONDS` after
+the hazard is recorded, so a stale worker cannot overlap the recovered turn.
+
+The per-response cap limits a transient serialization allocation in the HTTP
+process. The aggregate cap limits disk/database payload, not permanently
+resident Rust heap. For a 1 GiB Railway/OpenShift instance, a conservative
+starting policy is 4 MiB per response and 64 MiB aggregate:
+
+```bash
+IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true
+IRONCREW_IDEMPOTENCY_TTL_SECONDS=86400
+IRONCREW_IDEMPOTENCY_MAX_RECORDS=10000
+IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=4194304
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=67108864
+```
+
+Size `MAX_RECORDS` from admitted mutation throughput, not only RAM. With a
+24-hour TTL, 10,000 rows permit roughly 0.116 new keyed mutations/second before
+the ledger is full; bursts can exhaust it sooner. The record count and response
+byte caps are global to the store, so production admission/rate limits must
+prevent one principal from consuming the whole budget. Per-principal quotas
+and saturation metrics are a recommended resource-hardening follow-up.
+
+Backend guarantees differ:
+
+- PostgreSQL claims and conversation transcript+ledger commits are database
+  transactions and coordinate independent processes.
+- SQLite uses `BEGIN IMMEDIATE` transactions and coordinates processes sharing
+  the same database file, but it remains a single-host deployment choice.
+- JSON stores one owner-only file per key and uses atomic file replacement plus
+  a process-local critical section. It is intentionally single-process and
+  must not be mounted read/write by multiple pods.
+
+Even with PostgreSQL, live Lua VMs, SSE streams, cancellation, and human-input
+bridges remain process-local, so the supported HTTP topology is still one
+executor replica.
+
 ## JSON File Backend (default)
 
 Run records are stored as individual `.json` files in `<flow>/.ironcrew/runs/`:
@@ -83,6 +149,8 @@ my-flow/.ironcrew/runs/
 - No indexing — status filtering scans all records
 - Process-local handles serialize updates to the same runs directory, but JSON
   remains a single-process backend and is not safe on a shared multi-pod volume
+- Idempotency records are durable across restarts of that one process, but two
+  processes can race file claims; use PostgreSQL for Railway/OpenShift
 
 ## SQLite Backend
 
@@ -309,7 +377,8 @@ All IronCrew features use the same store:
 | `crew:run()` | `save_run_intent` at start, then `update_run_completion` at termination |
 | `crew:ask_human()` | `update_run_status` — transitions between `running` and `waiting_for_input` |
 | process startup | `reconcile_abandoned_runs` — marks only expired/unleased in-flight runs as `abandoned` |
-| run heartbeat | `heartbeat_owned_runs` — refreshes leases owned by this process |
+| non-keyed run heartbeat | `heartbeat_owned_runs` — refreshes unlinked run leases owned by this process |
+| keyed HTTP run heartbeat | `heartbeat_idempotent_run` — atomically verifies and refreshes the matching operation ledger and run lease |
 | readiness | `health_check` — performs a minimal backend round-trip |
 | `ironcrew runs` | `list_runs_summary` + `count_runs` — paginated metadata listing |
 | `ironcrew inspect` | `get_run` — retrieves a specific run by ID |
@@ -323,13 +392,17 @@ All IronCrew features use the same store:
 
 ### Run ownership and terminal writes
 
-An in-flight record carries an owner id and lease deadline. The owning process
-refreshes its leases periodically; startup reconciliation abandons only
-expired (or legacy unleased) records, never a healthy run owned by another
-process. `update_run_completion` is an owner-checked compare-and-set: the first
-terminal writer wins, and a later timeout, abort, panic, or completion cannot
-replace that terminal payload. This protects restart recovery, but does not
-make process-local HTTP control state horizontally scalable.
+An in-flight record carries an owner id and lease deadline. Non-keyed work is
+renewed by the process heartbeat. A keyed HTTP run is deliberately excluded
+from that broad heartbeat: its monitor atomically renews both the run record
+and the matching idempotency attempt, so a detached or fenced worker cannot be
+kept alive accidentally by process maintenance. Startup reconciliation
+abandons only expired (or legacy unleased) records, never a healthy run owned
+by another process. `update_run_completion` is an owner-checked
+compare-and-set: the first terminal writer wins, and a later timeout, abort,
+panic, or completion cannot replace that terminal payload. This protects
+restart recovery, but does not make process-local HTTP control state
+horizontally scalable.
 
 ## The StateStore Trait
 
@@ -369,8 +442,55 @@ pub trait StateStore: Send + Sync {
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64>;
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 
+    // ─── Durable HTTP idempotency ──────────────────────────────────
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup>;
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome>;
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool>;
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat>;
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome>;
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit>;
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool>;
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool>;
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize>;
+
     // ─── Persistent sessions ────────────────────────────────────────
-    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64>;
     async fn get_conversation(
         &self,
         flow_path: Option<&str>,
