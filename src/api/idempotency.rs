@@ -166,6 +166,11 @@ impl RunLeaseHeartbeat {
                     Ok(Ok(RunFenceHeartbeat::Owned)) => {
                         lease_deadline = tokio::time::Instant::now() + lease_ttl;
                     }
+                    Ok(Ok(RunFenceHeartbeat::CancelRequested)) => {
+                        tracing::info!(run_id, "Durable run cancellation was requested");
+                        let _ = outcome_tx.send(Some(RunFenceHeartbeat::CancelRequested));
+                        return;
+                    }
                     Ok(Ok(outcome @ RunFenceHeartbeat::Terminal(_))) => {
                         tracing::debug!(run_id, "Run heartbeat observed a terminal run fence");
                         let _ = outcome_tx.send(Some(outcome));

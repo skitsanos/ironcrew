@@ -256,6 +256,10 @@ concurrency control in front of IronCrew.
 
 ## Deployment topology
 
+For the status-labeled boundary between shared PostgreSQL coordination and
+process-local live control, including the two-replica release gate, see the
+[Multi-Replica Deployment Contract](multi-replica.md).
+
 ### One HTTP instance (required today)
 
 Use this when:

@@ -68,6 +68,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
 
+  postgres-integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Exercise the minimum PostgreSQL major version IronCrew supports.
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ironcrew_ci_admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRONCREW_TEST_PG_URL: postgres://ironcrew_ci:ironcrew_ci_password@localhost:5432/ironcrew_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Create isolated test database
+        env:
+          PGPASSWORD: ironcrew_ci_admin
+        run: |
+          psql --host localhost --username postgres --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE ironcrew_ci LOGIN PASSWORD 'ironcrew_ci_password'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
+          CREATE DATABASE ironcrew_test OWNER ironcrew_ci;
+          SQL
+      - name: Run PostgreSQL integration tests
+        run: >-
+          cargo test --locked --all-features
+          --test postgres_store_test
+          --test multi_replica_http_test
+          -- --test-threads=1
+
   windows-check:
     name: Windows compile check
     runs-on: windows-latest
@@ -86,6 +126,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --bin ironcrew
       - run: ./scripts/check-lua-examples.sh
+
+  crew-effectiveness-contract:
+    name: Crew effectiveness contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --bin ironcrew
+      - name: Test evaluator and orchestration contract
+        run: |
+          python3 -m unittest discover \
+            -s evaluations/crew-effectiveness \
+            -p 'test_*.py'
+          python3 evaluations/crew-effectiveness/evaluate.py \
+            --mode contract \
+            --binary target/debug/ironcrew \
+            --report evaluations/crew-effectiveness/reports/contract.json
 
   release-build:
     name: Release Build

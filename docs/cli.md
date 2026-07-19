@@ -550,7 +550,7 @@ individual ranges stated in their descriptions.
 | `IRONCREW_DB_CONNECT_RETRIES` | PostgreSQL connection retries after the initial attempt (default: `10`; range: 0–100) |
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (default: `1000`; range: 1–30000) |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (default: `30`; range: 1–120 seconds) |
-| `IRONCREW_INSTANCE_ID` | Optional unique process/pod identity stored as the owner of live runs. Generated once per process when unset |
+| `IRONCREW_INSTANCE_ID` | Optional unique 1–255 byte printable ASCII process/pod identity stored as the owner of live runs. Generated once per process when unset |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | Seconds before an unrefreshed run lease is eligible for abandoned-run reconciliation; also the mandatory grace before explicit recovery of an indeterminate conversation turn (default: `60`, range: 1–86400) |
 | `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum bytes read/written for one JSON run record (default: `67108864` = 64 MiB; hard ceiling: `134217728`) |
 | `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON-store list/count/clean scan (default: `10000`; hard ceiling: `100000`) |

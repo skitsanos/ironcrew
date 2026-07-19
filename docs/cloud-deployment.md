@@ -9,7 +9,10 @@ runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a
 one-shot job.
 
 For HTTP-specific capacity planning, active conversation sizing, SSE tuning,
-and the current single-replica constraint, see [HTTP Scaling](http-scaling.md).
+and RAM limits, see [HTTP Scaling](http-scaling.md). For the exact shared-state
+and live-control boundary, Railway/OpenShift routing constraints, and the
+multi-replica roadmap, see the
+[Multi-Replica Deployment Contract](multi-replica.md).
 
 ---
 
@@ -363,7 +366,7 @@ the run ID and dropped-result count.
 | `IRONCREW_DB_CONNECT_RETRIES` | `10` | Connection retries after the initial attempt (range 0–100). |
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | `1000` | Base delay for exponential connection-retry backoff, in milliseconds (range 1–30000). |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
-| `IRONCREW_INSTANCE_ID` | generated per process | Optional stable runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
+| `IRONCREW_INSTANCE_ID` | generated per process | Optional 1–255 byte printable ASCII runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Range: 1–86400. |
 
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage

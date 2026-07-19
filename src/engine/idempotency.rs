@@ -157,8 +157,28 @@ pub struct IdempotencyUsage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunFenceHeartbeat {
     Owned,
+    /// Another API replica durably requested cancellation of this keyed run.
+    /// The owning process must stop the worker before publishing `aborted`.
+    CancelRequested,
     Terminal(RunStatus),
     Lost,
+}
+
+/// Result of asking the shared state backend to cancel an in-flight run.
+///
+/// Durable cross-replica cancellation is deliberately limited to keyed runs:
+/// their idempotency ledger already provides the execution attempt and owner
+/// fence needed to deliver the request to exactly the current worker. Local
+/// process cancellation remains available for unkeyed runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunCancellationRequest {
+    Requested {
+        owner_instance_id: String,
+        already_requested: bool,
+    },
+    Terminal(RunStatus),
+    NotFound,
+    NotDurable,
 }
 
 /// Process-local notification that the run intent exists and its linked

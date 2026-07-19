@@ -220,6 +220,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Authentication is the outer layer: admission sees only server-issued
     // principal extensions, never X-Audit-Actor or source-IP guesses.
     let protected = Router::new()
+        .route("/capabilities", get(capabilities))
         .route("/flows/{flow}/run", post(run_flow))
         .route("/flows/{flow}/abort/{run_id}", post(abort_run))
         .route("/flows/{flow}/runs", get(list_runs))
