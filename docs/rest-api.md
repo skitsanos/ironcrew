@@ -672,7 +672,7 @@ curl http://localhost:3000/health
 ```json
 {
   "status": "ok",
-  "version": "2.13.0"
+  "version": "2.23.0"
 }
 ```
 
