@@ -266,6 +266,24 @@ pub(crate) fn read_bytes_bounded(
     Ok(bytes)
 }
 
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> std::io::Result<()> {
+    // cap-std deliberately opens directory capabilities with O_PATH on Linux.
+    // O_PATH descriptors are valid for openat-style confinement but fsync(2)
+    // rejects them with EBADF. Reopen `.` beneath the capability as a real
+    // read-only directory descriptor before flushing the rename.
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    directory.open_with(".", &options)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(directory: &Dir) -> std::io::Result<()> {
+    directory.try_clone()?.into_std_file().sync_all()
+}
+
 pub(crate) fn atomic_write(root: &Dir, path: &Path, content: &[u8]) -> std::io::Result<()> {
     validate_relative(path)?;
     let parent_path = path.parent().unwrap_or_else(|| Path::new(""));
@@ -308,7 +326,7 @@ pub(crate) fn atomic_write(root: &Dir, path: &Path, content: &[u8]) -> std::io::
         file.sync_all()?;
         drop(file);
         parent.rename(&temporary, &parent, file_name)?;
-        parent.try_clone()?.into_std_file().sync_all()?;
+        sync_directory(&parent)?;
         Ok(())
     })();
 
