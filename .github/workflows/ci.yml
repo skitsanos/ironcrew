@@ -100,6 +100,8 @@ jobs:
           CREATE ROLE ironcrew_ci LOGIN PASSWORD 'ironcrew_ci_password'
             NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
           CREATE DATABASE ironcrew_test OWNER ironcrew_ci;
+          \connect ironcrew_test
+          GRANT USAGE, CREATE ON SCHEMA public TO ironcrew_ci;
           SQL
       - name: Run PostgreSQL integration tests
         run: >-
