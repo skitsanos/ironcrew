@@ -14,6 +14,11 @@ and live-control boundary, Railway/OpenShift routing constraints, and the
 multi-replica roadmap, see the
 [Multi-Replica Deployment Contract](multi-replica.md).
 
+The PostgreSQL cross-replica HITL mailbox and run-event journal described here
+are committed but not yet in a published release. Until the next release,
+deploy a verified source commit rather than assuming the published `2.22.0`
+image contains those capabilities.
+
 ---
 
 ## Binary profile
@@ -104,6 +109,8 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | **unset** | Only enable if MCP servers run as sidecars. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
+| `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical on every replica | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. Store only in Railway/OpenShift secrets; never bake it into the image. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for new ciphertext. Both HITL variables must be set together. |
 | `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist shared by Lua `env()` and `${env.NAME}` interpolation. Opt in only the exact vars a crew needs. See [docs/sandbox.md](sandbox.md). |
 | `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
@@ -133,6 +140,14 @@ service credential and constrain its network/source access externally. Rotate
 a token under the same principal label to retain identity and retry semantics;
 changing the label is an identity rotation and must be coordinated across at
 least one full idempotency retention window.
+
+This is especially important for PostgreSQL run SSE: retained event payloads
+are plaintext JSONB and can contain task output, reasoning, logs, agent prompts,
+model content, and tool content. Durable `human_input_requested` events omit the
+prompt and choices, and `human_input_received` never contains the answer, but
+the rest of the journal is not a secret store. Every API token can read every
+flow's protected journal, so tokens are administrator-equivalent rather than
+per-flow read grants.
 
 ### Secrets handling
 
@@ -188,9 +203,9 @@ least one full idempotency retention window.
 | `IRONCREW_LUA_MAX_MEMORY_BYTES` | `33554432` (32 MiB) | Allocator cap for each live Lua VM. |
 | `IRONCREW_LUA_MAX_INSTRUCTIONS` | `50000000` | Per-top-level-execution instruction budget. |
 | `IRONCREW_LUA_MAX_EXECUTION_SECONDS` | `1800` | Per-top-level-execution wall-clock budget. |
-| `IRONCREW_MAX_EVENTS` | `1000` | SSE replay buffer size per run. |
-| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` (4 MB) | SSE replay byte budget per run. |
-| `IRONCREW_EVENT_MAX_BYTES` | `262144` (256 KiB) | Maximum serialized size of one live/replay event. |
+| `IRONCREW_MAX_EVENTS` | `1000` | Per-run replay count cap: in-memory for JSON/SQLite and logical journal retention for PostgreSQL. |
+| `IRONCREW_EVENT_REPLAY_MAX_BYTES` | `4194304` (4 MiB) | Per-run replay byte budget: in-memory for JSON/SQLite and logical journal retention for PostgreSQL. |
+| `IRONCREW_EVENT_MAX_BYTES` | `262144` (256 KiB) | Maximum serialized size of one live or durable event. |
 | `IRONCREW_EVENT_CHANNEL_CAPACITY` | `32` | Live broadcast-ring entry cap per EventBus; automatically reduced to fit the replay byte budget. |
 | `IRONCREW_MAX_SSE_CONNECTIONS` | `16` | Process-wide admission cap for long-lived run and conversation SSE connections. |
 | `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | `1000` | Max pending messages per agent. |
@@ -223,13 +238,23 @@ least one full idempotency retention window.
 | `IRONCREW_RUNS_MAX_LIMIT` | `100` | Hard cap on `?limit=` for the run list endpoint. |
 | `IRONCREW_MAX_FLOW_DEPTH` | `5` | Maximum recursion depth for `run_flow` sub-flow invocation. Raise only if you have intentional deep nesting. |
 | `IRONCREW_TOOL_TIMEOUT` | `60` | Seconds to wait before a single tool call is cancelled (hard ceiling 3600; invalid or zero uses 60). |
-| `IRONCREW_SSE_OUTPUT_MAX_CHARS` | _off_ | If set, truncates per-event SSE output text at N characters. Unset leaves events unlimited. |
+| `IRONCREW_SSE_OUTPUT_MAX_CHARS` | _off_ | Optional response-only task-output truncation for process-local JSON/SQLite run SSE. PostgreSQL durable events use `IRONCREW_EVENT_MAX_BYTES` instead. |
 
 The conversation-related defaults above are only generic fallbacks. For Cloud
 deployments, especially when using HTTP chat and SSE, size them intentionally
 using the guidance in [HTTP Scaling](http-scaling.md). The complete list,
 including API image/message, memory, ask-human, schema, MCP, and database
 ceilings, is in [CLI environment variables](cli.md#environment-variables).
+
+PostgreSQL does not move all journal limits out of pod RAM. Each active run has
+the normal bounded EventBus replay plus a durable producer queue (at most 64
+events and, by default, 1 MiB, enlarged only enough for the configured
+single-event limit without exceeding the per-run budget). Each journal reader
+also fetches a bounded page before writing SSE. Multiply those allocations, Lua
+VMs, provider buffers, database pool connections, and SSE connections by
+replica count. Leave container headroom for allocator overhead and shutdown
+spikes; Railway Pro's account ceiling and an OpenShift namespace quota are not
+per-process memory targets.
 
 ### Recommended baselines
 
@@ -305,12 +330,16 @@ have explicit per-service CPU/RAM limits and conservative application caps.
 - `IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE` /
   `IRONCREW_ADMISSION_CONTROL_BURST` separately bound lower-cost control-plane
   mutations such as cancellation and answers (defaults `120` / `20`).
+- `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` /
+  `IRONCREW_ADMISSION_OBSERVATION_BURST` bound question-list observation per
+  principal and process (defaults `600` / `20`; ranges `1–60000` / `1–1000`).
+  They do not throttle internal PostgreSQL journal or HITL owner polling.
 
 Admission is process-local and intentionally low-cardinality: the supported
-topology has one HTTP executor. Durable idempotency quotas are enforced by the
-store and remain the restart-safe protection. A `429` includes `Retry-After`;
-clients should back off without changing the idempotency key for the same
-logical operation.
+limits multiply with HTTP replica count. Durable idempotency quotas are
+enforced by the store and remain the restart-safe protection. A `429` includes
+`Retry-After`; clients should back off without changing the idempotency key for
+the same logical operation.
 
 ---
 
@@ -324,24 +353,39 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 | SQLite | single-pod or small team, self-contained | `IRONCREW_STORE=sqlite`, `IRONCREW_STORE_PATH=/data/ironcrew.db` |
 | PostgreSQL | durable production storage and safe restart recovery | `IRONCREW_STORE=postgres`, `DATABASE_URL=postgres://...` |
 
-**Kubernetes/OpenShift:** use PostgreSQL for production durability, but keep
-`replicas: 1`. PostgreSQL shares records; it does not distribute the live
-`active_runs`, conversation, question, cancellation, or SSE control planes.
-JSON/SQLite remain single-process backends and require a writable persistent
-volume if their records must survive replacement.
+**Kubernetes/OpenShift:** use PostgreSQL for production durability. With a
+shared HITL keyring, idempotency-keyed runs support cross-replica cancellation
+and question listing/answer delivery. PostgreSQL's bounded run-event journal
+also supports cross-replica run SSE replay. Live Lua execution, conversation
+handles/SSE, and JSON/SQLite run SSE remain owner-local, so keep `replicas: 1`
+when clients require those surfaces through arbitrary Service routing.
+JSON/SQLite require a writable persistent volume if their records must survive
+replacement.
 
 **Railway:** the built-in PostgreSQL add-on is the simplest path. Add it and Railway sets `DATABASE_URL` automatically.
 
-### One live HTTP executor
+### Live-control boundary
 
-Until distributed live control is implemented, run exactly one `serve`
-replica. This restriction applies even with PostgreSQL. A second process cannot
-serve or cancel another process's live run/conversation, and routing affinity
-does not make lifecycle ownership distributed. Use one-shot `ironcrew run`
-workers only when their workload and store ownership are intentionally
-separated from the HTTP service.
+The safest general-purpose topology remains one `serve` replica because a
+second process cannot use another process's live conversation handle or take
+over a dead owner's Lua VM. PostgreSQL does support a bounded multi-replica
+slice: any replica can accept new keyed runs and durable reads, stream retained
+run journal events, replay keyed acceptance, request keyed cancellation,
+and—when the shared HITL keyring is configured—list or answer that keyed run's
+pending questions. Routing affinity is not a correctness mechanism for the
+remaining owner-local surfaces. Use one-shot `ironcrew run` workers only when
+their workload and store ownership are intentionally separated from the HTTP
+service.
 
 **Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once per process startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run once during each process boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
+
+The current PostgreSQL runtime role is also the bootstrap/migration role: it
+must be able to create and alter IronCrew tables, indexes, functions, and
+triggers. An advisory lock serializes concurrent replica bootstrap, and the
+schema-version marker avoids repeating the event-journal reconciliation work,
+but it does not remove the DDL requirement. A separate migration job plus a
+least-privileged runtime role is a future hardening step; do not revoke DDL
+permissions from the configured role yet.
 
 **Terminal-write outage memory bound.** A healthy terminal write persists the
 full task-result payload. If storage rejects that write, IronCrew will retain
@@ -368,10 +412,83 @@ the run ID and dropped-result count.
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
 | `IRONCREW_INSTANCE_ID` | generated per process | Optional 1–255 byte printable ASCII runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Range: 1–86400. |
+| `IRONCREW_HITL_ENCRYPTION_KEYS` | unset | Secret JSON object of at most 8 key ids and canonical base64 32-byte keys; maximum 16 KiB. Enables the encrypted mailbox only when the active id is also set. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | unset | Key id used for new HITL ciphertext. Configure identically on every replica. |
+| `IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` | `1048576` (1 MiB) | Aggregate serialized pending-question metadata per run; range 1 byte–16 MiB. PostgreSQL ciphertext admission also accounts for 28 AEAD bytes per allowed pending row. |
+| `IRONCREW_HITL_POLL_INTERVAL_MS` | `500` | PostgreSQL poll interval per pending durable question. Effective range 50–5000 ms; tune against latency and aggregate database reads. |
+| `IRONCREW_HITL_READ_TIMEOUT_MS` | `2000` | Timeout for one owner-side PostgreSQL answer read. Effective range 100–30000 ms. |
+| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | `8` | Process-wide concurrency cap for PostgreSQL question-list/decrypt reads; range 1–64. |
+| `IRONCREW_EVENT_JOURNAL_RETENTION_SECS` | `3600` | Logical PostgreSQL event retention; range 60–2592000 seconds. |
+| `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS` | `100000` | Global logical event-count cap; range 1–10000000 and at least `IRONCREW_MAX_EVENTS`. |
+| `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES` | `268435456` (256 MiB) | Global logical event-byte cap; range 1 KiB–8 GiB and at least the per-run replay-byte budget. |
+| `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES` | `524288` (512 KiB), or the event maximum when larger | Maximum bytes read in one journal page; range 1 KiB–64 MiB and at least `IRONCREW_EVENT_MAX_BYTES`. A page contains at most 64 events. |
+| `IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS` | `500` | Active-stream database poll interval; range 100–5000 ms. |
+| `IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS` | `2000` | Timeout for one journal page read; range 100–30000 ms. |
+| `IRONCREW_EVENT_JOURNAL_PRUNE_BATCH` | `1000` | Maximum rows pruned per bounded pass; range 1–10000 and no greater than the global event cap. |
+| `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | `600` | Per-principal/process rate for question-list observation; range 1–60000. |
+| `IRONCREW_ADMISSION_OBSERVATION_BURST` | `20` | Per-principal/process observation burst; range 1–1000. |
 
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage
 features used by the runtime and the intended deployment target of
 extension-capable Postgres installs such as `pgvector`.
+
+### HITL key rotation on Railway and OpenShift
+
+Treat `IRONCREW_HITL_ENCRYPTION_KEYS` as encryption-key material, not ordinary
+configuration. Put it in a Railway secret variable or an
+OpenShift/Kubernetes `Secret` supplied by an external secret manager. The JSON
+values must be canonical base64 encodings of exactly 32 random bytes.
+
+Rotate without making in-flight questions unreadable:
+
+1. Add the new key id/material to the secret on every replica, but leave the
+   old active id selected.
+2. Wait until every replica is running the expanded keyring.
+3. Change `IRONCREW_HITL_ACTIVE_KEY_ID` to the new id everywhere; retain the
+   old key so old ciphertext can still be decrypted.
+4. After the old deployment is drained, verify that no `{prefix}human_inputs`
+   row references the old question or answer key fingerprint. Answer
+   consumption, timeout, terminalization, and abandoned-run reconciliation
+   normally remove those rows; only then remove the old key.
+
+Railway rolling deployments and OpenShift rolling updates can temporarily run
+both revisions. A one-step key replacement is therefore unsafe: an old pod
+cannot read new-key ciphertext, while a new pod cannot read old-key ciphertext.
+The keyring supports at most eight keys, which leaves room for staged rotation
+without unbounded secret or process memory.
+
+At the default 500 ms poll interval, each pending question performs about two
+PostgreSQL reads per second. Multiply that by pending questions and suspended
+runs across all pods; lower `IRONCREW_ASK_HUMAN_MAX_PENDING` or increase the
+poll interval when Railway/OpenShift database IOPS or pool usage matters more
+than sub-second answer pickup. Prompt, aggregate-choice, and answer defaults
+are each 64 KiB, and pending questions default to 16 per run. Prompt and
+aggregate choices each have a 1 MiB hard ceiling, answers have a 1 MiB hard
+ceiling, and pending count has a 256 hard ceiling. The aggregate serialized
+pending-question metadata cap is 1 MiB by default and 16 MiB at its hard
+maximum, so the independent field/count maxima cannot combine into an
+unbounded pending map. Keep the aggregate cap conservative on small pods and
+leave headroom for JSON, encryption, map, and allocator overhead.
+
+### PostgreSQL event-journal operations
+
+Successful PostgreSQL run streams can be served by any replica, emit
+`id: <run_id>:<sequence>`, honor `Last-Event-ID`, and set
+`Cache-Control: no-store, no-transform` plus `X-Accel-Buffering: no`.
+Malformed or cross-run cursors return `400`; ahead/expired cursors and replay
+requests against JSON/SQLite return `409`. Gaps caused by writer backpressure,
+retention, global capacity, or owner loss are explicit. Active-run completeness
+is best-effort, and a terminal run record can synthesize an unnumbered
+`run_complete` with `journal_complete: false` when the numbered terminal event
+is absent.
+
+The per-run/global byte caps are logical accounting, with at least 1 KiB
+charged per event. They do not include PostgreSQL tuple/page or index overhead,
+the runs/state/usage tables, WAL, replication/backups, or dead tuples awaiting
+autovacuum. Expired rows become logically invisible immediately, while bounded
+physical pruning runs on append and best-effort reconciliation. Monitor actual
+database size and autovacuum independently; disk usage can exceed the logical
+cap substantially.
 
 ---
 
@@ -437,7 +554,9 @@ policy to every cluster namespace.
 
 Use one replica and `Recreate`. Kubernetes documents that `Recreate` kills the
 existing pod before creating the replacement during a Deployment upgrade. Do
-not add an HPA until IronCrew has a distributed live-control plane.
+not add an HPA for a general-purpose service: scale only an application whose
+routed requests fit the documented PostgreSQL run-SSE/keyed-control slice and
+which does not require conversation routing or execution takeover.
 
 ```yaml
 apiVersion: apps/v1
@@ -530,8 +649,10 @@ traffic during a later storage outage without killing it.
 For small flow sets, mount `crew.lua` / `config.lua` via ConfigMap. For larger sets, bake them into a separate image layer or pull from object storage at startup.
 
 Do not configure session affinity as a substitute for this restriction. Affinity
-can improve routing but cannot transfer run ownership, pending questions,
-abort handles, or SSE replay state between processes.
+can improve routing but cannot transfer run execution or conversation handles
+between processes. Configured PostgreSQL run SSE and a keyed HITL mailbox work
+without affinity, but neither can transfer the Lua VM or suspended coroutine;
+conversation SSE and JSON/SQLite run SSE remain process-local.
 
 ---
 
@@ -540,7 +661,8 @@ abort handles, or SSE replay state between processes.
 The checked-in [`deploy/openshift.yaml`](../deploy/openshift.yaml) is the
 production baseline. It deliberately uses:
 
-- one replica with Deployment strategy `Recreate`
+- one replica with Deployment strategy `Recreate` as the conservative baseline
+  for applications that also use owner-local conversations or unkeyed controls
 - `/health/ready` for startup and readiness, and `/health/live` for liveness
 - a five-minute startup budget for PostgreSQL initialization/retries
 - `restricted-v2`-compatible security settings: arbitrary non-root UID, no
@@ -549,12 +671,13 @@ production baseline. It deliberately uses:
 - `emptyDir` mounted at `/tmp`, with flows mounted read-only from the
   `ironcrew-flows` ConfigMap
 - PostgreSQL credentials and API tokens from the externally created
-  `ironcrew-secrets` Secret
+  `ironcrew-secrets` Secret; optional HITL keyring references use that Secret
 - stdio MCP disabled by a non-matching command allowlist until the operator
   replaces it with the exact trusted binaries installed in the image
 - a pod-selecting `NetworkPolicy` that admits Route traffic and permits only
   cluster DNS, same-namespace PostgreSQL on TCP 5432, and public HTTPS egress
-- principal-scoped mutation admission and idempotency budgets, plus a bounded
+- principal-scoped work/control/observation admission, idempotency budgets,
+  bounded HITL metadata, a bounded PostgreSQL event journal, and a bounded
   conversation lifecycle registry, sized for the 1 GiB pod baseline
 
 Apply it only after replacing the image tag, example CORS origin, ConfigMap,
@@ -697,6 +820,8 @@ IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE=60
 IRONCREW_ADMISSION_WORK_BURST=10
 IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE=120
 IRONCREW_ADMISSION_CONTROL_BURST=20
+IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE=600
+IRONCREW_ADMISSION_OBSERVATION_BURST=20
 IRONCREW_MAX_ACTIVE_RUNS=2
 IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
 IRONCREW_MAX_CONVERSATION_LIFECYCLES=256
@@ -731,7 +856,19 @@ IRONCREW_MAX_EVENTS=200
 IRONCREW_EVENT_REPLAY_MAX_BYTES=1048576
 IRONCREW_EVENT_MAX_BYTES=131072
 IRONCREW_EVENT_CHANNEL_CAPACITY=8
+IRONCREW_EVENT_JOURNAL_RETENTION_SECS=3600
+IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS=10000
+IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES=67108864
+IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES=262144
+IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS=1000
+IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS=2000
+IRONCREW_EVENT_JOURNAL_PRUNE_BATCH=500
 IRONCREW_MAX_SSE_CONNECTIONS=16
+IRONCREW_ASK_HUMAN_MAX_PENDING=8
+IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES=524288
+IRONCREW_HITL_POLL_INTERVAL_MS=1000
+IRONCREW_HITL_READ_TIMEOUT_MS=2000
+IRONCREW_HITL_PG_MAX_CONCURRENT_READS=2
 IRONCREW_DB_POOL_SIZE=2
 IRONCREW_SHUTDOWN_TIMEOUT_SECS=25
 IRONCREW_SHUTDOWN_DRAIN_MS=1000
@@ -763,9 +900,12 @@ plans, but that ceiling includes replica multiplication and is not a sizing
 recommendation for this service. Start with an explicit per-service allocation
 around 1 vCPU/1 GiB and the conservative caps above (the checked-in OpenShift
 manifest contains the fuller set). Raise CPU/RAM and application caps only
-after a representative container soak test. Keep `numReplicas: 1`; Pro plan
-headroom does not authorize horizontal serving while live control is
-process-local.
+after a representative container soak test. The checked-in general-purpose
+baseline keeps `numReplicas: 1`; Pro plan headroom does not make owner-local
+conversations or execution horizontally safe. Scale only applications whose
+routed surfaces fit the documented PostgreSQL run-SSE/keyed-control contract,
+and include per-replica pools, admission, Lua memory, journal queues/pages, and
+HITL polling in the aggregate budget.
 
 The live Railway JSON schema supports
 `deploy.limitOverride.containers.{cpu,memoryBytes}`. The checked-in config uses
@@ -807,8 +947,10 @@ IRONCREW_SHUTDOWN_DRAIN_MS=1000
 ```
 
 `overlapSeconds: 0` prevents extra overlap after the candidate becomes active;
-it does not authorize horizontal replicas. Keep the service replica count at
-one until live run/conversation control is distributed.
+it does not make owner-local live controls distributed. Multiple replicas can
+use PostgreSQL run SSE and the keyed cancellation/HITL slice, but keep the
+service at one when clients require arbitrary-replica conversations or unkeyed
+live controls.
 
 ### 5. Volumes
 
@@ -870,7 +1012,8 @@ RUN cargo build --release --locked --no-default-features --features postgres
 
 ### Pod killed by OOM
 - Lower `IRONCREW_DEFAULT_MAX_CONCURRENT` and `IRONCREW_MAX_EVENTS`.
-- Check for large SSE event histories (SSE replay buffer is per-run).
+- Check per-run EventBus replay, PostgreSQL producer queues/reader pages, HITL
+  pending metadata, and the number of concurrent SSE connections across pods.
 - Reduce `IRONCREW_MAX_PROMPT_CHARS` and per-tool byte caps.
 
 ### MCP stdio children orphaned after SIGKILL
@@ -910,11 +1053,19 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [ ] Per-principal idempotency and admission limits are set, and `429`
       saturation alerts are configured from protected `/metrics`
 - [ ] `IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s` fits within platform termination grace
-- [ ] Exactly one HTTP replica configured (`numReplicas: 1` or `replicas: 1`)
+- [ ] Replica count matches the
+      [multi-replica live-control contract](multi-replica.md); use exactly one
+      when clients require arbitrary-routed conversations or unkeyed controls;
+      PostgreSQL run SSE has its own bounded shared contract
 - [ ] Replacement strategy does not intentionally overlap active executors (`Recreate` on OpenShift; Railway overlap set to zero)
 - [ ] Railway config-as-code and dashboard replica limits agree at the intended
       baseline (the checked-in start point is 1 vCPU / 1 GiB)
 - [ ] PostgreSQL configured for production durability
+- [ ] PostgreSQL event-journal logical limits, read/page/poll/prune bounds, and
+      actual database/WAL/autovacuum footprint are monitored independently
+- [ ] If cross-replica HITL is enabled, every replica receives the same staged
+      `IRONCREW_HITL_ENCRYPTION_KEYS` secret and active key id; rotation keeps
+      old keys until no mailbox row references their fingerprints
 - [ ] Secrets mounted from `Secret` / vault, not baked into image
 - [ ] Startup/readiness probes hit `/health/ready`; liveness hits `/health/live`
 - [ ] Resource `requests` and `limits` set on the container

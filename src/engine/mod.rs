@@ -6,6 +6,10 @@ pub mod crew;
 pub mod eventbus;
 pub mod executor;
 pub mod foreach;
+// This module is a public library contract; the binary declares the same
+// module tree privately and does not consume every public helper directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod human_input;
 pub mod idempotency;
 pub mod input_bridge;
 pub mod interpolate;
@@ -16,6 +20,10 @@ pub mod orchestrator;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 pub mod reconciler;
+// This module is a public library contract; the binary declares the same
+// module tree privately and does not consume every public surface directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod run_events;
 pub mod run_history;
 pub mod runtime;
 pub mod sessions;

@@ -51,7 +51,8 @@ printf 'run_id=%s\n' "$run_id"
 ```
 
 Subscribe to the run's replayable SSE stream in a third shell, or background
-it while answering questions:
+it while answering questions. JSON/SQLite replay is process-local; PostgreSQL
+mode below provides durable cross-replica run replay:
 
 ```bash
 curl -N \
@@ -112,6 +113,55 @@ answer_current publish
 wait "$sse_pid"
 ```
 
-The bridge-generated audit and `human_input_*` events contain question metadata
-but not the human answer. Arbitrary flow logs, model output, and tool output
-are not sanitized, so flows should not print sensitive answers.
+The bridge-generated audit and `human_input_*` events never contain the human
+answer. In PostgreSQL's durable event journal,
+`human_input_requested` also omits prompt and choices and points clients to the
+authenticated questions endpoint. Arbitrary flow logs, model output, and tool
+output are not sanitized, so flows should not print sensitive answers.
+
+## Cross-replica PostgreSQL mode
+
+The example above works with the owner-local bridge on any backend. To let a
+different replica list and answer its questions, run every server against the
+same PostgreSQL 15+ database and give every replica the same HITL keyring:
+
+```bash
+export IRONCREW_STORE=postgres
+export DATABASE_URL='postgres://user:password@host/ironcrew'
+
+# Generate once, then store these two values in your platform secret manager.
+hitl_key=$(openssl rand -base64 32)
+export IRONCREW_HITL_ENCRYPTION_KEYS=$(jq -nc \
+  --arg key "$hitl_key" '{"2026-07": $key}')
+unset hitl_key
+export IRONCREW_HITL_ACTIVE_KEY_ID='2026-07'
+```
+
+The run request must keep its `Idempotency-Key`. A question GET through either
+replica then reports `control_scope: "shared_store"`; an accepted answer
+returns HTTP `202` with `status: "queued"`. PostgreSQL stores encrypted
+question metadata and answer ciphertext, and the owning replica polls and
+resumes the Lua coroutine. A second answer returns `404` because the first
+writer wins.
+
+PostgreSQL also journals bounded run events in plaintext JSONB. Any replica can
+serve the run SSE endpoint and resume retained events with an id such as
+`<run_id>:<sequence>` in `Last-Event-ID`:
+
+```bash
+last_event_id="$run_id:17" # Replace 17 with the last id you fully processed.
+curl -N -H "Authorization: Bearer $IRONCREW_API_TOKEN" \
+  -H "Last-Event-ID: $last_event_id" \
+  "http://127.0.0.1:3000/flows/ask-human/events/$run_id"
+```
+
+The journal is best-effort and bounded: it can report explicit gaps, and a
+terminal run record can synthesize an incomplete `run_complete`. Other event
+payloads may contain sensitive task/model/tool/log data. Because API tokens do
+not provide per-flow read authorization, treat every token as
+administrator-equivalent and configure journal retention/capacity accordingly.
+
+Neither the encrypted HITL mailbox nor the event journal moves execution
+between pods. Conversation SSE and JSON/SQLite run SSE remain process-local.
+Follow the staged key-rotation procedure in the
+[cloud deployment guide](../../docs/cloud-deployment.md#hitl-key-rotation-on-railway-and-openshift).

@@ -764,7 +764,11 @@ machinery treat it like any other failure.
   `human_input_requested`, and the answer arrives via
   [`POST /flows/{flow}/answer/{run_id}`](rest-api.md#answer-a-question). A UI
   that missed the event lists pending questions with
-  `GET /flows/{flow}/questions/{run_id}`.
+  `GET /flows/{flow}/questions/{run_id}`. For an idempotency-keyed HTTP run,
+  PostgreSQL plus the shared HITL encryption keyring lets either endpoint enter
+  through any replica. PostgreSQL-backed run SSE can also replay through any
+  replica; execution and conversation SSE still remain on the owner. See
+  [cross-replica delivery](rest-api.md#cross-replica-delivery).
 - **CLI mode** (`ironcrew run`): the prompt (and numbered choices) print to
   stderr and the answer is read from stdin. A bare number picks the matching
   choice. Non-TTY stdin (piped, CI) resolves as an immediate timeout, so
@@ -773,7 +777,9 @@ machinery treat it like any other failure.
 
 Parallel branches (`foreach_parallel`) may each ask concurrently; questions
 are answered independently by `question_id`, capped at
-`IRONCREW_ASK_HUMAN_MAX_PENDING` (default 16) per run.
+`IRONCREW_ASK_HUMAN_MAX_PENDING` (default 16) and
+`IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` (default 1 MiB of aggregate serialized
+question metadata) per run.
 
 Note on run status: the persisted run record flips to `waiting_for_input`
 only when a run record exists at ask time (the record is created inside

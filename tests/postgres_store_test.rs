@@ -13,13 +13,22 @@
 #![cfg(feature = "postgres")]
 
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+use ironcrew::engine::human_input::{
+    DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputKeyring,
+    HumanInputListOutcome, HumanInputReadOutcome, HumanInputRegistrationOutcome,
+};
 use ironcrew::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
     IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
     IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION, RunCancellationRequest,
     RunFenceHeartbeat,
 };
+use ironcrew::engine::input_bridge::QuestionInfo;
 use ironcrew::engine::postgres_store::PostgresStore;
+use ironcrew::engine::run_events::{
+    EventJournalScope, RunEventAppendBatch, RunEventAppendEntry, RunEventGapReason,
+    RunEventJournalConfig,
+};
 use ironcrew::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunStatus, RunTransition,
 };
@@ -41,12 +50,16 @@ fn pg_url() -> Option<String> {
 async fn reset(url: &str, prefix: &str) {
     let pool = sqlx::PgPool::connect(url).await.expect("connect for reset");
     for t in [
+        "run_events",
+        "run_event_state",
+        "run_event_usage",
         "runs",
         "conversations",
         "dialogs",
         "audit_events",
         "idempotency",
         "idempotency_accounting",
+        "human_inputs",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {prefix}{t} CASCADE");
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -59,6 +72,11 @@ async fn reset(url: &str, prefix: &str) {
         .execute(&pool)
         .await
         .expect("drop idempotency accounting function");
+    let function = format!("DROP FUNCTION IF EXISTS {prefix}run_events_acct_fn() CASCADE");
+    sqlx::query(sqlx::AssertSqlSafe(function))
+        .execute(&pool)
+        .await
+        .expect("drop run-event accounting function");
     pool.close().await;
 }
 
@@ -190,6 +208,148 @@ fn idempotency_limits(
 
 fn default_idempotency_limits() -> IdempotencyLimits {
     idempotency_limits(100, usize::MAX, 10)
+}
+
+fn human_input_keyring() -> HumanInputKeyring {
+    HumanInputKeyring::from_json(
+        r#"{"primary":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="}"#,
+        "primary",
+    )
+    .unwrap()
+}
+
+fn human_input_registration(
+    run_id: &str,
+    question_id: &str,
+    key_hash: &str,
+    attempt_id: &str,
+) -> DurableHumanInputRegistration {
+    DurableHumanInputRegistration {
+        flow: "flow-a".into(),
+        run_id: run_id.into(),
+        question: QuestionInfo {
+            question_id: question_id.into(),
+            prompt: "Approve the production rollout?".into(),
+            choices: vec!["approve".into(), "reject".into()],
+            asked_at: "2026-07-19T12:00:00Z".into(),
+            timeout_s: 60,
+            kind: "approval".into(),
+        },
+        key_hash: key_hash.into(),
+        attempt_id: attempt_id.into(),
+    }
+}
+
+fn run_event_config() -> RunEventJournalConfig {
+    RunEventJournalConfig {
+        max_events_per_run: 16,
+        max_bytes_per_run: 16 * 1024,
+        max_event_bytes: 1024,
+        retention: Duration::from_secs(60),
+        max_total_events: 64,
+        max_total_bytes: 64 * 1024,
+        page_max_events: 16,
+        page_max_bytes: 16 * 1024,
+        poll_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_secs(2),
+        prune_batch: 64,
+    }
+}
+
+fn run_event(sequence: u64, event_type: &str, padding_bytes: usize) -> RunEventAppendEntry {
+    RunEventAppendEntry::new(
+        sequence,
+        event_type,
+        serde_json::json!({
+            "event": event_type,
+            "data": {
+                "sequence": sequence,
+                "padding": "x".repeat(padding_bytes),
+            }
+        }),
+        1024,
+    )
+    .unwrap()
+}
+
+fn terminal_run_event(
+    sequence: u64,
+    run_id: &str,
+    status: RunStatus,
+    duration_ms: u64,
+    total_tokens: u32,
+) -> RunEventAppendEntry {
+    RunEventAppendEntry::new(
+        sequence,
+        "run_complete",
+        serde_json::json!({
+            "event": "run_complete",
+            "data": {
+                "run_id": run_id,
+                "status": status.to_string(),
+                "duration_ms": duration_ms,
+                "total_tokens": total_tokens,
+            }
+        }),
+        1024,
+    )
+    .unwrap()
+}
+
+fn run_event_batch(
+    run_id: &str,
+    owner_instance_id: &str,
+    entries: Vec<RunEventAppendEntry>,
+) -> RunEventAppendBatch {
+    RunEventAppendBatch {
+        run_id: run_id.into(),
+        flow: "flow-a".into(),
+        owner_instance_id: owner_instance_id.into(),
+        entries,
+    }
+}
+
+async fn journal_store(
+    url: &str,
+    prefix: &str,
+    owner_instance_id: &str,
+    config: RunEventJournalConfig,
+) -> PostgresStore {
+    PostgresStore::new_with_runtime_config(
+        url,
+        prefix,
+        RunLeaseConfig::new(owner_instance_id, Duration::from_secs(60)).unwrap(),
+        None,
+        config,
+    )
+    .await
+    .unwrap()
+}
+
+async fn create_keyed_run(store: &PostgresStore, run_id: &str, key: char) -> IdempotencyClaim {
+    let mut claim = idempotency_claim(
+        key,
+        char::from_u32(key as u32 + 1).unwrap(),
+        RUN_OPERATION,
+        run_id,
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    claim.response_status = Some(202);
+    claim.response_body = Some(format!(r#"{{"run_id":"{run_id}"}}"#));
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    store
+        .save_run_intent(intent(run_id, "flow-a", "2026-07-19T12:00:00Z", vec![]))
+        .await
+        .unwrap();
+    claim
 }
 
 fn idempotency_claim(
@@ -2868,4 +3028,1470 @@ async fn pg_keyed_run_cancellation_crosses_instance_boundary() {
             .unwrap(),
         RunCancellationRequest::NotFound
     );
+}
+
+#[tokio::test]
+async fn pg_human_input_mailbox_is_encrypted_and_cross_replica() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_human_input_mailbox_is_encrypted_and_cross_replica: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "hitl_mailbox_";
+    reset(&url, prefix).await;
+    let keyring = human_input_keyring();
+    let owner = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(keyring.clone()),
+    )
+    .await
+    .unwrap();
+    let peer_b = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+        Some(keyring.clone()),
+    )
+    .await
+    .unwrap();
+    let peer_c = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-c", Duration::from_secs(60)).unwrap(),
+        Some(keyring),
+    )
+    .await
+    .unwrap();
+    assert!(owner.supports_durable_human_input());
+    assert!(peer_b.supports_durable_human_input());
+
+    let claim = create_keyed_run(&owner, "hitl-run", '1').await;
+    let registration =
+        human_input_registration("hitl-run", "question-1", &claim.key_hash, &claim.attempt_id);
+    assert_eq!(
+        owner.register_human_input(&registration).await.unwrap(),
+        HumanInputRegistrationOutcome::Registered
+    );
+
+    let listed = peer_b
+        .list_human_inputs("flow-a", "hitl-run")
+        .await
+        .unwrap();
+    let HumanInputListOutcome::Shared {
+        owner_instance_id,
+        questions,
+    } = listed
+    else {
+        panic!("PostgreSQL mailbox should be shared")
+    };
+    assert_eq!(owner_instance_id, "owner-a");
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].owner_instance_id, "owner-a");
+    assert_eq!(questions[0].info, registration.question);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let table = format!("{prefix}human_inputs");
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(&table)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns.len(), 17);
+    for forbidden in ["prompt", "choices", "question", "answer", "answer_json"] {
+        assert!(
+            !columns.iter().any(|column| column == forbidden),
+            "mailbox exposes plaintext column '{forbidden}'"
+        );
+    }
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = $1",
+    )
+    .bind(&table)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index_count, 3, "primary key plus two bounded indexes");
+    let cascading_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint AS con \
+         JOIN pg_class AS tbl ON tbl.oid = con.conrelid \
+         JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace \
+         WHERE ns.nspname = current_schema() AND tbl.relname = $1 \
+           AND con.contype = 'f' AND con.confdeltype = 'c')",
+    )
+    .bind(&table)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cascading_fk);
+    let (question_nonce, question_ciphertext): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT question_nonce, question_ciphertext FROM {table} \
+             WHERE run_id = 'hitl-run' AND question_id = 'question-1'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(question_nonce.len(), 12);
+    assert!(question_ciphertext.len() > registration.question.prompt.len());
+    assert!(
+        !question_ciphertext
+            .windows(registration.question.prompt.len())
+            .any(|window| window == registration.question.prompt.as_bytes())
+    );
+
+    let answer_b = serde_json::json!({"approved": true, "comment": "ship it"});
+    let answer_c = serde_json::json!({"approved": false, "comment": "hold"});
+    let (result_b, result_c) = tokio::join!(
+        peer_b.answer_human_input("flow-a", "hitl-run", "question-1", &answer_b),
+        peer_c.answer_human_input("flow-a", "hitl-run", "question-1", &answer_c),
+    );
+    let outcomes = [result_b.unwrap(), result_c.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, HumanInputAnswerOutcome::Queued { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, HumanInputAnswerOutcome::AlreadyAnswered))
+            .count(),
+        1
+    );
+    let winning_answer = match owner.read_human_input(&registration).await.unwrap() {
+        HumanInputReadOutcome::Answered(answer) => answer,
+        other => panic!("expected encrypted answer, got {other:?}"),
+    };
+    assert!(winning_answer == answer_b || winning_answer == answer_c);
+    assert_eq!(
+        owner.read_human_input(&registration).await.unwrap(),
+        HumanInputReadOutcome::Answered(winning_answer.clone()),
+        "owner reads do not consume the answer"
+    );
+
+    let expire_answered_question = format!(
+        "UPDATE {table} SET \
+             created_at = clock_timestamp() - interval '2 seconds', \
+             expires_at = clock_timestamp() - interval '1 second' \
+         WHERE run_id = 'hitl-run' AND question_id = 'question-1'"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(expire_answered_question))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        peer_b
+            .answer_human_input("flow-a", "hitl-run", "question-1", &answer_b)
+            .await
+            .unwrap(),
+        HumanInputAnswerOutcome::AlreadyAnswered,
+        "an accepted answer survives a duplicate request after question expiry"
+    );
+    owner
+        .reconcile_abandoned_runs("2026-07-19T12:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(
+        owner.read_human_input(&registration).await.unwrap(),
+        HumanInputReadOutcome::Answered(winning_answer.clone()),
+        "reconciliation preserves an accepted answer until the owner consumes it"
+    );
+
+    let (answer_nonce, answer_ciphertext): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT answer_nonce, answer_ciphertext FROM {table} \
+             WHERE run_id = 'hitl-run' AND question_id = 'question-1'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let winning_plaintext = serde_json::to_vec(&winning_answer).unwrap();
+    assert_eq!(answer_nonce.len(), 12);
+    assert!(answer_ciphertext.len() > winning_plaintext.len());
+    assert!(
+        !answer_ciphertext
+            .windows(winning_plaintext.len())
+            .any(|window| window == winning_plaintext)
+    );
+    pool.close().await;
+
+    assert!(owner.close_human_input(&registration).await.unwrap());
+    assert_eq!(
+        owner.read_human_input(&registration).await.unwrap(),
+        HumanInputReadOutcome::NotFound
+    );
+    owner.health_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn pg_human_input_rejects_wrong_flow_fence_lease_and_expiry() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_human_input_rejects_wrong_flow_fence_lease_and_expiry: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "hitl_fence_";
+    reset(&url, prefix).await;
+    let keyring = human_input_keyring();
+    let owner = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(keyring.clone()),
+    )
+    .await
+    .unwrap();
+    let peer = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+        Some(keyring),
+    )
+    .await
+    .unwrap();
+
+    let fence_claim = create_keyed_run(&owner, "fence-run", '1').await;
+    let fence_registration = human_input_registration(
+        "fence-run",
+        "fence-question",
+        &fence_claim.key_hash,
+        &fence_claim.attempt_id,
+    );
+    owner
+        .register_human_input(&fence_registration)
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.answer_human_input(
+            "other-flow",
+            "fence-run",
+            "fence-question",
+            &serde_json::json!(true),
+        )
+        .await
+        .unwrap(),
+        HumanInputAnswerOutcome::NotFound
+    );
+    let mut wrong_fence = fence_registration.clone();
+    wrong_fence.attempt_id = "wrong-attempt".into();
+    assert_eq!(
+        owner.read_human_input(&wrong_fence).await.unwrap(),
+        HumanInputReadOutcome::NotFound
+    );
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let corrupt_fence = format!(
+        "UPDATE {prefix}human_inputs SET attempt_id = 'wrong-attempt' \
+         WHERE run_id = 'fence-run'"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(corrupt_fence))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.answer_human_input(
+            "flow-a",
+            "fence-run",
+            "fence-question",
+            &serde_json::json!(true),
+        )
+        .await
+        .unwrap(),
+        HumanInputAnswerOutcome::NotFound
+    );
+
+    let expiry_claim = create_keyed_run(&owner, "expiry-run", '3').await;
+    let expiry_registration = human_input_registration(
+        "expiry-run",
+        "expiry-question",
+        &expiry_claim.key_hash,
+        &expiry_claim.attempt_id,
+    );
+    owner
+        .register_human_input(&expiry_registration)
+        .await
+        .unwrap();
+    let expire_question = format!(
+        "UPDATE {prefix}human_inputs SET \
+             created_at = clock_timestamp() - interval '2 seconds', \
+             expires_at = clock_timestamp() - interval '1 second' \
+         WHERE run_id = 'expiry-run'"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(expire_question))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.answer_human_input(
+            "flow-a",
+            "expiry-run",
+            "expiry-question",
+            &serde_json::json!(true),
+        )
+        .await
+        .unwrap(),
+        HumanInputAnswerOutcome::NotFound
+    );
+
+    let lease_claim = create_keyed_run(&owner, "lease-run", '5').await;
+    let lease_registration = human_input_registration(
+        "lease-run",
+        "lease-question",
+        &lease_claim.key_hash,
+        &lease_claim.attempt_id,
+    );
+    owner
+        .register_human_input(&lease_registration)
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "lease-run").await;
+    assert_eq!(
+        peer.answer_human_input(
+            "flow-a",
+            "lease-run",
+            "lease-question",
+            &serde_json::json!(true),
+        )
+        .await
+        .unwrap(),
+        HumanInputAnswerOutcome::NotFound
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_human_input_rows_follow_run_lifecycle_cleanup() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_human_input_rows_follow_run_lifecycle_cleanup: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "hitl_cleanup_";
+    reset(&url, prefix).await;
+    let keyring = human_input_keyring();
+    let owner = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(keyring.clone()),
+    )
+    .await
+    .unwrap();
+    let peer = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+        Some(keyring),
+    )
+    .await
+    .unwrap();
+
+    let completion_claim = create_keyed_run(&owner, "completion-run", '1').await;
+    owner
+        .register_human_input(&human_input_registration(
+            "completion-run",
+            "completion-question",
+            &completion_claim.key_hash,
+            &completion_claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    owner
+        .update_run_completion(
+            "completion-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-07-19T12:01:00Z".into(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let cancellation_claim = create_keyed_run(&owner, "cancellation-run", '3').await;
+    owner
+        .register_human_input(&human_input_registration(
+            "cancellation-run",
+            "cancellation-question",
+            &cancellation_claim.key_hash,
+            &cancellation_claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        peer.request_run_cancellation("cancellation-run", "flow-a")
+            .await
+            .unwrap(),
+        RunCancellationRequest::Requested { .. }
+    ));
+
+    let deletion_claim = create_keyed_run(&owner, "deletion-run", '5').await;
+    owner
+        .register_human_input(&human_input_registration(
+            "deletion-run",
+            "deletion-question",
+            &deletion_claim.key_hash,
+            &deletion_claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    owner.delete_run("deletion-run").await.unwrap();
+
+    let reconciliation_claim = create_keyed_run(&owner, "reconciliation-run", 'a').await;
+    owner
+        .register_human_input(&human_input_registration(
+            "reconciliation-run",
+            "reconciliation-question",
+            &reconciliation_claim.key_hash,
+            &reconciliation_claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "reconciliation-run").await;
+    expire_idempotency_lease(&url, prefix, &reconciliation_claim.key_hash).await;
+    owner
+        .reconcile_abandoned_runs("2026-07-19T12:02:00Z")
+        .await
+        .unwrap();
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    for run_id in [
+        "completion-run",
+        "cancellation-run",
+        "deletion-run",
+        "reconciliation-run",
+    ] {
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id = $1"
+        )))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "mailbox row leaked for {run_id}");
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_event_journal_is_shared_fenced_idempotent_and_gap_aware() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_journal_is_shared_fenced_idempotent_and_gap_aware: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_shared_";
+    reset(&url, prefix).await;
+    let config = run_event_config();
+    let owner = journal_store(&url, prefix, "owner-a", config.clone()).await;
+    let peer = journal_store(&url, prefix, "owner-b", config.clone()).await;
+
+    assert_eq!(owner.event_journal_scope(), EventJournalScope::SharedStore);
+    assert_eq!(owner.event_journal_config(), config);
+    owner
+        .save_run_intent(intent(
+            "journal-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    let batch = run_event_batch(
+        "journal-run",
+        "owner-a",
+        vec![
+            run_event(1, "crew_started", 0),
+            run_event(3, "journal_gap", 0),
+        ],
+    );
+    let appended = owner.append_run_events(&batch).await.unwrap();
+    assert_eq!(appended.appended_events, 2);
+    assert_eq!(appended.duplicate_events, 0);
+    assert_eq!(appended.bounds.latest_sequence, 3);
+    assert!(!appended.bounds.journal_complete);
+
+    let page = peer
+        .read_run_events("flow-a", "journal-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert!(page.gap.is_none());
+    let gap_page = peer
+        .read_run_events("flow-a", "journal-run", 1)
+        .await
+        .unwrap();
+    assert!(gap_page.events.is_empty());
+    let gap = gap_page.gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (2, 2));
+    assert_eq!(gap.reason, RunEventGapReason::WriterBackpressure);
+    let resumed = peer
+        .read_run_events("flow-a", "journal-run", 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    assert!(resumed.gap.is_none());
+
+    let duplicate = owner.append_run_events(&batch).await.unwrap();
+    assert_eq!(duplicate.appended_events, 0);
+    assert_eq!(duplicate.duplicate_events, 2);
+    assert_eq!(duplicate.bounds, appended.bounds);
+
+    let conflicting = run_event_batch(
+        "journal-run",
+        "owner-a",
+        vec![run_event(1, "crew_started", 5)],
+    );
+    let error = owner.append_run_events(&conflicting).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("already contains different data"),
+        "unexpected conflict: {error}"
+    );
+
+    let wrong_owner = run_event_batch(
+        "journal-run",
+        "owner-b",
+        vec![run_event(4, "crew_complete", 0)],
+    );
+    let error = peer.append_run_events(&wrong_owner).await.unwrap_err();
+    assert!(
+        error.to_string().contains("is owned by instance 'owner-a'"),
+        "unexpected owner fence error: {error}"
+    );
+    let mut wrong_flow = run_event_batch(
+        "journal-run",
+        "owner-a",
+        vec![run_event(4, "crew_complete", 0)],
+    );
+    wrong_flow.flow = "other-flow".into();
+    let error = owner.append_run_events(&wrong_flow).await.unwrap_err();
+    assert!(
+        error.to_string().contains("does not match run"),
+        "unexpected flow fence error: {error}"
+    );
+    let error = peer
+        .read_run_events("other-flow", "journal-run", 0)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not match run"),
+        "unexpected read flow fence error: {error}"
+    );
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    for (table, expected_columns) in [
+        (format!("{prefix}run_events"), 8_i64),
+        (format!("{prefix}run_event_state"), 11_i64),
+        (format!("{prefix}run_event_usage"), 5_i64),
+    ] {
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(&table)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, expected_columns, "unexpected schema for {table}");
+    }
+    let event_table = format!("{prefix}run_events");
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = $1",
+    )
+    .bind(&event_table)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexes, 3, "primary key plus two bounded prune indexes");
+    let accounting_trigger: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger AS trigger_info \
+         JOIN pg_class AS table_info ON table_info.oid = trigger_info.tgrelid \
+         JOIN pg_namespace AS namespace ON namespace.oid = table_info.relnamespace \
+         WHERE namespace.nspname = current_schema() AND table_info.relname = $1 \
+           AND trigger_info.tgname = $2 AND NOT trigger_info.tgisinternal)",
+    )
+    .bind(&event_table)
+    .bind(format!("{event_table}_acct_trg"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(accounting_trigger);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {prefix}run_events SET \
+             created_at = clock_timestamp() - interval '2 seconds', \
+             expires_at = clock_timestamp() - interval '1 second' \
+         WHERE run_id = 'journal-run' AND sequence = 1"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let prefix_gap = peer
+        .read_run_events("flow-a", "journal-run", 0)
+        .await
+        .unwrap();
+    assert!(prefix_gap.events.is_empty());
+    let gap = prefix_gap.gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (1, 1));
+    assert_eq!(gap.reason, RunEventGapReason::Retention);
+    let internal_gap = peer
+        .read_run_events("flow-a", "journal-run", 1)
+        .await
+        .unwrap();
+    assert!(internal_gap.events.is_empty());
+    let gap = internal_gap.gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (2, 2));
+    assert_eq!(gap.reason, RunEventGapReason::WriterBackpressure);
+    let resumed = peer
+        .read_run_events("flow-a", "journal-run", 2)
+        .await
+        .unwrap();
+    assert_eq!(resumed.events.len(), 1);
+    assert_eq!(resumed.events[0].sequence, 3);
+    owner.health_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn pg_run_event_journal_enforces_per_run_and_global_caps() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_journal_enforces_per_run_and_global_caps: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_caps_";
+    reset(&url, prefix).await;
+    let config = RunEventJournalConfig {
+        max_events_per_run: 3,
+        max_bytes_per_run: 3 * 1024,
+        max_event_bytes: 1024,
+        retention: Duration::from_secs(60),
+        max_total_events: 4,
+        max_total_bytes: 4 * 1024,
+        page_max_events: 3,
+        page_max_bytes: 3 * 1024,
+        poll_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_secs(2),
+        prune_batch: 4,
+    };
+    let store = journal_store(&url, prefix, "owner-a", config.clone()).await;
+    for run_id in ["cap-a", "cap-b", "cap-c"] {
+        store
+            .save_run_intent(intent(run_id, "flow-a", "2026-07-19T12:00:00Z", vec![]))
+            .await
+            .unwrap();
+    }
+
+    store
+        .append_run_events(&run_event_batch(
+            "cap-a",
+            "owner-a",
+            vec![
+                run_event(1, "task_started", 0),
+                run_event(2, "task_complete", 0),
+                run_event(3, "crew_started", 0),
+            ],
+        ))
+        .await
+        .unwrap();
+    let per_run_eviction = store
+        .append_run_events(&run_event_batch(
+            "cap-a",
+            "owner-a",
+            vec![run_event(4, "crew_complete", 0)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(per_run_eviction.evicted_events, 1);
+    assert_eq!(per_run_eviction.bounds.retained_events, 3);
+    let gap = per_run_eviction.eviction_gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (1, 1));
+    assert_eq!(gap.reason, RunEventGapReason::WriterBackpressure);
+
+    store
+        .append_run_events(&run_event_batch(
+            "cap-b",
+            "owner-a",
+            vec![
+                run_event(1, "task_started", 800),
+                run_event(2, "task_complete", 800),
+            ],
+        ))
+        .await
+        .unwrap();
+    let bounded_append = store
+        .append_run_events(&run_event_batch(
+            "cap-b",
+            "owner-a",
+            vec![run_event(3, "crew_complete", 800)],
+        ))
+        .await
+        .unwrap();
+    assert!(bounded_append.bounds.retained_bytes <= config.max_bytes_per_run as u64);
+
+    store
+        .append_run_events(&run_event_batch(
+            "cap-c",
+            "owner-a",
+            vec![
+                run_event(1, "task_started", 800),
+                run_event(2, "task_complete", 800),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (usage_events, usage_bytes): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT retained_events, retained_bytes FROM {prefix}run_event_usage \
+         WHERE singleton = TRUE"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (actual_events, actual_bytes): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*)::BIGINT, COALESCE(SUM(accounted_bytes), 0)::BIGINT \
+         FROM {prefix}run_events"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((usage_events, usage_bytes), (actual_events, actual_bytes));
+    assert!(actual_events <= i64::try_from(config.max_total_events).unwrap());
+    assert!(actual_bytes <= i64::try_from(config.max_total_bytes).unwrap());
+    let run_bounds: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT retained_events, retained_bytes FROM {prefix}run_event_state"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(run_bounds.iter().all(|(events, bytes)| {
+        *events <= i64::try_from(config.max_events_per_run).unwrap()
+            && *bytes <= i64::try_from(config.max_bytes_per_run).unwrap()
+    }));
+    pool.close().await;
+
+    let evicted_page = store.read_run_events("flow-a", "cap-a", 0).await.unwrap();
+    let gap = evicted_page.gap.expect("global cap must evict cap-a");
+    assert_eq!(gap.reason, RunEventGapReason::GlobalCapacity);
+    assert_eq!(gap.last_sequence, evicted_page.bounds.dropped_through);
+}
+
+#[tokio::test]
+async fn pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascades() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascades: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_terminal_";
+    reset(&url, prefix).await;
+    let config = run_event_config();
+    let owner = journal_store(&url, prefix, "owner-a", config).await;
+    let peer = journal_store(&url, prefix, "owner-b", run_event_config()).await;
+    owner
+        .save_run_intent(intent(
+            "terminal-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    owner
+        .update_run_completion(
+            "terminal-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-07-19T12:01:00Z".into(),
+                duration_ms: 321,
+                task_results: vec![],
+                total_tokens: 42,
+                cached_tokens: 7,
+            },
+        )
+        .await
+        .unwrap();
+    let terminal_batch = run_event_batch(
+        "terminal-run",
+        "owner-a",
+        vec![terminal_run_event(
+            1,
+            "terminal-run",
+            RunStatus::Success,
+            321,
+            42,
+        )],
+    );
+    owner.append_run_events(&terminal_batch).await.unwrap();
+    let duplicate = owner.append_run_events(&terminal_batch).await.unwrap();
+    assert_eq!(duplicate.appended_events, 0);
+    assert_eq!(duplicate.duplicate_events, 1);
+
+    let page = peer
+        .read_run_events("flow-a", "terminal-run", 0)
+        .await
+        .unwrap();
+    let terminal = page.terminal.unwrap();
+    assert_eq!(terminal.status, RunStatus::Success);
+    assert_eq!(terminal.duration_ms, 321);
+    assert_eq!(terminal.total_tokens, 42);
+    assert_eq!(terminal.event_sequence, Some(1));
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {prefix}run_events SET \
+             created_at = clock_timestamp() - interval '2 seconds', \
+             expires_at = clock_timestamp() - interval '1 second' \
+         WHERE run_id = 'terminal-run'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let expired = peer
+        .read_run_events("flow-a", "terminal-run", 0)
+        .await
+        .unwrap();
+    assert!(expired.events.is_empty());
+    assert_eq!(expired.bounds.latest_sequence, 1);
+    assert_eq!(expired.bounds.dropped_through, 1);
+    assert_eq!(expired.bounds.retained_events, 0);
+    let gap = expired.gap.unwrap();
+    assert_eq!(gap.reason, RunEventGapReason::Retention);
+    assert_eq!((gap.first_sequence, gap.last_sequence), (1, 1));
+    let terminal = expired.terminal.unwrap();
+    assert_eq!(terminal.status, RunStatus::Success);
+    assert_eq!(terminal.event_sequence, Some(1));
+
+    owner
+        .save_run_intent(intent(
+            "terminal-without-event",
+            "flow-a",
+            "2026-07-19T12:02:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    owner
+        .update_run_completion(
+            "terminal-without-event",
+            RunCompletion {
+                status: RunStatus::Failed,
+                finished_at: "2026-07-19T12:03:00Z".into(),
+                duration_ms: 5,
+                task_results: vec![],
+                total_tokens: 2,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let missing_terminal = peer
+        .read_run_events("flow-a", "terminal-without-event", 0)
+        .await
+        .unwrap();
+    assert!(!missing_terminal.bounds.journal_complete);
+    let terminal = missing_terminal.terminal.unwrap();
+    assert_eq!(terminal.status, RunStatus::Failed);
+    assert_eq!(terminal.event_sequence, None);
+
+    owner.delete_run("terminal-run").await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let event_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_events WHERE run_id = 'terminal-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let state_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_event_state WHERE run_id = 'terminal-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let usage: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT retained_events, retained_bytes FROM {prefix}run_event_usage \
+         WHERE singleton = TRUE"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((event_rows, state_rows), (0, 0));
+    assert_eq!(usage, (0, 0));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_journal_rejects_stale_and_post_terminal_writes: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_fence_";
+    reset(&url, prefix).await;
+    let store = journal_store(&url, prefix, "owner-a", run_event_config()).await;
+
+    store
+        .save_run_intent(intent(
+            "premature-terminal",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    let premature = run_event_batch(
+        "premature-terminal",
+        "owner-a",
+        vec![terminal_run_event(
+            1,
+            "premature-terminal",
+            RunStatus::Success,
+            1,
+            1,
+        )],
+    );
+    let error = store.append_run_events(&premature).await.unwrap_err();
+    assert!(error.to_string().contains("before its terminal record"));
+
+    store
+        .save_run_intent(intent(
+            "stale-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "stale-run").await;
+    let stale = run_event_batch(
+        "stale-run",
+        "owner-a",
+        vec![run_event(1, "crew_started", 0)],
+    );
+    let error = store.append_run_events(&stale).await.unwrap_err();
+    assert!(error.to_string().contains("active owner lease"));
+
+    store
+        .save_run_intent(intent(
+            "sealed-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    store
+        .append_run_events(&run_event_batch(
+            "sealed-run",
+            "owner-a",
+            vec![run_event(1, "crew_started", 0)],
+        ))
+        .await
+        .unwrap();
+    store
+        .update_run_completion(
+            "sealed-run",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "2026-07-19T12:01:00Z".into(),
+                duration_ms: 12,
+                task_results: vec![],
+                total_tokens: 34,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let nonterminal = run_event_batch(
+        "sealed-run",
+        "owner-a",
+        vec![run_event(2, "crew_complete", 0)],
+    );
+    let error = store.append_run_events(&nonterminal).await.unwrap_err();
+    assert!(error.to_string().contains("nonterminal journal event"));
+    let mismatched = run_event_batch(
+        "sealed-run",
+        "owner-a",
+        vec![terminal_run_event(
+            2,
+            "sealed-run",
+            RunStatus::Failed,
+            12,
+            34,
+        )],
+    );
+    let error = store.append_run_events(&mismatched).await.unwrap_err();
+    assert!(error.to_string().contains("does not match"));
+
+    let terminal = run_event_batch(
+        "sealed-run",
+        "owner-a",
+        vec![terminal_run_event(
+            2,
+            "sealed-run",
+            RunStatus::Success,
+            12,
+            34,
+        )],
+    );
+    let appended = store.append_run_events(&terminal).await.unwrap();
+    assert_eq!(appended.appended_events, 1);
+    let duplicate = store.append_run_events(&terminal).await.unwrap();
+    assert_eq!(duplicate.duplicate_events, 1);
+    let second_terminal = run_event_batch(
+        "sealed-run",
+        "owner-a",
+        vec![terminal_run_event(
+            3,
+            "sealed-run",
+            RunStatus::Success,
+            12,
+            34,
+        )],
+    );
+    let error = store.append_run_events(&second_terminal).await.unwrap_err();
+    assert!(error.to_string().contains("sealed after run_complete"));
+    let post_terminal = run_event_batch(
+        "sealed-run",
+        "owner-a",
+        vec![run_event(3, "crew_complete", 0)],
+    );
+    let error = store.append_run_events(&post_terminal).await.unwrap_err();
+    assert!(error.to_string().contains("sealed after run_complete"));
+
+    store
+        .save_run_intent(intent(
+            "abandoned-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "abandoned-run").await;
+    store
+        .reconcile_abandoned_runs("2026-07-19T12:05:00Z")
+        .await
+        .unwrap();
+    let abandoned = run_event_batch(
+        "abandoned-run",
+        "owner-a",
+        vec![terminal_run_event(
+            1,
+            "abandoned-run",
+            RunStatus::Abandoned,
+            0,
+            0,
+        )],
+    );
+    let error = store.append_run_events(&abandoned).await.unwrap_err();
+    assert!(error.to_string().contains("Abandoned run"));
+}
+
+#[tokio::test]
+async fn pg_run_event_journal_reclaims_across_batches_and_survives_restart() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_journal_reclaims_across_batches_and_survives_restart: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_multibatch_";
+    reset(&url, prefix).await;
+    let config = RunEventJournalConfig {
+        max_events_per_run: 5,
+        max_bytes_per_run: 5 * 1024,
+        max_event_bytes: 1024,
+        retention: Duration::from_secs(60),
+        max_total_events: 20,
+        max_total_bytes: 20 * 1024,
+        page_max_events: 5,
+        page_max_bytes: 5 * 1024,
+        poll_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_secs(2),
+        prune_batch: 2,
+    };
+    let store = journal_store(&url, prefix, "owner-a", config.clone()).await;
+    store
+        .save_run_intent(intent(
+            "multi-run",
+            "flow-a",
+            "2026-07-19T12:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    store
+        .append_run_events(&run_event_batch(
+            "multi-run",
+            "owner-a",
+            (1..=5)
+                .map(|sequence| run_event(sequence, "task_started", 0))
+                .collect(),
+        ))
+        .await
+        .unwrap();
+    let reclaimed = store
+        .append_run_events(&run_event_batch(
+            "multi-run",
+            "owner-a",
+            (6..=8)
+                .map(|sequence| run_event(sequence, "task_complete", 0))
+                .collect(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.evicted_events, 3);
+    assert_eq!(reclaimed.bounds.dropped_through, 3);
+    assert_eq!(reclaimed.bounds.retained_events, 5);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {prefix}run_event_usage SET schema_version = 0 WHERE singleton = TRUE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let restarted = journal_store(&url, prefix, "owner-a", config).await;
+    let prefix_page = restarted
+        .read_run_events("flow-a", "multi-run", 0)
+        .await
+        .unwrap();
+    assert!(prefix_page.events.is_empty());
+    let gap = prefix_page.gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (1, 3));
+    assert_eq!(gap.reason, RunEventGapReason::WriterBackpressure);
+    let retained = restarted
+        .read_run_events("flow-a", "multi-run", 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        retained
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6, 7, 8]
+    );
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema_version: i32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT schema_version FROM {prefix}run_event_usage WHERE singleton = TRUE"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(schema_version, 1);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {prefix}run_events SET \
+             created_at = clock_timestamp() - interval '2 seconds', \
+             expires_at = clock_timestamp() - interval '1 second' \
+         WHERE run_id = 'multi-run'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    restarted
+        .reconcile_abandoned_runs("2026-07-19T12:10:00Z")
+        .await
+        .unwrap();
+    let logically_expired = restarted
+        .read_run_events("flow-a", "multi-run", 0)
+        .await
+        .unwrap();
+    assert!(logically_expired.events.is_empty());
+    assert_eq!(logically_expired.bounds.dropped_through, 8);
+    assert_eq!(logically_expired.bounds.retained_events, 0);
+    let gap = logically_expired.gap.unwrap();
+    assert_eq!((gap.first_sequence, gap.last_sequence), (1, 8));
+    assert_eq!(gap.reason, RunEventGapReason::Retention);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let remaining_after_one_sweep: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_events WHERE run_id = 'multi-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_after_one_sweep, 3);
+    pool.close().await;
+    for _ in 0..2 {
+        restarted
+            .reconcile_abandoned_runs("2026-07-19T12:10:00Z")
+            .await
+            .unwrap();
+    }
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_events WHERE run_id = 'multi-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let usage: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT retained_events, retained_bytes FROM {prefix}run_event_usage \
+         WHERE singleton = TRUE"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
+    assert_eq!(usage, (0, 0));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_event_page_delivers_first_wire_bounded_event_when_db_accounting_is_larger() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_page_delivers_first_wire_bounded_event_when_db_accounting_is_larger: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_page_accounting_";
+    reset(&url, prefix).await;
+    let config = RunEventJournalConfig {
+        max_events_per_run: 4,
+        max_bytes_per_run: 8 * 1024,
+        max_event_bytes: 1024,
+        retention: Duration::from_secs(60),
+        max_total_events: 16,
+        max_total_bytes: 32 * 1024,
+        page_max_events: 4,
+        page_max_bytes: 1024,
+        poll_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_secs(2),
+        prune_batch: 4,
+    };
+    let store = journal_store(&url, prefix, "owner-a", config).await;
+    store
+        .save_run_intent(intent("page-run", "flow-a", "2026-07-19T12:00:00Z", vec![]))
+        .await
+        .unwrap();
+    let mut fields = serde_json::Map::new();
+    for index in 0..90 {
+        fields.insert(format!("k{index:03}"), serde_json::json!(index));
+    }
+    let entry = RunEventAppendEntry::new(
+        1,
+        "log",
+        serde_json::json!({"event": "log", "data": fields}),
+        1024,
+    )
+    .unwrap();
+    assert!(entry.payload_bytes <= 1024);
+    store
+        .append_run_events(&run_event_batch("page-run", "owner-a", vec![entry]))
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let accounted_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT accounted_bytes FROM {prefix}run_events \
+         WHERE run_id = 'page-run' AND sequence = 1"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(accounted_bytes > 1024);
+    pool.close().await;
+
+    let page = store
+        .read_run_events("flow-a", "page-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].sequence, 1);
+    assert!(page.gap.is_none());
+}
+
+#[tokio::test]
+async fn pg_reconciliation_commits_when_journal_maintenance_is_unavailable() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_reconciliation_commits_when_journal_maintenance_is_unavailable: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_reconcile_isolation_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_runtime_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(human_input_keyring()),
+        run_event_config(),
+    )
+    .await
+    .unwrap();
+    let claim = create_keyed_run(&store, "isolated-run", '7').await;
+    store
+        .register_human_input(&human_input_registration(
+            "isolated-run",
+            "isolated-question",
+            &claim.key_hash,
+            &claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "isolated-run").await;
+    expire_idempotency_lease(&url, prefix, &claim.key_hash).await;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {prefix}run_event_usage WHERE singleton = TRUE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("2026-07-19T12:05:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let run_status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT status FROM {prefix}runs WHERE run_id = 'isolated-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ledger_state: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT state FROM {prefix}idempotency WHERE key_hash = $1"
+    )))
+    .bind(&claim.key_hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let human_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id = 'isolated-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(run_status, "abandoned");
+    assert_eq!(ledger_state, "completed");
+    assert_eq!(human_rows, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_human_input_registration_enforces_aggregate_capacity() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_human_input_registration_enforces_aggregate_capacity: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    if std::env::var_os("IRONCREW_ASK_HUMAN_MAX_PENDING").is_some()
+        || std::env::var_os("IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES").is_some()
+    {
+        eprintln!(
+            "SKIP pg_human_input_registration_enforces_aggregate_capacity: \
+             explicit mailbox limits override deterministic defaults"
+        );
+        return;
+    }
+    let prefix = "hitl_capacity_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_runtime_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(human_input_keyring()),
+        run_event_config(),
+    )
+    .await
+    .unwrap();
+    let claim = create_keyed_run(&store, "capacity-run", '8').await;
+    let mut last_registration = None;
+    for index in 0..16 {
+        let registration = human_input_registration(
+            "capacity-run",
+            &format!("question-{index}"),
+            &claim.key_hash,
+            &claim.attempt_id,
+        );
+        assert_eq!(
+            store.register_human_input(&registration).await.unwrap(),
+            HumanInputRegistrationOutcome::Registered
+        );
+        last_registration = Some(registration);
+    }
+    assert_eq!(
+        store
+            .register_human_input(last_registration.as_ref().unwrap())
+            .await
+            .unwrap(),
+        HumanInputRegistrationOutcome::Registered,
+        "an exact retry at capacity must remain idempotent"
+    );
+    let overflow = human_input_registration(
+        "capacity-run",
+        "question-overflow",
+        &claim.key_hash,
+        &claim.attempt_id,
+    );
+    let error = store.register_human_input(&overflow).await.unwrap_err();
+    assert!(error.to_string().contains("configured capacity"));
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let retained: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id = 'capacity-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, 16);
+    pool.close().await;
 }

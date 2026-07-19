@@ -4,10 +4,18 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
+use crate::engine::human_input::{
+    DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputListOutcome,
+    HumanInputReadOutcome, HumanInputRegistrationOutcome,
+};
 use crate::engine::idempotency::{
     ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
     IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
     IdempotencyUsage, PrincipalId, RunCancellationRequest, RunFenceHeartbeat,
+};
+use crate::engine::run_events::{
+    EventJournalScope, RunEventAppendBatch, RunEventAppendOutcome, RunEventJournalConfig,
+    RunEventPage,
 };
 use crate::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -162,6 +170,46 @@ pub trait StateStore: Send + Sync {
     /// at least three times within this interval.
     fn run_lease_ttl(&self) -> Duration;
 
+    /// Whether this handle has a shared, encrypted human-input transport.
+    /// PostgreSQL requires a valid process keyring; local backends retain the
+    /// process-only bridge and therefore use this default.
+    fn supports_durable_human_input(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend can replay run events across processes.
+    fn event_journal_scope(&self) -> EventJournalScope {
+        EventJournalScope::ProcessLocal
+    }
+
+    /// Immutable journal limits used by the event producer and page reader.
+    fn event_journal_config(&self) -> RunEventJournalConfig {
+        RunEventJournalConfig::default()
+    }
+
+    /// Append a strictly ordered event batch. Process-local stores reject
+    /// direct calls so a missed scope check cannot silently discard events.
+    async fn append_run_events(
+        &self,
+        _batch: &RunEventAppendBatch,
+    ) -> Result<RunEventAppendOutcome> {
+        Err(crate::utils::error::IronCrewError::Validation(
+            "State store does not provide a shared run-event journal".into(),
+        ))
+    }
+
+    /// Read one bounded replay page after `after_sequence` (zero = beginning).
+    async fn read_run_events(
+        &self,
+        _flow: &str,
+        _run_id: &str,
+        _after_sequence: u64,
+    ) -> Result<RunEventPage> {
+        Err(crate::utils::error::IronCrewError::Validation(
+            "State store does not provide a shared run-event journal".into(),
+        ))
+    }
+
     /// Extend every in-flight run owned by this instance. Returns the number
     /// of leases refreshed.
     async fn heartbeat_owned_runs(&self) -> Result<usize>;
@@ -280,6 +328,47 @@ pub trait StateStore: Send + Sync {
         _flow: &str,
     ) -> Result<RunCancellationRequest> {
         Ok(RunCancellationRequest::NotDurable)
+    }
+
+    // Durable human-input mailbox. Shared backends may override these methods
+    // to route pending questions and answers across replicas. Local stores
+    // deliberately preserve the existing process-local bridge semantics.
+    async fn register_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputRegistrationOutcome> {
+        Ok(HumanInputRegistrationOutcome::NotDurable)
+    }
+
+    async fn list_human_inputs(&self, _flow: &str, _run_id: &str) -> Result<HumanInputListOutcome> {
+        Ok(HumanInputListOutcome::NotDurable)
+    }
+
+    async fn answer_human_input(
+        &self,
+        _flow: &str,
+        _run_id: &str,
+        _question_id: &str,
+        _answer: &serde_json::Value,
+    ) -> Result<HumanInputAnswerOutcome> {
+        Ok(HumanInputAnswerOutcome::NotDurable)
+    }
+
+    async fn read_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputReadOutcome> {
+        Ok(HumanInputReadOutcome::NotDurable)
+    }
+
+    /// Remove a single mailbox row after the owning runtime has resolved or
+    /// abandoned its suspension point. `false` means the backend has no
+    /// durable mailbox or the fenced row no longer exists.
+    async fn close_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     #[allow(dead_code)] // retained for downstream StateStore API compatibility
