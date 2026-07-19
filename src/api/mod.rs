@@ -37,8 +37,9 @@ pub struct ActiveRun {
     /// targets another flow's run without a store round-trip.
     pub flow: String,
     /// Per-run human-input transport for `crew:ask_human()` — the questions
-    /// and answer endpoints reach the suspended flow through this. Dropped
-    /// with the entry, so pending oneshots die when the run is cleaned up.
+    /// and answer endpoints reach the suspended flow through this. Closed as
+    /// soon as the run aborts or otherwise terminates, independently of the
+    /// event bus's short terminal-replay retention window.
     pub input_bridge: Arc<InputBridge>,
     /// Becomes `true` after the monitor has persisted and emitted exactly one
     /// terminal outcome. Shutdown waits on this after aborting active work.

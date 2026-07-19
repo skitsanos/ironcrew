@@ -340,6 +340,19 @@ separated from the HTTP service.
 
 **Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once per process startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run once during each process boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
 
+**Terminal-write outage memory bound.** A healthy terminal write persists the
+full task-result payload. If storage rejects that write, IronCrew will retain
+at most 1 MiB of task-result allocations for one additional full-payload
+attempt. Larger payloads are released after the first failed attempt; smaller
+payloads are released after the second. Terminal status, timing, and aggregate
+token counts continue retrying until durable, admission stays occupied, and
+readiness remains down. Consequently, a run finalized during a sustained
+storage outage can eventually have an empty `task_results` array even though
+its terminal metadata is correct. This deliberate degradation prevents every
+admitted run from pinning up to the full run-result ceiling in Railway or
+OpenShift pod RAM while PostgreSQL is unavailable; the release is logged with
+the run ID and dropped-result count.
+
 ### Postgres-specific
 
 | Variable | Default | Description |

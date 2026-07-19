@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::engine::eventbus::CrewEvent;
 use crate::engine::input_bridge::AskOutcome;
-use crate::engine::run_history::RunStatus;
 use crate::tools::ToolCallContext;
 use crate::utils::error::Result;
 
@@ -225,34 +224,33 @@ pub async fn request(
     let store = ask.store.clone().or_else(|| ctx.store.clone());
     let question_id = uuid::Uuid::new_v4().to_string();
 
-    if let Some(bus) = &eventbus {
-        bus.emit(CrewEvent::HumanInputRequested {
-            question_id: question_id.clone(),
-            prompt: prompt.clone(),
-            choices: choices.clone(),
-            timeout_s,
-            kind: "approval".into(),
-        });
-    }
-    if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-        && let Err(e) = store
-            .update_run_status(run_id, RunStatus::WaitingForInput)
-            .await
-    {
-        tracing::debug!("approval gate: run status not updated: {}", e);
-    }
-
+    let requested_event = CrewEvent::HumanInputRequested {
+        question_id: question_id.clone(),
+        prompt: prompt.clone(),
+        choices: choices.clone(),
+        timeout_s,
+        kind: "approval".into(),
+    };
+    let requested_eventbus = eventbus.clone();
     let outcome = ask
         .bridge
-        .ask(&question_id, &prompt, &choices, timeout_s, "approval")
+        .with_run_wait_status(
+            store.clone(),
+            ask.run_id.as_deref(),
+            ask.bridge.ask_when_ready(
+                &question_id,
+                &prompt,
+                &choices,
+                timeout_s,
+                "approval",
+                move || {
+                    if let Some(bus) = requested_eventbus {
+                        bus.emit(requested_event);
+                    }
+                },
+            ),
+        )
         .await?;
-
-    if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-        && ask.bridge.pending_count() == 0
-        && let Err(e) = store.update_run_status(run_id, RunStatus::Running).await
-    {
-        tracing::debug!("approval gate: run status not restored: {}", e);
-    }
 
     let (verdict, outcome_str) = match outcome {
         AskOutcome::Answered(value) => (parse_answer(tool, &value, policy), "answered"),

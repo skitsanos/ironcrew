@@ -1,7 +1,7 @@
 # Tools
 
 Tools are functions that agents can invoke during task execution. IronCrew ships
-with 8 built-in tools by default (9 when the opt-in `shell` tool is enabled via
+with 9 built-in tools by default (10 when the opt-in `shell` tool is enabled via
 `IRONCREW_ALLOW_SHELL=1`) and supports custom tools written in Lua. Additional
 tools can be contributed by MCP servers configured on the crew (see
 [MCP Tools](#mcp-tools) below).

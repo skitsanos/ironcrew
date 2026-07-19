@@ -3,16 +3,17 @@
 //!   POST /flows/{flow}/answer/{run_id}
 //!
 //! Spins up a real axum server (same wiring as production, mirroring
-//! http_audit_test.rs) with a flows dir containing a crew.lua that suspends
-//! on `crew:ask_human()`. The flow never calls `crew:run()`, so no LLM
-//! access is needed.
+//! http_audit_test.rs) with flows that suspend on `crew:ask_human()`. The
+//! post-crew fixture uses a conditionally skipped task, so it exercises the
+//! full `crew:run()` lifecycle without making an LLM request.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ironcrew::api::{AppState, create_router};
-use ironcrew::engine::store::create_store;
+use ironcrew::engine::run_history::JsonFileStore;
+use ironcrew::engine::store::{RunLeaseConfig, StateStore};
 
 /// Flow that suspends on ask_human and validates the delivered answer.
 const ASK_FLOW: &str = r#"
@@ -44,6 +45,41 @@ local crew = Crew.new({
 crew:ask_human({ prompt = "Waiting forever", timeout_s = 600 })
 "#;
 
+/// Flow that completes its crew tasks before suspending in outer Lua. The
+/// false condition makes the task deterministic and provider-free while still
+/// producing a real task result for terminal persistence.
+const POST_CREW_FLOW: &str = r#"
+local crew = Crew.new({
+    goal = "post-crew human checkpoint",
+    provider = "openai",
+    model = "test",
+    api_key = "test",
+})
+crew:add_agent(Agent.new({
+    name = "offline",
+    goal = "Exercise lifecycle without a provider call",
+    capabilities = { "testing" },
+}))
+crew:add_task_if("false", {
+    name = "skipped",
+    agent = "offline",
+    description = "This task is intentionally skipped",
+    expected_output = "No provider output",
+})
+local results = crew:run()
+if not results[1] or not results[1].success then
+    error("expected the conditionally skipped task result")
+end
+local answer = crew:ask_human({
+    prompt = "Release the completed crew output?",
+    choices = { "yes", "no" },
+    timeout_s = 30,
+})
+if answer ~= "yes" then
+    error("unexpected post-crew answer: " .. tostring(answer))
+end
+"#;
+
 async fn spawn_test_server() -> (SocketAddr, PathBuf) {
     // SAFETY: same rationale as http_audit_test.rs — these tests want the
     // API token unset; the remove is idempotent.
@@ -52,8 +88,12 @@ async fn spawn_test_server() -> (SocketAddr, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let flows_dir = temp.path().to_path_buf();
 
-    // Two flow projects under the flows root.
-    for (name, script) in [("askflow", ASK_FLOW), ("parkflow", PARK_FLOW)] {
+    // Flow projects under the flows root.
+    for (name, script) in [
+        ("askflow", ASK_FLOW),
+        ("parkflow", PARK_FLOW),
+        ("postcrew", POST_CREW_FLOW),
+    ] {
         let dir = flows_dir.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("crew.lua"), script).unwrap();
@@ -61,7 +101,13 @@ async fn spawn_test_server() -> (SocketAddr, PathBuf) {
 
     let ironcrew_dir = flows_dir.join(".ironcrew");
     std::fs::create_dir_all(&ironcrew_dir).unwrap();
-    let store = create_store(ironcrew_dir).await.unwrap();
+    let lease = RunLeaseConfig::new(
+        format!("ask-human-http-test-{}", uuid::Uuid::new_v4()),
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    let store: Arc<dyn StateStore> =
+        Arc::new(JsonFileStore::new_with_lease_config(ironcrew_dir, lease).unwrap());
 
     let _ = Box::leak(Box::new(temp));
 
@@ -150,6 +196,21 @@ async fn happy_path_question_lifecycle_over_http() {
     assert_eq!(q["timeout_s"], 30);
     let question_id = q["question_id"].as_str().unwrap().to_string();
 
+    // An oversized answer is a retryable payload error, not a misleading
+    // "question not found" response, and leaves the question pending.
+    let resp = client
+        .post(format!("{}/flows/askflow/answer/{}", base, run_id))
+        .json(&serde_json::json!({
+            "question_id": question_id,
+            "answer": "x".repeat(64 * 1024),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let pending = wait_for_question(&client, &base, "askflow", &run_id).await;
+    assert_eq!(pending["question_id"], question_id);
+
     // Deliver the answer.
     let resp = client
         .post(format!("{}/flows/askflow/answer/{}", base, run_id))
@@ -207,6 +268,149 @@ async fn happy_path_question_lifecycle_over_http() {
         !text.contains("\"answer\""),
         "SSE must not echo the answer content: {text}"
     );
+
+    // Terminal replay keeps the ActiveRun tombstone briefly, but its question
+    // transport is already closed when run_complete is emitted.
+    let resp = client
+        .get(format!("{}/flows/askflow/questions/{}", base, run_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn post_crew_question_keeps_keyed_run_in_flight_until_outer_lua_finishes() {
+    let (addr, _flows) = spawn_test_server().await;
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    let start = client
+        .post(format!("{}/flows/postcrew/run", base))
+        .header("Idempotency-Key", "post-crew-human-checkpoint")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 200);
+    let start: serde_json::Value = start.json().await.unwrap();
+    let run_id = start["run_id"].as_str().expect("run_id").to_string();
+
+    let question = wait_for_question(&client, &base, "postcrew", &run_id).await;
+    assert_eq!(question["prompt"], "Release the completed crew output?");
+    let question_id = question["question_id"].as_str().unwrap().to_string();
+
+    // `crew:run()` has returned, but the outer Lua entrypoint is still parked.
+    // Its rich completion must be staged rather than terminalizing the durable
+    // record (which would make the keyed-run heartbeat fence this worker).
+    let record: serde_json::Value = client
+        .get(format!("{}/flows/postcrew/runs/{}", base, run_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(record["status"], "WaitingForInput");
+    assert_eq!(record["task_results"], serde_json::json!([]));
+
+    // The test store has a three-second run lease, so this crosses a keyed-run
+    // heartbeat tick. A prematurely terminal record would abort the Lua worker
+    // and expire this question during the wait.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let still_pending = wait_for_question(&client, &base, "postcrew", &run_id).await;
+    assert_eq!(still_pending["question_id"], question_id);
+
+    let answer = client
+        .post(format!("{}/flows/postcrew/answer/{}", base, run_id))
+        .json(&serde_json::json!({
+            "question_id": question_id,
+            "answer": "yes",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200);
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let record: serde_json::Value = client
+                .get(format!("{}/flows/postcrew/runs/{}", base, run_id))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if record["status"] == "Success" {
+                break record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("post-crew run did not become terminal after its answer");
+
+    let results = terminal["task_results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "staged task results were not persisted");
+    assert_eq!(results[0]["task"], "skipped");
+    assert_eq!(results[0]["success"], true);
+    assert!(
+        terminal["duration_ms"].as_u64().unwrap() >= 1_400,
+        "HTTP run duration did not include the outer-Lua input wait"
+    );
+}
+
+#[tokio::test]
+async fn abort_after_crew_completion_preserves_staged_task_results() {
+    let (addr, _flows) = spawn_test_server().await;
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    let start: serde_json::Value = client
+        .post(format!("{}/flows/postcrew/run", base))
+        .header("Idempotency-Key", "abort-post-crew-human-checkpoint")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = start["run_id"].as_str().expect("run_id").to_string();
+    wait_for_question(&client, &base, "postcrew", &run_id).await;
+
+    let aborted = client
+        .post(format!("{}/flows/postcrew/abort/{}", base, run_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(aborted.status(), 200);
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let record: serde_json::Value = client
+                .get(format!("{}/flows/postcrew/runs/{}", base, run_id))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if record["status"] == "Aborted" {
+                break record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("post-crew run did not persist its abort");
+
+    let results = terminal["task_results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "abort discarded completed task results");
+    assert_eq!(results[0]["task"], "skipped");
+    assert_eq!(results[0]["success"], true);
+    assert_eq!(terminal["total_tokens"], 0);
 }
 
 #[tokio::test]
@@ -281,28 +485,50 @@ async fn abort_while_waiting_kills_run_and_expires_questions() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The ActiveRun entry lingers ~5s for SSE drain, but answering the
-    // aborted run's question must not succeed once the entry is gone.
-    // Immediately after abort the bridge may still hold the entry; poll
-    // until the answer stops being deliverable.
-    let mut last_status = None;
-    for _ in 0..140 {
-        let resp = client
-            .post(format!("{}/flows/parkflow/answer/{}", base, run_id))
-            .json(&serde_json::json!({ "question_id": question_id, "answer": "x" }))
-            .send()
-            .await
-            .unwrap();
-        last_status = Some(resp.status());
-        if resp.status() == 404 {
-            break;
+    // Abort closes the question transport before returning even though the
+    // ActiveRun tombstone and its event bus remain available for SSE replay.
+    let resp = client
+        .get(format!("{}/flows/parkflow/questions/{}", base, run_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let resp = client
+        .post(format!("{}/flows/parkflow/answer/{}", base, run_id))
+        .json(&serde_json::json!({ "question_id": question_id, "answer": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let mut events = client
+        .get(format!("{}/flows/parkflow/events/{}", base, run_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+    let text = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut collected = String::new();
+        loop {
+            let Some(chunk) = events.chunk().await.unwrap() else {
+                break collected;
+            };
+            collected.push_str(&String::from_utf8_lossy(&chunk));
+            if collected.contains("run_complete") {
+                break collected;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        last_status,
-        Some(reqwest::StatusCode::NOT_FOUND),
-        "answer endpoint kept accepting answers after abort"
+    })
+    .await
+    .expect("SSE stream never delivered run_complete after abort");
+    assert!(
+        text.contains("run_complete"),
+        "SSE missing terminal event: {text}"
+    );
+    assert!(
+        text.contains("aborted"),
+        "SSE missing aborted status: {text}"
     );
 
     // unknown question id on a live run is also 404 (separate start to

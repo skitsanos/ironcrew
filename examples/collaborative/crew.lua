@@ -57,6 +57,21 @@ crew:add_collaborative_task({
     depends_on = {"research_benefits", "research_risks"},
 })
 
+-- Seed the MessageBus before execution. Targeted messages and broadcasts are
+-- delivered to each agent with its next task prompt, then consumed.
+crew:message_send(
+    "facilitator",
+    "*",
+    "Ground every claim in a concrete software-team practice.",
+    "broadcast"
+)
+crew:message_send(
+    "critic",
+    "pragmatist",
+    "In the synthesis, pair every recommendation with a risk control.",
+    "request"
+)
+
 local results = crew:run()
 
 for _, result in ipairs(results) do
@@ -68,3 +83,22 @@ for _, result in ipairs(results) do
     end
     print()
 end
+
+-- MessageBus is also available directly to Lua for explicit coordination.
+-- This targeted follow-up is consumed from the recipient's queue, while the
+-- history remains available for observability.
+crew:message_send(
+    "pragmatist",
+    "optimist",
+    "Please carry the agreed risk controls into the next planning cycle.",
+    "request"
+)
+
+print("=== MessageBus follow-up inbox ===")
+for _, message in ipairs(crew:message_read("optimist")) do
+    print(string.format("%s -> %s [%s]: %s",
+        message.from, message.to, message.type, message.content))
+end
+
+local history = crew:message_history()
+print(string.format("MessageBus history retained %d message(s).", #history))

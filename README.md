@@ -50,7 +50,7 @@ local results = crew:run()
 - **Reasoning/thinking support** — captures chain-of-thought from Anthropic, DeepSeek, Kimi, and OpenAI Responses API; streams dim to stderr and persists to run records
 - **Server-side tools** — built-in `web_search`, `code_execution`, `file_search`, `code_interpreter` via Anthropic and OpenAI Responses
 - **Structured output** — JSON Schema `response_format` for validated LLM responses
-- **10 built-in tools** — file I/O, HTTP, hashing, templates, schema validation, human-input (`ask_human`)
+- **9 built-in tools by default** — file I/O, HTTP, hashing, templates, schema validation, and human-input (`ask_human`), plus opt-in `shell`
 - **Memory & MessageBus** — shared state and agent-to-agent communication
 - **Collaborative tasks** — multi-agent discussions with automatic synthesis
 - **REST API + SSE** — run crews via HTTP with real-time event streaming
@@ -109,7 +109,7 @@ ironcrew run .
 
 ## Examples
 
-See [`examples/`](examples/) for working demos. Most ship a `.env.example` —
+See the [`examples` catalog](examples/README.md) for working demos. Most ship a `.env.example` —
 copy it to `.env` in that directory, add your API key, and run:
 
 ```bash
@@ -121,7 +121,7 @@ The `.env.example` includes the `IRONCREW_ENV_ALLOWLIST` line each flow needs so
 its `env()` config resolves (see the Quick Start note above).
 
 
-**Features:** `simple` · `research-crew` · `json-output` · `parallel` · `collaborative` · `memory` · `foreach` · `streaming` · `subworkflow` · `shared-modules` · `model-router` · `conditional-crew` · `http-api` · `batch-processing` · `config-lua` · `conversation` · `ask-human` · `stock-debate` · `roundtable` · `moderator-dialog`
+**Start here:** [`simple`](examples/simple/) · [`research-crew`](examples/research-crew/) · [`ask-human`](examples/ask-human/) · [`human-approval`](examples/human-approval/) · [`shared-modules`](examples/shared-modules/)
 
 **Providers:** [`examples/providers/`](examples/providers/) contains 12 reference files covering every supported provider — OpenAI Chat, OpenAI Responses (basic, reasoning, web_search), Anthropic (basic, web_search, extended thinking), Gemini, Groq, Kimi K2.5, Kimi K2-thinking, and DeepSeek Reasoner.
 

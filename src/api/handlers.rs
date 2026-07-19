@@ -16,6 +16,7 @@ use crate::engine::idempotency::{
     IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyRecord, PrincipalId, RUN_OPERATION,
     RunFenceHeartbeat, RunIntentSignal,
 };
+use crate::engine::input_bridge::AnswerError;
 use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
 use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
@@ -484,11 +485,86 @@ fn run_not_found(error: &IronCrewError, run_id: &str) -> bool {
     )
 }
 
-/// Persist one terminal transition for an HTTP-owned run. Normal crew runs
-/// have already completed their record inside `crew:run()`; in that case the
-/// store returns `AlreadyTerminal` and its winning status is preserved. If a
-/// task failed before Lua could create the intent, create a minimal fallback
-/// record only after confirming the run is genuinely absent.
+// A terminal completion may contain up to the aggregate run-results ceiling.
+// Retaining that payload through an unbounded storage outage would multiply
+// it by every admitted run. Keep at most 1 MiB per run for one extra full
+// retry; larger payloads get their normal first write attempt only.
+const TERMINAL_RESULT_RETRY_RETAINED_BYTES: usize = 1024 * 1024;
+const TERMINAL_RESULT_FULL_FAILURE_LIMIT: usize = 2;
+
+fn retained_task_result_bytes(
+    results: &[crate::engine::task::TaskResult],
+    result_capacity: usize,
+) -> usize {
+    result_capacity
+        .saturating_mul(std::mem::size_of::<crate::engine::task::TaskResult>())
+        .saturating_add(results.iter().fold(0usize, |total, result| {
+            total
+                .saturating_add(result.task.capacity())
+                .saturating_add(result.agent.capacity())
+                .saturating_add(result.output.capacity())
+                .saturating_add(result.reasoning.as_ref().map(String::capacity).unwrap_or(0))
+        }))
+}
+
+struct ReleasedTerminalResults {
+    result_count: usize,
+    retained_bytes: usize,
+    full_failures: usize,
+}
+
+struct TerminalResultRetention {
+    completion: Option<RunCompletion>,
+    full_failures: usize,
+}
+
+impl TerminalResultRetention {
+    fn new(completion: Option<RunCompletion>) -> Self {
+        Self {
+            completion,
+            full_failures: 0,
+        }
+    }
+
+    fn completion(&self) -> Option<&RunCompletion> {
+        self.completion.as_ref()
+    }
+
+    /// Record a failed persistence attempt and release task payloads once the
+    /// bounded retry allowance is exhausted. Status, timing, and aggregate
+    /// token counts stay resident and continue retrying until durable.
+    fn record_failure(&mut self) -> Option<ReleasedTerminalResults> {
+        let completion = self.completion.as_mut()?;
+        if completion.task_results.is_empty() {
+            return None;
+        }
+
+        self.full_failures = self.full_failures.saturating_add(1);
+        let retained_bytes = retained_task_result_bytes(
+            &completion.task_results,
+            completion.task_results.capacity(),
+        );
+        if retained_bytes <= TERMINAL_RESULT_RETRY_RETAINED_BYTES
+            && self.full_failures < TERMINAL_RESULT_FULL_FAILURE_LIMIT
+        {
+            return None;
+        }
+
+        let result_count = completion.task_results.len();
+        completion.task_results = Vec::new();
+        Some(ReleasedTerminalResults {
+            result_count,
+            retained_bytes,
+            full_failures: self.full_failures,
+        })
+    }
+}
+
+/// Persist one terminal transition for an HTTP-owned run. A normal
+/// `crew:run()` contributes its staged, result-bearing completion only after
+/// the enclosing Lua entrypoint ends. If a task failed before Lua could create
+/// the intent, create a minimal fallback record only after confirming the run
+/// is genuinely absent.
 struct TerminalPersistence<'a> {
     run_id: &'a str,
     flow: &'a str,
@@ -497,26 +573,38 @@ struct TerminalPersistence<'a> {
     status: RunStatus,
     duration_ms: u64,
     total_tokens: u32,
+    /// Full crew completion retained by the API lifecycle until the enclosing
+    /// Lua entrypoint has returned. Absent for pre-crew failures, aborts,
+    /// timeouts, and flows that never call `crew:run()`.
+    completion: Option<&'a RunCompletion>,
 }
 
 async fn persist_terminal_outcome(
     store: &Arc<dyn crate::engine::store::StateStore>,
     terminal: TerminalPersistence<'_>,
 ) -> Result<RunStatus, IronCrewError> {
-    let completion = RunCompletion {
-        status: terminal.status.clone(),
-        finished_at: chrono::Utc::now().to_rfc3339(),
-        duration_ms: terminal.duration_ms,
-        task_results: Vec::new(),
-        total_tokens: terminal.total_tokens,
-        cached_tokens: 0,
+    let synthesized;
+    let completion = match terminal.completion {
+        Some(completion) => completion,
+        None => {
+            synthesized = RunCompletion {
+                status: terminal.status.clone(),
+                finished_at: chrono::Utc::now().to_rfc3339(),
+                duration_ms: terminal.duration_ms,
+                task_results: Vec::new(),
+                total_tokens: terminal.total_tokens,
+                cached_tokens: 0,
+            };
+            &synthesized
+        }
     };
+    let completion_status = completion.status.clone();
 
     match store
         .update_run_completion(terminal.run_id, completion.clone())
         .await
     {
-        Ok(RunTransition::Applied) => return Ok(terminal.status),
+        Ok(RunTransition::Applied) => return Ok(completion_status.clone()),
         Ok(RunTransition::AlreadyTerminal(status)) => return Ok(status),
         Err(update_error) => match store.get_run(terminal.run_id).await {
             Ok(record) if record.status.is_terminal() => return Ok(record.status),
@@ -553,10 +641,10 @@ async fn persist_terminal_outcome(
     }
 
     match store
-        .update_run_completion(terminal.run_id, completion)
+        .update_run_completion(terminal.run_id, completion.clone())
         .await
     {
-        Ok(RunTransition::Applied) => Ok(terminal.status),
+        Ok(RunTransition::Applied) => Ok(completion_status),
         Ok(RunTransition::AlreadyTerminal(status)) => Ok(status),
         Err(error) => Err(IronCrewError::Validation(format!(
             "Failed to persist terminal outcome for fallback run '{}': {}",
@@ -570,6 +658,19 @@ struct WorkOutcome {
     duration_ms: u64,
     total_tokens: u32,
     error_message: Option<String>,
+}
+
+struct RunWorkResult {
+    status: String,
+    duration_ms: u64,
+    total_tokens: u32,
+}
+
+struct RunExecutionContext {
+    shared_store: Option<Arc<dyn crate::engine::store::StateStore>>,
+    input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
+    run_intent_signal: Option<RunIntentSignal>,
+    api_lifecycle: crate::lua::crew_userdata::ApiRunLifecycle,
 }
 
 /// Tokio detaches a task when its `JoinHandle` is dropped. The run monitor is
@@ -599,23 +700,30 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 
 fn classify_work_result(
     join_result: std::result::Result<
-        std::result::Result<RunCrewResponse, IronCrewError>,
+        std::result::Result<RunWorkResult, IronCrewError>,
         tokio::task::JoinError,
     >,
     elapsed_ms: u64,
 ) -> WorkOutcome {
     match join_result {
-        Ok(Ok(response)) => WorkOutcome {
-            status: response
-                .status
+        Ok(Ok(work)) => {
+            let RunWorkResult {
+                status: response_status,
+                duration_ms: response_duration_ms,
+                total_tokens: response_total_tokens,
+            } = work;
+            let status = response_status
                 .parse::<RunStatus>()
                 .ok()
                 .filter(RunStatus::is_terminal)
-                .unwrap_or(RunStatus::Success),
-            duration_ms: response.duration_ms,
-            total_tokens: response.total_tokens,
-            error_message: None,
-        },
+                .unwrap_or(RunStatus::Success);
+            WorkOutcome {
+                status,
+                duration_ms: response_duration_ms,
+                total_tokens: response_total_tokens,
+                error_message: None,
+            }
+        }
         Ok(Err(error)) => WorkOutcome {
             status: RunStatus::Failed,
             duration_ms: elapsed_ms,
@@ -877,6 +985,10 @@ pub async fn run_flow(
     let input_bridge = Arc::new(crate::engine::input_bridge::InputBridge::new(
         crate::engine::input_bridge::BridgeMode::Http,
     ));
+    // Retained by both the worker and its monitor. If outer Lua is aborted or
+    // times out after `crew:run()` completed, the monitor can still preserve
+    // those task results while applying the authoritative terminal status.
+    let api_lifecycle = crate::lua::crew_userdata::ApiRunLifecycle::default();
 
     // Prepare the work task, then register it while holding the active-map
     // write lock. Rechecking readiness under that lock closes the race where
@@ -885,6 +997,9 @@ pub async fn run_flow(
     let run_id_for_work = run_id.clone();
     let store_for_work = state.store.clone();
     let bridge_for_work = input_bridge.clone();
+    let bridge_for_monitor = input_bridge.clone();
+    let lifecycle_for_work = api_lifecycle.clone();
+    let lifecycle_for_monitor = api_lifecycle;
     let (run_intent_signal, mut run_intent_ready) =
         if let Some(attempt) = idempotency_attempt.as_ref() {
             let (signal, receiver) = RunIntentSignal::channel(
@@ -931,9 +1046,12 @@ pub async fn run_flow(
                 &eventbus_inner,
                 &run_id_for_work,
                 input.as_ref(),
-                Some(store_for_work),
-                Some(bridge_for_work),
-                run_intent_signal,
+                RunExecutionContext {
+                    shared_store: Some(store_for_work),
+                    input_bridge: Some(bridge_for_work),
+                    run_intent_signal,
+                    api_lifecycle: lifecycle_for_work,
+                },
             )
             .await
         });
@@ -993,10 +1111,10 @@ pub async fn run_flow(
         .await;
     });
 
-    // Monitor the work handle. It is the single API-level finalizer for
-    // errors, cancellation, panic, timeout, and server shutdown. Store
-    // transitions are compare-and-set, so a normal `crew:run()` completion
-    // that wins first remains authoritative.
+    // Monitor the work handle. It is the single API-level finalizer for normal
+    // completion, errors, cancellation, panic, timeout, and server shutdown.
+    // Store transitions remain compare-and-set so an external terminal writer
+    // (for example an abort request) stays authoritative.
     tokio::spawn(async move {
         let max_lifetime = state_clone.max_run_lifetime;
         let mut work_handle = AbortTaskOnDrop::new(work_handle);
@@ -1102,6 +1220,36 @@ pub async fn run_flow(
                 }
             }
         };
+        let staged_completion = lifecycle_for_monitor.take_completion().await;
+        let run_completion = if matches!(&fence_result, Some(RunFenceHeartbeat::Terminal(_))) {
+            // Another durable writer won. Its terminal payload is the fence;
+            // never replace it with process-local staged task results.
+            None
+        } else {
+            staged_completion.map(|mut staged| {
+                staged.completion.status = requested_status.clone();
+                staged.completion.finished_at = chrono::Utc::now().to_rfc3339();
+                staged.completion.duration_ms = started.elapsed().as_millis() as u64;
+                staged.completion
+            })
+        };
+        let duration_ms = run_completion
+            .as_ref()
+            .map(|completion| completion.duration_ms)
+            .unwrap_or(duration_ms);
+        let total_tokens = run_completion
+            .as_ref()
+            .map(|completion| completion.total_tokens)
+            .unwrap_or(total_tokens);
+        let mut terminal_results = TerminalResultRetention::new(run_completion);
+        let expired_questions = bridge_for_monitor.expire_all();
+        if expired_questions > 0 {
+            tracing::debug!(
+                run_id = %run_id_clone,
+                expired_questions,
+                "Expired pending human-input questions after run termination"
+            );
+        }
         if let Some(message) = error_message {
             eventbus.emit(CrewEvent::Log {
                 level: "error".into(),
@@ -1122,6 +1270,7 @@ pub async fn run_flow(
                     status: requested_status.clone(),
                     duration_ms,
                     total_tokens,
+                    completion: terminal_results.completion(),
                 },
             )
             .await
@@ -1136,6 +1285,15 @@ pub async fn run_flow(
                     break status;
                 }
                 Err(error) => {
+                    if let Some(released) = terminal_results.record_failure() {
+                        tracing::warn!(
+                            run_id = %run_id_clone,
+                            result_count = released.result_count,
+                            retained_bytes = released.retained_bytes,
+                            full_persistence_failures = released.full_failures,
+                            "Released staged task results after terminal persistence failures; terminal metadata will keep retrying without task outputs"
+                        );
+                    }
                     if !persistence_degraded {
                         persistence_degraded = true;
                         state_clone
@@ -1207,12 +1365,17 @@ async fn execute_crew_from_path_with_events(
     eventbus: &EventBus,
     run_id: &str,
     input: Option<&serde_json::Value>,
-    shared_store: Option<Arc<dyn crate::engine::store::StateStore>>,
-    input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
-    run_intent_signal: Option<RunIntentSignal>,
-) -> std::result::Result<RunCrewResponse, IronCrewError> {
+    context: RunExecutionContext,
+) -> std::result::Result<RunWorkResult, IronCrewError> {
     use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
+
+    let RunExecutionContext {
+        shared_store,
+        input_bridge,
+        run_intent_signal,
+        api_lifecycle,
+    } = context;
 
     // A Lua entrypoint may perform asynchronous setup (including
     // `ask_human`) before it reaches `crew:run()`. For keyed HTTP work, create
@@ -1266,6 +1429,13 @@ async fn execute_crew_from_path_with_events(
     let loader = load_project(flow_path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
+    // Unlike a CLI invocation, an HTTP run owns the complete Lua entrypoint.
+    // `crew:run()` stages its rich completion here so flow-level Lua can keep
+    // running (and can suspend on post-crew human input) while the durable run
+    // remains in-flight. The API monitor performs the terminal write after
+    // this worker returns.
+    lua.set_app_data(api_lifecycle.clone());
+
     // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
     lua.set_app_data(eventbus.clone());
 
@@ -1317,7 +1487,9 @@ async fn execute_crew_from_path_with_events(
     };
 
     // Even if post-run Lua code failed (e.g., json_parse on skipped output),
-    // the crew may have completed successfully. Check the run record first.
+    // the crew may have completed successfully. Prefer its staged completion,
+    // preserving the historical behavior where that crew outcome wins.
+    let staged_completion = api_lifecycle.completion_summary().await;
     let run_id: Option<String> = lua.globals().get("__ironcrew_last_run_id").ok();
 
     // Read the recorded run directly so concurrent executions cannot swap results.
@@ -1327,23 +1499,30 @@ async fn execute_crew_from_path_with_events(
             None => create_store(loader.project_dir().join(".ironcrew")).await?,
         };
         let run = store.get_run(&run_id).await?;
-        return Ok(RunCrewResponse {
-            run_id: run.run_id.clone(),
-            flow_name: run.flow_name.clone(),
-            status: run.status.to_string(),
-            duration_ms: run.duration_ms,
-            total_tokens: run.total_tokens,
-            results: run
-                .task_results
-                .iter()
-                .map(|r| TaskResultResponse {
-                    task: r.task.clone(),
-                    agent: r.agent.clone(),
-                    output: r.output.clone(),
-                    success: r.success,
-                    duration_ms: r.duration_ms,
-                })
-                .collect(),
+        if staged_completion
+            .as_ref()
+            .is_some_and(|staged| staged.run_id != run_id)
+        {
+            return Err(IronCrewError::Validation(
+                "HTTP run staged completion for a different run id".into(),
+            ));
+        }
+        let status = staged_completion
+            .as_ref()
+            .map(|staged| staged.status.to_string())
+            .unwrap_or_else(|| run.status.to_string());
+        let duration_ms = staged_completion
+            .as_ref()
+            .map(|staged| staged.duration_ms)
+            .unwrap_or(run.duration_ms);
+        let total_tokens = staged_completion
+            .as_ref()
+            .map(|staged| staged.total_tokens)
+            .unwrap_or(run.total_tokens);
+        return Ok(RunWorkResult {
+            status,
+            duration_ms,
+            total_tokens,
         });
     }
 
@@ -1352,13 +1531,10 @@ async fn execute_crew_from_path_with_events(
         return Err(IronCrewError::Lua(err));
     }
 
-    Ok(RunCrewResponse {
-        run_id: uuid::Uuid::new_v4().to_string(),
-        flow_name: "unknown".into(),
+    Ok(RunWorkResult {
         status: "completed".into(),
         duration_ms: 0,
         total_tokens: 0,
-        results: vec![],
     })
 }
 
@@ -1452,6 +1628,7 @@ pub async fn abort_run(
                 match active_runs.get(&run_id) {
                     Some(active_run) if active_run.flow == flow_slug => {
                         active_run.abort_handle.abort();
+                        active_run.input_bridge.expire_all();
                         tracing::info!("Run {} aborted by client", run_id);
                         Ok(Json(serde_json::json!({
                             "run_id": run_id,
@@ -1516,7 +1693,10 @@ pub async fn list_questions(
                     .to_string();
                 let active_runs = state.active_runs.read().await;
                 match active_runs.get(&run_id) {
-                    Some(active_run) if active_run.flow == flow_slug => {
+                    Some(active_run)
+                        if active_run.flow == flow_slug
+                            && !active_run.input_bridge.is_expired() =>
+                    {
                         let questions = active_run.input_bridge.list();
                         let status = if questions.is_empty() {
                             "running"
@@ -1598,7 +1778,14 @@ pub async fn answer_question(
                                 "question_id": question_id,
                                 "status": "delivered",
                             }))),
-                            Err(_) => Err(error_response(
+                            Err(AnswerError::TooLarge { max_bytes }) => Err(error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                format!("Question answer exceeds the {max_bytes}-byte limit"),
+                            )),
+                            Err(AnswerError::Invalid(message)) => {
+                                Err(error_response(StatusCode::BAD_REQUEST, message))
+                            }
+                            Err(AnswerError::UnknownOrExpired { .. }) => Err(error_response(
                                 StatusCode::NOT_FOUND,
                                 format!(
                                     "Question '{}' not found or expired on run '{}'",
@@ -2166,11 +2353,13 @@ pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod truncate_tests {
     use super::{
-        RunCrewResponse, TerminalPersistence, classify_work_result, persist_terminal_outcome,
-        truncate_utf8, validate_run_id, validate_run_tags,
+        RunWorkResult, TERMINAL_RESULT_RETRY_RETAINED_BYTES, TerminalPersistence,
+        TerminalResultRetention, classify_work_result, persist_terminal_outcome, truncate_utf8,
+        validate_run_id, validate_run_tags,
     };
-    use crate::engine::run_history::{JsonFileStore, RunStatus};
+    use crate::engine::run_history::{JsonFileStore, RunCompletion, RunStatus};
     use crate::engine::store::StateStore;
+    use crate::engine::task::TaskResult;
     use crate::utils::error::IronCrewError;
     use std::sync::Arc;
 
@@ -2249,9 +2438,64 @@ mod truncate_tests {
         assert!(validate_run_tags(Some(&too_large)).is_err());
     }
 
+    fn result_completion(output_bytes: usize) -> RunCompletion {
+        RunCompletion {
+            status: RunStatus::Success,
+            finished_at: "2026-07-19T00:00:00Z".into(),
+            duration_ms: 123,
+            task_results: vec![TaskResult {
+                task: "task".into(),
+                agent: "agent".into(),
+                output: "x".repeat(output_bytes),
+                success: true,
+                duration_ms: 100,
+                token_usage: None,
+                reasoning: Some("reasoning".into()),
+            }],
+            total_tokens: 42,
+            cached_tokens: 7,
+        }
+    }
+
+    #[test]
+    fn small_terminal_results_get_one_bounded_full_retry_then_release() {
+        let mut retention = TerminalResultRetention::new(Some(result_completion(128)));
+
+        assert!(retention.record_failure().is_none());
+        assert_eq!(retention.completion().unwrap().task_results.len(), 1);
+
+        let released = retention
+            .record_failure()
+            .expect("second failed full-payload attempt must release results");
+        assert_eq!(released.result_count, 1);
+        assert_eq!(released.full_failures, 2);
+
+        let completion = retention.completion().unwrap();
+        assert!(completion.task_results.is_empty());
+        assert_eq!(completion.status, RunStatus::Success);
+        assert_eq!(completion.duration_ms, 123);
+        assert_eq!(completion.total_tokens, 42);
+        assert_eq!(completion.cached_tokens, 7);
+    }
+
+    #[test]
+    fn large_terminal_results_release_after_first_failed_write() {
+        let mut retention = TerminalResultRetention::new(Some(result_completion(
+            TERMINAL_RESULT_RETRY_RETAINED_BYTES + 1,
+        )));
+
+        let released = retention
+            .record_failure()
+            .expect("oversized retry payload must be released immediately");
+        assert_eq!(released.result_count, 1);
+        assert_eq!(released.full_failures, 1);
+        assert!(released.retained_bytes > TERMINAL_RESULT_RETRY_RETAINED_BYTES);
+        assert!(retention.completion().unwrap().task_results.is_empty());
+    }
+
     #[tokio::test]
     async fn panicked_work_is_persisted_as_failed() {
-        let handle: tokio::task::JoinHandle<std::result::Result<RunCrewResponse, IronCrewError>> =
+        let handle: tokio::task::JoinHandle<std::result::Result<RunWorkResult, IronCrewError>> =
             tokio::spawn(async { panic!("intentional monitor test panic") });
         let outcome = classify_work_result(handle.await, 42);
         assert_eq!(outcome.status, RunStatus::Failed);
@@ -2275,6 +2519,7 @@ mod truncate_tests {
                 status: outcome.status,
                 duration_ms: outcome.duration_ms,
                 total_tokens: outcome.total_tokens,
+                completion: None,
             },
         )
         .await
