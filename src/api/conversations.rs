@@ -12,12 +12,12 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
 };
@@ -25,11 +25,14 @@ use mlua::AnyUserData;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, broadcast};
 
+use super::admission::QuotaMetric;
+use super::auth::Principal;
 use super::{AppState, ErrorResponse, error_response, resolve_flow_path};
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
-    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup, IdempotencyRecord,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup, IdempotencyQuotaResource,
+    IdempotencyQuotaScope, IdempotencyRecord, PrincipalId,
 };
 use crate::engine::sessions::validate_session_id;
 use crate::lua::api::{CHAT_CREW_REGISTRY_KEY, ChatMode, set_ironcrew_mode};
@@ -42,6 +45,7 @@ type MessageResult = Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<Er
 #[derive(Clone)]
 struct MessageIdempotencyAttempt {
     key_hash: String,
+    principal_id: PrincipalId,
     request_fingerprint: String,
     attempt_id: String,
 }
@@ -76,6 +80,36 @@ fn message_idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<Er
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         "Idempotency storage is temporarily unavailable".into(),
+    )
+}
+
+fn message_idempotency_quota_error(
+    state: &AppState,
+    scope: IdempotencyQuotaScope,
+    resource: IdempotencyQuotaResource,
+    retry_after_seconds: u64,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let metric = match (scope, resource) {
+        (IdempotencyQuotaScope::Global, IdempotencyQuotaResource::Records) => {
+            QuotaMetric::GlobalRecords
+        }
+        (IdempotencyQuotaScope::Principal, IdempotencyQuotaResource::Records) => {
+            QuotaMetric::PrincipalRecords
+        }
+        (IdempotencyQuotaScope::Principal, IdempotencyQuotaResource::InFlight) => {
+            QuotaMetric::PrincipalInFlight
+        }
+        (IdempotencyQuotaScope::Global, IdempotencyQuotaResource::InFlight) => {
+            QuotaMetric::PrincipalInFlight
+        }
+    };
+    state.admission.metrics().record_quota_rejection(metric);
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "Idempotency capacity is exhausted; retry after at least {} second(s)",
+            retry_after_seconds.max(1)
+        ),
     )
 }
 
@@ -204,25 +238,171 @@ fn api_max_image_locator_bytes() -> usize {
 type ConversationKey = (String, String);
 type LifecycleLock = Mutex<()>;
 
-/// Per-conversation operation gates. Weak entries keep the registry bounded:
-/// once no request owns a gate, the next lookup prunes it. Serializing start,
-/// message, delete, and eviction gives each operation a clear linearization
-/// point without holding the global active-conversation map across LLM calls.
-static CONVERSATION_LIFECYCLES: OnceLock<StdMutex<HashMap<ConversationKey, Weak<LifecycleLock>>>> =
-    OnceLock::new();
+const DEFAULT_MAX_CONVERSATION_LIFECYCLES: usize = 256;
+const HARD_MAX_CONVERSATION_LIFECYCLES: usize = 4_096;
 
-fn lifecycle_lock(key: &ConversationKey) -> Arc<LifecycleLock> {
-    let registry = CONVERSATION_LIFECYCLES.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = registry.get(key).and_then(Weak::upgrade) {
-        return lock;
+struct LifecycleRegistryEntry {
+    key: Arc<ConversationKey>,
+    gate: Arc<LifecycleLock>,
+    leases: usize,
+}
+
+/// Bounded registry of per-conversation operation gates.
+///
+/// Entries exist only while a caller owns a [`LifecycleLease`]. Dropping the
+/// last lease removes its exact key in O(1), so sequential attacker-chosen IDs
+/// neither accumulate in memory nor trigger a full-map scan on later lookups.
+struct LifecycleRegistry {
+    capacity: usize,
+    entries: StdMutex<HashMap<ConversationKey, LifecycleRegistryEntry>>,
+}
+
+#[derive(Debug)]
+struct LifecycleRegistryFull {
+    capacity: usize,
+}
+
+/// Pins one registry entry for the full operation lifetime.
+struct LifecycleLease {
+    registry: Arc<LifecycleRegistry>,
+    key: Arc<ConversationKey>,
+    gate: Arc<LifecycleLock>,
+}
+
+/// An owned lifecycle lock used by detached message tasks. Keeping the lease
+/// beside the Tokio guard prevents the registry entry from disappearing while
+/// the task still holds the gate.
+struct OwnedLifecycleGuard {
+    // Field order is intentional: Rust drops the mutex guard before the lease,
+    // so a replacement entry cannot be published while this gate is locked.
+    _guard: OwnedMutexGuard<()>,
+    _lease: LifecycleLease,
+}
+
+impl LifecycleRegistry {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "lifecycle registry capacity must be positive");
+        Self {
+            capacity,
+            entries: StdMutex::new(HashMap::with_capacity(capacity)),
+        }
     }
-    let lock = Arc::new(Mutex::new(()));
-    registry.insert(key.clone(), Arc::downgrade(&lock));
-    lock
+
+    fn acquire(
+        self: &Arc<Self>,
+        key: &ConversationKey,
+    ) -> Result<LifecycleLease, LifecycleRegistryFull> {
+        let (owned_key, gate) = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = entries.get_mut(key) {
+                entry.leases = entry.leases.checked_add(1).ok_or(LifecycleRegistryFull {
+                    capacity: self.capacity,
+                })?;
+                (Arc::clone(&entry.key), Arc::clone(&entry.gate))
+            } else {
+                if entries.len() >= self.capacity {
+                    return Err(LifecycleRegistryFull {
+                        capacity: self.capacity,
+                    });
+                }
+                let owned_key = Arc::new(key.clone());
+                let gate = Arc::new(Mutex::new(()));
+                entries.insert(
+                    key.clone(),
+                    LifecycleRegistryEntry {
+                        key: Arc::clone(&owned_key),
+                        gate: Arc::clone(&gate),
+                        leases: 1,
+                    },
+                );
+                (owned_key, gate)
+            }
+        };
+
+        Ok(LifecycleLease {
+            registry: Arc::clone(self),
+            key: owned_key,
+            gate,
+        })
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+impl LifecycleLease {
+    fn try_lock(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, tokio::sync::TryLockError> {
+        self.gate.try_lock()
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
+    fn try_lock_owned(self) -> Result<OwnedLifecycleGuard, Self> {
+        match Arc::clone(&self.gate).try_lock_owned() {
+            Ok(guard) => Ok(OwnedLifecycleGuard {
+                _guard: guard,
+                _lease: self,
+            }),
+            Err(_) => Err(self),
+        }
+    }
+}
+
+impl Drop for LifecycleLease {
+    fn drop(&mut self) {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = entries.get_mut(self.key.as_ref()).is_some_and(|entry| {
+            if !Arc::ptr_eq(&entry.gate, &self.gate) {
+                return false;
+            }
+            debug_assert!(entry.leases > 0);
+            entry.leases = entry.leases.saturating_sub(1);
+            entry.leases == 0
+        });
+        if remove {
+            entries.remove(self.key.as_ref());
+        }
+    }
+}
+
+static CONVERSATION_LIFECYCLES: OnceLock<Arc<LifecycleRegistry>> = OnceLock::new();
+
+fn max_conversation_lifecycles() -> usize {
+    positive_bounded_env(
+        "IRONCREW_MAX_CONVERSATION_LIFECYCLES",
+        DEFAULT_MAX_CONVERSATION_LIFECYCLES,
+        HARD_MAX_CONVERSATION_LIFECYCLES,
+    )
+}
+
+fn lifecycle_lock(key: &ConversationKey) -> Result<LifecycleLease, LifecycleRegistryFull> {
+    CONVERSATION_LIFECYCLES
+        .get_or_init(|| Arc::new(LifecycleRegistry::new(max_conversation_lifecycles())))
+        .acquire(key)
+}
+
+fn lifecycle_capacity_error(error: LifecycleRegistryFull) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "Concurrent conversation lifecycle limit reached ({} distinct conversations); retry shortly or raise IRONCREW_MAX_CONVERSATION_LIFECYCLES",
+            error.capacity
+        ),
+    )
 }
 
 fn decoded_base64_len(data: &str) -> usize {
@@ -406,7 +586,7 @@ async fn start_conversation_inner(
 
     let flow_slug = flow_segment(&flow_path_resolved);
     let key = (flow_slug.clone(), id.clone());
-    let lifecycle = lifecycle_lock(&key);
+    let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
     let _lifecycle_guard = lifecycle.try_lock().map_err(|_| {
         error_response(
             StatusCode::CONFLICT,
@@ -745,10 +925,10 @@ async fn commit_message_with_retry(
     loop {
         match state
             .store
-            .commit_conversation_idempotency(
+            .commit_conversation_idempotency_with_limits(
                 completion.clone(),
                 conversation,
-                state.idempotency.max_total_response_bytes,
+                state.idempotency.limits(),
             )
             .await
         {
@@ -796,7 +976,7 @@ async fn execute_idempotent_message(
     content: String,
     images: Option<Vec<crate::llm::provider::ImageInput>>,
     attempt: MessageIdempotencyAttempt,
-    _lifecycle_guard: OwnedMutexGuard<()>,
+    _lifecycle_guard: OwnedLifecycleGuard,
     _turn_guard: OwnedMutexGuard<()>,
 ) -> Result<MessageResp, (StatusCode, Json<ErrorResponse>)> {
     let heartbeat = super::idempotency::LeaseHeartbeat::spawn(
@@ -899,6 +1079,7 @@ async fn execute_idempotent_message(
     let completed_at = chrono::Utc::now();
     let completion = IdempotencyCompletion {
         key_hash: attempt.key_hash.clone(),
+        principal_id: attempt.principal_id.clone(),
         request_fingerprint: attempt.request_fingerprint.clone(),
         attempt_id: attempt.attempt_id.clone(),
         owner_instance_id: state.store.instance_id().to_string(),
@@ -971,6 +1152,7 @@ async fn execute_idempotent_message(
 
 pub async fn post_message(
     State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
     Path((flow, id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1006,9 +1188,10 @@ pub async fn post_message(
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
-    let request_key = super::idempotency::request_key(&headers, state.idempotency.require_key)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let recovery_key = super::idempotency::recovery_key(&headers)
+    let request_key =
+        super::idempotency::request_key(&headers, state.idempotency.require_key, principal.id())
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let recovery_key = super::idempotency::recovery_key(&headers, principal.id())
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
     if recovery_key.is_some() && request_key.is_none() {
         return Err(error_response(
@@ -1036,7 +1219,12 @@ pub async fn post_message(
         let now = chrono::Utc::now().to_rfc3339();
         match state
             .store
-            .lookup_idempotency(&request_key.key_hash, &request_fingerprint, &now)
+            .lookup_idempotency_for_principal(
+                principal.id(),
+                &request_key.key_hash,
+                &request_fingerprint,
+                &now,
+            )
             .await
             .map_err(message_idempotency_store_error)?
         {
@@ -1065,8 +1253,8 @@ pub async fn post_message(
     }
 
     let key = (flow_slug, id.clone());
-    let lifecycle = lifecycle_lock(&key);
-    let lifecycle_guard = lifecycle.clone().try_lock_owned().map_err(|_| {
+    let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
+    let lifecycle_guard = lifecycle.try_lock_owned().map_err(|_| {
         error_response(
             StatusCode::CONFLICT,
             "Conversation is busy; retry after the active operation completes".into(),
@@ -1194,6 +1382,7 @@ pub async fn post_message(
             .to_rfc3339();
         let claim = IdempotencyClaim {
             key_hash: request_key.key_hash.clone(),
+            principal_id: principal.id().clone(),
             recovery_key_hash: recovery_key.as_ref().map(|key| key.key_hash.clone()),
             request_fingerprint: request_fingerprint.clone(),
             operation: CONVERSATION_MESSAGE_OPERATION.into(),
@@ -1214,16 +1403,13 @@ pub async fn post_message(
         };
         let attempt = MessageIdempotencyAttempt {
             key_hash: request_key.key_hash,
+            principal_id: principal.id().clone(),
             request_fingerprint,
             attempt_id,
         };
         match state
             .store
-            .claim_idempotency(
-                claim,
-                state.idempotency.max_records,
-                state.idempotency.prune_batch,
-            )
+            .claim_idempotency_with_limits(claim, state.idempotency.limits())
             .await
             .map_err(message_idempotency_store_error)?
         {
@@ -1259,6 +1445,18 @@ pub async fn post_message(
                     StatusCode::CONFLICT,
                     "Conversation is busy or has an unacknowledged indeterminate turn; inspect history, then retry with Idempotency-Recovery-Key when required"
                         .into(),
+                ));
+            }
+            IdempotencyClaimOutcome::QuotaExceeded {
+                scope,
+                resource,
+                retry_after_seconds,
+            } => {
+                return Err(message_idempotency_quota_error(
+                    &state,
+                    scope,
+                    resource,
+                    retry_after_seconds,
                 ));
             }
         }
@@ -1571,7 +1769,7 @@ pub async fn delete_conversation(
 
         let flow_slug = flow_segment(&flow_path_resolved);
         let key = (flow_slug.clone(), id.clone());
-        let lifecycle = lifecycle_lock(&key);
+        let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
         let _lifecycle_guard = lifecycle.lock().await;
 
         // Wait for an in-flight turn before deleting its durable record. All
@@ -1721,7 +1919,17 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
         // evicting a freshly touched handle or deleting a newly recreated one.
         let mut evicted = 0usize;
         for (key, observed) in expired {
-            let lifecycle = lifecycle_lock(&key);
+            let lifecycle = match lifecycle_lock(&key) {
+                Ok(lifecycle) => lifecycle,
+                Err(error) => {
+                    tracing::warn!(
+                        capacity = error.capacity,
+                        conversation_id = %observed.id,
+                        "Skipping idle eviction while the conversation lifecycle registry is full"
+                    );
+                    continue;
+                }
+            };
             let _lifecycle_guard = lifecycle.lock().await;
             let _turn_guard = observed.turn_lock.lock().await;
 
@@ -1756,5 +1964,147 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
         if evicted > 0 {
             tracing::info!(evicted, "Evicted idle chat conversation handles");
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_registry_tests {
+    use super::*;
+    use tokio::sync::Barrier;
+
+    fn key(index: usize) -> ConversationKey {
+        ("flow".to_string(), format!("conversation-{index}"))
+    }
+
+    #[test]
+    fn sequential_high_cardinality_keys_are_removed_immediately() {
+        let registry = Arc::new(LifecycleRegistry::new(4));
+
+        for index in 0..20_000 {
+            let lease = registry
+                .acquire(&key(index))
+                .expect("a released slot must be reusable");
+            assert_eq!(registry.len(), 1);
+            drop(lease);
+            assert_eq!(registry.len(), 0);
+        }
+    }
+
+    #[test]
+    fn capacity_bounds_distinct_keys_but_preserves_existing_key_serialization() {
+        let registry = Arc::new(LifecycleRegistry::new(4));
+        let leases: Vec<_> = (0..4)
+            .map(|index| registry.acquire(&key(index)).expect("slot available"))
+            .collect();
+
+        assert_eq!(registry.len(), 4);
+        assert!(registry.acquire(&key(4)).is_err());
+
+        let same_key = registry
+            .acquire(&key(0))
+            .expect("an existing key must not consume another slot");
+        assert!(Arc::ptr_eq(&same_key.gate, &leases[0].gate));
+        assert_eq!(registry.len(), 4);
+        drop(same_key);
+
+        drop(leases);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn owned_guard_pins_the_entry_and_fails_fast_for_the_same_key() {
+        let registry = Arc::new(LifecycleRegistry::new(2));
+        let conversation = key(0);
+        let owner = registry
+            .acquire(&conversation)
+            .expect("owner lease available")
+            .try_lock_owned()
+            .unwrap_or_else(|_| panic!("owner must acquire the gate"));
+
+        assert_eq!(registry.len(), 1);
+        let contender = registry
+            .acquire(&conversation)
+            .expect("same key shares its slot");
+        assert!(contender.try_lock_owned().is_err());
+        assert_eq!(registry.len(), 1);
+
+        drop(owner);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn unrelated_keys_do_not_share_a_gate() {
+        let registry = Arc::new(LifecycleRegistry::new(2));
+        let first = registry.acquire(&key(0)).expect("first slot available");
+        let second = registry.acquire(&key(1)).expect("second slot available");
+        let _first_guard = first.try_lock().expect("first gate available");
+        let _second_guard = second.try_lock().expect("second gate available");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_high_cardinality_registry_never_exceeds_capacity() {
+        const CAPACITY: usize = 64;
+
+        let registry = Arc::new(LifecycleRegistry::new(CAPACITY));
+        let acquired = Arc::new(Barrier::new(CAPACITY + 1));
+        let release = Arc::new(Barrier::new(CAPACITY + 1));
+        let mut tasks = Vec::with_capacity(CAPACITY);
+
+        for index in 0..CAPACITY {
+            let registry = Arc::clone(&registry);
+            let acquired = Arc::clone(&acquired);
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(async move {
+                let _lease = registry
+                    .acquire(&key(index))
+                    .expect("one slot per concurrent key");
+                acquired.wait().await;
+                release.wait().await;
+            }));
+        }
+
+        acquired.wait().await;
+        assert_eq!(registry.len(), CAPACITY);
+        assert!(registry.acquire(&key(CAPACITY)).is_err());
+        release.wait().await;
+
+        for task in tasks {
+            task.await.expect("registry worker must finish");
+        }
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_owned_guard_releases_its_capacity() {
+        let registry = Arc::new(LifecycleRegistry::new(1));
+        let task_registry = Arc::clone(&registry);
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _owner = task_registry
+                .acquire(&key(0))
+                .expect("slot available")
+                .try_lock_owned()
+                .unwrap_or_else(|_| panic!("gate available"));
+            acquired_tx.send(()).expect("test receiver remains open");
+            std::future::pending::<()>().await;
+        });
+
+        acquired_rx.await.expect("owner acquires its gate");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.acquire(&key(1)).is_err());
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("task must be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(registry.len(), 0);
+
+        let replacement = registry
+            .acquire(&key(1))
+            .expect("cancelled owner returns its slot");
+        drop(replacement);
+        assert_eq!(registry.len(), 0);
     }
 }

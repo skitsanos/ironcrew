@@ -351,6 +351,12 @@ For HTTP chat deployments, keep in mind:
 
 - `IRONCREW_MAX_ACTIVE_CONVERSATIONS` caps live in-memory chat handles, not
   total persisted sessions and not overall throughput
+- `IRONCREW_MAX_CONVERSATION_LIFECYCLES` caps distinct conversation IDs with
+  an in-flight start, message, delete, or eviction operation (default `256`,
+  hard ceiling `4096`). New operations for a different ID return `503` while
+  the cap is full; an existing ID keeps its per-conversation serialization.
+  Entries are removed as soon as their last operation finishes, so arbitrary
+  IDs do not accumulate in process memory
 - `IRONCREW_CHAT_SESSION_IDLE_SECS` controls when inactive chat handles are
   evicted from RAM
 - SSE replay buffering is bounded separately by `IRONCREW_MAX_EVENTS` and
@@ -618,8 +624,8 @@ always reflects the binary you are actually running.
 Set `IRONCREW_API_TOKEN` to require Bearer token authentication on all endpoints
 except the public health routes. Public/non-loopback binds require a token by
 default, along with an explicit `IRONCREW_STORE`; the server refuses to start
-otherwise. A configured token must be valid UTF-8, 32–4096 bytes, contain no
-whitespace/control characters, and an empty or malformed value fails startup:
+otherwise. A configured token must contain 32–4096 visible ASCII bytes without
+spaces; an empty, Unicode, or otherwise malformed value fails startup:
 
 ```bash
 IRONCREW_API_TOKEN=replace-with-a-random-32-byte-token ironcrew serve --flows-dir ./flows

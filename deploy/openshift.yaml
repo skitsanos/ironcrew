@@ -58,6 +58,18 @@ spec:
               value: "2"
             - name: IRONCREW_MAX_ACTIVE_CONVERSATIONS
               value: "4"
+            # Bound lifecycle lock cardinality independently from resident
+            # conversations so random IDs cannot grow process memory.
+            - name: IRONCREW_MAX_CONVERSATION_LIFECYCLES
+              value: "256"
+            - name: IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE
+              value: "60"
+            - name: IRONCREW_ADMISSION_WORK_BURST
+              value: "10"
+            - name: IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE
+              value: "120"
+            - name: IRONCREW_ADMISSION_CONTROL_BURST
+              value: "20"
             - name: IRONCREW_MAX_CONVERSATION_TURN_SECS
               value: "300"
             - name: IRONCREW_MAX_SSE_CONNECTIONS
@@ -140,12 +152,18 @@ spec:
               value: "86400"
             - name: IRONCREW_IDEMPOTENCY_MAX_RECORDS
               value: "10000"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL
+              value: "2500"
+            - name: IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL
+              value: "16"
             - name: IRONCREW_IDEMPOTENCY_PRUNE_BATCH
               value: "1000"
             - name: IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES
               value: "4194304"
             - name: IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES
               value: "67108864"
+            - name: IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL
+              value: "16777216"
             - name: IRONCREW_MAX_TASK_TIMEOUT_SECS
               value: "900"
             - name: IRONCREW_MAX_TASK_RETRIES
@@ -368,6 +386,104 @@ spec:
     - name: http
       port: 80
       targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ironcrew
+  labels:
+    app.kubernetes.io/name: ironcrew
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ironcrew
+  policyTypes:
+    - Ingress
+    - Egress
+  # Only OpenShift ingress-controller namespaces may reach the HTTP port.
+  # Node-originated kubelet probes remain governed by the cluster CNI's normal
+  # node-to-pod handling; validate this policy against the installed CNI.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # OpenShift DNS. TCP is required for large answers and retry fallback.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Compatibility for clusters that retain CoreDNS in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The baseline assumes PostgreSQL runs in the same namespace. Narrow this
+    # peer with a database pod label when the operator provides a stable one.
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Public provider/tool HTTPS only. Private, loopback, link-local,
+    # benchmarking, multicast, and reserved IPv4 destinations stay denied.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+    # On dual-stack clusters, permit public IPv6 HTTPS while excluding local,
+    # private, documentation, mapped-IPv4, and multicast destinations.
+    - to:
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::/128"
+              - "::1/128"
+              - "::ffff:0:0/96"
+              - "2001:db8::/32"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "ff00::/8"
+      ports:
+        - protocol: TCP
+          port: 443
 ---
 apiVersion: route.openshift.io/v1
 kind: Route

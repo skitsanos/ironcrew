@@ -15,7 +15,8 @@
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
 use ironcrew::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
-    IdempotencyCompletion, IdempotencyLookup, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+    IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
+    IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION, RunFenceHeartbeat,
 };
 use ironcrew::engine::postgres_store::PostgresStore;
 use ironcrew::engine::run_history::{
@@ -44,6 +45,7 @@ async fn reset(url: &str, prefix: &str) {
         "dialogs",
         "audit_events",
         "idempotency",
+        "idempotency_accounting",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {prefix}{t} CASCADE");
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -51,6 +53,11 @@ async fn reset(url: &str, prefix: &str) {
             .await
             .expect("drop table");
     }
+    let function = format!("DROP FUNCTION IF EXISTS {prefix}idempotency_acct_fn() CASCADE");
+    sqlx::query(sqlx::AssertSqlSafe(function))
+        .execute(&pool)
+        .await
+        .expect("drop idempotency accounting function");
     pool.close().await;
 }
 
@@ -165,6 +172,25 @@ fn digest(byte: char) -> String {
     byte.to_string().repeat(64)
 }
 
+fn idempotency_limits(
+    max_records: usize,
+    max_response_bytes: usize,
+    prune_batch: usize,
+) -> IdempotencyLimits {
+    IdempotencyLimits {
+        global_max_records: max_records,
+        principal_max_records: max_records,
+        principal_max_in_flight: max_records,
+        global_max_response_bytes: max_response_bytes,
+        principal_max_response_bytes: max_response_bytes,
+        prune_batch: prune_batch.max(1),
+    }
+}
+
+fn default_idempotency_limits() -> IdempotencyLimits {
+    idempotency_limits(100, usize::MAX, 10)
+}
+
 fn idempotency_claim(
     key: char,
     fingerprint: char,
@@ -176,6 +202,7 @@ fn idempotency_claim(
 ) -> IdempotencyClaim {
     IdempotencyClaim {
         key_hash: digest(key),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest(fingerprint),
         operation: operation.into(),
@@ -197,6 +224,7 @@ fn idempotency_claim(
 fn idempotency_completion(claim: &IdempotencyClaim, body: Option<&str>) -> IdempotencyCompletion {
     IdempotencyCompletion {
         key_hash: claim.key_hash.clone(),
+        principal_id: claim.principal_id.clone(),
         request_fingerprint: claim.request_fingerprint.clone(),
         attempt_id: claim.attempt_id.clone(),
         owner_instance_id: claim.owner_instance_id.clone(),
@@ -738,7 +766,7 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(idempotency_columns, 18);
+    assert_eq!(idempotency_columns, 19);
     let idempotency_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes \
          WHERE schemaname = current_schema() AND tablename = $1",
@@ -748,7 +776,130 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .await
     .unwrap();
     assert_eq!(idempotency_indexes, 4, "primary key plus three indexes");
+    let accounting_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(format!("{prefix}idempotency_accounting"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(accounting_columns, 6);
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger AS trg \
+         JOIN pg_class AS table_class ON table_class.oid = trg.tgrelid \
+         WHERE table_class.relname = $1 AND NOT trg.tgisinternal",
+    )
+    .bind(format!("{prefix}idempotency"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(trigger_count, 1);
     pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_migrates_legacy_principals_and_reconciles_accounting() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_migrates_legacy_principals_and_reconciles_accounting: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_account_mig_";
+    reset(&url, prefix).await;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let create = format!(
+        "CREATE TABLE {prefix}idempotency (
+            key_hash TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            exclusive_scope TEXT,
+            attempt_id TEXT NOT NULL,
+            owner_instance_id TEXT NOT NULL,
+            base_revision BIGINT,
+            state TEXT NOT NULL,
+            response_status INTEGER,
+            response_body TEXT,
+            lease_expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            expires_at TEXT,
+            ttl_seconds BIGINT NOT NULL
+        )"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(create))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let insert = format!(
+        "INSERT INTO {prefix}idempotency \
+         (key_hash, request_fingerprint, operation, scope, resource_id, exclusive_scope, \
+          attempt_id, owner_instance_id, base_revision, state, response_status, response_body, \
+          lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds) \
+         VALUES \
+         ($1, $2, 'flow.run', 'flow-a', 'legacy-run', NULL, 'legacy-a', 'legacy-owner', NULL, \
+          'claimed', 202, 'abc', '9999-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+          '2026-01-01T00:00:00Z', NULL, NULL, 86400), \
+         ($3, $4, 'conversation.message', 'flow-a', 'legacy-chat', NULL, 'legacy-b', \
+          'legacy-owner', 0, 'completed', 200, 'hello', '', '2026-01-01T00:00:00Z', \
+          '2026-01-01T00:01:00Z', '2026-01-01T00:01:00Z', '9999-01-01T00:00:00Z', 86400)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert))
+        .bind(digest('7'))
+        .bind(digest('8'))
+        .bind(digest('8'))
+        .bind(digest('9'))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let usage = store
+        .idempotency_usage(&PrincipalId::legacy(), default_idempotency_limits())
+        .await
+        .unwrap();
+    assert_eq!(usage.global_records, 2);
+    assert_eq!(usage.global_in_flight, 1);
+    assert_eq!(usage.global_response_bytes, 8);
+    assert_eq!(usage.principal_records, 2);
+    assert_eq!(usage.principal_in_flight, 1);
+    assert_eq!(usage.principal_response_bytes, 8);
+    assert_eq!(usage.principal_count, 1);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let migrated: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}idempotency WHERE principal_id = $1"
+    )))
+    .bind(PrincipalId::legacy().as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(migrated, 2);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {prefix}idempotency_accounting \
+         SET record_count = 0, in_flight_count = 0, response_bytes = 0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let repaired = PostgresStore::new(&url, prefix).await.unwrap();
+    let usage = repaired
+        .idempotency_usage(&PrincipalId::legacy(), default_idempotency_limits())
+        .await
+        .unwrap();
+    assert_eq!(usage.global_records, 2);
+    assert_eq!(usage.global_in_flight, 1);
+    assert_eq!(usage.global_response_bytes, 8);
+    assert_eq!(usage.principal_records, 2);
+    assert_eq!(usage.principal_in_flight, 1);
+    assert_eq!(usage.principal_response_bytes, 8);
 }
 
 #[tokio::test]
@@ -945,8 +1096,8 @@ async fn pg_two_stores_claim_once_and_fence_stale_attempts() {
     );
 
     let (left, right) = tokio::join!(
-        store_a.claim_idempotency(claim.clone(), 100, 10),
-        store_b.claim_idempotency(claim.clone(), 100, 10)
+        store_a.claim_idempotency_with_limits(claim.clone(), default_idempotency_limits()),
+        store_b.claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
     );
     let outcomes = [left.unwrap(), right.unwrap()];
     assert_eq!(
@@ -973,19 +1124,21 @@ async fn pg_two_stores_claim_once_and_fence_stale_attempts() {
     let mut stale_completion = idempotency_completion(&claim, Some("{\"ok\":true}"));
     stale_completion.attempt_id = "stale-attempt".into();
     assert!(matches!(
-        store_b.complete_idempotency(stale_completion, 1024).await,
+        store_b
+            .complete_idempotency_with_limits(stale_completion, idempotency_limits(100, 1024, 10))
+            .await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
 
     let completion = idempotency_completion(&claim, Some("{\"ok\":true}"));
     let completed = store_a
-        .complete_idempotency(completion.clone(), 1024)
+        .complete_idempotency_with_limits(completion.clone(), idempotency_limits(100, 1024, 10))
         .await
         .unwrap();
     assert!(completed.replayable);
     assert!(!completed.already_completed);
     let repeated = store_b
-        .complete_idempotency(completion, 1024)
+        .complete_idempotency_with_limits(completion, idempotency_limits(100, 1024, 10))
         .await
         .unwrap();
     assert!(repeated.replayable);
@@ -1004,6 +1157,207 @@ async fn pg_two_stores_claim_once_and_fence_stale_attempts() {
         }
         other => panic!("expected replay, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn pg_key_advisory_locks_do_not_serialize_unrelated_heartbeats() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_key_advisory_locks_do_not_serialize_unrelated_heartbeats: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_key_lock_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let first = idempotency_claim(
+        '1',
+        '2',
+        CONVERSATION_MESSAGE_OPERATION,
+        "lock-a",
+        Some("conversation:flow-a:lock-a"),
+        Some(0),
+        "9999-01-01T00:00:00Z",
+    );
+    let second = idempotency_claim(
+        '2',
+        '3',
+        CONVERSATION_MESSAGE_OPERATION,
+        "lock-b",
+        Some("conversation:flow-a:lock-b"),
+        Some(0),
+        "9999-01-01T00:00:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(first.clone(), default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(second.clone(), default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    let lock_name = format!(
+        "ironcrew:{prefix}idempotency:idempotency-key:64:{}",
+        first.key_hash
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_name)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let unrelated = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.heartbeat_idempotency(&second.key_hash, &second.attempt_id, "9999-01-01T00:00:00Z"),
+    )
+    .await
+    .expect("an unrelated key must not wait for the held key lock")
+    .unwrap();
+    assert!(unrelated);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            store
+                .heartbeat_idempotency(&first.key_hash, &first.attempt_id, "9999-01-01T00:00:00Z",),
+        )
+        .await
+        .is_err(),
+        "the matching key must remain fenced by its advisory lock"
+    );
+    blocker.rollback().await.unwrap();
+    assert!(
+        store
+            .heartbeat_idempotency(&first.key_hash, &first.attempt_id, "9999-01-01T00:00:00Z",)
+            .await
+            .unwrap()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_concurrent_principal_quota_is_exact_and_isolated() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_concurrent_principal_quota_is_exact_and_isolated: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idem_principal_quota_";
+    reset(&url, prefix).await;
+    let store_a = PostgresStore::new(&url, prefix).await.unwrap();
+    let store_b = PostgresStore::new(&url, prefix).await.unwrap();
+    let principal = PrincipalId::from_label("tenant-a");
+    let other_principal = PrincipalId::from_label("tenant-b");
+    let mut first = idempotency_claim(
+        '4',
+        '5',
+        RUN_OPERATION,
+        "principal-run-a",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    first.principal_id = principal.clone();
+    let mut second = idempotency_claim(
+        '5',
+        '6',
+        RUN_OPERATION,
+        "principal-run-b",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    second.principal_id = principal.clone();
+    let limits = IdempotencyLimits {
+        global_max_records: 10,
+        principal_max_records: 1,
+        principal_max_in_flight: 1,
+        global_max_response_bytes: 1024,
+        principal_max_response_bytes: 512,
+        prune_batch: 1,
+    };
+    let (left, right) = tokio::join!(
+        store_a.claim_idempotency_with_limits(first.clone(), limits),
+        store_b.claim_idempotency_with_limits(second.clone(), limits)
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, IdempotencyClaimOutcome::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                IdempotencyClaimOutcome::QuotaExceeded {
+                    scope: IdempotencyQuotaScope::Principal,
+                    resource: IdempotencyQuotaResource::Records,
+                    retry_after_seconds: 1..,
+                }
+            ))
+            .count(),
+        1
+    );
+
+    let mut independent = idempotency_claim(
+        '6',
+        '7',
+        RUN_OPERATION,
+        "principal-run-c",
+        None,
+        None,
+        "9999-01-01T00:00:00Z",
+    );
+    independent.principal_id = other_principal.clone();
+    assert!(matches!(
+        store_a
+            .claim_idempotency_with_limits(independent, limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let usage = store_a.idempotency_usage(&principal, limits).await.unwrap();
+    assert_eq!(usage.global_records, 2);
+    assert_eq!(usage.global_in_flight, 2);
+    assert_eq!(usage.principal_records, 1);
+    assert_eq!(usage.principal_in_flight, 1);
+    assert_eq!(usage.principal_count, 2);
+    assert_eq!(usage.max_principal_records, 1);
+    assert_eq!(usage.principals_at_or_above_100_percent, 2);
+
+    let winning_key = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            IdempotencyClaimOutcome::Claimed(record) => Some(record.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        store_b
+            .lookup_idempotency_for_principal(
+                &other_principal,
+                &winning_key.key_hash,
+                &winning_key.request_fingerprint,
+                "9999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Conflict
+    ));
 }
 
 #[tokio::test]
@@ -1036,7 +1390,7 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
     );
     claim.created_at = "1900-01-01T00:00:00Z".into();
     let stored = match store
-        .claim_idempotency(claim.clone(), 100, 10)
+        .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
         .await
         .unwrap()
     {
@@ -1070,7 +1424,7 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
     future_competitor.created_at = "9999-01-01T00:00:00Z".into();
     assert!(matches!(
         store
-            .claim_idempotency(future_competitor, 100, 10)
+            .claim_idempotency_with_limits(future_competitor, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Busy
@@ -1120,7 +1474,10 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
     );
 
     let completion = idempotency_completion(&claim, Some("{}"));
-    store.complete_idempotency(completion, 1024).await.unwrap();
+    store
+        .complete_idempotency_with_limits(completion, idempotency_limits(100, 1024, 10))
+        .await
+        .unwrap();
     assert!(
         store
             .heartbeat_idempotency(&claim.key_hash, &claim.attempt_id, "1900-01-01T00:00:01Z",)
@@ -1139,7 +1496,7 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(indeterminate.clone(), 100, 10)
+            .claim_idempotency_with_limits(indeterminate.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1196,7 +1553,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(first.clone(), 100, 10)
+            .claim_idempotency_with_limits(first.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1214,7 +1571,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(second.clone(), 100, 10)
+            .claim_idempotency_with_limits(second.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Busy
@@ -1232,7 +1589,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     ));
     assert!(matches!(
         store
-            .claim_idempotency(second.clone(), 100, 10)
+            .claim_idempotency_with_limits(second.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Busy
@@ -1242,7 +1599,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     wrong_recovery.recovery_key_hash = Some(digest('b'));
     assert!(matches!(
         store
-            .claim_idempotency(wrong_recovery, 100, 10)
+            .claim_idempotency_with_limits(wrong_recovery, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Busy
@@ -1251,7 +1608,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     acknowledged.recovery_key_hash = Some(first.key_hash.clone());
     assert!(matches!(
         store
-            .claim_idempotency(acknowledged.clone(), 100, 10)
+            .claim_idempotency_with_limits(acknowledged.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Busy
@@ -1274,7 +1631,48 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     age_idempotency_completion(&url, prefix, &first.key_hash, 61).await;
     assert!(matches!(
         store
-            .claim_idempotency(acknowledged, 100, 10)
+            .claim_idempotency_with_limits(
+                acknowledged.clone(),
+                idempotency_limits(1, usize::MAX, 10),
+            )
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::QuotaExceeded {
+            scope: IdempotencyQuotaScope::Global,
+            resource: IdempotencyQuotaResource::Records,
+            retry_after_seconds: 1..,
+        }
+    ));
+    match store
+        .lookup_idempotency(
+            &first.key_hash,
+            &first.request_fingerprint,
+            "1900-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Indeterminate(record) => {
+            assert_eq!(
+                record.exclusive_scope.as_deref(),
+                Some(scope),
+                "a quota-denied recovery must not consume the hazard binding"
+            );
+        }
+        other => panic!("expected quota-preserved hazard tombstone, got {other:?}"),
+    }
+    let mut foreign_recovery = acknowledged.clone();
+    foreign_recovery.principal_id = PrincipalId::from_label("foreign-hazard-principal");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(foreign_recovery, default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(acknowledged, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1293,7 +1691,10 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     }
 
     store
-        .complete_idempotency(idempotency_completion(&second, Some("{}")), 1024)
+        .complete_idempotency_with_limits(
+            idempotency_completion(&second, Some("{}")),
+            idempotency_limits(100, 1024, 10),
+        )
         .await
         .unwrap();
     let completed_is_ignored = idempotency_claim(
@@ -1307,7 +1708,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(completed_is_ignored, 100, 10)
+            .claim_idempotency_with_limits(completed_is_ignored, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1336,7 +1737,7 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(claim.clone(), 100, 10)
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1364,7 +1765,11 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
 
     let completion = idempotency_completion(&claim, Some("{\"reply\":\"hi\"}"));
     let committed = store
-        .commit_conversation_idempotency(completion.clone(), &conversation, 1024)
+        .commit_conversation_idempotency_with_limits(
+            completion.clone(),
+            &conversation,
+            idempotency_limits(100, 1024, 10),
+        )
         .await
         .unwrap();
     assert_eq!(committed.revision, 1);
@@ -1381,7 +1786,11 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
     assert_eq!(persisted.messages[0].content.as_deref(), Some("hello"));
 
     let repeated = store
-        .commit_conversation_idempotency(completion, &conversation, 1024)
+        .commit_conversation_idempotency_with_limits(
+            completion,
+            &conversation,
+            idempotency_limits(100, 1024, 10),
+        )
         .await
         .unwrap();
     assert_eq!(repeated.revision, 1);
@@ -1422,7 +1831,7 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(stale.clone(), 100, 10)
+            .claim_idempotency_with_limits(stale.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Conflict
@@ -1449,7 +1858,10 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
-        store.claim_idempotency(current, 100, 10).await.unwrap(),
+        store
+            .claim_idempotency_with_limits(current, default_idempotency_limits())
+            .await
+            .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
     ));
 
@@ -1464,7 +1876,7 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(missing_stale, 100, 10)
+            .claim_idempotency_with_limits(missing_stale, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Conflict
@@ -1480,7 +1892,7 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(missing_zero, 100, 10)
+            .claim_idempotency_with_limits(missing_zero, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1509,7 +1921,7 @@ async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
     );
     assert!(matches!(
         store
-            .claim_idempotency(claim.clone(), 100, 10)
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1528,7 +1940,9 @@ async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
 
     let completion = idempotency_completion(&claim, Some("{\"reply\":\"unsafe\"}"));
     assert!(matches!(
-        store.complete_idempotency(completion.clone(), 1024).await,
+        store
+            .complete_idempotency_with_limits(completion.clone(), idempotency_limits(100, 1024, 10))
+            .await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
     let conversation = ConversationRecord {
@@ -1543,7 +1957,11 @@ async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
     };
     assert!(matches!(
         store
-            .commit_conversation_idempotency(completion, &conversation, 1024)
+            .commit_conversation_idempotency_with_limits(
+                completion,
+                &conversation,
+                idempotency_limits(100, 1024, 10)
+            )
             .await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
@@ -1597,16 +2015,33 @@ async fn pg_idempotency_retention_prunes_only_terminal_records() {
         "2026-07-19T12:10:00Z",
     );
     store
-        .claim_idempotency(expired.clone(), 100, 10)
+        .claim_idempotency_with_limits(expired.clone(), default_idempotency_limits())
         .await
         .unwrap();
     store
-        .claim_idempotency(live.clone(), 100, 10)
+        .claim_idempotency_with_limits(live.clone(), default_idempotency_limits())
         .await
         .unwrap();
+    let usage = store
+        .idempotency_usage(&expired.principal_id, default_idempotency_limits())
+        .await
+        .unwrap();
+    assert_eq!(usage.global_records, 2);
+    assert_eq!(usage.global_in_flight, 2);
+    assert_eq!(usage.global_response_bytes, 0);
     let mut completion = idempotency_completion(&expired, Some("{}"));
     completion.expires_at = "2026-07-19T12:02:00Z".into();
-    store.complete_idempotency(completion, 1024).await.unwrap();
+    store
+        .complete_idempotency_with_limits(completion, idempotency_limits(100, 1024, 10))
+        .await
+        .unwrap();
+    let usage = store
+        .idempotency_usage(&expired.principal_id, default_idempotency_limits())
+        .await
+        .unwrap();
+    assert_eq!(usage.global_records, 2);
+    assert_eq!(usage.global_in_flight, 1);
+    assert_eq!(usage.global_response_bytes, 2);
     assert!(matches!(
         store
             .lookup_idempotency(
@@ -1637,6 +2072,13 @@ async fn pg_idempotency_retention_prunes_only_terminal_records() {
             .unwrap(),
         1
     );
+    let usage = store
+        .idempotency_usage(&expired.principal_id, default_idempotency_limits())
+        .await
+        .unwrap();
+    assert_eq!(usage.global_records, 1);
+    assert_eq!(usage.global_in_flight, 1);
+    assert_eq!(usage.global_response_bytes, 0);
     assert!(matches!(
         store
             .lookup_idempotency(
@@ -1659,7 +2101,10 @@ async fn pg_idempotency_retention_prunes_only_terminal_records() {
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
-        store.claim_idempotency(replacement, 2, 0).await.unwrap(),
+        store
+            .claim_idempotency_with_limits(replacement, idempotency_limits(2, usize::MAX, 1))
+            .await
+            .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
     ));
 }
@@ -1696,7 +2141,6 @@ async fn pg_run_claim_enforces_aggregate_response_budget_before_terminalization(
     );
     first.response_status = Some(202);
     first.response_body = Some(first_body.into());
-    first.max_total_response_bytes = aggregate_cap;
     let mut second = idempotency_claim(
         '3',
         '4',
@@ -1708,10 +2152,10 @@ async fn pg_run_claim_enforces_aggregate_response_budget_before_terminalization(
     );
     second.response_status = Some(202);
     second.response_body = Some(second_body.into());
-    second.max_total_response_bytes = aggregate_cap;
+    let budget_limits = idempotency_limits(100, aggregate_cap, 10);
 
     match store
-        .claim_idempotency(first.clone(), 100, 10)
+        .claim_idempotency_with_limits(first.clone(), budget_limits)
         .await
         .unwrap()
     {
@@ -1722,7 +2166,7 @@ async fn pg_run_claim_enforces_aggregate_response_budget_before_terminalization(
         other => panic!("expected first budgeted claim, got {other:?}"),
     }
     match store
-        .claim_idempotency(second.clone(), 100, 10)
+        .claim_idempotency_with_limits(second.clone(), budget_limits)
         .await
         .unwrap()
     {
@@ -1820,7 +2264,7 @@ async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
     live.response_status = Some(202);
     live.response_body = Some("{\"run_id\":\"mapped-run\"}".into());
     store
-        .claim_idempotency(live.clone(), 100, 10)
+        .claim_idempotency_with_limits(live.clone(), default_idempotency_limits())
         .await
         .unwrap();
     store
@@ -1883,7 +2327,7 @@ async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
     orphan.response_status = Some(202);
     orphan.response_body = Some("{\"run_id\":\"orphan-run\"}".into());
     store
-        .claim_idempotency(orphan.clone(), 100, 10)
+        .claim_idempotency_with_limits(orphan.clone(), default_idempotency_limits())
         .await
         .unwrap();
     expire_idempotency_lease(&url, prefix, &orphan.key_hash).await;
@@ -1942,7 +2386,7 @@ async fn pg_run_intent_hydrates_only_linked_provisional_row() {
     claim.response_body = Some("{\"run_id\":\"provisional-run\"}".into());
     assert!(matches!(
         store
-            .claim_idempotency(claim.clone(), 100, 10)
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -1982,7 +2426,10 @@ async fn pg_run_intent_hydrates_only_linked_provisional_row() {
     assert_eq!(run.started_at, "1900-01-01T00:00:00Z");
 
     store
-        .complete_idempotency(idempotency_completion(&claim, Some("{}")), 1024)
+        .complete_idempotency_with_limits(
+            idempotency_completion(&claim, Some("{}")),
+            idempotency_limits(100, 1024, 10),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -2080,7 +2527,7 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
     claim.response_body = Some("{\"run_id\":\"fenced-run\"}".into());
     assert!(matches!(
         store
-            .claim_idempotency(claim.clone(), 100, 10)
+            .claim_idempotency_with_limits(claim.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -2253,13 +2700,13 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
     completed_without_run.response_status = Some(202);
     completed_without_run.response_body = Some("{\"run_id\":\"no-run\"}".into());
     store
-        .claim_idempotency(completed_without_run.clone(), 100, 10)
+        .claim_idempotency_with_limits(completed_without_run.clone(), default_idempotency_limits())
         .await
         .unwrap();
     store
-        .complete_idempotency(
+        .complete_idempotency_with_limits(
             idempotency_completion(&completed_without_run, Some("{}")),
-            1024,
+            idempotency_limits(100, 1024, 10),
         )
         .await
         .unwrap();

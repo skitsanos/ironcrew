@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use super::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
-    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
-    validate_digest,
+    IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource, IdempotencyQuotaScope,
+    IdempotencyRecord, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
+    RunFenceHeartbeat, validate_digest,
 };
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -128,6 +129,7 @@ impl SqliteStore {
 
             CREATE TABLE IF NOT EXISTS idempotency (
                 key_hash            TEXT PRIMARY KEY,
+                principal_id        TEXT NOT NULL,
                 request_fingerprint TEXT NOT NULL,
                 operation           TEXT NOT NULL,
                 scope               TEXT NOT NULL,
@@ -178,6 +180,27 @@ impl SqliteStore {
                 }
             }
         }
+
+        let principal_migration = format!(
+            "ALTER TABLE idempotency ADD COLUMN principal_id TEXT NOT NULL DEFAULT '{}'",
+            crate::engine::idempotency::PrincipalId::legacy().as_str()
+        );
+        if let Err(error) = conn.execute(&principal_migration, [])
+            && !error.to_string().contains("duplicate column")
+        {
+            return Err(IronCrewError::Validation(format!(
+                "SQLite idempotency principal migration failed: {error}"
+            )));
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_principal ON idempotency (principal_id)",
+            [],
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite idempotency principal index failed: {error}"
+            ))
+        })?;
 
         // Add the `flow` column to existing `runs` tables (flow-scoping the run
         // history). Detected via PRAGMA so we only ALTER when absent — mirrors
@@ -361,7 +384,7 @@ fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError
 
 const IDEMPOTENCY_SELECT_COLUMNS: &str = "key_hash, request_fingerprint, operation, scope, resource_id, exclusive_scope, \
      attempt_id, owner_instance_id, base_revision, state, response_status, response_body, \
-     lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds";
+     lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds, principal_id";
 
 fn sqlite_idempotency_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdempotencyRecord> {
     let state_raw: String = row.get(9)?;
@@ -382,6 +405,13 @@ fn sqlite_idempotency_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Idempoten
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, i64::MIN))?;
     Ok(IdempotencyRecord {
         key_hash: row.get(0)?,
+        principal_id: PrincipalId::from_digest(row.get(18)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                18,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
         request_fingerprint: row.get(1)?,
         operation: row.get(2)?,
         scope: row.get(3)?,
@@ -492,6 +522,50 @@ fn sqlite_deadline_passed(deadline: &str, now: &str) -> Result<bool> {
     )
 }
 
+fn sqlite_quota_retry_after(
+    conn: &rusqlite::Connection,
+    principal_id: Option<&PrincipalId>,
+    now: &str,
+) -> Result<u64> {
+    let deadline: Option<String> = if let Some(principal_id) = principal_id {
+        conn.query_row(
+            "SELECT MIN(CASE WHEN state IN ('claimed', 'running') \
+                        THEN lease_expires_at ELSE expires_at END) \
+             FROM idempotency WHERE principal_id = ?1",
+            rusqlite::params![principal_id.as_str()],
+            |row| row.get(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT MIN(CASE WHEN state IN ('claimed', 'running') \
+                        THEN lease_expires_at ELSE expires_at END) FROM idempotency",
+            [],
+            |row| row.get(0),
+        )
+    }
+    .map_err(|error| {
+        IronCrewError::Validation(format!(
+            "SQLite idempotency capacity deadline query error: {error}"
+        ))
+    })?;
+    let Some(deadline) = deadline else {
+        return Ok(60);
+    };
+    let deadline = sqlite_parse_idempotency_time("idempotency capacity deadline", &deadline)?;
+    let now = sqlite_parse_idempotency_time("idempotency capacity clock", now)?;
+    let milliseconds = deadline
+        .signed_duration_since(now)
+        .num_milliseconds()
+        .max(1);
+    Ok(u64::try_from(milliseconds.saturating_add(999) / 1_000)
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
+fn sqlite_quota_at_or_above(value: usize, limit: usize, percentage: usize) -> bool {
+    value >= limit.saturating_mul(percentage).saturating_add(99) / 100
+}
+
 fn sqlite_recovery_grace_elapsed(
     hazard: &IdempotencyRecord,
     claim_time: &str,
@@ -581,7 +655,11 @@ fn sqlite_prune_idempotency(conn: &rusqlite::Connection, now: &str, limit: usize
     Ok(removed)
 }
 
-fn sqlite_response_bytes(conn: &rusqlite::Connection, except_key_hash: &str) -> Result<usize> {
+fn sqlite_response_bytes(
+    conn: &rusqlite::Connection,
+    principal_id: &PrincipalId,
+    except_key_hash: &str,
+) -> Result<(usize, usize)> {
     let total: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
@@ -594,16 +672,36 @@ fn sqlite_response_bytes(conn: &rusqlite::Connection, except_key_hash: &str) -> 
                 "SQLite idempotency response byte query error: {error}"
             ))
         })?;
-    usize::try_from(total).map_err(|_| {
+    let principal_total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
+             FROM idempotency \
+             WHERE key_hash != ?1 AND response_body IS NOT NULL AND principal_id = ?2",
+            rusqlite::params![except_key_hash, principal_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "SQLite principal idempotency response byte query error: {error}"
+            ))
+        })?;
+    let total = usize::try_from(total).map_err(|_| {
         IronCrewError::Validation("Idempotency response byte total is out of range".into())
-    })
+    })?;
+    let principal_total = usize::try_from(principal_total).map_err(|_| {
+        IronCrewError::Validation(
+            "Principal idempotency response byte total is out of range".into(),
+        )
+    })?;
+    Ok((total, principal_total))
 }
 
 fn sqlite_completion_fence(
     record: &IdempotencyRecord,
     completion: &IdempotencyCompletion,
 ) -> Result<()> {
-    if record.request_fingerprint != completion.request_fingerprint
+    if record.principal_id != completion.principal_id
+        || record.request_fingerprint != completion.request_fingerprint
         || record.attempt_id != completion.attempt_id
         || record.owner_instance_id != completion.owner_instance_id
     {
@@ -1550,8 +1648,9 @@ impl StateStore for SqliteStore {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 
-    async fn lookup_idempotency(
+    async fn lookup_idempotency_for_principal(
         &self,
+        principal_id: &PrincipalId,
         key_hash: &str,
         request_fingerprint: &str,
         now: &str,
@@ -1561,6 +1660,7 @@ impl StateStore for SqliteStore {
         sqlite_parse_idempotency_time("idempotency current time", now)?;
         let conn = Arc::clone(&self.conn);
         let key_hash = key_hash.to_string();
+        let principal_id = principal_id.clone();
         let fingerprint = request_fingerprint.to_string();
         let now = now.to_string();
         flatten_join(
@@ -1571,7 +1671,8 @@ impl StateStore for SqliteStore {
                 let Some(record) = sqlite_idempotency_record(&conn, &key_hash)? else {
                     return Ok(IdempotencyLookup::Miss);
                 };
-                if record.request_fingerprint != fingerprint {
+                if record.principal_id != principal_id || record.request_fingerprint != fingerprint
+                {
                     return Ok(IdempotencyLookup::Conflict);
                 }
                 if record.state.is_terminal()
@@ -1602,18 +1703,13 @@ impl StateStore for SqliteStore {
         )
     }
 
-    async fn claim_idempotency(
+    async fn claim_idempotency_with_limits(
         &self,
         claim: IdempotencyClaim,
-        max_records: usize,
-        prune_batch: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyClaimOutcome> {
         claim.validate()?;
-        if max_records == 0 {
-            return Err(IronCrewError::Validation(
-                "Idempotency record limit must be positive".into(),
-            ));
-        }
+        limits.validate()?;
         let recovery_grace_ttl = self.lease.ttl();
         let conn = Arc::clone(&self.conn);
         flatten_join(
@@ -1628,7 +1724,7 @@ impl StateStore for SqliteStore {
                             "SQLite idempotency claim transaction error: {error}"
                         ))
                     })?;
-                sqlite_prune_idempotency(&tx, &claim.created_at, prune_batch)?;
+                sqlite_prune_idempotency(&tx, &claim.created_at, limits.prune_batch)?;
 
                 if let Some(mut existing) = sqlite_idempotency_record(&tx, &claim.key_hash)? {
                     let expired_terminal = existing.state.is_terminal()
@@ -1647,7 +1743,9 @@ impl StateStore for SqliteStore {
                             ))
                         })?;
                     } else {
-                        let outcome = if existing.request_fingerprint != claim.request_fingerprint {
+                        let outcome = if existing.principal_id != claim.principal_id
+                            || existing.request_fingerprint != claim.request_fingerprint
+                        {
                             IdempotencyClaimOutcome::Conflict
                         } else if existing.state == IdempotencyState::Indeterminate {
                             IdempotencyClaimOutcome::Indeterminate(existing)
@@ -1714,6 +1812,7 @@ impl StateStore for SqliteStore {
                     let hazards = sqlite_indeterminate_exclusive_records(&tx, exclusive_scope)?;
                     if !hazards.is_empty() {
                         let acknowledged = hazards.len() == 1
+                            && hazards[0].principal_id == claim.principal_id
                             && claim.recovery_key_hash.as_deref()
                                 == Some(hazards[0].key_hash.as_str());
                         if !acknowledged
@@ -1760,6 +1859,11 @@ impl StateStore for SqliteStore {
                         }
                     };
                     if current_revision != expected_revision {
+                        tx.commit().map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "SQLite conversation idempotency conflict commit error: {error}"
+                            ))
+                        })?;
                         return Ok(IdempotencyClaimOutcome::Conflict);
                     }
                 }
@@ -1777,10 +1881,78 @@ impl StateStore for SqliteStore {
                             "SQLite idempotency claim aggregate error: {error}"
                         ))
                     })?;
-                if usize::try_from(count).unwrap_or(usize::MAX) >= max_records {
-                    return Err(IronCrewError::Validation(format!(
-                        "Idempotency record limit reached ({max_records})"
-                    )));
+                let (principal_count, principal_in_flight, principal_response_bytes):
+                    (i64, i64, i64) = tx
+                    .query_row(
+                        "SELECT COUNT(*), \
+                                COALESCE(SUM(CASE WHEN state IN ('claimed', 'running') THEN 1 ELSE 0 END), 0), \
+                                COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
+                         FROM idempotency WHERE principal_id = ?1",
+                        rusqlite::params![claim.principal_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite principal idempotency aggregate error: {error}"
+                        ))
+                    })?;
+                if usize::try_from(count).unwrap_or(usize::MAX) >= limits.global_max_records {
+                    let outcome = IdempotencyClaimOutcome::QuotaExceeded {
+                        scope: IdempotencyQuotaScope::Global,
+                        resource: IdempotencyQuotaResource::Records,
+                        retry_after_seconds: sqlite_quota_retry_after(
+                            &tx,
+                            None,
+                            &claim.created_at,
+                        )?,
+                    };
+                    // Pruning happens in this transaction. Commit it even
+                    // when the current claim is denied so a bounded backlog
+                    // makes forward progress across retries.
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite global idempotency quota commit error: {error}"
+                        ))
+                    })?;
+                    return Ok(outcome);
+                }
+                if usize::try_from(principal_count).unwrap_or(usize::MAX)
+                    >= limits.principal_max_records
+                {
+                    let outcome = IdempotencyClaimOutcome::QuotaExceeded {
+                        scope: IdempotencyQuotaScope::Principal,
+                        resource: IdempotencyQuotaResource::Records,
+                        retry_after_seconds: sqlite_quota_retry_after(
+                            &tx,
+                            Some(&claim.principal_id),
+                            &claim.created_at,
+                        )?,
+                    };
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite principal idempotency quota commit error: {error}"
+                        ))
+                    })?;
+                    return Ok(outcome);
+                }
+                if usize::try_from(principal_in_flight).unwrap_or(usize::MAX)
+                    >= limits.principal_max_in_flight
+                {
+                    let outcome = IdempotencyClaimOutcome::QuotaExceeded {
+                        scope: IdempotencyQuotaScope::Principal,
+                        resource: IdempotencyQuotaResource::InFlight,
+                        retry_after_seconds: sqlite_quota_retry_after(
+                            &tx,
+                            Some(&claim.principal_id),
+                            &claim.created_at,
+                        )?,
+                    };
+                    tx.commit().map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite principal in-flight quota commit error: {error}"
+                        ))
+                    })?;
+                    return Ok(outcome);
                 }
 
                 let stored_response_bytes =
@@ -1789,11 +1961,21 @@ impl StateStore for SqliteStore {
                             "Idempotency response byte total is out of range".into(),
                         )
                     })?;
+                let principal_response_bytes =
+                    usize::try_from(principal_response_bytes).map_err(|_| {
+                        IronCrewError::Validation(
+                            "Principal idempotency response byte total is out of range".into(),
+                        )
+                    })?;
                 let mut record = claim.to_record();
                 record.response_body = record.response_body.filter(|body| {
-                    stored_response_bytes
+                    let global_fits = stored_response_bytes
                         .checked_add(body.len())
-                        .is_some_and(|total| total <= claim.max_total_response_bytes)
+                        .is_some_and(|total| total <= limits.global_max_response_bytes);
+                    let principal_fits = principal_response_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= limits.principal_max_response_bytes);
+                    global_fits && principal_fits
                 });
                 record.validate()?;
                 if let Some(hazard_key) = recovery_hazard_key.as_deref() {
@@ -1820,14 +2002,15 @@ impl StateStore for SqliteStore {
                     }
                 }
                 tx.execute(
-                    "INSERT INTO idempotency (key_hash, request_fingerprint, operation, scope, \
+                    "INSERT INTO idempotency (key_hash, principal_id, request_fingerprint, operation, scope, \
                      resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, \
                      state, response_status, response_body, lease_expires_at, created_at, \
                      updated_at, completed_at, expires_at, ttl_seconds) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                             ?15, ?16, ?17, ?18)",
+                             ?15, ?16, ?17, ?18, ?19)",
                     rusqlite::params![
                         &record.key_hash,
+                        record.principal_id.as_str(),
                         &record.request_fingerprint,
                         &record.operation,
                         &record.scope,
@@ -2079,12 +2262,13 @@ impl StateStore for SqliteStore {
         )
     }
 
-    async fn complete_idempotency(
+    async fn complete_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyCompletionOutcome> {
         completion.validate()?;
+        limits.validate()?;
         let conn = Arc::clone(&self.conn);
         flatten_join(
             tokio::task::spawn_blocking(move || {
@@ -2115,11 +2299,16 @@ impl StateStore for SqliteStore {
                         "Indeterminate idempotency outcomes cannot be completed".into(),
                     ));
                 }
-                let stored_bytes = sqlite_response_bytes(&tx, &completion.key_hash)?;
+                let (stored_bytes, principal_stored_bytes) =
+                    sqlite_response_bytes(&tx, &completion.principal_id, &completion.key_hash)?;
                 let response_body = completion.response_body.filter(|body| {
-                    stored_bytes
+                    let global_fits = stored_bytes
                         .checked_add(body.len())
-                        .is_some_and(|total| total <= max_total_response_bytes)
+                        .is_some_and(|total| total <= limits.global_max_response_bytes);
+                    let principal_fits = principal_stored_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= limits.principal_max_response_bytes);
+                    global_fits && principal_fits
                 });
                 let changed = tx
                     .execute(
@@ -2160,13 +2349,14 @@ impl StateStore for SqliteStore {
         )
     }
 
-    async fn commit_conversation_idempotency(
+    async fn commit_conversation_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
         conversation: &ConversationRecord,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<ConversationIdempotencyCommit> {
         completion.validate()?;
+        limits.validate()?;
         validate_session_id(&conversation.id)?;
         let conn = Arc::clone(&self.conn);
         let conversation = conversation.clone();
@@ -2316,11 +2506,19 @@ impl StateStore for SqliteStore {
                     }
                 }
 
-                let stored_bytes = sqlite_response_bytes(&tx, &completion.key_hash)?;
+                let (stored_bytes, principal_stored_bytes) = sqlite_response_bytes(
+                    &tx,
+                    &completion.principal_id,
+                    &completion.key_hash,
+                )?;
                 let response_body = completion.response_body.filter(|body| {
-                    stored_bytes
+                    let global_fits = stored_bytes
                         .checked_add(body.len())
-                        .is_some_and(|total| total <= max_total_response_bytes)
+                        .is_some_and(|total| total <= limits.global_max_response_bytes);
+                    let principal_fits = principal_stored_bytes
+                        .checked_add(body.len())
+                        .is_some_and(|total| total <= limits.principal_max_response_bytes);
+                    global_fits && principal_fits
                 });
                 let changed = tx
                     .execute(
@@ -2485,6 +2683,114 @@ impl StateStore for SqliteStore {
                     ))
                 })?;
                 Ok(removed)
+            })
+            .await,
+        )
+    }
+
+    async fn idempotency_usage(
+        &self,
+        principal_id: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage> {
+        limits.validate()?;
+        let conn = Arc::clone(&self.conn);
+        let principal_id = principal_id.clone();
+        flatten_join(
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock().map_err(|error| {
+                    IronCrewError::Validation(format!("SQLite lock error: {error}"))
+                })?;
+                let mut statement = conn
+                    .prepare(
+                        "SELECT principal_id, COUNT(*), \
+                                COALESCE(SUM(CASE WHEN state IN ('claimed', 'running') THEN 1 ELSE 0 END), 0), \
+                                COALESCE(SUM(length(CAST(response_body AS BLOB))), 0) \
+                         FROM idempotency GROUP BY principal_id",
+                    )
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency usage prepare error: {error}"
+                        ))
+                    })?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency usage query error: {error}"
+                        ))
+                    })?;
+                let mut snapshot = IdempotencyUsage::default();
+                for row in rows {
+                    let (raw_principal, records, in_flight, response_bytes) = row.map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite idempotency usage row error: {error}"
+                        ))
+                    })?;
+                    let id = PrincipalId::from_digest(raw_principal)?;
+                    let records = usize::try_from(records).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite principal idempotency record count is out of range".into(),
+                        )
+                    })?;
+                    let in_flight = usize::try_from(in_flight).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite principal idempotency in-flight count is out of range".into(),
+                        )
+                    })?;
+                    let response_bytes = usize::try_from(response_bytes).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite principal idempotency response bytes are out of range".into(),
+                        )
+                    })?;
+                    snapshot.principal_count = snapshot.principal_count.saturating_add(1);
+                    snapshot.global_records = snapshot.global_records.saturating_add(records);
+                    snapshot.global_in_flight = snapshot.global_in_flight.saturating_add(in_flight);
+                    snapshot.global_response_bytes = snapshot
+                        .global_response_bytes
+                        .checked_add(response_bytes)
+                        .ok_or_else(|| {
+                            IronCrewError::Validation(
+                                "SQLite idempotency response bytes overflow".into(),
+                            )
+                        })?;
+                    snapshot.max_principal_records = snapshot.max_principal_records.max(records);
+                    snapshot.max_principal_in_flight =
+                        snapshot.max_principal_in_flight.max(in_flight);
+                    snapshot.max_principal_response_bytes =
+                        snapshot.max_principal_response_bytes.max(response_bytes);
+                    if id == principal_id {
+                        snapshot.principal_records = records;
+                        snapshot.principal_in_flight = in_flight;
+                        snapshot.principal_response_bytes = response_bytes;
+                    }
+                    let at = |percentage| {
+                        sqlite_quota_at_or_above(
+                            records,
+                            limits.principal_max_records,
+                            percentage,
+                        ) || sqlite_quota_at_or_above(
+                            in_flight,
+                            limits.principal_max_in_flight,
+                            percentage,
+                        ) || sqlite_quota_at_or_above(
+                            response_bytes,
+                            limits.principal_max_response_bytes,
+                            percentage,
+                        )
+                    };
+                    snapshot.principals_at_or_above_80_percent += usize::from(at(80));
+                    snapshot.principals_at_or_above_90_percent += usize::from(at(90));
+                    snapshot.principals_at_or_above_100_percent += usize::from(at(100));
+                }
+                Ok(snapshot)
             })
             .await,
         )

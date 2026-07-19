@@ -7,6 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::engine::run_history::RunStatus;
 use crate::utils::error::{IronCrewError, Result};
@@ -16,6 +17,135 @@ pub const CONVERSATION_MESSAGE_OPERATION: &str = "conversation.message";
 pub const MAX_IDEMPOTENCY_SCOPE_BYTES: usize = 512;
 pub const MAX_IDEMPOTENCY_RESOURCE_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Opaque server-issued identity used for admission and durable quota
+/// accounting. It is derived from an operator-controlled principal label,
+/// never from a bearer token, IP address, or caller-supplied audit header.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PrincipalId(String);
+
+impl PrincipalId {
+    /// Preserve ledgers created before principal-aware idempotency. Legacy
+    /// static-token and unauthenticated local modes both use this identity, so
+    /// an upgrade does not silently make retained keys executable again.
+    pub fn legacy() -> Self {
+        Self::from_domain_value(b"ironcrew:principal:legacy:v1", b"default")
+    }
+
+    pub fn anonymous() -> Self {
+        // Anonymous and authenticated modes cannot coexist in one server.
+        // Sharing this migration identity preserves pre-upgrade local ledgers.
+        Self::legacy()
+    }
+
+    pub fn from_label(label: &str) -> Self {
+        Self::from_domain_value(b"ironcrew:principal:named:v1", label.as_bytes())
+    }
+
+    pub fn from_digest(value: String) -> Result<Self> {
+        let principal = Self(value);
+        principal.validate()?;
+        Ok(principal)
+    }
+
+    fn from_domain_value(domain: &[u8], value: &[u8]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update([0]);
+        digest.update(value);
+        let digest = digest.finalize();
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in digest {
+            encoded.push(HEX[usize::from(byte >> 4)] as char);
+            encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        Self(encoded)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_digest("principal id", &self.0)
+    }
+}
+
+impl Default for PrincipalId {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
+
+impl AsRef<str> for PrincipalId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Immutable resource policy supplied to each atomic ledger mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdempotencyLimits {
+    pub global_max_records: usize,
+    pub principal_max_records: usize,
+    pub principal_max_in_flight: usize,
+    pub global_max_response_bytes: usize,
+    pub principal_max_response_bytes: usize,
+    pub prune_batch: usize,
+}
+
+impl IdempotencyLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.global_max_records == 0
+            || self.principal_max_records == 0
+            || self.principal_max_in_flight == 0
+            || self.global_max_response_bytes == 0
+            || self.principal_max_response_bytes == 0
+            || self.prune_batch == 0
+        {
+            return Err(IronCrewError::Validation(
+                "Idempotency limits must all be positive".into(),
+            ));
+        }
+        if self.principal_max_records > self.global_max_records {
+            return Err(IronCrewError::Validation(
+                "Per-principal idempotency record limit cannot exceed the global limit".into(),
+            ));
+        }
+        if self.principal_max_in_flight > self.principal_max_records {
+            return Err(IronCrewError::Validation(
+                "Per-principal in-flight idempotency limit cannot exceed its record limit".into(),
+            ));
+        }
+        if self.principal_max_response_bytes > self.global_max_response_bytes {
+            return Err(IronCrewError::Validation(
+                "Per-principal idempotency response-byte limit cannot exceed the global limit"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Low-cardinality ledger snapshot returned to the protected metrics route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdempotencyUsage {
+    pub global_records: usize,
+    pub global_in_flight: usize,
+    pub global_response_bytes: usize,
+    pub principal_records: usize,
+    pub principal_in_flight: usize,
+    pub principal_response_bytes: usize,
+    pub principal_count: usize,
+    pub max_principal_records: usize,
+    pub max_principal_in_flight: usize,
+    pub max_principal_response_bytes: usize,
+    pub principals_at_or_above_80_percent: usize,
+    pub principals_at_or_above_90_percent: usize,
+    pub principals_at_or_above_100_percent: usize,
+}
 
 /// Result of atomically renewing a keyed HTTP run's two durable ownership
 /// fences: its idempotency ledger row and its in-flight run record.
@@ -39,6 +169,7 @@ pub enum RunFenceHeartbeat {
 pub struct RunIntentSignal {
     sender: tokio::sync::watch::Sender<bool>,
     key_hash: String,
+    principal_id: PrincipalId,
     request_fingerprint: String,
     attempt_id: String,
 }
@@ -46,6 +177,7 @@ pub struct RunIntentSignal {
 impl RunIntentSignal {
     pub fn channel(
         key_hash: String,
+        principal_id: PrincipalId,
         request_fingerprint: String,
         attempt_id: String,
     ) -> (Self, tokio::sync::watch::Receiver<bool>) {
@@ -54,6 +186,7 @@ impl RunIntentSignal {
             Self {
                 sender,
                 key_hash,
+                principal_id,
                 request_fingerprint,
                 attempt_id,
             },
@@ -65,8 +198,12 @@ impl RunIntentSignal {
         let _ = self.sender.send(true);
     }
 
-    pub fn lookup_identity(&self) -> (&str, &str) {
-        (&self.key_hash, &self.request_fingerprint)
+    pub fn lookup_identity(&self) -> (&PrincipalId, &str, &str) {
+        (
+            &self.principal_id,
+            &self.key_hash,
+            &self.request_fingerprint,
+        )
     }
 
     pub fn matches_running(&self, record: &IdempotencyRecord, run_id: &str) -> bool {
@@ -127,6 +264,10 @@ impl FromStr for IdempotencyState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub key_hash: String,
+    /// Trusted quota owner. Older JSON ledgers adopt the legacy deployment
+    /// principal during deserialization.
+    #[serde(default = "PrincipalId::legacy")]
+    pub principal_id: PrincipalId,
     pub request_fingerprint: String,
     pub operation: String,
     pub scope: String,
@@ -158,6 +299,7 @@ pub struct IdempotencyRecord {
 impl IdempotencyRecord {
     pub fn validate(&self) -> Result<()> {
         validate_digest("idempotency key hash", &self.key_hash)?;
+        self.principal_id.validate()?;
         validate_digest("request fingerprint", &self.request_fingerprint)?;
         validate_operation(&self.operation)?;
         validate_bounded_printable(
@@ -235,6 +377,7 @@ impl IdempotencyRecord {
 #[derive(Debug, Clone)]
 pub struct IdempotencyClaim {
     pub key_hash: String,
+    pub principal_id: PrincipalId,
     /// Optional hash of a prior indeterminate key whose conversation-scope
     /// hazard the caller explicitly acknowledges. This is claim input only;
     /// it is never copied into the durable record.
@@ -249,8 +392,9 @@ pub struct IdempotencyClaim {
     pub base_revision: Option<u64>,
     pub response_status: Option<u16>,
     pub response_body: Option<String>,
-    /// Aggregate response-body budget enforced atomically when the claim is
-    /// inserted. This is admission policy only and is not persisted.
+    /// Backwards-compatible global body budget used by the legacy
+    /// `StateStore::claim_idempotency` wrapper. Principal-aware HTTP callers
+    /// supply the complete `IdempotencyLimits` policy instead.
     pub max_total_response_bytes: usize,
     pub lease_expires_at: String,
     pub created_at: String,
@@ -261,6 +405,7 @@ impl IdempotencyClaim {
     pub fn to_record(&self) -> IdempotencyRecord {
         IdempotencyRecord {
             key_hash: self.key_hash.clone(),
+            principal_id: self.principal_id.clone(),
             request_fingerprint: self.request_fingerprint.clone(),
             operation: self.operation.clone(),
             scope: self.scope.clone(),
@@ -283,6 +428,11 @@ impl IdempotencyClaim {
 
     pub fn validate(&self) -> Result<()> {
         self.to_record().validate()?;
+        if self.max_total_response_bytes == 0 {
+            return Err(IronCrewError::Validation(
+                "Idempotency response-byte budget must be positive".into(),
+            ));
+        }
         if let Some(recovery_key_hash) = self.recovery_key_hash.as_deref() {
             validate_digest("idempotency recovery key hash", recovery_key_hash)?;
             if self.operation != CONVERSATION_MESSAGE_OPERATION
@@ -303,6 +453,7 @@ impl IdempotencyClaim {
 #[derive(Debug, Clone)]
 pub struct IdempotencyCompletion {
     pub key_hash: String,
+    pub principal_id: PrincipalId,
     pub request_fingerprint: String,
     pub attempt_id: String,
     pub owner_instance_id: String,
@@ -315,6 +466,7 @@ pub struct IdempotencyCompletion {
 impl IdempotencyCompletion {
     pub fn validate(&self) -> Result<()> {
         validate_digest("idempotency key hash", &self.key_hash)?;
+        self.principal_id.validate()?;
         validate_digest("request fingerprint", &self.request_fingerprint)?;
         validate_bounded_printable("idempotency attempt id", &self.attempt_id, 128)?;
         validate_bounded_printable(
@@ -349,6 +501,23 @@ pub enum IdempotencyClaimOutcome {
     Indeterminate(IdempotencyRecord),
     Conflict,
     Busy,
+    QuotaExceeded {
+        scope: IdempotencyQuotaScope,
+        resource: IdempotencyQuotaResource,
+        retry_after_seconds: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyQuotaScope {
+    Global,
+    Principal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyQuotaResource {
+    Records,
+    InFlight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +583,7 @@ mod tests {
     fn record() -> IdempotencyRecord {
         IdempotencyRecord {
             key_hash: "a".repeat(64),
+            principal_id: PrincipalId::legacy(),
             request_fingerprint: "b".repeat(64),
             operation: RUN_OPERATION.into(),
             scope: "flow-a".into(),

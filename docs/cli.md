@@ -130,8 +130,9 @@ values, an empty resolved host, and port `0` fail startup with a validation
 error instead of silently using a different address.
 
 A non-loopback/public bind also fails startup unless `IRONCREW_STORE` is set
-explicitly and either a valid `IRONCREW_API_TOKEN` is configured or the unsafe
-`IRONCREW_ALLOW_UNAUTHENTICATED=true` override is deliberately enabled. Local
+explicitly and either `IRONCREW_API_TOKEN` or `IRONCREW_API_TOKENS` is
+configured, or the unsafe `IRONCREW_ALLOW_UNAUTHENTICATED=true` override is
+deliberately enabled. Local
 `127.0.0.1`/`localhost` development keeps the implicit JSON/no-auth defaults.
 
 **Endpoints:**
@@ -141,6 +142,7 @@ explicitly and either a valid `IRONCREW_API_TOKEN` is configured or the unsafe
 | GET    | `/health`                        | Backwards-compatible lightweight liveness check |
 | GET    | `/health/live`                   | Process liveness check |
 | GET    | `/health/ready`                  | Storage-aware readiness check (`503` while unavailable) |
+| GET    | `/metrics`                       | Protected Prometheus process/admission metrics |
 | POST   | `/flows/{flow}/run`              | Run a crew (async, returns run_id) |
 | GET    | `/flows/{flow}/events/{run_id}`  | SSE event stream for a run |
 | GET    | `/flows/{flow}/runs`             | List past runs for a flow |
@@ -398,6 +400,7 @@ be set in the shell or in `.env` files.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `8`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
+| `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | Hard cap on distinct conversation IDs with an in-flight start/message/delete/eviction operation (default: `256`; hard ceiling: `4096`). Saturation for a new ID returns `503`; entries are removed after their final owner exits |
 | `IRONCREW_MAX_ACTIVE_RUNS` | Hard cap on simultaneously in-flight flow runs (`POST /flows/{flow}/run`, default: `4`). Breaches return `503` |
 | `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | Aggregate retained collaborative-task transcript (default: `8388608` = 8 MiB; hard ceiling: 32 MiB) |
 | `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | Maximum provider response retained for one collaborative turn (default: `1048576` = 1 MiB; hard ceiling: 8 MiB) |
@@ -425,8 +428,14 @@ be set in the shell or in `.env` files.
 
 | Variable          | Description |
 |-------------------|-------------|
-| `IRONCREW_API_TOKEN` | Bearer token for REST API auth. Public binds require it unless the explicit unsafe override below is enabled. Tokens must be valid UTF-8, 32–4096 bytes, with no whitespace/control characters. Health routes remain public |
-| `IRONCREW_ALLOW_UNAUTHENTICATED` | Explicit `true`/`1` override permitting a public bind without `IRONCREW_API_TOKEN`; unsafe for production and logged as a warning |
+| `IRONCREW_API_TOKEN` | Bearer token for REST API auth. Public binds require it unless the explicit unsafe override below is enabled. Tokens must be 32–4096 visible ASCII bytes without spaces. Health routes remain public |
+| `IRONCREW_API_PRINCIPAL` | Stable audit/quota principal label for `IRONCREW_API_TOKEN` (default: `default`; 1–128 restricted ASCII bytes). Authenticated requests overwrite caller-supplied `X-Audit-Actor` with this trusted label |
+| `IRONCREW_API_TOKENS` | Optional JSON object mapping up to 256 named principals to bearer-token strings. The legacy token counts toward the same 256-token process limit; duplicate tokens or principal names fail startup |
+| `IRONCREW_ALLOW_UNAUTHENTICATED` | Explicit `true`/`1` override permitting a public bind without either API token source; unsafe for production and logged as a warning |
+| `IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE` | Per-principal process-local refill rate for run, conversation-start, and conversation-message mutations (default: `60`; range: 1–60000) |
+| `IRONCREW_ADMISSION_WORK_BURST` | Per-principal work-mutation burst capacity (default: `10`; range: 1–10000) |
+| `IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE` | Independent per-principal refill rate for abort, answer, and delete control mutations (default: `120`; range: 1–60000) |
+| `IRONCREW_ADMISSION_CONTROL_BURST` | Per-principal control-mutation burst capacity (default: `20`; range: 1–10000) |
 | `IRONCREW_HOST` | Server bind host used when `--host` is absent. If neither is set, `PORT` implies `0.0.0.0`; otherwise the default is `127.0.0.1` |
 | `IRONCREW_PORT` | Server bind port used when `--port` is absent. Takes precedence over platform `PORT` |
 | `PORT` | Platform-provided server port fallback (including Railway). Causes the default host to become `0.0.0.0` |
@@ -437,15 +446,26 @@ be set in the shell or in `.env` files.
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP run and conversation-message mutations (default: `false`; recommended: `true` in production) |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Completed/indeterminate ledger retention (default: `86400`; range: 60–2592000; must be at least `IRONCREW_MAX_RUN_LIFETIME + 3600`) |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum in-flight plus retained terminal request records (default: `10000`; hard ceiling: `100000`) |
+| `IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL` | Maximum in-flight plus retained terminal records charged to one authenticated principal (default: global record cap; cannot exceed it) |
+| `IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL` | Maximum concurrent claimed/in-progress mutations charged to one principal (default: `min(global record cap, 64)`; cannot exceed the principal record cap) |
 | `IRONCREW_IDEMPOTENCY_PRUNE_BATCH` | Maximum expired terminal records removed in one bounded pass (default: `1000`; hard ceiling: `10000`) |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | Maximum compact JSON response retained per key (default: `8388608` = 8 MiB; hard ceiling: 64 MiB) |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | Aggregate retained response-body budget (default: `268435456` = 256 MiB; hard ceiling: 8 GiB); excess responses become non-replayable tombstones |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL` | Aggregate retained response-body budget charged to one principal (default: global response-byte cap; cannot exceed it); excess responses become non-replayable tombstones |
 | `IRONCREW_MAX_SSE_CONNECTIONS` | Global cap on live run and conversation SSE connections (default: `16`; hard ceiling: `1024`) |
 | `IRONCREW_READINESS_CACHE_MS` | Storage-aware readiness result cache/coalescing interval (default: `1000`; hard ceiling: `10000`) |
 | `IRONCREW_RUN_SSE_RETENTION_SECS` | Time a completed run's event bus remains available for a late subscriber (default: `5`; hard ceiling: `300`) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in SSE events to N chars (disabled by default) |
 | `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | Hard deadline in seconds applied after SIGTERM/Ctrl+C. If graceful teardown hasn't completed by then, the process exits anyway (default: `10`; range: 1–300) |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | Post-serve drain window in milliseconds for background tasks spawned from `Drop` paths (notably reaping stdio MCP children) (default: `1000`; range: 0–30000) |
+
+Admission buckets are intentionally process-local for the supported topology of
+exactly one HTTP executor. Rate-limit breaches return `429` with numeric
+`Retry-After` and `Cache-Control: no-store`; the independent control bucket
+keeps abort/answer/delete operations available when work admission is busy.
+`GET /metrics` is protected by the same API authentication and exposes only
+fixed, low-cardinality labels—never principal names, bearer tokens, audit
+actors, flow names, or idempotency keys.
 
 **Security:**
 

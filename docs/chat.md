@@ -276,7 +276,7 @@ throughout.
 
 | Variable                               | Default | Purpose                                                      |
 | -------------------------------------- | ------- | ------------------------------------------------------------ |
-| `IRONCREW_API_TOKEN`                   | —       | Bearer token for the protected REST API; when set, must be 32–4096 printable bytes |
+| `IRONCREW_API_TOKEN`                   | —       | Bearer token for the protected REST API; when set, must be 32–4096 visible ASCII bytes without spaces |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS`      | 1800    | Idle window after which a session handle is evicted          |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS`    | 8       | Simultaneous in-memory session cap                           |
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT` | 20      | Default page size for `GET /conversations`                   |

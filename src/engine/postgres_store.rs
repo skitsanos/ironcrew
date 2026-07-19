@@ -15,7 +15,7 @@ const MAX_DB_POOL_SIZE: u32 = 128;
 const MAX_CONNECT_RETRIES: u32 = 100;
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
 const MAX_TABLE_PREFIX_BYTES: usize = 37;
-const IDEMPOTENCY_COLUMNS: &str = "key_hash, request_fingerprint, operation, scope, \
+const IDEMPOTENCY_COLUMNS: &str = "key_hash, principal_id, request_fingerprint, operation, scope, \
     resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, state, \
     response_status, response_body, lease_expires_at, created_at, updated_at, completed_at, \
     expires_at, ttl_seconds";
@@ -84,8 +84,9 @@ fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
 use super::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
-    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
-    validate_digest,
+    IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource, IdempotencyQuotaScope,
+    IdempotencyRecord, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
+    RunFenceHeartbeat, validate_digest,
 };
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -117,7 +118,15 @@ pub struct PostgresStore {
     dialogs_table: String,
     audit_events_table: String,
     idempotency_table: String,
+    idempotency_accounting_table: String,
     lease: RunLeaseConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdempotencyAccounting {
+    records: usize,
+    in_flight: usize,
+    response_bytes: usize,
 }
 
 impl PostgresStore {
@@ -203,6 +212,7 @@ impl PostgresStore {
         let dialogs_table = format!("{}dialogs", table_prefix);
         let audit_events_table = format!("{}audit_events", table_prefix);
         let idempotency_table = format!("{}idempotency", table_prefix);
+        let idempotency_accounting_table = format!("{}idempotency_accounting", table_prefix);
 
         let store = Self {
             pool,
@@ -211,6 +221,7 @@ impl PostgresStore {
             dialogs_table,
             audit_events_table,
             idempotency_table,
+            idempotency_accounting_table,
             lease,
         };
         store.bootstrap().await?;
@@ -219,23 +230,188 @@ impl PostgresStore {
         Ok(store)
     }
 
-    async fn lock_idempotency_table(
+    async fn lock_advisory(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        domain: &str,
+        identity: &str,
+        shared: bool,
     ) -> Result<()> {
-        let sql = format!(
-            "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
-            self.idempotency_table
+        let lock_name = format!(
+            "ironcrew:{}:{domain}:{}:{identity}",
+            self.idempotency_table,
+            identity.len()
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        let sql = if shared {
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+        } else {
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+        };
+        sqlx::query(sql)
+            .bind(lock_name)
             .execute(&mut **tx)
             .await
             .map_err(|error| {
                 IronCrewError::Validation(format!(
-                    "Failed to lock PostgreSQL idempotency table: {error}"
+                    "Failed to acquire PostgreSQL {domain} advisory lock: {error}"
                 ))
             })?;
         Ok(())
+    }
+
+    async fn lock_idempotency_quota(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<()> {
+        self.lock_advisory(tx, "idempotency-quota", "global", false)
+            .await
+    }
+
+    async fn lock_idempotency_key(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key_hash: &str,
+    ) -> Result<()> {
+        self.lock_advisory(tx, "idempotency-key", key_hash, false)
+            .await
+    }
+
+    async fn lock_idempotency_principal(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        principal_id: &PrincipalId,
+    ) -> Result<()> {
+        self.lock_advisory(tx, "idempotency-principal", principal_id.as_str(), false)
+            .await
+    }
+
+    async fn lock_idempotency_scope(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        exclusive_scope: &str,
+    ) -> Result<()> {
+        self.lock_advisory(tx, "idempotency-scope", exclusive_scope, false)
+            .await
+    }
+
+    async fn lock_resource(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        operation: &str,
+        scope: &str,
+        resource_id: &str,
+    ) -> Result<()> {
+        let identity = format!(
+            "{}:{operation}:{}:{scope}:{}:{resource_id}",
+            operation.len(),
+            scope.len(),
+            resource_id.len()
+        );
+        self.lock_advisory(tx, "resource", &identity, false).await
+    }
+
+    async fn lock_run_fence(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        shared: bool,
+    ) -> Result<()> {
+        self.lock_advisory(tx, "run-fence", "global", shared).await
+    }
+
+    async fn idempotency_accounting_for_update(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        principal_id: &PrincipalId,
+    ) -> Result<(IdempotencyAccounting, IdempotencyAccounting)> {
+        let global_sql = format!(
+            "SELECT record_count, in_flight_count, response_bytes FROM {} \
+             WHERE principal_id = 'global' AND is_global = TRUE FOR UPDATE",
+            self.idempotency_accounting_table
+        );
+        let global = sqlx::query_as(sqlx::AssertSqlSafe(global_sql))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL global idempotency accounting lookup failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL global idempotency accounting row is missing".into(),
+                )
+            })?;
+
+        let principal_sql = format!(
+            "SELECT record_count, in_flight_count, response_bytes FROM {} \
+             WHERE principal_id = $1 AND is_global = FALSE FOR UPDATE",
+            self.idempotency_accounting_table
+        );
+        let principal = sqlx::query_as(sqlx::AssertSqlSafe(principal_sql))
+            .bind(principal_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL principal idempotency accounting lookup failed: {error}"
+                ))
+            })?;
+        Ok((
+            decode_idempotency_accounting(global)?,
+            principal
+                .map(decode_idempotency_accounting)
+                .transpose()?
+                .unwrap_or(IdempotencyAccounting {
+                    records: 0,
+                    in_flight: 0,
+                    response_bytes: 0,
+                }),
+        ))
+    }
+
+    async fn idempotency_retry_after_seconds(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        principal_id: Option<&PrincipalId>,
+        resource: IdempotencyQuotaResource,
+        database_now: &str,
+    ) -> Result<u64> {
+        let principal = principal_id.map(PrincipalId::as_str);
+        let sql = match resource {
+            IdempotencyQuotaResource::Records => format!(
+                "SELECT GREATEST(1, COALESCE(CEIL(EXTRACT(EPOCH FROM (MIN(\
+                     CASE WHEN state IN ('completed', 'indeterminate') \
+                          THEN expires_at::timestamptz \
+                          ELSE lease_expires_at::timestamptz + \
+                               ttl_seconds * interval '1 second' END\
+                 ) - $1::timestamptz)))::BIGINT, 1)) \
+                 FROM {} WHERE ($2::TEXT IS NULL OR principal_id = $2)",
+                self.idempotency_table
+            ),
+            IdempotencyQuotaResource::InFlight => format!(
+                "SELECT GREATEST(1, COALESCE(CEIL(EXTRACT(EPOCH FROM (\
+                     MIN(lease_expires_at::timestamptz) - $1::timestamptz\
+                 )))::BIGINT, 1)) \
+                 FROM {} WHERE state IN ('claimed', 'running') \
+                   AND ($2::TEXT IS NULL OR principal_id = $2)",
+                self.idempotency_table
+            ),
+        };
+        let seconds: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(database_now)
+            .bind(principal)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency quota retry calculation failed: {error}"
+                ))
+            })?;
+        u64::try_from(seconds).map_err(|_| {
+            IronCrewError::Validation(
+                "PostgreSQL idempotency quota retry delay is out of range".into(),
+            )
+        })
     }
 
     async fn get_idempotency_in_transaction(
@@ -255,6 +431,23 @@ impl PostgresStore {
                 IronCrewError::Validation(format!("PostgreSQL idempotency lookup failed: {error}"))
             })?;
         row.as_ref().map(row_to_idempotency_record).transpose()
+    }
+
+    async fn idempotency_principal_for_key(&self, key_hash: &str) -> Result<Option<PrincipalId>> {
+        let sql = format!(
+            "SELECT principal_id FROM {} WHERE key_hash = $1",
+            self.idempotency_table
+        );
+        let principal: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(key_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency principal lookup failed: {error}"
+                ))
+            })?;
+        principal.map(PrincipalId::from_digest).transpose()
     }
 
     async fn database_clock_with_deadline(
@@ -344,6 +537,8 @@ impl PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|e| {
             IronCrewError::Validation(format!("Failed to begin PostgreSQL bootstrap: {e}"))
         })?;
+        self.lock_advisory(&mut tx, "bootstrap", "global", false)
+            .await?;
 
         // 1. Create table if not exists
         let create_sql = format!(
@@ -726,6 +921,7 @@ impl PostgresStore {
         let idempotency_sql = format!(
             "CREATE TABLE IF NOT EXISTS {it} (
                 key_hash            TEXT PRIMARY KEY,
+                principal_id        TEXT NOT NULL,
                 request_fingerprint TEXT NOT NULL,
                 operation           TEXT NOT NULL,
                 scope               TEXT NOT NULL,
@@ -757,6 +953,74 @@ impl PostgresStore {
                 ))
             })?;
 
+        // Backfill ledgers created before principal-aware admission. The
+        // opaque legacy digest preserves their non-reusability across an
+        // upgrade without persisting a bearer credential or raw label.
+        let add_principal = format!("ALTER TABLE {it} ADD COLUMN IF NOT EXISTS principal_id TEXT");
+        sqlx::query(sqlx::AssertSqlSafe(add_principal))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to add PostgreSQL idempotency principal column: {error}"
+                ))
+            })?;
+        let backfill_principal = format!(
+            "UPDATE {it} SET principal_id = $1 \
+             WHERE principal_id IS NULL OR principal_id = ''"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(backfill_principal))
+            .bind(PrincipalId::legacy().as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to migrate PostgreSQL idempotency principals: {error}"
+                ))
+            })?;
+        let require_principal = format!("ALTER TABLE {it} ALTER COLUMN principal_id SET NOT NULL");
+        sqlx::query(sqlx::AssertSqlSafe(require_principal))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to require PostgreSQL idempotency principals: {error}"
+                ))
+            })?;
+        let principal_constraint = format!("{it}_principal_ck");
+        let has_principal_constraint: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM pg_constraint AS con \
+                 JOIN pg_class AS tbl ON tbl.oid = con.conrelid \
+                 JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace \
+                 WHERE ns.nspname = current_schema() AND tbl.relname = $1 \
+                   AND con.conname = $2 AND con.contype = 'c'\
+             )",
+        )
+        .bind(it)
+        .bind(&principal_constraint)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to inspect PostgreSQL idempotency principal constraint: {error}"
+            ))
+        })?;
+        if !has_principal_constraint {
+            let sql = format!(
+                "ALTER TABLE {it} ADD CONSTRAINT {principal_constraint} \
+                 CHECK (length(principal_id) = 64 AND principal_id !~ '[^0-9a-f]')"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "Failed to constrain PostgreSQL idempotency principals: {error}"
+                    ))
+                })?;
+        }
+
         let idempotency_indexes = [
             format!("CREATE INDEX IF NOT EXISTS {it}_exp_idx ON {it} (expires_at)"),
             format!(
@@ -780,6 +1044,166 @@ impl PostgresStore {
                     ))
                 })?;
         }
+
+        // A compact accounting table avoids COUNT/SUM scans on every claim
+        // and completion. The global row is always updated first, then the
+        // opaque principal row, matching the application advisory-lock order.
+        let accounting = &self.idempotency_accounting_table;
+        let accounting_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {accounting} (
+                principal_id    TEXT PRIMARY KEY,
+                is_global       BOOLEAN NOT NULL,
+                record_count    BIGINT NOT NULL DEFAULT 0 CHECK (record_count >= 0),
+                in_flight_count BIGINT NOT NULL DEFAULT 0 CHECK (in_flight_count >= 0),
+                response_bytes  BIGINT NOT NULL DEFAULT 0 CHECK (response_bytes >= 0),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                CHECK ((is_global AND principal_id = 'global') OR
+                       (NOT is_global AND length(principal_id) = 64 AND
+                        principal_id !~ '[^0-9a-f]'))
+            );
+            INSERT INTO {accounting} (principal_id, is_global)
+            VALUES ('global', TRUE)
+            ON CONFLICT (principal_id) DO NOTHING"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(accounting_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL idempotency accounting table: {error}"
+                ))
+            })?;
+
+        let accounting_function = format!("{it}_acct_fn");
+        let accounting_trigger = format!("{it}_acct_trg");
+        let function_sql = format!(
+            r#"CREATE OR REPLACE FUNCTION {accounting_function}() RETURNS TRIGGER
+               LANGUAGE plpgsql AS $ironcrew$
+               DECLARE
+                   changed_principal TEXT;
+                   record_delta BIGINT := 0;
+                   in_flight_delta BIGINT := 0;
+                   response_delta BIGINT := 0;
+               BEGIN
+                   IF TG_OP = 'INSERT' THEN
+                       changed_principal := NEW.principal_id;
+                       record_delta := 1;
+                       in_flight_delta := CASE WHEN NEW.state IN ('claimed', 'running') THEN 1 ELSE 0 END;
+                       response_delta := COALESCE(octet_length(NEW.response_body), 0);
+                   ELSIF TG_OP = 'DELETE' THEN
+                       changed_principal := OLD.principal_id;
+                       record_delta := -1;
+                       in_flight_delta := -(CASE WHEN OLD.state IN ('claimed', 'running') THEN 1 ELSE 0 END);
+                       response_delta := -COALESCE(octet_length(OLD.response_body), 0);
+                   ELSE
+                       IF OLD.principal_id <> NEW.principal_id THEN
+                           RAISE EXCEPTION 'idempotency principal_id is immutable';
+                       END IF;
+                       changed_principal := NEW.principal_id;
+                       in_flight_delta :=
+                           (CASE WHEN NEW.state IN ('claimed', 'running') THEN 1 ELSE 0 END) -
+                           (CASE WHEN OLD.state IN ('claimed', 'running') THEN 1 ELSE 0 END);
+                       response_delta := COALESCE(octet_length(NEW.response_body), 0) -
+                                         COALESCE(octet_length(OLD.response_body), 0);
+                       IF in_flight_delta = 0 AND response_delta = 0 THEN
+                           RETURN NEW;
+                       END IF;
+                   END IF;
+
+                   UPDATE {accounting}
+                   SET record_count = record_count + record_delta,
+                       in_flight_count = in_flight_count + in_flight_delta,
+                       response_bytes = response_bytes + response_delta,
+                       updated_at = clock_timestamp()
+                   WHERE principal_id = 'global' AND is_global = TRUE;
+                   IF NOT FOUND THEN
+                       RAISE EXCEPTION 'global idempotency accounting row is missing';
+                   END IF;
+
+                   IF TG_OP = 'INSERT' THEN
+                       INSERT INTO {accounting} AS usage
+                           (principal_id, is_global, record_count, in_flight_count,
+                            response_bytes, updated_at)
+                       VALUES (changed_principal, FALSE, record_delta, in_flight_delta,
+                               response_delta, clock_timestamp())
+                       ON CONFLICT (principal_id) DO UPDATE SET
+                           record_count = usage.record_count + EXCLUDED.record_count,
+                           in_flight_count = usage.in_flight_count + EXCLUDED.in_flight_count,
+                           response_bytes = usage.response_bytes + EXCLUDED.response_bytes,
+                           updated_at = clock_timestamp();
+                   ELSE
+                       UPDATE {accounting}
+                       SET record_count = record_count + record_delta,
+                           in_flight_count = in_flight_count + in_flight_delta,
+                           response_bytes = response_bytes + response_delta,
+                           updated_at = clock_timestamp()
+                       WHERE principal_id = changed_principal AND is_global = FALSE;
+                       IF NOT FOUND THEN
+                           RAISE EXCEPTION 'principal idempotency accounting row is missing';
+                       END IF;
+                   END IF;
+
+                   DELETE FROM {accounting}
+                   WHERE principal_id = changed_principal AND is_global = FALSE
+                     AND record_count = 0 AND in_flight_count = 0 AND response_bytes = 0;
+                   IF TG_OP = 'DELETE' THEN
+                       RETURN OLD;
+                   END IF;
+                   RETURN NEW;
+               END;
+               $ironcrew$"#
+        );
+        sqlx::query(sqlx::AssertSqlSafe(function_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL idempotency accounting function: {error}"
+                ))
+            })?;
+        let trigger_sql = format!(
+            "DROP TRIGGER IF EXISTS {accounting_trigger} ON {it}; \
+             CREATE TRIGGER {accounting_trigger} \
+             AFTER INSERT OR DELETE OR UPDATE OF principal_id, state, response_body ON {it} \
+             FOR EACH ROW EXECUTE FUNCTION {accounting_function}()"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(trigger_sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to create PostgreSQL idempotency accounting trigger: {error}"
+                ))
+            })?;
+
+        // Reconcile once during migration. DDL locks on the ledger remain
+        // held until commit, so a concurrent write either precedes this scan
+        // or runs through the newly installed trigger afterwards.
+        let reconcile_accounting = format!(
+            "DELETE FROM {accounting} WHERE is_global = FALSE; \
+             INSERT INTO {accounting} \
+                 (principal_id, is_global, record_count, in_flight_count, response_bytes) \
+             SELECT principal_id, FALSE, COUNT(*)::BIGINT, \
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'running'))::BIGINT, \
+                    COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
+             FROM {it} GROUP BY principal_id; \
+             UPDATE {accounting} SET \
+                 record_count = (SELECT COUNT(*)::BIGINT FROM {it}), \
+                 in_flight_count = (SELECT COUNT(*)::BIGINT FROM {it} \
+                                    WHERE state IN ('claimed', 'running')), \
+                 response_bytes = (SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
+                                   FROM {it}), \
+                 updated_at = clock_timestamp() \
+             WHERE principal_id = 'global' AND is_global = TRUE"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(reconcile_accounting))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Failed to reconcile PostgreSQL idempotency accounting: {error}"
+                ))
+            })?;
 
         for (column, data_type) in [
             ("owner_instance_id", "text"),
@@ -817,12 +1241,13 @@ impl PostgresStore {
         self.verify_required_schema().await?;
 
         tracing::debug!(
-            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}', '{}'",
+            "PostgreSQL bootstrap complete for tables '{}', '{}', '{}', '{}', '{}', '{}'",
             self.table_name,
             self.conversations_table,
             self.dialogs_table,
             self.audit_events_table,
-            self.idempotency_table
+            self.idempotency_table,
+            self.idempotency_accounting_table
         );
         Ok(())
     }
@@ -910,6 +1335,7 @@ impl PostgresStore {
              FROM information_schema.columns AS c \
              JOIN (VALUES \
                  ('key_hash', 'text'), \
+                 ('principal_id', 'text'), \
                  ('request_fingerprint', 'text'), \
                  ('operation', 'text'), \
                  ('scope', 'text'), \
@@ -940,7 +1366,7 @@ impl PostgresStore {
                 "Failed to verify PostgreSQL idempotency columns: {e}"
             ))
         })?;
-        if idempotency_columns != 18 {
+        if idempotency_columns != 19 {
             return Err(IronCrewError::Validation(format!(
                 "PostgreSQL schema for '{}' is missing one or more required typed columns",
                 self.idempotency_table
@@ -1019,6 +1445,78 @@ impl PostgresStore {
                 self.idempotency_table
             )));
         }
+
+        let accounting_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns AS c \
+             JOIN (VALUES \
+                 ('principal_id', 'text'), \
+                 ('is_global', 'boolean'), \
+                 ('record_count', 'bigint'), \
+                 ('in_flight_count', 'bigint'), \
+                 ('response_bytes', 'bigint'), \
+                 ('updated_at', 'timestamp with time zone') \
+             ) AS required(column_name, data_type) \
+               ON required.column_name = c.column_name \
+              AND required.data_type = c.data_type \
+             WHERE c.table_schema = current_schema() AND c.table_name = $1",
+        )
+        .bind(&self.idempotency_accounting_table)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL idempotency accounting columns: {error}"
+            ))
+        })?;
+        if accounting_columns != 6 {
+            return Err(IronCrewError::Validation(format!(
+                "PostgreSQL schema for '{}' is missing one or more accounting columns",
+                self.idempotency_accounting_table
+            )));
+        }
+        let accounting_trigger = format!("{}_acct_trg", self.idempotency_table);
+        let trigger_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM pg_trigger AS trg \
+                 JOIN pg_class AS tbl ON tbl.oid = trg.tgrelid \
+                 JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace \
+                 WHERE ns.nspname = current_schema() AND tbl.relname = $1 \
+                   AND trg.tgname = $2 AND NOT trg.tgisinternal \
+                   AND trg.tgenabled <> 'D'\
+             )",
+        )
+        .bind(&self.idempotency_table)
+        .bind(&accounting_trigger)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL idempotency accounting trigger: {error}"
+            ))
+        })?;
+        if !trigger_exists {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL idempotency accounting trigger is missing or disabled".into(),
+            ));
+        }
+        let global_accounting_valid: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {} \
+                 WHERE principal_id = 'global' AND is_global = TRUE \
+                   AND record_count >= 0 AND in_flight_count >= 0 AND response_bytes >= 0)",
+            self.idempotency_accounting_table
+        )))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to verify PostgreSQL global idempotency accounting: {error}"
+            ))
+        })?;
+        if !global_accounting_valid {
+            return Err(IronCrewError::Validation(
+                "PostgreSQL global idempotency accounting row is missing or invalid".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1074,7 +1572,9 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG insert intent transaction: {error}"))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", &run_id)
+            .await?;
         let (database_now, lease_expires_at) = self
             .database_clock_with_deadline(&mut tx, self.lease.ttl().as_secs(), "run intent lease")
             .await?;
@@ -1169,7 +1669,10 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG update completion transaction: {error}"))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", run_id)
+            .await?;
         let (database_now, _) = self
             .database_clock_with_deadline(&mut tx, 0, "run completion")
             .await?;
@@ -1308,7 +1811,7 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG heartbeat transaction: {error}"))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_run_fence(&mut tx, true).await?;
         let (_, deadline) = self
             .database_clock_with_deadline(
                 &mut tx,
@@ -1370,6 +1873,18 @@ impl StateStore for PostgresStore {
                     "PostgreSQL idempotency health write probe: {error}"
                 ))
             })?;
+        let accounting_sql = format!(
+            "UPDATE {} SET updated_at = updated_at WHERE FALSE",
+            self.idempotency_accounting_table
+        );
+        sqlx::query(sqlx::AssertSqlSafe(accounting_sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency accounting health write probe: {error}"
+                ))
+            })?;
         transaction
             .rollback()
             .await
@@ -1382,7 +1897,8 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG reconcile transaction: {error}"))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_run_fence(&mut tx, false).await?;
         let (database_now, _) = self
             .database_clock_with_deadline(&mut tx, 0, "run reconciliation")
             .await?;
@@ -1584,12 +2100,14 @@ impl StateStore for PostgresStore {
         Ok(())
     }
 
-    async fn lookup_idempotency(
+    async fn lookup_idempotency_for_principal(
         &self,
+        principal_id: &PrincipalId,
         key_hash: &str,
         request_fingerprint: &str,
         now: &str,
     ) -> Result<IdempotencyLookup> {
+        principal_id.validate()?;
         validate_digest("idempotency key hash", key_hash)?;
         validate_digest("request fingerprint", request_fingerprint)?;
         parse_timestamp("idempotency lookup time", now)?;
@@ -1598,7 +2116,7 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotency lookup transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_key(&mut tx, key_hash).await?;
         let (database_now, _) = self
             .database_clock_with_deadline(&mut tx, 0, "idempotency lookup")
             .await?;
@@ -1616,7 +2134,9 @@ impl StateStore for PostgresStore {
             return Ok(IdempotencyLookup::Miss);
         };
 
-        let outcome = if record.request_fingerprint != request_fingerprint {
+        let outcome = if &record.principal_id != principal_id
+            || record.request_fingerprint != request_fingerprint
+        {
             IdempotencyLookup::Conflict
         } else if record.state.is_terminal()
             && record
@@ -1660,30 +2180,49 @@ impl StateStore for PostgresStore {
         Ok(outcome)
     }
 
-    async fn claim_idempotency(
+    async fn claim_idempotency_with_limits(
         &self,
         claim: IdempotencyClaim,
-        max_records: usize,
-        prune_batch: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyClaimOutcome> {
         claim.validate()?;
-        if max_records == 0 {
-            return Err(IronCrewError::Validation(
-                "Idempotency record capacity must be positive".into(),
-            ));
-        }
+        limits.validate()?;
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!(
                 "PostgreSQL idempotency claim transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        // Every capacity mutation follows one order: global quota, principal,
+        // optional run fence, resource, exclusive scope, and finally key.
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_idempotency_principal(&mut tx, &claim.principal_id)
+            .await?;
+        if claim.operation == RUN_OPERATION {
+            self.lock_run_fence(&mut tx, true).await?;
+        }
+        self.lock_resource(
+            &mut tx,
+            &claim.operation,
+            if claim.operation == RUN_OPERATION {
+                ""
+            } else {
+                &claim.scope
+            },
+            &claim.resource_id,
+        )
+        .await?;
+        let mut recovery_hazard_key = None;
+        if let Some(exclusive_scope) = claim.exclusive_scope.as_deref() {
+            self.lock_idempotency_scope(&mut tx, exclusive_scope)
+                .await?;
+        }
+        self.lock_idempotency_key(&mut tx, &claim.key_hash).await?;
         let (database_now, lease_expires_at) = self
             .database_clock_with_deadline(&mut tx, self.lease.ttl().as_secs(), "idempotency claim")
             .await?;
         let database_timestamp = parse_timestamp("PostgreSQL idempotency clock", &database_now)?;
 
-        if prune_batch > 0 {
+        if limits.prune_batch > 0 {
             let sql = format!(
                 "DELETE FROM {table} WHERE key_hash IN (\
                      SELECT key_hash FROM {table} \
@@ -1696,7 +2235,7 @@ impl StateStore for PostgresStore {
             );
             sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(&database_now)
-                .bind(i64::try_from(prune_batch).unwrap_or(i64::MAX))
+                .bind(i64::try_from(limits.prune_batch).unwrap_or(i64::MAX))
                 .execute(&mut *tx)
                 .await
                 .map_err(|error| {
@@ -1732,7 +2271,9 @@ impl StateStore for PostgresStore {
                         ))
                     })?;
             } else {
-                let outcome = if record.request_fingerprint != claim.request_fingerprint {
+                let outcome = if record.principal_id != claim.principal_id
+                    || record.request_fingerprint != claim.request_fingerprint
+                {
                     IdempotencyClaimOutcome::Conflict
                 } else if record.state == IdempotencyState::Indeterminate {
                     IdempotencyClaimOutcome::Indeterminate(record)
@@ -1839,7 +2380,7 @@ impl StateStore for PostgresStore {
             }
 
             let hazard_sql = format!(
-                "SELECT key_hash, completed_at FROM {} \
+                "SELECT key_hash, principal_id, completed_at FROM {} \
                  WHERE exclusive_scope = $1 AND key_hash <> $2 \
                    AND state = 'indeterminate' \
                  ORDER BY completed_at, key_hash LIMIT 2 FOR UPDATE",
@@ -1865,6 +2406,14 @@ impl StateStore for PostgresStore {
                                     "PostgreSQL idempotency hazard key decode failed: {error}"
                                 ))
                             })?;
+                    let principal_id = hazard_rows[0]
+                        .try_get::<String, _>("principal_id")
+                        .map(PrincipalId::from_digest)
+                        .map_err(|error| {
+                            IronCrewError::Validation(format!(
+                                "PostgreSQL idempotency hazard principal decode failed: {error}"
+                            ))
+                        })??;
                     let completed_at = hazard_rows[0]
                         .try_get::<Option<String>, _>("completed_at")
                         .map_err(|error| {
@@ -1872,7 +2421,7 @@ impl StateStore for PostgresStore {
                                 "PostgreSQL idempotency hazard timestamp decode failed: {error}"
                             ))
                         })?;
-                    Some((key_hash, completed_at))
+                    Some((key_hash, principal_id, completed_at))
                 } else {
                     None
                 };
@@ -1883,15 +2432,16 @@ impl StateStore for PostgresStore {
                 })?;
                 let grace_elapsed = hazard
                     .as_ref()
-                    .and_then(|(_, completed_at)| completed_at.as_deref())
+                    .and_then(|(_, _, completed_at)| completed_at.as_deref())
                     .map(|completed_at| {
                         parse_timestamp("stored idempotency hazard completion", completed_at)
                     })
                     .transpose()?
                     .and_then(|completed_at| completed_at.checked_add_signed(grace))
                     .is_some_and(|recovery_at| recovery_at <= database_timestamp);
-                let recoverable = hazard.as_ref().is_some_and(|(key_hash, _)| {
-                    claim.recovery_key_hash.as_deref() == Some(key_hash.as_str())
+                let recoverable = hazard.as_ref().is_some_and(|(key_hash, principal_id, _)| {
+                    principal_id == &claim.principal_id
+                        && claim.recovery_key_hash.as_deref() == Some(key_hash.as_str())
                 }) && grace_elapsed;
                 if !recoverable {
                     tx.commit().await.map_err(|error| {
@@ -1904,45 +2454,53 @@ impl StateStore for PostgresStore {
                 let recovery_key_hash = claim.recovery_key_hash.as_deref().ok_or_else(|| {
                     IronCrewError::Validation("Missing idempotency recovery key".into())
                 })?;
-                let clear_sql = format!(
-                    "UPDATE {} SET exclusive_scope = NULL \
-                     WHERE key_hash = $1 AND exclusive_scope = $2 \
-                       AND state = 'indeterminate'",
-                    self.idempotency_table
-                );
-                let cleared = sqlx::query(sqlx::AssertSqlSafe(clear_sql))
-                    .bind(recovery_key_hash)
-                    .bind(exclusive_scope)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|error| {
-                        IronCrewError::Validation(format!(
-                            "PostgreSQL idempotency hazard recovery failed: {error}"
-                        ))
-                    })?;
-                if cleared.rows_affected() != 1 {
-                    return Err(IronCrewError::Conflict(
-                        "Idempotency recovery hazard changed during claim".into(),
-                    ));
-                }
+                // Keep the locked hazard bound until every quota check has
+                // passed. A quota-denied transaction is committed so bounded
+                // pruning/accounting can progress; clearing here would make
+                // that commit consume the recovery capability without
+                // inserting its successor.
+                recovery_hazard_key = Some(recovery_key_hash.to_string());
             }
         }
 
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {}",
-            self.idempotency_table
-        )))
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL idempotency capacity check failed: {error}"
+        let (global_usage, principal_usage) = self
+            .idempotency_accounting_for_update(&mut tx, &claim.principal_id)
+            .await?;
+        let quota = if global_usage.records >= limits.global_max_records {
+            Some((
+                IdempotencyQuotaScope::Global,
+                IdempotencyQuotaResource::Records,
+                None,
             ))
-        })?;
-        if usize::try_from(count).unwrap_or(usize::MAX) >= max_records {
-            return Err(IronCrewError::Validation(format!(
-                "Idempotency record capacity ({max_records}) is exhausted; retry after retained records expire"
-            )));
+        } else if principal_usage.records >= limits.principal_max_records {
+            Some((
+                IdempotencyQuotaScope::Principal,
+                IdempotencyQuotaResource::Records,
+                Some(&claim.principal_id),
+            ))
+        } else if principal_usage.in_flight >= limits.principal_max_in_flight {
+            Some((
+                IdempotencyQuotaScope::Principal,
+                IdempotencyQuotaResource::InFlight,
+                Some(&claim.principal_id),
+            ))
+        } else {
+            None
+        };
+        if let Some((scope, resource, retry_principal)) = quota {
+            let retry_after_seconds = self
+                .idempotency_retry_after_seconds(&mut tx, retry_principal, resource, &database_now)
+                .await?;
+            tx.commit().await.map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency quota commit failed: {error}"
+                ))
+            })?;
+            return Ok(IdempotencyClaimOutcome::QuotaExceeded {
+                scope,
+                resource,
+                retry_after_seconds,
+            });
         }
 
         let mut record = claim.to_record();
@@ -1950,26 +2508,44 @@ impl StateStore for PostgresStore {
         record.created_at = database_now.clone();
         record.updated_at = database_now;
         if let Some(response_body) = record.response_body.as_ref() {
-            let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT FROM {}",
-                self.idempotency_table
-            )))
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL idempotency claim response capacity check failed: {error}"
-                ))
-            })?;
-            let response_fits = usize::try_from(retained_bytes)
-                .ok()
-                .and_then(|retained| retained.checked_add(response_body.len()))
-                .is_some_and(|total| total <= claim.max_total_response_bytes);
+            let response_fits = global_usage
+                .response_bytes
+                .checked_add(response_body.len())
+                .is_some_and(|total| total <= limits.global_max_response_bytes)
+                && principal_usage
+                    .response_bytes
+                    .checked_add(response_body.len())
+                    .is_some_and(|total| total <= limits.principal_max_response_bytes);
             if !response_fits {
                 record.response_body = None;
             }
         }
         record.validate()?;
+        if let Some(hazard_key) = recovery_hazard_key.as_deref() {
+            let clear_sql = format!(
+                "UPDATE {} SET exclusive_scope = NULL, updated_at = $1 \
+                 WHERE key_hash = $2 AND exclusive_scope = $3 \
+                   AND principal_id = $4 AND state = 'indeterminate'",
+                self.idempotency_table
+            );
+            let cleared = sqlx::query(sqlx::AssertSqlSafe(clear_sql))
+                .bind(&record.created_at)
+                .bind(hazard_key)
+                .bind(record.exclusive_scope.as_deref())
+                .bind(record.principal_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL idempotency hazard recovery failed: {error}"
+                    ))
+                })?;
+            if cleared.rows_affected() != 1 {
+                return Err(IronCrewError::Conflict(
+                    "Idempotency recovery hazard changed before claim insertion".into(),
+                ));
+            }
+        }
         let base_revision = record
             .base_revision
             .map(i64::try_from)
@@ -1981,13 +2557,14 @@ impl StateStore for PostgresStore {
             })?;
         let sql = format!(
             "INSERT INTO {} ({IDEMPOTENCY_COLUMNS}) VALUES (\
-                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'claimed', \
-                 $10, $11, $12, $13, $13, NULL, NULL, $14\
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'claimed', \
+                 $11, $12, $13, $14, $14, NULL, NULL, $15\
              )",
             self.idempotency_table
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&record.key_hash)
+            .bind(record.principal_id.as_str())
             .bind(&record.request_fingerprint)
             .bind(&record.operation)
             .bind(&record.scope)
@@ -2036,7 +2613,7 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotency heartbeat transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_key(&mut tx, key_hash).await?;
         let (database_now, database_deadline) = self
             .database_clock_with_deadline(
                 &mut tx,
@@ -2113,7 +2690,10 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotent run heartbeat transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_run_fence(&mut tx, true).await?;
+        self.lock_resource(&mut tx, RUN_OPERATION, "", run_id)
+            .await?;
+        self.lock_idempotency_key(&mut tx, key_hash).await?;
         let (database_now, database_deadline) = self
             .database_clock_with_deadline(
                 &mut tx,
@@ -2297,25 +2877,31 @@ impl StateStore for PostgresStore {
         Ok(RunFenceHeartbeat::Owned)
     }
 
-    async fn complete_idempotency(
+    async fn complete_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyCompletionOutcome> {
         completion.validate()?;
+        limits.validate()?;
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!(
                 "PostgreSQL idempotency completion transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_idempotency_principal(&mut tx, &completion.principal_id)
+            .await?;
+        self.lock_idempotency_key(&mut tx, &completion.key_hash)
+            .await?;
         let record = self
             .get_idempotency_in_transaction(&mut tx, &completion.key_hash)
             .await?
             .ok_or_else(|| {
                 IronCrewError::Validation("Idempotency claim not found during completion".into())
             })?;
-        if record.request_fingerprint != completion.request_fingerprint
+        if record.principal_id != completion.principal_id
+            || record.request_fingerprint != completion.request_fingerprint
             || record.attempt_id != completion.attempt_id
             || record.owner_instance_id != completion.owner_instance_id
         {
@@ -2345,24 +2931,33 @@ impl StateStore for PostgresStore {
             .database_clock_with_deadline(&mut tx, record.ttl_seconds, "idempotency completion")
             .await?;
 
-        let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
-             FROM {} WHERE key_hash <> $1",
-            self.idempotency_table
-        )))
-        .bind(&completion.key_hash)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL idempotency response capacity check failed: {error}"
-            ))
-        })?;
+        let (global_usage, principal_usage) = self
+            .idempotency_accounting_for_update(&mut tx, &completion.principal_id)
+            .await?;
+        let old_response_bytes = record.response_body.as_ref().map_or(0, String::len);
+        let global_without_record = global_usage
+            .response_bytes
+            .checked_sub(old_response_bytes)
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL global idempotency response accounting is inconsistent".into(),
+                )
+            })?;
+        let principal_without_record = principal_usage
+            .response_bytes
+            .checked_sub(old_response_bytes)
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL principal idempotency response accounting is inconsistent".into(),
+                )
+            })?;
         let response_body = completion.response_body.as_ref().filter(|body| {
-            usize::try_from(retained_bytes)
-                .unwrap_or(usize::MAX)
-                .saturating_add(body.len())
-                <= max_total_response_bytes
+            global_without_record
+                .checked_add(body.len())
+                .is_some_and(|total| total <= limits.global_max_response_bytes)
+                && principal_without_record
+                    .checked_add(body.len())
+                    .is_some_and(|total| total <= limits.principal_max_response_bytes)
         });
         let sql = format!(
             "UPDATE {} SET state = 'completed', response_status = $1, \
@@ -2406,13 +3001,14 @@ impl StateStore for PostgresStore {
         })
     }
 
-    async fn commit_conversation_idempotency(
+    async fn commit_conversation_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
         conversation: &ConversationRecord,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<ConversationIdempotencyCommit> {
         completion.validate()?;
+        limits.validate()?;
         let messages_json = serde_json::to_string(&conversation.messages).map_err(|error| {
             IronCrewError::Validation(format!(
                 "Failed to serialize idempotent conversation messages: {error}"
@@ -2426,7 +3022,18 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotent conversation transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_idempotency_principal(&mut tx, &completion.principal_id)
+            .await?;
+        self.lock_resource(
+            &mut tx,
+            CONVERSATION_MESSAGE_OPERATION,
+            conversation.flow_path.as_deref().unwrap_or(""),
+            &conversation.id,
+        )
+        .await?;
+        self.lock_idempotency_key(&mut tx, &completion.key_hash)
+            .await?;
         let record = self
             .get_idempotency_in_transaction(&mut tx, &completion.key_hash)
             .await?
@@ -2435,7 +3042,8 @@ impl StateStore for PostgresStore {
                     "Idempotency claim not found during conversation commit".into(),
                 )
             })?;
-        if record.request_fingerprint != completion.request_fingerprint
+        if record.principal_id != completion.principal_id
+            || record.request_fingerprint != completion.request_fingerprint
             || record.attempt_id != completion.attempt_id
             || record.owner_instance_id != completion.owner_instance_id
         {
@@ -2562,24 +3170,33 @@ impl StateStore for PostgresStore {
             ))
         })?;
 
-        let retained_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COALESCE(SUM(octet_length(response_body)), 0)::BIGINT \
-             FROM {} WHERE key_hash <> $1",
-            self.idempotency_table
-        )))
-        .bind(&completion.key_hash)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL idempotency response capacity check failed: {error}"
-            ))
-        })?;
+        let (global_usage, principal_usage) = self
+            .idempotency_accounting_for_update(&mut tx, &completion.principal_id)
+            .await?;
+        let old_response_bytes = record.response_body.as_ref().map_or(0, String::len);
+        let global_without_record = global_usage
+            .response_bytes
+            .checked_sub(old_response_bytes)
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL global idempotency response accounting is inconsistent".into(),
+                )
+            })?;
+        let principal_without_record = principal_usage
+            .response_bytes
+            .checked_sub(old_response_bytes)
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL principal idempotency response accounting is inconsistent".into(),
+                )
+            })?;
         let response_body = completion.response_body.as_ref().filter(|body| {
-            usize::try_from(retained_bytes)
-                .unwrap_or(usize::MAX)
-                .saturating_add(body.len())
-                <= max_total_response_bytes
+            global_without_record
+                .checked_add(body.len())
+                .is_some_and(|total| total <= limits.global_max_response_bytes)
+                && principal_without_record
+                    .checked_add(body.len())
+                    .is_some_and(|total| total <= limits.principal_max_response_bytes)
         });
         let update_idempotency = format!(
             "UPDATE {} SET state = 'completed', response_status = $1, \
@@ -2635,18 +3252,29 @@ impl StateStore for PostgresStore {
         validate_digest("idempotency key hash", key_hash)?;
         parse_timestamp("idempotency completion time", completed_at)?;
         parse_timestamp("idempotency retention expiry", expires_at)?;
+        let Some(principal_id) = self.idempotency_principal_for_key(key_hash).await? else {
+            return Ok(false);
+        };
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!(
                 "PostgreSQL idempotency indeterminate transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_idempotency_principal(&mut tx, &principal_id)
+            .await?;
+        self.lock_idempotency_key(&mut tx, key_hash).await?;
         let Some(record) = self
             .get_idempotency_in_transaction(&mut tx, key_hash)
             .await?
         else {
             return Ok(false);
         };
+        if record.principal_id != principal_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency principal changed before indeterminate transition".into(),
+            ));
+        }
         if record.attempt_id != attempt_id {
             return Err(IronCrewError::Conflict(
                 "Idempotency attempt changed before indeterminate transition".into(),
@@ -2692,18 +3320,29 @@ impl StateStore for PostgresStore {
 
     async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool> {
         validate_digest("idempotency key hash", key_hash)?;
+        let Some(principal_id) = self.idempotency_principal_for_key(key_hash).await? else {
+            return Ok(false);
+        };
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!(
                 "PostgreSQL idempotency release transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
+        self.lock_idempotency_principal(&mut tx, &principal_id)
+            .await?;
+        self.lock_idempotency_key(&mut tx, key_hash).await?;
         let Some(record) = self
             .get_idempotency_in_transaction(&mut tx, key_hash)
             .await?
         else {
             return Ok(false);
         };
+        if record.principal_id != principal_id {
+            return Err(IronCrewError::Conflict(
+                "Idempotency principal changed before release".into(),
+            ));
+        }
         if record.attempt_id != attempt_id {
             return Err(IronCrewError::Conflict(
                 "Idempotency attempt changed before release".into(),
@@ -2743,7 +3382,7 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotency prune transaction failed: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_idempotency_quota(&mut tx).await?;
         let (database_now, _) = self
             .database_clock_with_deadline(&mut tx, 0, "idempotency pruning")
             .await?;
@@ -2773,6 +3412,89 @@ impl StateStore for PostgresStore {
         Ok(result.rows_affected() as usize)
     }
 
+    async fn idempotency_usage(
+        &self,
+        principal_id: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage> {
+        principal_id.validate()?;
+        limits.validate()?;
+        let threshold = |limit: usize, percentage: usize| {
+            i64::try_from(limit.saturating_mul(percentage).div_ceil(100).max(1)).unwrap_or(i64::MAX)
+        };
+        let sql = format!(
+            "SELECT \
+                 global.record_count AS global_records, \
+                 global.in_flight_count AS global_in_flight, \
+                 global.response_bytes AS global_response_bytes, \
+                 COALESCE(principal.record_count, 0) AS principal_records, \
+                 COALESCE(principal.in_flight_count, 0) AS principal_in_flight, \
+                 COALESCE(principal.response_bytes, 0) AS principal_response_bytes, \
+                 stats.principal_count, stats.max_principal_records, \
+                 stats.max_principal_in_flight, stats.max_principal_response_bytes, \
+                 stats.at_80, stats.at_90, stats.at_100 \
+             FROM {accounting} AS global \
+             LEFT JOIN {accounting} AS principal \
+               ON principal.principal_id = $1 AND principal.is_global = FALSE \
+             CROSS JOIN LATERAL (\
+                 SELECT COUNT(*)::BIGINT AS principal_count, \
+                        COALESCE(MAX(record_count), 0)::BIGINT AS max_principal_records, \
+                        COALESCE(MAX(in_flight_count), 0)::BIGINT AS max_principal_in_flight, \
+                        COALESCE(MAX(response_bytes), 0)::BIGINT AS max_principal_response_bytes, \
+                        COUNT(*) FILTER (WHERE record_count >= $2 OR in_flight_count >= $3 \
+                                                OR response_bytes >= $4)::BIGINT AS at_80, \
+                        COUNT(*) FILTER (WHERE record_count >= $5 OR in_flight_count >= $6 \
+                                                OR response_bytes >= $7)::BIGINT AS at_90, \
+                        COUNT(*) FILTER (WHERE record_count >= $8 OR in_flight_count >= $9 \
+                                                OR response_bytes >= $10)::BIGINT AS at_100 \
+                 FROM {accounting} WHERE is_global = FALSE\
+             ) AS stats \
+             WHERE global.principal_id = 'global' AND global.is_global = TRUE",
+            accounting = self.idempotency_accounting_table
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(principal_id.as_str())
+            .bind(threshold(limits.principal_max_records, 80))
+            .bind(threshold(limits.principal_max_in_flight, 80))
+            .bind(threshold(limits.principal_max_response_bytes, 80))
+            .bind(threshold(limits.principal_max_records, 90))
+            .bind(threshold(limits.principal_max_in_flight, 90))
+            .bind(threshold(limits.principal_max_response_bytes, 90))
+            .bind(threshold(limits.principal_max_records, 100))
+            .bind(threshold(limits.principal_max_in_flight, 100))
+            .bind(threshold(limits.principal_max_response_bytes, 100))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL idempotency usage query failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                IronCrewError::Validation(
+                    "PostgreSQL global idempotency accounting row is missing".into(),
+                )
+            })?;
+        Ok(IdempotencyUsage {
+            global_records: accounting_row_value(&row, "global_records")?,
+            global_in_flight: accounting_row_value(&row, "global_in_flight")?,
+            global_response_bytes: accounting_row_value(&row, "global_response_bytes")?,
+            principal_records: accounting_row_value(&row, "principal_records")?,
+            principal_in_flight: accounting_row_value(&row, "principal_in_flight")?,
+            principal_response_bytes: accounting_row_value(&row, "principal_response_bytes")?,
+            principal_count: accounting_row_value(&row, "principal_count")?,
+            max_principal_records: accounting_row_value(&row, "max_principal_records")?,
+            max_principal_in_flight: accounting_row_value(&row, "max_principal_in_flight")?,
+            max_principal_response_bytes: accounting_row_value(
+                &row,
+                "max_principal_response_bytes",
+            )?,
+            principals_at_or_above_80_percent: accounting_row_value(&row, "at_80")?,
+            principals_at_or_above_90_percent: accounting_row_value(&row, "at_90")?,
+            principals_at_or_above_100_percent: accounting_row_value(&row, "at_100")?,
+        })
+    }
+
     // ─── Persistent sessions ────────────────────────────────────────────────
 
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
@@ -2787,7 +3509,13 @@ impl StateStore for PostgresStore {
                 "PostgreSQL save_conversation transaction error: {e}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_resource(
+            &mut tx,
+            CONVERSATION_MESSAGE_OPERATION,
+            record.flow_path.as_deref().unwrap_or(""),
+            &record.id,
+        )
+        .await?;
         let guard_sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {} \
              WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
@@ -2953,7 +3681,13 @@ impl StateStore for PostgresStore {
                 "PostgreSQL delete_conversation transaction error: {error}"
             ))
         })?;
-        self.lock_idempotency_table(&mut tx).await?;
+        self.lock_resource(
+            &mut tx,
+            CONVERSATION_MESSAGE_OPERATION,
+            flow_path.unwrap_or(""),
+            id,
+        )
+        .await?;
         let guard_sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {} \
              WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
@@ -3493,6 +4227,29 @@ fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
     })
 }
 
+fn nonnegative_accounting_value(label: &str, value: i64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        IronCrewError::Validation(format!(
+            "PostgreSQL idempotency accounting value '{label}' is negative or out of range"
+        ))
+    })
+}
+
+fn decode_idempotency_accounting(values: (i64, i64, i64)) -> Result<IdempotencyAccounting> {
+    Ok(IdempotencyAccounting {
+        records: nonnegative_accounting_value("record_count", values.0)?,
+        in_flight: nonnegative_accounting_value("in_flight_count", values.1)?,
+        response_bytes: nonnegative_accounting_value("response_bytes", values.2)?,
+    })
+}
+
+fn accounting_row_value(row: &sqlx::postgres::PgRow, column: &str) -> Result<usize> {
+    let value = row
+        .try_get::<i64, _>(column)
+        .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
+    nonnegative_accounting_value(column, value)
+}
+
 fn row_to_idempotency_record(row: &sqlx::postgres::PgRow) -> Result<IdempotencyRecord> {
     let base_revision = row
         .try_get::<Option<i64>, _>("base_revision")
@@ -3556,6 +4313,10 @@ fn row_to_idempotency_record(row: &sqlx::postgres::PgRow) -> Result<IdempotencyR
         key_hash: row
             .try_get("key_hash")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        principal_id: PrincipalId::from_digest(
+            row.try_get("principal_id")
+                .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
+        )?,
         request_fingerprint: row
             .try_get("request_fingerprint")
             .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,

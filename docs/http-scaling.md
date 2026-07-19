@@ -31,6 +31,7 @@ Related knobs:
 | Variable | Default | Purpose |
 |---|---|---|
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max live chat sessions kept in memory |
+| `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | `256` | Max distinct conversation IDs with an in-flight lifecycle operation (hard ceiling `4096`) |
 | `IRONCREW_CHAT_SESSION_IDLE_SECS` | `1800` | Idle time before a chat handle is evicted |
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Max retained conversation messages |
 | `IRONCREW_API_MESSAGE_MAX_BYTES` | `262144` | Max bytes in one HTTP chat message |
@@ -45,13 +46,14 @@ Related knobs:
 
 ## What actually consumes memory
 
-For HTTP traffic, memory pressure usually comes from five places:
+For HTTP traffic, memory pressure usually comes from six places:
 
 1. Active chat sessions
 2. SSE replay buffers
 3. Large tool/model outputs held in memory
 4. Concurrent in-flight requests
 5. Temporary idempotency-response serialization buffers
+6. Per-conversation lifecycle gates
 
 ### Active chat sessions
 
@@ -86,6 +88,22 @@ sensitive, lower the relevant caps from the cloud defaults.
 `IRONCREW_MAX_ACTIVE_CONVERSATIONS` does not limit simultaneous LLM calls. Ten
 active sessions can still overload CPU or provider quotas if all ten send
 messages at once. Treat residency and concurrency as separate control planes.
+
+### Lifecycle gate registry
+
+Start, message, delete, and idle-eviction operations use a process-local gate
+per `(flow, conversation ID)` so delete/recreate and message races have a clear
+order. The registry retains only keys with a currently owned operation and
+removes the exact key when its final owner exits; lookup and cleanup do not scan
+all prior IDs.
+
+`IRONCREW_MAX_CONVERSATION_LIFECYCLES` bounds the number of distinct keys that
+can be owned concurrently (default `256`, hard ceiling `4096`). At saturation,
+a request for a new distinct key receives `503`; operations already sharing an
+existing key retain their normal serialization and `409` fail-fast behavior.
+Set this above expected legitimate concurrent conversation mutations but below
+the ingress concurrency budget. It is independent of the live-session residency
+cap and does not coordinate gates across pods.
 
 ### Idempotency response buffers
 
@@ -220,6 +238,8 @@ Keep these separate:
 
 - `IRONCREW_MAX_ACTIVE_CONVERSATIONS` controls how many live chat sessions stay
   in memory
+- `IRONCREW_MAX_CONVERSATION_LIFECYCLES` bounds distinct conversation keys with
+  an operation currently in flight
 - `IRONCREW_DEFAULT_MAX_CONCURRENT` controls task parallelism inside crew runs
 - provider-side rate limits still apply independently
 - request bursts can saturate CPU even if session count is low

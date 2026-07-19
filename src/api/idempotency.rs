@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::utils::error::{IronCrewError, Result};
 
-use crate::engine::idempotency::RunFenceHeartbeat;
+use crate::engine::idempotency::{IdempotencyLimits, PrincipalId, RunFenceHeartbeat};
 use crate::engine::store::StateStore;
 
 pub const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
@@ -229,9 +229,12 @@ pub struct IdempotencyConfig {
     pub require_key: bool,
     pub ttl_seconds: u64,
     pub max_records: usize,
+    pub max_records_per_principal: usize,
+    pub max_in_flight_per_principal: usize,
     pub prune_batch: usize,
     pub max_response_bytes: usize,
     pub max_total_response_bytes: usize,
+    pub max_total_response_bytes_per_principal: usize,
 }
 
 impl IdempotencyConfig {
@@ -256,14 +259,33 @@ impl IdempotencyConfig {
             )));
         }
 
-        Ok(Self {
+        let max_records = bounded_env_usize(
+            "IRONCREW_IDEMPOTENCY_MAX_RECORDS",
+            DEFAULT_MAX_RECORDS,
+            1,
+            HARD_MAX_RECORDS,
+        )?;
+        let max_total_response_bytes = bounded_env_usize(
+            "IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES",
+            DEFAULT_MAX_TOTAL_RESPONSE_BYTES,
+            1,
+            HARD_MAX_TOTAL_RESPONSE_BYTES,
+        )?;
+        let config = Self {
             require_key,
             ttl_seconds: configured_ttl,
-            max_records: bounded_env_usize(
-                "IRONCREW_IDEMPOTENCY_MAX_RECORDS",
-                DEFAULT_MAX_RECORDS,
+            max_records,
+            max_records_per_principal: bounded_env_usize(
+                "IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL",
+                max_records,
                 1,
-                HARD_MAX_RECORDS,
+                max_records,
+            )?,
+            max_in_flight_per_principal: bounded_env_usize(
+                "IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL",
+                max_records.min(64),
+                1,
+                max_records,
             )?,
             prune_batch: bounded_env_usize(
                 "IRONCREW_IDEMPOTENCY_PRUNE_BATCH",
@@ -277,13 +299,16 @@ impl IdempotencyConfig {
                 1,
                 HARD_MAX_RESPONSE_BYTES,
             )?,
-            max_total_response_bytes: bounded_env_usize(
-                "IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES",
-                DEFAULT_MAX_TOTAL_RESPONSE_BYTES,
+            max_total_response_bytes,
+            max_total_response_bytes_per_principal: bounded_env_usize(
+                "IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL",
+                max_total_response_bytes,
                 1,
-                HARD_MAX_TOTAL_RESPONSE_BYTES,
+                max_total_response_bytes,
             )?,
-        })
+        };
+        config.limits().validate()?;
+        Ok(config)
     }
 
     pub fn retention_expiry(&self, completed_at: chrono::DateTime<chrono::Utc>) -> String {
@@ -291,6 +316,17 @@ impl IdempotencyConfig {
             .checked_add_signed(chrono::Duration::seconds(self.ttl_seconds as i64))
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
             .to_rfc3339()
+    }
+
+    pub fn limits(&self) -> IdempotencyLimits {
+        IdempotencyLimits {
+            global_max_records: self.max_records,
+            principal_max_records: self.max_records_per_principal,
+            principal_max_in_flight: self.max_in_flight_per_principal,
+            global_max_response_bytes: self.max_total_response_bytes,
+            principal_max_response_bytes: self.max_total_response_bytes_per_principal,
+            prune_batch: self.prune_batch,
+        }
     }
 }
 
@@ -300,9 +336,12 @@ impl Default for IdempotencyConfig {
             require_key: false,
             ttl_seconds: DEFAULT_TTL_SECONDS,
             max_records: DEFAULT_MAX_RECORDS,
+            max_records_per_principal: DEFAULT_MAX_RECORDS,
+            max_in_flight_per_principal: 64,
             prune_batch: DEFAULT_PRUNE_BATCH,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_total_response_bytes: DEFAULT_MAX_TOTAL_RESPONSE_BYTES,
+            max_total_response_bytes_per_principal: DEFAULT_MAX_TOTAL_RESPONSE_BYTES,
         }
     }
 }
@@ -315,21 +354,27 @@ pub struct RequestKey {
 /// Parse exactly zero or one idempotency-key header. Only visible non-space
 /// ASCII is accepted so proxies and databases cannot disagree about the key.
 /// The returned value contains the SHA-256 digest only.
-pub fn request_key(headers: &HeaderMap, required: bool) -> Result<Option<RequestKey>> {
+pub fn request_key(
+    headers: &HeaderMap,
+    required: bool,
+    principal_id: &PrincipalId,
+) -> Result<Option<RequestKey>> {
     parse_key_header(
         headers,
         &IDEMPOTENCY_KEY_HEADER,
         "Idempotency-Key",
         required,
+        principal_id,
     )
 }
 
-pub fn recovery_key(headers: &HeaderMap) -> Result<Option<RequestKey>> {
+pub fn recovery_key(headers: &HeaderMap, principal_id: &PrincipalId) -> Result<Option<RequestKey>> {
     parse_key_header(
         headers,
         &IDEMPOTENCY_RECOVERY_KEY_HEADER,
         "Idempotency-Recovery-Key",
         false,
+        principal_id,
     )
 }
 
@@ -338,6 +383,7 @@ fn parse_key_header(
     header: &HeaderName,
     label: &str,
     required: bool,
+    principal_id: &PrincipalId,
 ) -> Result<Option<RequestKey>> {
     let mut values = headers.get_all(header).iter();
     let Some(value) = values.next() else {
@@ -360,9 +406,18 @@ fn parse_key_header(
             "{label} must be 1-128 visible ASCII bytes without whitespace"
         )));
     }
-    Ok(Some(RequestKey {
-        key_hash: hex_digest(bytes),
-    }))
+    // Legacy/anonymous deployments retain the original digest so an upgrade
+    // cannot accidentally re-execute an existing key. Explicit named
+    // principals receive separate namespaces and may safely reuse client keys.
+    let key_hash = if principal_id == &PrincipalId::legacy() {
+        hex_digest(bytes)
+    } else {
+        let mut encoder = FingerprintEncoder::new(b"ironcrew:idempotency-key:v2");
+        encoder.field(principal_id.as_str().as_bytes());
+        encoder.field(bytes);
+        encoder.finish()
+    };
+    Ok(Some(RequestKey { key_hash }))
 }
 
 pub fn replay_headers() -> HeaderMap {
@@ -583,35 +638,37 @@ mod tests {
 
     #[test]
     fn request_key_is_hashed_and_malformed_or_multiple_values_fail() {
+        let principal = PrincipalId::legacy();
         let mut headers = HeaderMap::new();
         headers.insert(
             IDEMPOTENCY_KEY_HEADER,
             HeaderValue::from_static("client-key-1"),
         );
-        let parsed = request_key(&headers, true).unwrap().unwrap();
+        let parsed = request_key(&headers, true, &principal).unwrap().unwrap();
         assert_eq!(parsed.key_hash.len(), 64);
         assert!(!parsed.key_hash.contains("client-key-1"));
 
         headers.append(IDEMPOTENCY_KEY_HEADER, HeaderValue::from_static("second"));
-        assert!(request_key(&headers, false).is_err());
+        assert!(request_key(&headers, false, &principal).is_err());
 
         let mut headers = HeaderMap::new();
         headers.insert(
             IDEMPOTENCY_KEY_HEADER,
             HeaderValue::from_static("contains space"),
         );
-        assert!(request_key(&headers, false).is_err());
-        assert!(request_key(&HeaderMap::new(), true).is_err());
+        assert!(request_key(&headers, false, &principal).is_err());
+        assert!(request_key(&HeaderMap::new(), true, &principal).is_err());
     }
 
     #[test]
     fn recovery_key_uses_the_same_secret_safe_validation() {
+        let principal = PrincipalId::legacy();
         let mut headers = HeaderMap::new();
         headers.insert(
             IDEMPOTENCY_RECOVERY_KEY_HEADER,
             HeaderValue::from_static("prior-message-key"),
         );
-        let parsed = recovery_key(&headers).unwrap().unwrap();
+        let parsed = recovery_key(&headers, &principal).unwrap().unwrap();
         assert_eq!(parsed.key_hash.len(), 64);
         assert!(!parsed.key_hash.contains("prior-message-key"));
 
@@ -619,7 +676,7 @@ mod tests {
             IDEMPOTENCY_RECOVERY_KEY_HEADER,
             HeaderValue::from_static("duplicate"),
         );
-        assert!(recovery_key(&headers).is_err());
+        assert!(recovery_key(&headers, &principal).is_err());
     }
 
     #[test]
