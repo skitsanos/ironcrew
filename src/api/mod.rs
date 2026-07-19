@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod audit;
 pub mod auth;
 pub mod conversations;
@@ -54,6 +55,11 @@ pub type ActiveConversationsMap =
 /// Shared application state
 pub struct AppState {
     pub flows_dir: PathBuf,
+    /// Immutable authentication policy parsed once at startup. Successful
+    /// protected requests receive a trusted `auth::Principal` extension.
+    pub auth: Arc<auth::AuthConfig>,
+    /// Principal-aware process admission and low-cardinality metrics.
+    pub admission: Arc<admission::AdmissionController>,
     /// Cleared as soon as graceful shutdown begins so readiness fails before
     /// active work is cancelled and drained.
     pub accepting_traffic: AtomicBool,
@@ -209,7 +215,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(health))
         .route("/health/ready", get(readiness));
 
-    // Protected routes (auth required when IRONCREW_API_TOKEN is set)
+    // Protected routes (auth required when either token source is configured).
+    // Authentication is the outer layer: admission sees only server-issued
+    // principal extensions, never X-Audit-Actor or source-IP guesses.
     let protected = Router::new()
         .route("/flows/{flow}/run", post(run_flow))
         .route("/flows/{flow}/abort/{run_id}", post(abort_run))
@@ -248,8 +256,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             delete(conversations::delete_conversation),
         )
         .route("/audit", get(handlers::list_audit))
+        .route("/metrics", get(admission::metrics))
         .route("/nodes", get(list_nodes))
-        .layer(axum::middleware::from_fn(auth::bearer_auth));
+        .layer(axum::middleware::from_fn_with_state(
+            state.admission.clone(),
+            admission::enforce_mutation_admission,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::bearer_auth,
+        ));
 
     public.merge(protected).with_state(state)
 }

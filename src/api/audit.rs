@@ -123,7 +123,8 @@ mod tests {
     use crate::engine::audit::{AuditEvent, AuditFilter};
     use crate::engine::idempotency::{
         ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
-        IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLookup,
+        IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
+        IdempotencyUsage, PrincipalId,
     };
     use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary, RunTransition};
     use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
@@ -208,14 +209,19 @@ mod tests {
         async fn delete_run(&self, _: &str) -> Result<()> {
             unimplemented!()
         }
-        async fn lookup_idempotency(&self, _: &str, _: &str, _: &str) -> Result<IdempotencyLookup> {
+        async fn lookup_idempotency_for_principal(
+            &self,
+            _: &PrincipalId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<IdempotencyLookup> {
             Ok(IdempotencyLookup::Miss)
         }
-        async fn claim_idempotency(
+        async fn claim_idempotency_with_limits(
             &self,
             _: IdempotencyClaim,
-            _: usize,
-            _: usize,
+            _: IdempotencyLimits,
         ) -> Result<IdempotencyClaimOutcome> {
             Err(IronCrewError::Validation("not supported".into()))
         }
@@ -231,18 +237,18 @@ mod tests {
         ) -> Result<crate::engine::idempotency::RunFenceHeartbeat> {
             Ok(crate::engine::idempotency::RunFenceHeartbeat::Lost)
         }
-        async fn complete_idempotency(
+        async fn complete_idempotency_with_limits(
             &self,
             _: IdempotencyCompletion,
-            _: usize,
+            _: IdempotencyLimits,
         ) -> Result<IdempotencyCompletionOutcome> {
             Err(IronCrewError::Validation("not supported".into()))
         }
-        async fn commit_conversation_idempotency(
+        async fn commit_conversation_idempotency_with_limits(
             &self,
             _: IdempotencyCompletion,
             _: &ConversationRecord,
-            _: usize,
+            _: IdempotencyLimits,
         ) -> Result<ConversationIdempotencyCommit> {
             Err(IronCrewError::Validation("not supported".into()))
         }
@@ -260,6 +266,13 @@ mod tests {
         }
         async fn prune_idempotency(&self, _: &str, _: usize) -> Result<usize> {
             Ok(0)
+        }
+        async fn idempotency_usage(
+            &self,
+            _: &PrincipalId,
+            _: IdempotencyLimits,
+        ) -> Result<IdempotencyUsage> {
+            Ok(IdempotencyUsage::default())
         }
         async fn save_conversation(&self, _: &ConversationRecord) -> Result<u64> {
             unimplemented!()

@@ -8,6 +8,12 @@
     "numReplicas": 1,
     "healthcheckPath": "/health/ready",
     "healthcheckTimeout": 300,
+    "limitOverride": {
+      "containers": {
+        "cpu": 1,
+        "memoryBytes": 1073741824
+      }
+    },
     "restartPolicyType": "ALWAYS",
     "overlapSeconds": 0,
     "drainingSeconds": 30

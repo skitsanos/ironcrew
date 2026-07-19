@@ -83,8 +83,26 @@ async fn spawn_server_with_idempotency(
 
     let store: Arc<dyn StateStore> =
         Arc::new(JsonFileStore::new(root.join(".ironcrew")).expect("create JSON test store"));
+    // These regressions exercise run/session semaphores and durable
+    // idempotency under synchronized bursts. Give that independent layer a
+    // deliberately roomy admission policy; token-bucket behavior has focused
+    // unit/HTTP coverage in `api::admission` and `api::auth`.
+    let admission = ironcrew::api::admission::AdmissionController::new(
+        ironcrew::api::admission::AdmissionConfig {
+            work: ironcrew::api::admission::RatePolicy {
+                rate_per_minute: 60_000,
+                burst: 10_000,
+            },
+            control: ironcrew::api::admission::RatePolicy {
+                rate_per_minute: 60_000,
+                burst: 10_000,
+            },
+        },
+    );
     let state = Arc::new(AppState {
         flows_dir: root.clone(),
+        auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
+        admission: Arc::new(admission),
         accepting_traffic: AtomicBool::new(true),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),

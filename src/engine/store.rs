@@ -6,7 +6,8 @@ use std::time::Duration;
 use crate::engine::audit::{AuditEvent, AuditFilter};
 use crate::engine::idempotency::{
     ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
-    IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLookup, RunFenceHeartbeat,
+    IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
+    IdempotencyUsage, PrincipalId, RunFenceHeartbeat,
 };
 use crate::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
@@ -190,18 +191,56 @@ pub trait StateStore: Send + Sync {
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 
     // Durable request idempotency.
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
     async fn lookup_idempotency(
         &self,
         key_hash: &str,
         request_fingerprint: &str,
         now: &str,
+    ) -> Result<IdempotencyLookup> {
+        self.lookup_idempotency_for_principal(
+            &PrincipalId::legacy(),
+            key_hash,
+            request_fingerprint,
+            now,
+        )
+        .await
+    }
+
+    async fn lookup_idempotency_for_principal(
+        &self,
+        principal_id: &PrincipalId,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
     ) -> Result<IdempotencyLookup>;
 
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
     async fn claim_idempotency(
         &self,
         claim: IdempotencyClaim,
         max_records: usize,
         prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome> {
+        let max_response_bytes = claim.max_total_response_bytes;
+        self.claim_idempotency_with_limits(
+            claim,
+            IdempotencyLimits {
+                global_max_records: max_records,
+                principal_max_records: max_records,
+                principal_max_in_flight: max_records,
+                global_max_response_bytes: max_response_bytes,
+                principal_max_response_bytes: max_response_bytes,
+                prune_batch,
+            },
+        )
+        .await
+    }
+
+    async fn claim_idempotency_with_limits(
+        &self,
+        claim: IdempotencyClaim,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyClaimOutcome>;
 
     /// Extend an in-flight claim. `true` means this attempt still owns the
@@ -226,17 +265,59 @@ pub trait StateStore: Send + Sync {
         new_lease_expires_at: &str,
     ) -> Result<RunFenceHeartbeat>;
 
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
     async fn complete_idempotency(
         &self,
         completion: IdempotencyCompletion,
         max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome> {
+        self.complete_idempotency_with_limits(
+            completion,
+            IdempotencyLimits {
+                global_max_records: usize::MAX,
+                principal_max_records: usize::MAX,
+                principal_max_in_flight: usize::MAX,
+                global_max_response_bytes: max_total_response_bytes,
+                principal_max_response_bytes: max_total_response_bytes,
+                prune_batch: 1,
+            },
+        )
+        .await
+    }
+
+    async fn complete_idempotency_with_limits(
+        &self,
+        completion: IdempotencyCompletion,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyCompletionOutcome>;
 
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
     async fn commit_conversation_idempotency(
         &self,
         completion: IdempotencyCompletion,
         conversation: &ConversationRecord,
         max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit> {
+        self.commit_conversation_idempotency_with_limits(
+            completion,
+            conversation,
+            IdempotencyLimits {
+                global_max_records: usize::MAX,
+                principal_max_records: usize::MAX,
+                principal_max_in_flight: usize::MAX,
+                global_max_response_bytes: max_total_response_bytes,
+                principal_max_response_bytes: max_total_response_bytes,
+                prune_batch: 1,
+            },
+        )
+        .await
+    }
+
+    async fn commit_conversation_idempotency_with_limits(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        limits: IdempotencyLimits,
     ) -> Result<ConversationIdempotencyCommit>;
 
     async fn mark_idempotency_indeterminate(
@@ -250,6 +331,15 @@ pub trait StateStore: Send + Sync {
     async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool>;
 
     async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize>;
+
+    /// Low-cardinality resource snapshot for the authenticated caller plus
+    /// global/high-water usage. Implementations must never return principal
+    /// identifiers or raw idempotency keys.
+    async fn idempotency_usage(
+        &self,
+        principal_id: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage>;
 
     // ─── Persistent sessions ────────────────────────────────────────────────
 

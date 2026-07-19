@@ -41,9 +41,12 @@ Environment variables control storage:
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require `Idempotency-Key` on run/message mutation endpoints | `false` |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Terminal ledger retention, 60–2592000 seconds; must be at least max run lifetime + 3600 | `86400` |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum retained in-flight and terminal ledger records (hard ceiling 100000) | `10000` |
+| `IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL` | Maximum records charged to one authenticated principal; cannot exceed the global cap | global record cap |
+| `IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL` | Maximum concurrent claimed/in-progress records charged to one principal; cannot exceed its record cap | `min(global record cap, 64)` |
 | `IRONCREW_IDEMPOTENCY_PRUNE_BATCH` | Maximum expired terminal records removed per claim/startup prune (hard ceiling 10000) | `1000` |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | Maximum compact response stored for one key (hard ceiling 64 MiB) | `8388608` (8 MiB) |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | Aggregate stored response-body budget; excess completions retain a non-replayable tombstone (hard ceiling 8 GiB) | `268435456` (256 MiB) |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL` | Aggregate stored response-body budget charged to one principal; cannot exceed the global cap | global response-byte cap |
 | `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum JSON run-record bytes; larger configured values clamp to 128 MiB | `67108864` (64 MiB) |
 | `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON list/count/clean scan; use PostgreSQL above this scale | `10000` (hard ceiling `100000`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` | `20` |
@@ -70,13 +73,19 @@ docker run -e IRONCREW_STORE=sqlite ...
 ## Idempotency ledger
 
 The HTTP run and conversation-message endpoints persist a separate ledger from
-run history and conversation rows. Only SHA-256 key digests, versioned request
-fingerprints, fenced attempt/owner ids, bounded response JSON, leases, and
-retention timestamps are stored. Deleting a run does not delete its ledger
-entry, because doing so would make the same client key executable again during
-the retention window.
+run history and conversation rows. Only SHA-256 key digests, an opaque
+server-derived principal digest, versioned request fingerprints, fenced
+attempt/owner ids, bounded response JSON, leases, and retention timestamps are
+stored. Bearer tokens and raw principal labels are never ledger fields.
+Deleting a run does not delete its ledger entry, because doing so would make
+the same client key executable again during the retention window.
 
-Claims and terminal rows count toward `IRONCREW_IDEMPOTENCY_MAX_RECORDS`.
+Claims and terminal rows count toward `IRONCREW_IDEMPOTENCY_MAX_RECORDS` and
+the authenticated principal's
+`IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL`. In-flight work also consumes
+`IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL`, preventing one caller from
+occupying every executor slot while retained terminal rows remain available to
+other callers.
 Expired terminal rows are pruned in bounded batches at startup and while
 claiming new operations. In-flight rows are never pruned into a reusable key:
 expired message claims become `indeterminate`, while expired run claims are
@@ -102,21 +111,33 @@ starting policy is 4 MiB per response and 64 MiB aggregate:
 IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true
 IRONCREW_IDEMPOTENCY_TTL_SECONDS=86400
 IRONCREW_IDEMPOTENCY_MAX_RECORDS=10000
+IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL=2500
+IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL=16
 IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=4194304
 IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=67108864
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL=16777216
 ```
 
 Size `MAX_RECORDS` from admitted mutation throughput, not only RAM. With a
 24-hour TTL, 10,000 rows permit roughly 0.116 new keyed mutations/second before
-the ledger is full; bursts can exhaust it sooner. The record count and response
-byte caps are global to the store, so production admission/rate limits must
-prevent one principal from consuming the whole budget. Per-principal quotas
-and saturation metrics are a recommended resource-hardening follow-up.
+the ledger is full; bursts can exhaust it sooner. Both global and per-principal
+record/response budgets are enforced atomically. Capacity denial returns `429`
+with `Retry-After`; response-byte exhaustion instead retains a non-replayable
+tombstone so a completed mutation is never executed twice. Protected metrics
+publish aggregate and high-water counts only, never principal digests or raw
+idempotency keys.
 
 Backend guarantees differ:
 
 - PostgreSQL claims and conversation transcript+ledger commits are database
-  transactions and coordinate independent processes.
+  transactions and coordinate independent processes. Transaction-scoped
+  advisory locks are partitioned by quota, opaque principal, resource,
+  exclusive scope, and key, so heartbeats and lookups for unrelated keys do
+  not take a table-wide lock. A trigger incrementally maintains compact global
+  and per-principal record, in-flight, and response-byte counters; ordinary
+  requests do not scan the ledger with `COUNT` or `SUM`. Bootstrap backfills
+  pre-principal rows to the legacy principal and reconciles counters during
+  bootstrap while ledger DDL excludes concurrent writes.
 - SQLite uses `BEGIN IMMEDIATE` transactions and coordinates processes sharing
   the same database file, but it remains a single-host deployment choice.
 - JSON stores one owner-only file per key and uses atomic file replacement plus

@@ -89,7 +89,9 @@ Production deployments should set these at minimum:
 
 | Variable | Recommended | Why |
 |---|---|---|
-| `IRONCREW_API_TOKEN` | strong random string (32+ bytes) | Protects `/flows/*` endpoints. Health endpoints stay public. |
+| `IRONCREW_API_TOKEN` | strong random visible-ASCII string (32+ bytes) | Backwards-compatible single credential protecting the API and `/metrics`; health endpoints stay public. |
+| `IRONCREW_API_PRINCIPAL` | stable service/client label | Audit and quota identity for `IRONCREW_API_TOKEN`; defaults to `default`. This is operator configuration, not a caller header. |
+| `IRONCREW_API_TOKENS` | secret JSON object of `principal: token` entries | Prefer for multiple callers so admission and durable idempotency quotas isolate each trusted principal. Keep it in a Secret; do not put it directly in a manifest. |
 | `IRONCREW_ALLOW_UNAUTHENTICATED` | **unset** | Public binds fail closed without a token. This explicit override is for isolated development only. |
 | `IRONCREW_CORS_ORIGINS` | explicit domain list | Default is **deny-all**. Set `https://app.example.com` (comma-separated for multiple). Avoid `*`. |
 | `IRONCREW_ALLOW_SHELL` | **unset** | Leaving shell disabled prevents agents from running arbitrary commands. Only enable in sandboxed workloads. |
@@ -109,6 +111,25 @@ and related environment proxy settings because proxy routing would bypass the
 connect-time address policy. Railway/OpenShift deployments must allow direct
 egress to provider/tool destinations; a mandatory egress proxy is not currently
 a supported transport path.
+
+Bearer authentication is parsed once during process startup. Each successful
+credential produces an internal principal identity; caller-provided audit
+headers cannot select another principal or consume another principal's
+idempotency recovery boundary. When migrating from one shared token, configure
+`IRONCREW_API_TOKENS` in the platform secret, keep the legacy credential path
+available for retries whose idempotency keys were created before the upgrade,
+and remove it only after every caller has moved and the longest retained
+idempotency TTL has elapsed. Moving a caller from the legacy credential to a
+named principal intentionally changes its idempotency namespace: an old key
+sent under the new identity is a different operation.
+
+Principals provide identity, rate/quota isolation, recovery binding, and token
+rotation; they are not an authorization role system. Every configured token can
+reach the same protected API routes, so treat a monitoring-only token as a full
+service credential and constrain its network/source access externally. Rotate
+a token under the same principal label to retain identity and retry semantics;
+changing the label is an identity rotation and must be coordinated across at
+least one full idempotency retention window.
 
 ### Secrets handling
 
@@ -180,11 +201,15 @@ a supported transport path.
 | `IRONCREW_DIALOG_MAX_TURNS` | `1000` | Maximum accepted total turns in one dialog (hard ceiling 10000). |
 | `IRONCREW_DIALOG_MAX_PARTICIPANTS` | `16` | Maximum accepted participants in one dialog (hard ceiling 64). |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
+| `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | `256` | Bounds distinct conversation IDs with an in-flight lifecycle operation, preventing unbounded coordination-map growth (hard ceiling 4096). |
 | `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run/message retries cannot silently duplicate work. |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | `86400` | Replay/tombstone retention; must exceed max run lifetime by at least one hour. |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | `8388608` | Per-key transient serialization and stored-response cap. Lower to 4 MiB for the 1 GiB baseline. |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | `268435456` | Aggregate stored response budget. Lower to 64 MiB for the 1 GiB baseline. |
+| `IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL` | global record cap | Durable record budget for one authenticated principal; never exceeds the global cap. |
+| `IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL` | min(global record cap, 64) | Maximum concurrent claimed/in-progress mutations for one principal. |
+| `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL` | global response-byte cap | Durable completed-response budget for one principal; never exceeds the global byte cap. |
 | `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | `8388608` (8 MiB) | Aggregate retained transcript for one collaborative task (hard ceiling 32 MiB). |
 | `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | `1048576` (1 MiB) | Maximum one collaborative provider response may add (hard ceiling 8 MiB). |
 | `IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS` | `64` | Maximum participants multiplied by turns (hard ceiling 512). |
@@ -245,7 +270,8 @@ IRONCREW_MAX_SSE_CONNECTIONS=8
 
 **Medium pod (1 GiB / 1 CPU):** the checked-in OpenShift manifest is a
 conservative, unbenchmarked baseline: 2 active runs, 4 resident conversations,
-concurrency 2 with a hard ceiling of 4, 24 MiB per Lua VM, bounded
+256 in-flight conversation lifecycle keys, concurrency 2 with a hard ceiling
+of 4, 24 MiB per Lua VM, principal admission and ledger quotas, bounded
 history/images/network/provider output, and a PostgreSQL pool of 2. Keep these
 settings until a workload-specific Linux/container soak test demonstrates
 headroom.
@@ -270,6 +296,18 @@ have explicit per-service CPU/RAM limits and conservative application caps.
 - `IRONCREW_RATE_LIMIT_MS` — per-provider minimum interval between LLM calls (milliseconds). Use to stay within provider-side quotas.
 - `IRONCREW_DEFAULT_MAX_CONCURRENT` limits task parallelism inside each crew run; it is not a process-wide provider limit.
 - `IRONCREW_MAX_ACTIVE_RUNS` and `IRONCREW_MAX_ACTIVE_CONVERSATIONS` are process-wide admission limits for the HTTP server.
+- `IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE` / `IRONCREW_ADMISSION_WORK_BURST`
+  apply a per-principal token bucket before run and conversation-message work
+  begins (defaults `60` / `10`).
+- `IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE` /
+  `IRONCREW_ADMISSION_CONTROL_BURST` separately bound lower-cost control-plane
+  mutations such as cancellation and answers (defaults `120` / `20`).
+
+Admission is process-local and intentionally low-cardinality: the supported
+topology has one HTTP executor. Durable idempotency quotas are enforced by the
+store and remain the restart-safe protection. A `429` includes `Retry-After`;
+clients should back off without changing the idempotency key for the same
+logical operation.
 
 ---
 
@@ -350,7 +388,30 @@ service.
 
 ### Metrics
 
-Not built-in today. Structured tracing output can be scraped via Loki/Promtail or similar.
+`GET /metrics` exposes Prometheus text and is protected by the same bearer
+authentication as the API. It reports process-wide active/limit gauges,
+principal admission outcomes, tracked bucket count, idempotency quota
+rejections, and a store-backed durable-ledger snapshot. Store reads are
+coalesced for one second. The durable series expose global record/response-byte
+usage and limits, global in-flight count, maximum usage by any one principal,
+per-principal limits, principal count, and counts at 80/90/100 percent
+saturation. Labels are fixed; principal names, tokens, keys, flow names, and
+other caller-controlled values are deliberately omitted.
+
+If the store snapshot fails, `/metrics` returns `503` rather than serving
+fabricated or stale durable utilization.
+
+Scrape with a dedicated bearer principal used only by the monitoring client,
+and alert before a pod reaches its active run/conversation/SSE limits, on
+sustained admission `limited` outcomes, and on idempotency utilization
+thresholds. Structured tracing output remains available for Loki/Promtail or
+similar log pipelines. Do not expose `/metrics` through an unauthenticated
+ServiceMonitor or public exception.
+
+The OpenShift baseline admits only ingress-controller traffic. Scrape through
+the authenticated Route, or add a separate ingress rule limited to the actual
+monitoring namespace/pod labels and TCP 8080; do not broaden the application
+policy to every cluster namespace.
 
 ---
 
@@ -475,6 +536,10 @@ production baseline. It deliberately uses:
   `ironcrew-secrets` Secret
 - stdio MCP disabled by a non-matching command allowlist until the operator
   replaces it with the exact trusted binaries installed in the image
+- a pod-selecting `NetworkPolicy` that admits Route traffic and permits only
+  cluster DNS, same-namespace PostgreSQL on TCP 5432, and public HTTPS egress
+- principal-scoped mutation admission and idempotency budgets, plus a bounded
+  conversation lifecycle registry, sized for the 1 GiB pod baseline
 
 Apply it only after replacing the image tag, example CORS origin, ConfigMap,
 and Secret names:
@@ -514,6 +579,48 @@ The checked-in manifest includes a `Route` pointing at the `ironcrew` Service,
 with edge TLS termination and HTTP-to-HTTPS redirect. Replace or remove it when
 the cluster uses a different ingress policy.
 
+### NetworkPolicy and egress
+
+The checked-in `NetworkPolicy` selects only IronCrew pods; it does not impose a
+namespace-wide default deny on PostgreSQL or other workloads. Its ingress rule
+admits TCP 8080 from namespaces carrying OpenShift's preferred
+`policy-group.network.openshift.io/ingress` label, its legacy
+`network.openshift.io/policy-group=ingress` label, or the default
+`openshift-ingress` namespace name. Verify the installed ingress controller's
+namespace labels before rollout, especially when using a custom router. Test
+the Route and kubelet probes after applying the policy because node-to-pod
+probe handling is CNI-specific.
+
+Egress is allowlisted to:
+
+- UDP/TCP 53 in `openshift-dns` (plus `kube-system` for CoreDNS-compatible
+  clusters);
+- TCP 5432 to pods in the IronCrew namespace; and
+- TCP 443 to public IPv4/IPv6 addresses, excluding private, loopback,
+  link-local, reserved/documentation, benchmarking, and multicast ranges.
+
+Plain outbound HTTP is intentionally denied, including redirect hops to port
+80. Use HTTPS provider/tool URLs; add port 80 only for an explicitly reviewed
+dependency.
+
+This baseline assumes PostgreSQL is in the same namespace. For an
+operator-managed database in another namespace, replace the empty PostgreSQL
+`podSelector` with a stable database pod label and a tightly matched
+`namespaceSelector`; do not open the entire private CIDR. Likewise, if cluster
+DNS runs under another namespace label, update only the DNS peers. NetworkPolicy
+is additive, so an operator may add a separate narrow rule for an internal MCP
+service or a private provider endpoint without weakening public HTTPS rules.
+Restrict RBAC permission to create additional NetworkPolicy objects in the
+production namespace, because another allow policy selecting IronCrew pods is
+unioned with this one.
+
+Kubernetes `ipBlock` behavior around Service translation and node traffic can
+vary by network plugin. Validate resolved destinations from inside a staged pod:
+public provider HTTPS and the configured database must work, while requests to
+loopback, link-local metadata addresses, RFC1918 destinations, and unrelated
+same-namespace ports must fail. IronCrew's connect-time SSRF checks remain a
+second layer and must not be disabled merely because NetworkPolicy is present.
+
 ### Secrets
 
 OpenShift `Secret` objects work the same as Kubernetes ones. For stricter environments, use **SealedSecrets** or the platform's vault integration.
@@ -531,6 +638,8 @@ root Dockerfile and configures:
 
 - exactly one replica
 - `/health/ready` as the deployment healthcheck, with a 300-second timeout
+- a per-replica limit of 1 vCPU and 1 GiB through
+  `deploy.limitOverride.containers`
 - no additional old/new deployment overlap
 - a 30-second SIGTERM draining window
 - restart policy `ALWAYS`
@@ -562,11 +671,19 @@ IRONCREW_MAX_RUN_LIFETIME=300
 IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true
 IRONCREW_IDEMPOTENCY_TTL_SECONDS=86400
 IRONCREW_IDEMPOTENCY_MAX_RECORDS=10000
+IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL=2500
+IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL=16
 IRONCREW_IDEMPOTENCY_PRUNE_BATCH=1000
 IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES=4194304
 IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES=67108864
+IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL=16777216
+IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE=60
+IRONCREW_ADMISSION_WORK_BURST=10
+IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE=120
+IRONCREW_ADMISSION_CONTROL_BURST=20
 IRONCREW_MAX_ACTIVE_RUNS=2
 IRONCREW_MAX_ACTIVE_CONVERSATIONS=4
+IRONCREW_MAX_CONVERSATION_LIFECYCLES=256
 IRONCREW_CHAT_SESSION_IDLE_SECS=600
 IRONCREW_DEFAULT_MAX_CONCURRENT=2
 IRONCREW_MAX_CONCURRENT_TASKS=4
@@ -612,6 +729,13 @@ OPENAI_API_KEY=sk-...
 
 Railway's Postgres add-on auto-injects `DATABASE_URL`.
 
+For multiple callers, migrate the shared `IRONCREW_API_TOKEN` to a secret
+`IRONCREW_API_TOKENS` JSON object, for example
+`{"frontend":"<token>","automation":"<token>"}`. Keep the legacy token
+configured until outstanding retries have aged past the longest idempotency
+TTL, as described in the security section above. Railway variables are still
+secrets: do not commit real token JSON to this file or the repository.
+
 With `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`, every caller of the run and
 conversation-message mutation endpoints must generate a stable 1–128 byte
 visible-ASCII key per logical operation. Keep the key across client/proxy
@@ -627,12 +751,26 @@ after a representative container soak test. Keep `numReplicas: 1`; Pro plan
 headroom does not authorize horizontal serving while live control is
 process-local.
 
-Replica CPU and memory limits are dashboard state rather than fields in the
-current `railway.json` schema. In **Service Settings > Deploy > Replica
-Limits**, set and verify approximately **1 vCPU / 1 GiB per replica** for the
-initial deployment. Do not assume that checking in `railway.json` applied this
-cost and OOM guard. Railway documents the control in its
-[cost-control guide](https://docs.railway.com/pricing/cost-control#replica-limits).
+The live Railway JSON schema supports
+`deploy.limitOverride.containers.{cpu,memoryBytes}`. The checked-in config uses
+that contract to cap each replica at **1 vCPU / 1 GiB**; config-as-code overrides
+the equivalent dashboard values for that deployment. Verify the effective
+values in deployment details after rollout and keep the dashboard's Replica
+Limits aligned as defense against deployments that bypass this repository
+config. See Railway's [config-as-code reference](https://docs.railway.com/config-as-code/reference)
+and [cost-control guide](https://docs.railway.com/pricing/cost-control#replica-limits).
+
+Railway's config schema does not provide a destination NetworkPolicy or an
+outbound CIDR/hostname allowlist. Its `ipv6EgressEnabled` switch controls the
+address family, not destinations, and the checked-in config deliberately leaves
+it at the platform default: legacy `*.railway.internal` environments can be
+IPv6-only, including the private PostgreSQL address. Keep IronCrew's SSRF
+protection and MCP host allowlist enabled, expose only the authenticated HTTPS
+service, and use an external network boundary when compliance requires
+platform-enforced egress. Because protected IronCrew clients intentionally
+ignore proxy environment variables, a mandatory HTTP egress proxy is not a
+supported substitute today. See Railway's
+[private-networking contract](https://docs.railway.com/private-networking).
 
 ### 3. Health check
 
@@ -706,6 +844,8 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [Railway-provided variables](https://docs.railway.com/variables/reference)
 - [Kubernetes Deployment strategies](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
 - [Kubernetes startup, readiness, and liveness probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+- [OpenShift NetworkPolicy](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/network_security/network-policy)
 - [OpenShift `restricted-v2` SCC behavior](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/authentication_and_authorization/managing-pod-security-policies)
 
 ---
@@ -729,6 +869,12 @@ RUN cargo build --release --locked --no-default-features --features postgres
 ### CORS blocks legitimate frontend
 - Set `IRONCREW_CORS_ORIGINS` explicitly — default is deny-all. Never use `*` in production.
 
+### OpenShift Route or provider calls fail after NetworkPolicy
+- Verify the router and DNS namespace labels used by this cluster, then inspect
+  the resolved provider/database destination from inside the pod. Add a narrow
+  namespace/pod/CIDR rule for the real dependency; do not remove egress policy
+  or allow all RFC1918 space as a shortcut.
+
 ### Run records lost between deploys
 - Using JSON or SQLite backend with an `emptyDir` volume? Switch to a persistent volume or PostgreSQL.
 
@@ -737,20 +883,27 @@ RUN cargo build --release --locked --no-default-features --features postgres
 ## Checklist before go-live
 
 - [ ] `IRONCREW_API_TOKEN` set to a strong value
+- [ ] Each production caller has its own `IRONCREW_API_TOKENS` principal where
+      isolation is required; the token map remains in a platform Secret
 - [ ] `IRONCREW_CORS_ORIGINS` restricted to your frontend domains
 - [ ] `IRONCREW_ALLOW_SHELL` unset (unless sandboxed)
 - [ ] `IRONCREW_MCP_ALLOWED_COMMANDS` whitelist set (if using MCP stdio)
 - [ ] `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` is `__disabled__` or lists only exact operator-trusted hosts
 - [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (active runs are aborted on SIGTERM, so this limit is independent of termination grace)
 - [ ] `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`; clients preserve keys across retries, and ledger byte/record caps fit the pod/database budget
+- [ ] Per-principal idempotency and admission limits are set, and `429`
+      saturation alerts are configured from protected `/metrics`
 - [ ] `IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s` fits within platform termination grace
 - [ ] Exactly one HTTP replica configured (`numReplicas: 1` or `replicas: 1`)
 - [ ] Replacement strategy does not intentionally overlap active executors (`Recreate` on OpenShift; Railway overlap set to zero)
-- [ ] Railway replica limits explicitly set and verified in the dashboard (start around 1 vCPU / 1 GiB)
+- [ ] Railway config-as-code and dashboard replica limits agree at the intended
+      baseline (the checked-in start point is 1 vCPU / 1 GiB)
 - [ ] PostgreSQL configured for production durability
 - [ ] Secrets mounted from `Secret` / vault, not baked into image
 - [ ] Startup/readiness probes hit `/health/ready`; liveness hits `/health/live`
 - [ ] Resource `requests` and `limits` set on the container
+- [ ] OpenShift Route, DNS, PostgreSQL, and provider HTTPS verified with the
+      NetworkPolicy applied; private/link-local negative probes fail
 - [ ] Production image reference replaced with the signed release digest (`image@sha256:...`), not a mutable tag
 - [ ] Container runs non-root with no privilege escalation and dropped capabilities
 - [ ] TLS terminated at ingress / router / load balancer

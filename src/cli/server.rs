@@ -125,6 +125,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let public_bind = public_bind_requires_auth(host);
     prepare_file_write_root(public_bind, &flows_dir)?;
     require_public_mcp_policy(public_bind)?;
+    let auth = Arc::new(api::auth::AuthConfig::from_env()?);
+    let admission = Arc::new(api::admission::AdmissionController::from_env()?);
     if public_bind
         && matches!(
             std::env::var("IRONCREW_STORE"),
@@ -136,30 +138,10 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         ));
     }
 
-    let api_token_configured = match std::env::var("IRONCREW_API_TOKEN") {
-        Ok(api_token)
-            if api_token.trim().is_empty()
-                || api_token.len() < 32
-                || api_token.len() > 4096
-                || api_token.chars().any(char::is_whitespace)
-                || api_token.chars().any(char::is_control) =>
-        {
-            return Err(IronCrewError::Validation(
-                "IRONCREW_API_TOKEN must be 32-4096 bytes and contain no whitespace or control characters".into(),
-            ));
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(IronCrewError::Validation(
-                "IRONCREW_API_TOKEN must contain valid UTF-8".into(),
-            ));
-        }
-        Ok(_) => true,
-        Err(std::env::VarError::NotPresent) => false,
-    };
-    if public_bind && !api_token_configured {
+    if public_bind && !auth.is_configured() {
         if !unauthenticated_public_bind_allowed()? {
             return Err(IronCrewError::Validation(format!(
-                "Refusing unauthenticated public bind on {host}; set IRONCREW_API_TOKEN (recommended) or explicitly set IRONCREW_ALLOW_UNAUTHENTICATED=true"
+                "Refusing unauthenticated public bind on {host}; set IRONCREW_API_TOKEN or IRONCREW_API_TOKENS (recommended), or explicitly set IRONCREW_ALLOW_UNAUTHENTICATED=true"
             )));
         }
         tracing::warn!(
@@ -205,6 +187,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     }
     let state = Arc::new(api::AppState {
         flows_dir: flows_dir.clone(),
+        auth,
+        admission,
         accepting_traffic: std::sync::atomic::AtomicBool::new(true),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -301,7 +285,10 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
                     api::idempotency::IDEMPOTENCY_KEY_HEADER,
                     api::idempotency::IDEMPOTENCY_RECOVERY_KEY_HEADER,
                 ])
-                .expose_headers([api::idempotency::IDEMPOTENCY_REPLAYED_HEADER])
+                .expose_headers([
+                    api::idempotency::IDEMPOTENCY_REPLAYED_HEADER,
+                    http::header::RETRY_AFTER,
+                ])
         }
         Err(_) => CorsLayer::new(), // no origins allowed by default
     };
@@ -331,6 +318,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     println!("  GET    /health                       - Health check");
     println!("  GET    /health/live                  - Liveness check");
     println!("  GET    /health/ready                 - Storage-aware readiness check");
+    println!("  GET    /metrics                      - Protected Prometheus metrics");
     println!("  POST   /flows/{{flow}}/run             - Run a crew (async, returns run_id)");
     println!("  POST   /flows/{{flow}}/abort/{{run_id}}  - Abort a running crew");
     println!("  GET    /flows/{{flow}}/events/{{run_id}} - SSE event stream for a run");

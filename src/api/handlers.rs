@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     response::sse::{Event, Sse},
@@ -13,12 +13,15 @@ use tokio::sync::broadcast;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::idempotency::{
     IdempotencyClaim, IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup,
-    IdempotencyRecord, RUN_OPERATION, RunFenceHeartbeat, RunIntentSignal,
+    IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyRecord, PrincipalId, RUN_OPERATION,
+    RunFenceHeartbeat, RunIntentSignal,
 };
 use crate::engine::run_history::{RunCompletion, RunIntent, RunStatus, RunTransition};
 use crate::engine::store::create_store;
 use crate::utils::error::IronCrewError;
 
+use super::admission::QuotaMetric;
+use super::auth::Principal;
 use super::{
     AppState, ErrorResponse, ListRunsQuery, ListRunsResponse, RunCrewResponse, TaskResultResponse,
     error_response, resolve_flow_path,
@@ -27,6 +30,7 @@ use super::{
 #[derive(Clone)]
 struct RunIdempotencyAttempt {
     key_hash: String,
+    principal_id: PrincipalId,
     request_fingerprint: String,
     attempt_id: String,
     response_body: String,
@@ -68,6 +72,36 @@ fn idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorRespo
     )
 }
 
+fn idempotency_quota_error(
+    state: &AppState,
+    scope: IdempotencyQuotaScope,
+    resource: IdempotencyQuotaResource,
+    retry_after_seconds: u64,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let metric = match (scope, resource) {
+        (IdempotencyQuotaScope::Global, IdempotencyQuotaResource::Records) => {
+            QuotaMetric::GlobalRecords
+        }
+        (IdempotencyQuotaScope::Principal, IdempotencyQuotaResource::Records) => {
+            QuotaMetric::PrincipalRecords
+        }
+        (IdempotencyQuotaScope::Principal, IdempotencyQuotaResource::InFlight) => {
+            QuotaMetric::PrincipalInFlight
+        }
+        (IdempotencyQuotaScope::Global, IdempotencyQuotaResource::InFlight) => {
+            QuotaMetric::PrincipalInFlight
+        }
+    };
+    state.admission.metrics().record_quota_rejection(metric);
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "Idempotency capacity is exhausted; retry after at least {} second(s)",
+            retry_after_seconds.max(1)
+        ),
+    )
+}
+
 async fn release_run_idempotency(state: &AppState, attempt: Option<&RunIdempotencyAttempt>) {
     let Some(attempt) = attempt else {
         return;
@@ -85,6 +119,7 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
     let completed_at = chrono::Utc::now();
     let completion = IdempotencyCompletion {
         key_hash: attempt.key_hash,
+        principal_id: attempt.principal_id,
         request_fingerprint: attempt.request_fingerprint,
         attempt_id: attempt.attempt_id,
         owner_instance_id: state.store.instance_id().to_string(),
@@ -98,10 +133,7 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
     loop {
         match state
             .store
-            .complete_idempotency(
-                completion.clone(),
-                state.idempotency.max_total_response_bytes,
-            )
+            .complete_idempotency_with_limits(completion.clone(), state.idempotency.limits())
             .await
         {
             Ok(_) => {
@@ -611,14 +643,16 @@ fn classify_work_result(
 
 pub async fn run_flow(
     State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
     Path(flow): Path<String>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<serde_json::Value>>,
 ) -> RunFlowResult {
     let input = body.map(|Json(v)| v);
-    let request_key = super::idempotency::request_key(&headers, state.idempotency.require_key)
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let request_key =
+        super::idempotency::request_key(&headers, state.idempotency.require_key, principal.id())
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
     let request_fingerprint = super::idempotency::run_fingerprint(&flow, input.as_ref());
 
     // Look up before flow resolution and admission so a completed request can
@@ -629,7 +663,12 @@ pub async fn run_flow(
         let now = chrono::Utc::now().to_rfc3339();
         match state
             .store
-            .lookup_idempotency(&key.key_hash, &request_fingerprint, &now)
+            .lookup_idempotency_for_principal(
+                principal.id(),
+                &key.key_hash,
+                &request_fingerprint,
+                &now,
+            )
             .await
             .map_err(idempotency_store_error)?
         {
@@ -757,6 +796,7 @@ pub async fn run_flow(
             .to_rfc3339();
         let claim = IdempotencyClaim {
             key_hash: key.key_hash.clone(),
+            principal_id: principal.id().clone(),
             recovery_key_hash: None,
             request_fingerprint: request_fingerprint.clone(),
             operation: RUN_OPERATION.into(),
@@ -775,16 +815,13 @@ pub async fn run_flow(
         };
         match state
             .store
-            .claim_idempotency(
-                claim,
-                state.idempotency.max_records,
-                state.idempotency.prune_batch,
-            )
+            .claim_idempotency_with_limits(claim, state.idempotency.limits())
             .await
             .map_err(idempotency_store_error)?
         {
             IdempotencyClaimOutcome::Claimed(_) => Some(RunIdempotencyAttempt {
                 key_hash: key.key_hash.clone(),
+                principal_id: principal.id().clone(),
                 request_fingerprint: request_fingerprint.clone(),
                 attempt_id,
                 response_body,
@@ -815,6 +852,18 @@ pub async fn run_flow(
                     "An idempotent operation is already in progress".into(),
                 ));
             }
+            IdempotencyClaimOutcome::QuotaExceeded {
+                scope,
+                resource,
+                retry_after_seconds,
+            } => {
+                return Err(idempotency_quota_error(
+                    &state,
+                    scope,
+                    resource,
+                    retry_after_seconds,
+                ));
+            }
         }
     } else {
         None
@@ -840,6 +889,7 @@ pub async fn run_flow(
         if let Some(attempt) = idempotency_attempt.as_ref() {
             let (signal, receiver) = RunIntentSignal::channel(
                 attempt.key_hash.clone(),
+                attempt.principal_id.clone(),
                 attempt.request_fingerprint.clone(),
                 attempt.attempt_id.clone(),
             );
@@ -1192,9 +1242,14 @@ async fn execute_crew_from_path_with_events(
             })
             .await?;
 
-        let (key_hash, request_fingerprint) = signal.lookup_identity();
+        let (principal_id, key_hash, request_fingerprint) = signal.lookup_identity();
         let lookup = store
-            .lookup_idempotency(key_hash, request_fingerprint, &started_at)
+            .lookup_idempotency_for_principal(
+                principal_id,
+                key_hash,
+                request_fingerprint,
+                &started_at,
+            )
             .await?;
         match lookup {
             IdempotencyLookup::Replay(record) if signal.matches_running(&record, run_id) => {

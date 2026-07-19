@@ -36,6 +36,8 @@ async fn spawn_test_server() -> SocketAddr {
 
     let state = Arc::new(AppState {
         flows_dir: std::path::PathBuf::from("examples"),
+        auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
+        admission: Arc::new(ironcrew::api::admission::AdmissionController::default()),
         accepting_traffic: std::sync::atomic::AtomicBool::new(true),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),

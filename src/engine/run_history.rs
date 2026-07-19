@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use crate::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
-    IdempotencyLookup, IdempotencyRecord, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
-    validate_digest,
+    IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource, IdempotencyQuotaScope,
+    IdempotencyRecord, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
+    RunFenceHeartbeat, validate_digest,
 };
 use crate::engine::sessions::{
     ConversationRecord, ConversationSummary, DialogStateRecord, validate_session_id,
@@ -780,6 +781,42 @@ fn timestamp_has_passed(deadline: &str, now: &str) -> Result<bool> {
     )
 }
 
+fn earliest_deadline(current: Option<String>, candidate: &str) -> Result<Option<String>> {
+    let candidate_time = parse_idempotency_timestamp("idempotency capacity deadline", candidate)?;
+    match current {
+        Some(current) => {
+            let current_time =
+                parse_idempotency_timestamp("idempotency capacity deadline", &current)?;
+            Ok(Some(if current_time <= candidate_time {
+                current
+            } else {
+                candidate.to_string()
+            }))
+        }
+        None => Ok(Some(candidate.to_string())),
+    }
+}
+
+fn retry_after_seconds(deadline: Option<&str>, now: &str) -> Result<u64> {
+    let Some(deadline) = deadline else {
+        return Ok(60);
+    };
+    let deadline = parse_idempotency_timestamp("idempotency capacity deadline", deadline)?;
+    let now = parse_idempotency_timestamp("idempotency capacity clock", now)?;
+    let milliseconds = deadline
+        .signed_duration_since(now)
+        .num_milliseconds()
+        .max(1);
+    Ok(u64::try_from(milliseconds.saturating_add(999) / 1_000)
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
+fn quota_at_or_above(value: usize, limit: usize, percentage: usize) -> bool {
+    let threshold = limit.saturating_mul(percentage).saturating_add(99) / 100;
+    value >= threshold
+}
+
 fn json_recovery_grace_elapsed(
     hazard: &IdempotencyRecord,
     claim_time: &str,
@@ -885,19 +922,30 @@ fn prune_json_idempotency_locked(dir: &Path, now: &str, limit: usize) -> Result<
     Ok(removed)
 }
 
-fn json_idempotency_response_bytes(dir: &Path, except_key: Option<&str>) -> Result<usize> {
+fn json_idempotency_response_bytes(
+    dir: &Path,
+    principal_id: &PrincipalId,
+    except_key: Option<&str>,
+) -> Result<(usize, usize)> {
     let mut total = 0usize;
+    let mut principal_total = 0usize;
     visit_idempotency_records(dir, |_, record| {
         if except_key != Some(record.key_hash.as_str()) {
-            total = total
-                .checked_add(record.response_body.as_deref().map(str::len).unwrap_or(0))
-                .ok_or_else(|| {
-                    IronCrewError::Validation("Idempotency response byte total overflow".into())
+            let bytes = record.response_body.as_deref().map(str::len).unwrap_or(0);
+            total = total.checked_add(bytes).ok_or_else(|| {
+                IronCrewError::Validation("Idempotency response byte total overflow".into())
+            })?;
+            if &record.principal_id == principal_id {
+                principal_total = principal_total.checked_add(bytes).ok_or_else(|| {
+                    IronCrewError::Validation(
+                        "Principal idempotency response byte total overflow".into(),
+                    )
                 })?;
+            }
         }
         Ok(())
     })?;
-    Ok(total)
+    Ok((total, principal_total))
 }
 
 fn terminalize_json_idempotency_indeterminate(
@@ -941,7 +989,8 @@ fn ensure_idempotency_completion_fence(
     record: &IdempotencyRecord,
     completion: &IdempotencyCompletion,
 ) -> Result<()> {
-    if record.request_fingerprint != completion.request_fingerprint
+    if record.principal_id != completion.principal_id
+        || record.request_fingerprint != completion.request_fingerprint
         || record.attempt_id != completion.attempt_id
         || record.owner_instance_id != completion.owner_instance_id
     {
@@ -1574,8 +1623,9 @@ impl StateStore for JsonFileStore {
 
     // ─── Persistent sessions ────────────────────────────────────────────────
     //
-    async fn lookup_idempotency(
+    async fn lookup_idempotency_for_principal(
         &self,
+        principal_id: &PrincipalId,
         key_hash: &str,
         request_fingerprint: &str,
         now: &str,
@@ -1587,25 +1637,28 @@ impl StateStore for JsonFileStore {
         if !path.exists() {
             return Ok(IdempotencyLookup::Miss);
         }
-        classify_idempotency_record(&read_idempotency_record(&path)?, request_fingerprint, now)
+        let record = read_idempotency_record(&path)?;
+        if &record.principal_id != principal_id {
+            return Ok(IdempotencyLookup::Conflict);
+        }
+        classify_idempotency_record(&record, request_fingerprint, now)
     }
 
-    async fn claim_idempotency(
+    async fn claim_idempotency_with_limits(
         &self,
         claim: IdempotencyClaim,
-        max_records: usize,
-        prune_batch: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyClaimOutcome> {
         claim.validate()?;
-        if max_records == 0 {
-            return Err(IronCrewError::Validation(
-                "Idempotency record limit must be positive".into(),
-            ));
-        }
+        limits.validate()?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
         })?;
-        prune_json_idempotency_locked(&self.idempotency_dir, &claim.created_at, prune_batch)?;
+        prune_json_idempotency_locked(
+            &self.idempotency_dir,
+            &claim.created_at,
+            limits.prune_batch,
+        )?;
 
         let path = idempotency_path(&self.idempotency_dir, &claim.key_hash)?;
         if path.exists() {
@@ -1617,7 +1670,9 @@ impl StateStore for JsonFileStore {
                 };
             if expired_terminal {
                 std::fs::remove_file(&path)?;
-            } else if existing.request_fingerprint != claim.request_fingerprint {
+            } else if existing.principal_id != claim.principal_id
+                || existing.request_fingerprint != claim.request_fingerprint
+            {
                 return Ok(IdempotencyClaimOutcome::Conflict);
             } else if existing.state == IdempotencyState::Indeterminate {
                 return Ok(IdempotencyClaimOutcome::Indeterminate(existing));
@@ -1680,6 +1735,7 @@ impl StateStore for JsonFileStore {
             })?;
             if !hazards.is_empty() {
                 let acknowledged = hazards.len() == 1
+                    && hazards[0].1.principal_id == claim.principal_id
                     && claim.recovery_key_hash.as_deref() == Some(hazards[0].1.key_hash.as_str());
                 if !acknowledged
                     || !json_recovery_grace_elapsed(
@@ -1715,26 +1771,85 @@ impl StateStore for JsonFileStore {
         }
 
         let mut record_count = 0usize;
+        let mut principal_record_count = 0usize;
+        let mut principal_in_flight = 0usize;
         let mut stored_response_bytes = 0usize;
+        let mut principal_response_bytes = 0usize;
+        let mut next_global_capacity = None;
+        let mut next_principal_capacity = None;
         visit_idempotency_records(&self.idempotency_dir, |_, record| {
             record_count = record_count.saturating_add(1);
+            let response_bytes = record.response_body.as_deref().map(str::len).unwrap_or(0);
             stored_response_bytes = stored_response_bytes
-                .checked_add(record.response_body.as_deref().map(str::len).unwrap_or(0))
+                .checked_add(response_bytes)
                 .ok_or_else(|| {
                     IronCrewError::Validation("Idempotency response byte total overflow".into())
                 })?;
+            let deadline = if record.state.is_in_flight() {
+                Some(record.lease_expires_at.as_str())
+            } else {
+                record.expires_at.as_deref()
+            };
+            if let Some(deadline) = deadline {
+                next_global_capacity = earliest_deadline(next_global_capacity.take(), deadline)?;
+            }
+            if record.principal_id == claim.principal_id {
+                principal_record_count = principal_record_count.saturating_add(1);
+                principal_in_flight =
+                    principal_in_flight.saturating_add(usize::from(record.state.is_in_flight()));
+                principal_response_bytes = principal_response_bytes
+                    .checked_add(response_bytes)
+                    .ok_or_else(|| {
+                        IronCrewError::Validation(
+                            "Principal idempotency response byte total overflow".into(),
+                        )
+                    })?;
+                if let Some(deadline) = deadline {
+                    next_principal_capacity =
+                        earliest_deadline(next_principal_capacity.take(), deadline)?;
+                }
+            }
             Ok(())
         })?;
-        if record_count >= max_records {
-            return Err(IronCrewError::Validation(format!(
-                "Idempotency record limit reached ({max_records})"
-            )));
+        if record_count >= limits.global_max_records {
+            return Ok(IdempotencyClaimOutcome::QuotaExceeded {
+                scope: IdempotencyQuotaScope::Global,
+                resource: IdempotencyQuotaResource::Records,
+                retry_after_seconds: retry_after_seconds(
+                    next_global_capacity.as_deref(),
+                    &claim.created_at,
+                )?,
+            });
+        }
+        if principal_record_count >= limits.principal_max_records {
+            return Ok(IdempotencyClaimOutcome::QuotaExceeded {
+                scope: IdempotencyQuotaScope::Principal,
+                resource: IdempotencyQuotaResource::Records,
+                retry_after_seconds: retry_after_seconds(
+                    next_principal_capacity.as_deref(),
+                    &claim.created_at,
+                )?,
+            });
+        }
+        if principal_in_flight >= limits.principal_max_in_flight {
+            return Ok(IdempotencyClaimOutcome::QuotaExceeded {
+                scope: IdempotencyQuotaScope::Principal,
+                resource: IdempotencyQuotaResource::InFlight,
+                retry_after_seconds: retry_after_seconds(
+                    next_principal_capacity.as_deref(),
+                    &claim.created_at,
+                )?,
+            });
         }
         let mut record = claim.to_record();
         record.response_body = record.response_body.filter(|body| {
-            stored_response_bytes
+            let global_fits = stored_response_bytes
                 .checked_add(body.len())
-                .is_some_and(|total| total <= claim.max_total_response_bytes)
+                .is_some_and(|total| total <= limits.global_max_response_bytes);
+            let principal_fits = principal_response_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= limits.principal_max_response_bytes);
+            global_fits && principal_fits
         });
         record.validate()?;
         write_serialized_record_create_new(&path, &record, "idempotency claim")?;
@@ -1882,12 +1997,13 @@ impl StateStore for JsonFileStore {
         Ok(RunFenceHeartbeat::Owned)
     }
 
-    async fn complete_idempotency(
+    async fn complete_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<IdempotencyCompletionOutcome> {
         completion.validate()?;
+        limits.validate()?;
         let path = idempotency_path(&self.idempotency_dir, &completion.key_hash)?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
@@ -1911,14 +2027,19 @@ impl StateStore for JsonFileStore {
             ));
         }
 
-        let stored_bytes = json_idempotency_response_bytes(
+        let (stored_bytes, principal_stored_bytes) = json_idempotency_response_bytes(
             &self.idempotency_dir,
+            &completion.principal_id,
             Some(completion.key_hash.as_str()),
         )?;
         let response_body = completion.response_body.filter(|body| {
-            stored_bytes
+            let global_fits = stored_bytes
                 .checked_add(body.len())
-                .is_some_and(|total| total <= max_total_response_bytes)
+                .is_some_and(|total| total <= limits.global_max_response_bytes);
+            let principal_fits = principal_stored_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= limits.principal_max_response_bytes);
+            global_fits && principal_fits
         });
         record.state = IdempotencyState::Completed;
         record.response_status = Some(completion.response_status);
@@ -1934,13 +2055,14 @@ impl StateStore for JsonFileStore {
         })
     }
 
-    async fn commit_conversation_idempotency(
+    async fn commit_conversation_idempotency_with_limits(
         &self,
         completion: IdempotencyCompletion,
         conversation: &ConversationRecord,
-        max_total_response_bytes: usize,
+        limits: IdempotencyLimits,
     ) -> Result<ConversationIdempotencyCommit> {
         completion.validate()?;
+        limits.validate()?;
         validate_session_id(&conversation.id)?;
         let ledger_path = idempotency_path(&self.idempotency_dir, &completion.key_hash)?;
         let _guard = self.run_lock.lock().map_err(|error| {
@@ -2001,14 +2123,19 @@ impl StateStore for JsonFileStore {
         let next_revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| IronCrewError::Validation("Conversation revision overflow".into()))?;
-        let stored_bytes = json_idempotency_response_bytes(
+        let (stored_bytes, principal_stored_bytes) = json_idempotency_response_bytes(
             &self.idempotency_dir,
+            &completion.principal_id,
             Some(completion.key_hash.as_str()),
         )?;
         let response_body = completion.response_body.filter(|body| {
-            stored_bytes
+            let global_fits = stored_bytes
                 .checked_add(body.len())
-                .is_some_and(|total| total <= max_total_response_bytes)
+                .is_some_and(|total| total <= limits.global_max_response_bytes);
+            let principal_fits = principal_stored_bytes
+                .checked_add(body.len())
+                .is_some_and(|total| total <= limits.principal_max_response_bytes);
+            global_fits && principal_fits
         });
 
         let mut conversation_to_write = conversation.clone();
@@ -2099,6 +2226,70 @@ impl StateStore for JsonFileStore {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
         })?;
         prune_json_idempotency_locked(&self.idempotency_dir, now, limit)
+    }
+
+    async fn idempotency_usage(
+        &self,
+        principal_id: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage> {
+        limits.validate()?;
+        let _guard = self.run_lock.lock().map_err(|error| {
+            IronCrewError::Validation(format!("JSON store lock error: {error}"))
+        })?;
+        let mut by_principal =
+            std::collections::HashMap::<PrincipalId, (usize, usize, usize)>::new();
+        visit_idempotency_records(&self.idempotency_dir, |_, record| {
+            let usage = by_principal.entry(record.principal_id).or_default();
+            usage.0 = usage.0.saturating_add(1);
+            usage.1 = usage
+                .1
+                .saturating_add(usize::from(record.state.is_in_flight()));
+            usage.2 = usage
+                .2
+                .checked_add(record.response_body.as_deref().map(str::len).unwrap_or(0))
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Idempotency response byte total overflow".into())
+                })?;
+            Ok(())
+        })?;
+
+        let mut snapshot = IdempotencyUsage {
+            principal_count: by_principal.len(),
+            ..IdempotencyUsage::default()
+        };
+        for (id, (records, in_flight, response_bytes)) in by_principal {
+            snapshot.global_records = snapshot.global_records.saturating_add(records);
+            snapshot.global_in_flight = snapshot.global_in_flight.saturating_add(in_flight);
+            snapshot.global_response_bytes = snapshot
+                .global_response_bytes
+                .checked_add(response_bytes)
+                .ok_or_else(|| {
+                    IronCrewError::Validation("Idempotency response byte total overflow".into())
+                })?;
+            snapshot.max_principal_records = snapshot.max_principal_records.max(records);
+            snapshot.max_principal_in_flight = snapshot.max_principal_in_flight.max(in_flight);
+            snapshot.max_principal_response_bytes =
+                snapshot.max_principal_response_bytes.max(response_bytes);
+            if &id == principal_id {
+                snapshot.principal_records = records;
+                snapshot.principal_in_flight = in_flight;
+                snapshot.principal_response_bytes = response_bytes;
+            }
+            let at = |threshold: usize| {
+                quota_at_or_above(records, limits.principal_max_records, threshold)
+                    || quota_at_or_above(in_flight, limits.principal_max_in_flight, threshold)
+                    || quota_at_or_above(
+                        response_bytes,
+                        limits.principal_max_response_bytes,
+                        threshold,
+                    )
+            };
+            snapshot.principals_at_or_above_80_percent += usize::from(at(80));
+            snapshot.principals_at_or_above_90_percent += usize::from(at(90));
+            snapshot.principals_at_or_above_100_percent += usize::from(at(100));
+        }
+        Ok(snapshot)
     }
 
     // `get_*` returns Ok(None) when the file is missing so the caller can

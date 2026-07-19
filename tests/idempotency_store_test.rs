@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use ironcrew::api::{AppState, create_router};
 use ironcrew::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
-    IdempotencyCompletion, IdempotencyLookup, IdempotencyState, RUN_OPERATION, RunFenceHeartbeat,
+    IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
+    IdempotencyQuotaScope, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
+    RunFenceHeartbeat,
 };
 use ironcrew::engine::run_history::{
     JsonFileStore, RunCompletion, RunIntent, RunRecord, RunStatus, RunTransition,
@@ -43,6 +46,7 @@ fn conversation_claim(
 ) -> IdempotencyClaim {
     IdempotencyClaim {
         key_hash: digest(key_byte),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest(fingerprint_byte),
         operation: CONVERSATION_MESSAGE_OPERATION.into(),
@@ -69,6 +73,7 @@ fn run_claim(
 ) -> IdempotencyClaim {
     IdempotencyClaim {
         key_hash: numbered_digest(key),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: numbered_digest(key.saturating_add(100)),
         operation: RUN_OPERATION.into(),
@@ -90,6 +95,7 @@ fn run_claim(
 fn completion(claim: &IdempotencyClaim, body: &str) -> IdempotencyCompletion {
     IdempotencyCompletion {
         key_hash: claim.key_hash.clone(),
+        principal_id: claim.principal_id.clone(),
         request_fingerprint: claim.request_fingerprint.clone(),
         attempt_id: claim.attempt_id.clone(),
         owner_instance_id: claim.owner_instance_id.clone(),
@@ -98,6 +104,339 @@ fn completion(claim: &IdempotencyClaim, body: &str) -> IdempotencyCompletion {
         completed_at: COMPLETED_AT.into(),
         expires_at: RETENTION_EXPIRES_AT.into(),
     }
+}
+
+fn principal_limits(
+    principal_max_records: usize,
+    principal_max_in_flight: usize,
+) -> IdempotencyLimits {
+    IdempotencyLimits {
+        global_max_records: 64,
+        principal_max_records,
+        principal_max_in_flight,
+        global_max_response_bytes: 64 * 1024,
+        principal_max_response_bytes: 32 * 1024,
+        prune_batch: 64,
+    }
+}
+
+fn principal_run_claim(key: u64, principal_id: &PrincipalId, attempt_id: &str) -> IdempotencyClaim {
+    let mut claim = run_claim(
+        key,
+        "principal-test-pod",
+        &format!("principal-run-{key}"),
+        attempt_id,
+    );
+    claim.principal_id = principal_id.clone();
+    claim.response_body = None;
+    claim
+}
+
+async fn exercise_principal_quota_and_recovery_isolation(store: Arc<dyn StateStore>) {
+    let principal_a = PrincipalId::from_label("principal-a");
+    let principal_b = PrincipalId::from_label("principal-b");
+    let record_limits = principal_limits(2, 2);
+
+    let a_first = principal_run_claim(10_001, &principal_a, "principal-a-first");
+    let a_second = principal_run_claim(10_002, &principal_a, "principal-a-second");
+    for claim in [&a_first, &a_second] {
+        assert!(matches!(
+            store
+                .claim_idempotency_with_limits(claim.clone(), record_limits)
+                .await
+                .unwrap(),
+            IdempotencyClaimOutcome::Claimed(_)
+        ));
+        store
+            .complete_idempotency_with_limits(completion(claim, "{}"), record_limits)
+            .await
+            .unwrap();
+    }
+
+    let a_over_record_limit = principal_run_claim(10_003, &principal_a, "principal-a-third");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(a_over_record_limit, record_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::QuotaExceeded {
+            scope: IdempotencyQuotaScope::Principal,
+            resource: IdempotencyQuotaResource::Records,
+            retry_after_seconds,
+        } if retry_after_seconds >= 1
+    ));
+
+    assert!(matches!(
+        store
+            .lookup_idempotency_for_principal(
+                &principal_b,
+                &a_first.key_hash,
+                &a_first.request_fingerprint,
+                COMPLETED_AT,
+            )
+            .await
+            .unwrap(),
+        IdempotencyLookup::Conflict
+    ));
+    let mut cross_principal_replay = a_first.clone();
+    cross_principal_replay.principal_id = principal_b.clone();
+    cross_principal_replay.attempt_id = "principal-b-replay-attempt".into();
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(cross_principal_replay, record_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Conflict
+    ));
+
+    let b_first = principal_run_claim(10_004, &principal_b, "principal-b-first");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(b_first, record_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let principal_c = PrincipalId::from_label("principal-c");
+    let principal_d = PrincipalId::from_label("principal-d");
+    let in_flight_limits = principal_limits(4, 1);
+    let c_first = principal_run_claim(10_005, &principal_c, "principal-c-first");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(c_first, in_flight_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    let c_over_in_flight = principal_run_claim(10_006, &principal_c, "principal-c-second");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(c_over_in_flight, in_flight_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::QuotaExceeded {
+            scope: IdempotencyQuotaScope::Principal,
+            resource: IdempotencyQuotaResource::InFlight,
+            retry_after_seconds,
+        } if retry_after_seconds >= 1
+    ));
+    let d_first = principal_run_claim(10_007, &principal_d, "principal-d-first");
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(d_first, in_flight_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let recovery_owner = PrincipalId::from_label("recovery-owner");
+    let recovery_foreign = PrincipalId::from_label("recovery-foreign");
+    let recovery_limits = principal_limits(16, 8);
+    let mut expired_hazard = conversation_claim(
+        'a',
+        'b',
+        "recovery-hazard-attempt",
+        "principal-recovery-conversation",
+        "flow-a:principal-recovery-conversation",
+    );
+    expired_hazard.principal_id = recovery_owner.clone();
+    expired_hazard.created_at = "2026-07-19T11:58:00Z".into();
+    expired_hazard.lease_expires_at = "2026-07-19T11:59:00Z".into();
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(expired_hazard.clone(), recovery_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+
+    let mut foreign_recovery = conversation_claim(
+        'c',
+        'd',
+        "foreign-recovery-attempt",
+        "principal-recovery-conversation",
+        "flow-a:principal-recovery-conversation",
+    );
+    foreign_recovery.principal_id = recovery_foreign;
+    foreign_recovery.recovery_key_hash = Some(expired_hazard.key_hash.clone());
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(foreign_recovery.clone(), recovery_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+
+    let recovery_time = timestamp_after(CREATED_AT, store.run_lease_ttl());
+    foreign_recovery.created_at = recovery_time.clone();
+    foreign_recovery.lease_expires_at = timestamp_after(&recovery_time, store.run_lease_ttl());
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(foreign_recovery, recovery_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Busy
+    ));
+
+    let mut owner_recovery = conversation_claim(
+        'e',
+        'f',
+        "owner-recovery-attempt",
+        "principal-recovery-conversation",
+        "flow-a:principal-recovery-conversation",
+    );
+    owner_recovery.principal_id = recovery_owner;
+    owner_recovery.recovery_key_hash = Some(expired_hazard.key_hash);
+    owner_recovery.created_at = recovery_time.clone();
+    owner_recovery.lease_expires_at = timestamp_after(&recovery_time, store.run_lease_ttl());
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(owner_recovery, recovery_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+}
+
+fn assert_usage(actual: IdempotencyUsage, expected: IdempotencyUsage, stage: &str) {
+    assert_eq!(
+        actual, expected,
+        "unexpected idempotency usage after {stage}"
+    );
+}
+
+async fn exercise_principal_usage_lifecycle(store: Arc<dyn StateStore>) {
+    let principal_a = PrincipalId::from_label("usage-principal-a");
+    let principal_b = PrincipalId::from_label("usage-principal-b");
+    let limits = IdempotencyLimits {
+        global_max_records: 8,
+        principal_max_records: 4,
+        principal_max_in_flight: 3,
+        global_max_response_bytes: 1_024,
+        principal_max_response_bytes: 512,
+        prune_batch: 8,
+    };
+    let a_first = principal_run_claim(20_001, &principal_a, "usage-a-first");
+    let a_second = principal_run_claim(20_002, &principal_a, "usage-a-second");
+    let b_first = principal_run_claim(20_003, &principal_b, "usage-b-first");
+    for claim in [&a_first, &a_second, &b_first] {
+        assert!(matches!(
+            store
+                .claim_idempotency_with_limits(claim.clone(), limits)
+                .await
+                .unwrap(),
+            IdempotencyClaimOutcome::Claimed(_)
+        ));
+    }
+
+    assert_usage(
+        store.idempotency_usage(&principal_a, limits).await.unwrap(),
+        IdempotencyUsage {
+            global_records: 3,
+            global_in_flight: 3,
+            principal_records: 2,
+            principal_in_flight: 2,
+            principal_count: 2,
+            max_principal_records: 2,
+            max_principal_in_flight: 2,
+            ..IdempotencyUsage::default()
+        },
+        "claims",
+    );
+
+    const A_BODY: &str = "{\"a\":1}";
+    store
+        .complete_idempotency_with_limits(completion(&a_first, A_BODY), limits)
+        .await
+        .unwrap();
+    assert_usage(
+        store.idempotency_usage(&principal_a, limits).await.unwrap(),
+        IdempotencyUsage {
+            global_records: 3,
+            global_in_flight: 2,
+            global_response_bytes: A_BODY.len(),
+            principal_records: 2,
+            principal_in_flight: 1,
+            principal_response_bytes: A_BODY.len(),
+            principal_count: 2,
+            max_principal_records: 2,
+            max_principal_in_flight: 1,
+            max_principal_response_bytes: A_BODY.len(),
+            ..IdempotencyUsage::default()
+        },
+        "completion",
+    );
+
+    assert!(
+        store
+            .release_idempotency(&a_second.key_hash, &a_second.attempt_id)
+            .await
+            .unwrap()
+    );
+    assert_usage(
+        store.idempotency_usage(&principal_a, limits).await.unwrap(),
+        IdempotencyUsage {
+            global_records: 2,
+            global_in_flight: 1,
+            global_response_bytes: A_BODY.len(),
+            principal_records: 1,
+            principal_response_bytes: A_BODY.len(),
+            principal_count: 2,
+            max_principal_records: 1,
+            max_principal_in_flight: 1,
+            max_principal_response_bytes: A_BODY.len(),
+            ..IdempotencyUsage::default()
+        },
+        "release",
+    );
+
+    const B_BODY: &str = "{\"b\":22}";
+    store
+        .complete_idempotency_with_limits(completion(&b_first, B_BODY), limits)
+        .await
+        .unwrap();
+    assert_usage(
+        store.idempotency_usage(&principal_a, limits).await.unwrap(),
+        IdempotencyUsage {
+            global_records: 2,
+            global_response_bytes: A_BODY.len() + B_BODY.len(),
+            principal_records: 1,
+            principal_response_bytes: A_BODY.len(),
+            principal_count: 2,
+            max_principal_records: 1,
+            max_principal_response_bytes: B_BODY.len(),
+            ..IdempotencyUsage::default()
+        },
+        "second-principal completion",
+    );
+    assert_usage(
+        store.idempotency_usage(&principal_b, limits).await.unwrap(),
+        IdempotencyUsage {
+            global_records: 2,
+            global_response_bytes: A_BODY.len() + B_BODY.len(),
+            principal_records: 1,
+            principal_response_bytes: B_BODY.len(),
+            principal_count: 2,
+            max_principal_records: 1,
+            max_principal_response_bytes: B_BODY.len(),
+            ..IdempotencyUsage::default()
+        },
+        "second-principal snapshot",
+    );
+
+    assert_eq!(
+        store
+            .prune_idempotency("2026-07-19T12:11:00Z", limits.prune_batch)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_usage(
+        store.idempotency_usage(&principal_a, limits).await.unwrap(),
+        IdempotencyUsage::default(),
+        "prune",
+    );
 }
 
 fn conversation(id: &str) -> ConversationRecord {
@@ -414,6 +753,7 @@ async fn exercise_idempotency_contract(
 
     let expired = IdempotencyClaim {
         key_hash: digest('f'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('1'),
         operation: CONVERSATION_MESSAGE_OPERATION.into(),
@@ -473,6 +813,7 @@ async fn exercise_idempotency_contract(
 
     let run_claim = IdempotencyClaim {
         key_hash: digest('2'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('3'),
         operation: RUN_OPERATION.into(),
@@ -617,6 +958,7 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
     let owner = store.instance_id().to_string();
     let mapped_claim = IdempotencyClaim {
         key_hash: digest('4'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('5'),
         operation: RUN_OPERATION.into(),
@@ -697,6 +1039,7 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
 
     let orphaned_claim = IdempotencyClaim {
         key_hash: digest('6'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('7'),
         operation: RUN_OPERATION.into(),
@@ -720,6 +1063,7 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
 
     let expired_message = IdempotencyClaim {
         key_hash: digest('8'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('9'),
         operation: CONVERSATION_MESSAGE_OPERATION.into(),
@@ -1136,6 +1480,7 @@ async fn exercise_provisional_run_hydration(store: Arc<dyn StateStore>) {
     let owner = store.instance_id().to_string();
     let claim = IdempotencyClaim {
         key_hash: digest('d'),
+        principal_id: PrincipalId::legacy(),
         recovery_key_hash: None,
         request_fingerprint: digest('c'),
         operation: RUN_OPERATION.into(),
@@ -1321,4 +1666,178 @@ async fn sqlite_store_enforces_idempotency_contract() {
     drop(conn);
     assert_wrong_owner_run_loses_fence(Arc::clone(&store), &wrong_owner).await;
     exercise_provisional_run_hydration(store).await;
+}
+
+#[tokio::test]
+async fn json_store_isolates_principal_quotas_recovery_and_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let isolation_store: Arc<dyn StateStore> = Arc::new(
+        JsonFileStore::new(directory.path().join("isolation"))
+            .expect("create JSON isolation store"),
+    );
+    exercise_principal_quota_and_recovery_isolation(isolation_store).await;
+
+    let usage_store: Arc<dyn StateStore> = Arc::new(
+        JsonFileStore::new(directory.path().join("usage")).expect("create JSON usage store"),
+    );
+    exercise_principal_usage_lifecycle(usage_store).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_isolates_principal_quotas_recovery_and_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let isolation_store: Arc<dyn StateStore> = Arc::new(
+        SqliteStore::new(directory.path().join("isolation.db"))
+            .expect("create SQLite isolation store"),
+    );
+    exercise_principal_quota_and_recovery_isolation(isolation_store).await;
+
+    let usage_store: Arc<dyn StateStore> = Arc::new(
+        SqliteStore::new(directory.path().join("usage.db")).expect("create SQLite usage store"),
+    );
+    exercise_principal_usage_lifecycle(usage_store).await;
+}
+
+#[tokio::test]
+async fn sqlite_quota_denial_commits_bounded_pruning_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let store: Arc<dyn StateStore> = Arc::new(
+        SqliteStore::new(directory.path().join("prune-progress.db"))
+            .expect("create SQLite prune-progress store"),
+    );
+    let principal = PrincipalId::from_label("prune-progress-principal");
+    let initial_limits = principal_limits(16, 16);
+
+    for key in 40_001..=40_003 {
+        let claim = principal_run_claim(key, &principal, &format!("expired-attempt-{key}"));
+        assert!(matches!(
+            store
+                .claim_idempotency_with_limits(claim.clone(), initial_limits)
+                .await
+                .unwrap(),
+            IdempotencyClaimOutcome::Claimed(_)
+        ));
+        store
+            .complete_idempotency_with_limits(completion(&claim, "{}"), initial_limits)
+            .await
+            .unwrap();
+    }
+
+    let reduced_limits = IdempotencyLimits {
+        global_max_records: 1,
+        principal_max_records: 1,
+        principal_max_in_flight: 1,
+        global_max_response_bytes: 64 * 1024,
+        principal_max_response_bytes: 32 * 1024,
+        prune_batch: 1,
+    };
+    let mut replacement = principal_run_claim(40_004, &principal, "replacement-after-pruning");
+    replacement.created_at = "2026-07-19T12:11:00Z".into();
+    replacement.lease_expires_at = "2026-07-19T12:12:00Z".into();
+
+    for expected_remaining in [2, 1] {
+        assert!(matches!(
+            store
+                .claim_idempotency_with_limits(replacement.clone(), reduced_limits)
+                .await
+                .unwrap(),
+            IdempotencyClaimOutcome::QuotaExceeded {
+                scope: IdempotencyQuotaScope::Global,
+                resource: IdempotencyQuotaResource::Records,
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .idempotency_usage(&principal, reduced_limits)
+                .await
+                .unwrap()
+                .global_records,
+            expected_remaining,
+            "a quota-denied transaction must retain its bounded prune"
+        );
+    }
+
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(replacement, reduced_limits)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+}
+
+#[tokio::test]
+async fn metrics_omit_persisted_principal_identifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let store: Arc<dyn StateStore> = Arc::new(
+        JsonFileStore::new(directory.path().join("metrics-store"))
+            .expect("create JSON metrics store"),
+    );
+    let principal_a = PrincipalId::from_label("metrics-principal-a");
+    let principal_b = PrincipalId::from_label("metrics-principal-b");
+    let limits = principal_limits(4, 2);
+    for claim in [
+        principal_run_claim(30_001, &principal_a, "metrics-a"),
+        principal_run_claim(30_002, &principal_b, "metrics-b"),
+    ] {
+        assert!(matches!(
+            store
+                .claim_idempotency_with_limits(claim, limits)
+                .await
+                .unwrap(),
+            IdempotencyClaimOutcome::Claimed(_)
+        ));
+    }
+
+    let state = Arc::new(AppState {
+        flows_dir: directory.path().to_path_buf(),
+        auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
+        admission: Arc::new(ironcrew::api::admission::AdmissionController::default()),
+        accepting_traffic: std::sync::atomic::AtomicBool::new(true),
+        active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        max_active_conversations: 1,
+        conversation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_active_runs: 1,
+        run_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_sse_connections: 1,
+        sse_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_run_lifetime: std::time::Duration::from_secs(60),
+        terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
+        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
+        readiness_cache: tokio::sync::Mutex::new(None),
+        idempotency: Default::default(),
+        store,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let response = reqwest::get(format!("http://{address}/metrics"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    server.abort();
+
+    assert!(body.contains("ironcrew_idempotency_principals 2"));
+    for secret_identifier in [
+        principal_a.as_str(),
+        principal_b.as_str(),
+        "metrics-principal-a",
+        "metrics-principal-b",
+    ] {
+        assert!(
+            !body.contains(secret_identifier),
+            "metrics exposed principal identifier {secret_identifier}"
+        );
+    }
 }
