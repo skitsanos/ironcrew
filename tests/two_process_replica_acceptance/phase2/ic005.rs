@@ -49,10 +49,14 @@ fn assert_cancel_pending(
     observed: &ScopedSnapshot,
     baseline: &ScopedSnapshot,
     pair: &ProcessPair,
-    expected_status: &str,
+    expected_statuses: &[&str],
 ) {
     assert_eq!(observed.runs, 1);
-    assert_eq!(observed.status.as_deref(), Some(expected_status));
+    let status = observed.status.as_deref().expect("in-flight run status");
+    assert!(
+        expected_statuses.contains(&status),
+        "expected one of {expected_statuses:?}, observed {status}"
+    );
     assert_eq!(observed.run_owner, baseline.run_owner);
     assert_eq!(observed.ledgers, 1);
     assert_eq!(observed.ledger_state.as_deref(), Some("running"));
@@ -172,7 +176,7 @@ async fn owner_death_before_durable_cancellation_pickup_reconciles_once() {
             assert_cancel_ack(&cancellation, pair, &run_id);
             let cancelled = snapshot(pair, &run_id).await;
             assert_eq!(cancelled.run_lease, stopped.run_lease);
-            assert_cancel_pending(&cancelled, &baseline, pair, "waiting_for_input");
+            assert_cancel_pending(&cancelled, &baseline, pair, &["waiting_for_input"]);
             assert_sigkill(&mut pair.owner_a);
             assert_ready(pair).await;
 
@@ -199,10 +203,17 @@ async fn owner_death_after_cancellation_pickup_but_before_terminal_commit_reconc
             assert_cancel_ack(&cancellation, pair, &run_id);
             wait_for_log(&pair.owner_a, PICKUP_LOG).await;
             wait_until_blocked(pair, quota_lock.backend_pid).await;
-            // Dropping the parked Lua future removes its final waiter and
-            // restores the still-in-flight row to Running before the monitor's
-            // terminal write blocks behind the injected quota lock.
-            assert_cancel_pending(&snapshot(pair, &run_id).await, &baseline, pair, "running");
+            // Dropping the parked Lua future schedules a best-effort Running
+            // update, while the monitor expires the bridge before terminal
+            // persistence. Either operation can win: both statuses are
+            // deliberately in-flight and must reconcile to Abandoned after
+            // the owner dies.
+            assert_cancel_pending(
+                &snapshot(pair, &run_id).await,
+                &baseline,
+                pair,
+                &["running", "waiting_for_input"],
+            );
             assert_sigkill(&mut pair.owner_a);
             quota_lock.release().await;
 
