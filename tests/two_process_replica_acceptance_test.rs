@@ -538,6 +538,7 @@ async fn wait_for_terminal(
     panic!("run did not terminalize through replica B; {last_observation}");
 }
 
+#[cfg(unix)]
 async fn wait_for_lease_renewal(
     client: &Client,
     base_url: &str,
