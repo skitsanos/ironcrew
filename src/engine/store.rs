@@ -24,7 +24,10 @@ use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogSta
 use crate::utils::error::Result;
 
 pub const DEFAULT_RUN_LEASE_TTL_SECONDS: u64 = 60;
+pub const MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS: u64 = 6;
 pub const MAX_RUN_LEASE_TTL_SECONDS: u64 = 86_400;
+const MAX_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(100);
 
 static PROCESS_INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
@@ -76,13 +79,8 @@ impl RunLeaseConfig {
                 ));
             }
         };
-        if ttl_seconds == 0 || ttl_seconds > MAX_RUN_LEASE_TTL_SECONDS {
-            return Err(crate::utils::error::IronCrewError::Validation(
-                "IRONCREW_RUN_LEASE_TTL_SECONDS must be between 1 and 86400".into(),
-            ));
-        }
-
-        Self::new(instance_id, Duration::from_secs(ttl_seconds))
+        let ttl = production_run_lease_ttl(ttl_seconds)?;
+        Self::new(instance_id, ttl)
     }
 
     /// Explicit constructor used by deterministic storage and multi-instance
@@ -115,6 +113,39 @@ impl RunLeaseConfig {
     pub fn deadline_now(&self) -> String {
         self.deadline_from(Utc::now())
     }
+}
+
+fn production_run_lease_ttl(ttl_seconds: u64) -> Result<Duration> {
+    if !(MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS..=MAX_RUN_LEASE_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err(crate::utils::error::IronCrewError::Validation(format!(
+            "IRONCREW_RUN_LEASE_TTL_SECONDS must be between {MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS} and {MAX_RUN_LEASE_TTL_SECONDS}; shorter leases do not leave three heartbeat opportunities"
+        )));
+    }
+    Ok(Duration::from_secs(ttl_seconds))
+}
+
+/// Cadence shared by owner heartbeats and the replica maintenance loop.
+/// Production TTL validation guarantees at least three scheduled opportunities.
+pub fn run_lease_heartbeat_interval(ttl: Duration) -> Duration {
+    (ttl / 3).max(Duration::from_secs(1))
+}
+
+/// Per-operation outer bound for heartbeat and reconciliation maintenance.
+/// Two sequential operations consume at most two thirds of one cadence, with
+/// a five-second ceiling for long production leases.
+pub fn run_maintenance_timeout(ttl: Duration) -> Duration {
+    let milliseconds = (run_lease_heartbeat_interval(ttl).as_millis() / 3)
+        .max(MIN_RUN_MAINTENANCE_TIMEOUT.as_millis())
+        .min(MAX_RUN_MAINTENANCE_TIMEOUT.as_millis());
+    Duration::from_millis(milliseconds as u64)
+}
+
+/// PostgreSQL's per-statement timeout is smaller than the aggregate Tokio
+/// bound. It resolves an individual lock/query stall inside the database;
+/// the outer watchdog still bounds pool acquisition and cumulative statements.
+pub fn run_maintenance_database_timeout(ttl: Duration) -> Duration {
+    let milliseconds = (run_maintenance_timeout(ttl).as_millis() * 4 / 5).max(50);
+    Duration::from_millis(milliseconds as u64)
 }
 
 fn validate_instance_id(value: String) -> Result<String> {
@@ -169,6 +200,15 @@ pub trait StateStore: Send + Sync {
     /// Configured duration of an ownership lease. Heartbeat loops should run
     /// at least three times within this interval.
     fn run_lease_ttl(&self) -> Duration;
+
+    /// Optional outer watchdog for backends that can safely cancel in-flight
+    /// maintenance. PostgreSQL combines transaction-local statement limits
+    /// with SQLx transaction rollback-on-drop; local backends finish
+    /// synchronously or on owned blocking workers and therefore use no
+    /// cancellable wrapper.
+    fn run_maintenance_watchdog(&self) -> Option<Duration> {
+        None
+    }
 
     /// Whether this handle has a shared, encrypted human-input transport.
     /// PostgreSQL requires a valid process keyring; local backends retain the
@@ -297,8 +337,12 @@ pub trait StateStore: Send + Sync {
     ) -> Result<IdempotencyClaimOutcome>;
 
     /// Extend an in-flight claim. `true` means this attempt still owns the
-    /// claim or has already completed it. `false` means it is missing or
-    /// indeterminate; a different attempt is reported as `Conflict`.
+    /// claim or has already completed it, and any renewal is committed before
+    /// return. JSON/SQLite persist the caller's candidate deadline; PostgreSQL
+    /// validates it but derives the durable deadline from its own clock. The
+    /// caller must conservatively start its local TTL at invocation, never at
+    /// response arrival. `false` means the claim is missing or indeterminate;
+    /// a different attempt is reported as `Conflict`.
     async fn heartbeat_idempotency(
         &self,
         key_hash: &str,
@@ -308,8 +352,11 @@ pub trait StateStore: Send + Sync {
 
     /// Atomically renew a keyed HTTP run's operation ledger and matching run
     /// lease. `Owned` requires both in-flight fences to belong to this exact
-    /// attempt. A terminal run is returned separately so the API can preserve
-    /// the winning result while stopping any remaining Lua work.
+    /// attempt and confirms the renewal committed before return. As with the
+    /// ledger-only heartbeat, callers start their conservative local TTL when
+    /// invoking storage because PostgreSQL may sample its own deadline before
+    /// later transaction work. A terminal run is returned separately so the
+    /// API can preserve the winning result while stopping remaining Lua work.
     async fn heartbeat_idempotent_run(
         &self,
         run_id: &str,
@@ -617,5 +664,37 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(config.deadline_from(now), "2026-07-18T10:01:00+00:00");
+    }
+
+    #[test]
+    fn production_lease_has_three_heartbeat_opportunities_and_bounded_maintenance() {
+        assert!(production_run_lease_ttl(5).is_err());
+        assert_eq!(production_run_lease_ttl(6).unwrap(), Duration::from_secs(6));
+        assert_eq!(
+            production_run_lease_ttl(86_400).unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert!(production_run_lease_ttl(86_401).is_err());
+        assert_eq!(
+            run_lease_heartbeat_interval(Duration::from_secs(6)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            run_maintenance_timeout(Duration::from_secs(6)),
+            Duration::from_millis(666)
+        );
+        assert_eq!(
+            run_maintenance_database_timeout(Duration::from_secs(6)),
+            Duration::from_millis(532)
+        );
+        assert_eq!(
+            run_maintenance_timeout(Duration::from_secs(60)),
+            Duration::from_secs(5)
+        );
+
+        // Explicit constructors remain available for deterministic tests that
+        // never pass through production environment validation.
+        let short_test_lease = RunLeaseConfig::new("test-owner", Duration::from_secs(3)).unwrap();
+        assert_eq!(short_test_lease.ttl(), Duration::from_secs(3));
     }
 }

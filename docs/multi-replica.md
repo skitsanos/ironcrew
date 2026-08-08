@@ -31,8 +31,8 @@ Status labels on this page are deliberate:
 |---|---|---|
 | Shared PostgreSQL run, conversation, dialog, and audit records | Committed | Any replica using the same schema can read durable records. |
 | Shared idempotency ledger, accounting, advisory locks, owner ids, and run leases | Committed | Keyed retries and database transitions coordinate across replicas. |
-| Owner-aware run responses and control errors | Committed; not released | A wrong-owner request identifies the owning instance instead of pretending the live object is missing. This improves diagnosis; it does not route the request. |
-| Durable cancellation of a PostgreSQL-backed keyed run from another replica | Committed; not released | The keyed-run ledger acts as a cancellation mailbox that the owner observes through its fenced heartbeat. Direct two-router and local separate-process cancellation/terminal-race gates pass; owner-death and platform gates remain before production use. |
+| Owner-aware run responses and control errors | Committed; not released | A wrong-owner request identifies the owning instance instead of pretending the live object is missing. The local unkeyed separate-process diagnosis gate passes; this improves diagnosis but does not route the request. |
+| Durable cancellation of a PostgreSQL-backed keyed run from another replica | Committed; not released | The keyed-run ledger acts as a cancellation mailbox that the owner observes through its fenced heartbeat. Direct two-router and local separate-process cancellation, terminal-race, owner-death, and kill-during-cancellation gates pass. Real platform routing remains before production use. |
 | Encrypted cross-replica HITL questions/answers for PostgreSQL-backed keyed runs | Committed; not released | With the same keyring on every replica, any replica can list a pending question and queue the first answer for owner pickup. The local separate-process gate passes; unkeyed/local-store runs remain process-only. |
 | Bounded PostgreSQL cross-replica run SSE replay | Committed; not released | Any replica can replay/poll the shared journal using `<run_id>:<sequence>` cursors. Local separate-process retained replay passes, while gaps and cursor failures remain covered below the platform level. JSON/SQLite remain process-local. |
 | Live conversation turns/SSE and global admission | Not implemented | These operations still require the process that owns the live object or apply independently per replica. |
@@ -129,12 +129,21 @@ The intended sequence is:
    owner, and fence.
 2. A cancel request reaches replica B.
 3. Replica B verifies the flow and active run record, then records a
-   cancellation request in the matching in-flight PostgreSQL ledger row.
+   cancellation request in the matching in-flight PostgreSQL ledger row and
+   deletes that run's encrypted shared HITL mailbox rows in the same
+   transaction.
 4. Replica A's fenced lease heartbeat observes the cancellation request,
    stops the worker, expires its local HITL questions, and persists the run as
    `aborted`.
 5. Repeated cancellation is idempotent and cannot change an already-terminal
    result.
+
+If A dies before step 4 commits its terminal compare-and-set, normal lease
+reconciliation records `abandoned`. The completed ledger retains the original
+acceptance response and the cancellation timestamp as historical evidence,
+while the active lease and HITL mailbox are cleared. Reconciliation does not
+append a fictional durable `run_complete`; PostgreSQL SSE exposes the
+authoritative run row through an unnumbered, explicitly incomplete fallback.
 
 This does **not** make all cancellation distributed:
 
@@ -252,6 +261,25 @@ run `abandoned` and preserve the original run id. It does not recreate:
 - the process-local EventBus or conversation replay buffer (PostgreSQL may
   retain an explicitly incomplete run-event prefix)
 
+Production accepts `IRONCREW_RUN_LEASE_TTL_SECONDS=6..86400` (default 60), and
+owner heartbeats plus replica maintenance run every TTL/3. A keyed owner starts
+its process-local deadline when each durable claim or renewal is invoked, never
+when the response arrives, so a slow successful database round trip consumes
+rather than extends the remaining side-effect window.
+
+PostgreSQL bounds lock and statement work inside each maintenance transaction,
+then applies a slightly larger outer watchdog to both the owner-heartbeat and
+reconciliation calls. In steady state, a healthy peer therefore nominally
+observes a dead owner within `TTL + one cadence + bounded heartbeat and
+reconciliation work`—about 90 seconds at the 60-second default when the run is
+in the next fixed 64-row reconciliation batch. Larger backlogs add cadence
+windows; repeated database failures or scheduler starvation can extend the
+window further. A bounded maintenance failure makes `/health/ready` report
+`503` with `component: "storage_maintenance"`; healthy in-flight maintenance
+does not create transient failures, and readiness returns only after both
+operations succeed in one cycle. This fencing and detection behavior still
+does not move or resume execution.
+
 A retry with the same `Idempotency-Key` preserves the original identity and
 does not launch a replacement execution. Starting with a new key creates a
 new run, not a continuation. External tools may have completed effects before
@@ -282,6 +310,9 @@ Until all live-control paths required by an application are shared or brokered:
 - remember that database connections, resident Lua VMs, EventBus replay,
   durable queues/pages, admission bursts, and provider concurrency multiply
   with the replica count
+- monitor `/health/ready` continuously: Railway's configured healthcheck is a
+  deployment gate, so a later maintenance `503` needs external alerting rather
+  than being assumed to withdraw an active replica automatically
 
 An application-level control broker can eventually make Railway replicas
 safe. A design that depends only on load-balancer affinity cannot, because the
@@ -305,7 +336,9 @@ surfaces, and use a non-overlapping replacement strategy. For two-replica
 tests, give every pod a unique `IRONCREW_INSTANCE_ID` (the pod UID is suitable)
 and use per-pod test Services or port-forwarding to target A and B
 deterministically. Do not count affinity-assisted success as a passing
-cross-replica test.
+cross-replica test. Use `/health/ready` as the readiness probe and
+`/health/live` as liveness: a lease-maintenance failure should remove the pod
+from Service endpoints, not restart it while PostgreSQL remains contended.
 
 ## Phased roadmap
 
@@ -329,8 +362,9 @@ control endpoint returns success unless the requested action was delivered.
 - make repeated requests and terminal races deterministic
 - retain local immediate cancellation for owner-routed and unkeyed runs
 
-**Exit gate:** matrix cases 4–6 pass under real PostgreSQL with two processes,
-including owner death and terminalization races.
+**Exit gate:** the local PostgreSQL process gate now passes matrix cases 4–6
+and owner-death case 11, including terminalization and kill-during-cancellation
+races. Railway/OpenShift routing remains a separate deployment gate.
 
 ### Phase 2 — broker every live run-control path
 
@@ -380,9 +414,9 @@ routing must not be marketed as execution failover before this phase exists.
 Run this matrix with two separate `ironcrew serve` processes, `replica-a` and
 `replica-b`, using identical flows and authentication policy, unique
 `IRONCREW_INSTANCE_ID` values, `IRONCREW_STORE=postgres`, the same PostgreSQL
-15+ schema, and `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`. Use direct per-replica
-addresses first; repeat the applicable cases through the real platform load
-balancer afterward.
+15+ schema, and `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true` except for the
+deliberately unkeyed case 4 pair. Use direct per-replica addresses first;
+repeat the applicable cases through the real platform load balancer afterward.
 
 Use a long-running flow, an `ask_human` flow, and an HTTP conversation flow.
 Record provider/tool invocation counts outside IronCrew so duplicate effects
@@ -393,14 +427,14 @@ are visible.
 | 1. Shared readiness | Start A and B against one schema; call `/health/ready` on each. | Both become ready without schema races; each reports a distinct instance id through the development capability surface. | PostgreSQL sharing committed; capability metadata development. |
 | 2. Keyed run replay | Start a keyed run on A; retry the identical request and key on B. | Both responses contain the same `run_id`; the replay is marked; exactly one provider/tool execution starts. | Must pass now. |
 | 3. Key conflict | Reuse that key on B with a different body or flow. | `409`; no second run or external invocation is created. | Must pass now. |
-| 4. Wrong-owner diagnosis | Start a long unkeyed run on A; abort it through B. | B returns structured `409 run_owned_by_another_instance`, names A, and does not claim success. A continues until cancelled locally or completed. | Committed two-router contract test; separate-process release gate remains. |
+| 4. Wrong-owner diagnosis | Start a long unkeyed run on A; abort it through B. | B returns structured `409 run_owned_by_another_instance`, names A, and does not claim success. A continues until cancelled locally or completed. | Local separate-process PostgreSQL gate passes: exact `409`, unchanged authoritative state, continued owner lease renewal, graceful owner `SIGTERM` to `Aborted`, and deterministic post-terminal `404`. Platform routing remains. |
 | 5. Durable keyed cancellation | Start a long keyed run on A; cancel it through B. | B returns `cancellation_requested`; A observes the request, stops work, expires pending questions, and persists one `aborted` terminal result. | Local PostgreSQL two-router and separate-process gates pass; platform gate remains. |
-| 6. Cancellation races | Repeat case 5 concurrently from A and B, then repeat after terminalization. | No duplicate terminal transition; repeated requests are deterministic; a completed run is never rewritten as aborted. | Local separate-process peer-concurrent and terminal-boundary gate passes; owner-death race remains. |
+| 6. Cancellation races | Repeat case 5 concurrently from A and B, then repeat after terminalization. | No duplicate terminal transition; repeated requests are deterministic; a completed run is never rewritten as aborted. | Local separate-process peer-concurrent and terminal-boundary gates pass. Real `SIGKILL` injections before cancellation pickup and after pickup but before terminal commit both reconcile once to `Abandoned`, retain exact replay, and create no durable terminal event. Platform routing remains. |
 | 7. HITL cross-replica delivery | Start an idempotency-keyed run on A with the shared keyring and suspend in `ask_human`; list and answer through B, then repeat the answer. | B lists the same question with `shared_store`, accepts the first answer as `202 queued`, and returns `404` for the repeat. A resumes exactly once. Wrong-flow lookup remains `404`; no plaintext answer appears in SQL, logs, audit, or SSE. | Local PostgreSQL two-router and separate-process gates pass; key-rotation and platform gates remain. |
 | 8. Cross-replica run SSE | Subscribe through B to a run executing on A; persist one event id, disconnect, and reconnect through either replica with that `Last-Event-ID`. Exercise malformed, cross-run, ahead, and expired cursors. | Retained events resume after the cursor without duplicates; failures return the documented `400`/`409`; gaps are explicit; terminal fallback is marked incomplete. No HITL prompt/choices appear in journal JSONB. | Local separate-process retained replay/terminal gate passes; malformed/gap/retention cases remain router/store-level until repeated through processes and platforms. |
 | 9. Conversation wrong owner | Start a conversation on A; send a message and connect SSE through B; read history through B. | Message/SSE does not falsely succeed (`404` is the current boundary); durable history is readable; the turn succeeds through A exactly once. | Distributed conversation control remains absent. |
 | 10. Admission scope | Saturate A's active-run and principal token-bucket limits while B is idle. | A rejects at its local limit; B retains its own local capacity; shared idempotency quotas still reject consistently across both. Metrics distinguish process and durable scopes. | Must be documented and measured before any scale-out. |
-| 11. Owner death | Kill A during a keyed run without graceful shutdown; keep B alive past lease expiry. | The run becomes `abandoned`; B does not recreate the Lua VM or repeat provider/tool execution; retrying the same key preserves the original run id. | Must pass now; confirms no execution failover. |
+| 11. Owner death | Kill A during a keyed run without graceful shutdown; keep B alive past lease expiry. | The run becomes `abandoned`; B does not recreate the Lua VM or repeat provider/tool execution; retrying the same key preserves the original run id. | Local separate-process PostgreSQL gate passes: actual `SIGKILL`, peer reconciliation, concurrent same-key replay, and unchanged durable run/event counts. Railway/OpenShift routing remains a separate gate. |
 | 12. Platform routing | Send a sequence of related requests through Railway or an OpenShift Service with affinity disabled. | PostgreSQL run SSE and shared keyed-run operations match direct A/B tests regardless of replica. Conversation and unkeyed owner-local operations remain outside the multi-replica contract. | Per-surface production gate. |
 
 For release evidence, capture HTTP status/body, owner ids, run/audit rows,
@@ -423,6 +457,45 @@ runtime.
 The associated 150-second local soak completed 253/253 provider-free
 cross-replica HITL/SSE runs with zero readiness failures or deadlocks. See the
 [reviewed summary and machine report](../evaluations/replica-soak/reports/2026-07-19-local-postgres15-150s.md).
-This is local process-isolation evidence, not Railway/OpenShift validation:
-case 11 owner `SIGKILL`/abandonment and case 12 real platform routing remain
-open, as do owner-local conversation and unkeyed-control boundaries.
+
+On 2026-07-20, the same test target passed its extended case 11 gate 1/1 in
+17.90 seconds against isolated PostgreSQL 15. It observed an active
+`WaitingForInput` run, sent `SIGKILL` to and reaped its owner, kept the peer
+ready through the real six-second database-clock lease expiry, and observed
+peer reconciliation to `Abandoned` with the original run id and owner, a
+cleared lease, and an empty HITL mailbox. Same-key retries ran continuously
+across the live-lease, expiry, and reconciliation boundaries, followed by four
+concurrent post-reconciliation retries; all replayed the original acceptance.
+The HTTP run total and exact PostgreSQL run-row/run-event-row counts stayed
+unchanged. This proves the retained same-key path does not launch or transfer
+execution after owner death; it is not a claim that arbitrary external tool
+effects are exactly once.
+
+On 2026-08-07, the current local worktree passed two additional PostgreSQL 15
+process gates. IC-005 passed 2/2 in 22.86 seconds: one pair stopped A before
+cancellation pickup, and a second held the global idempotency-quota advisory
+lock that fences terminal persistence until A had logged cancellation pickup
+and PostgreSQL showed its session blocked. Both sent and reaped real `SIGKILL`,
+reconciled exactly one run to
+`Abandoned`, retained the original keyed acceptance for concurrent replay,
+kept zero durable `run_complete` rows, and returned the same unnumbered
+incomplete SSE fallback on repeated reads. The completed ledger keeps
+`cancel_requested_at` as history while its active lease and HITL mailbox are
+empty. The ordinary pre-pickup path sampled B ready before cancellation, after
+owner death, and after reconciliation; the artificial global-lock path proved
+readiness recovery after the lock was released rather than uninterrupted
+readiness during injected database contention.
+
+IC-006 passed 1/1 in 3.89 seconds with
+`IRONCREW_REQUIRE_IDEMPOTENCY_KEY=false` on a fresh pair. A provider-free
+skipped task created the durable run before process-local HITL. B returned the
+exact owner-aware `409` without changing run, ledger, mailbox, or event state;
+A retained the same question and renewed its lease. Graceful `SIGTERM` of A
+then persisted `Aborted` with the skipped result and one durable terminal
+event. B stayed ready, and its follow-up abort returned `404`; both abort audit
+rows were failures, so no false success was recorded.
+
+This remains local process-isolation evidence, not Railway/OpenShift
+validation. Case 12 real platform routing remains open, as do owner-local
+conversation and unkeyed-control delivery boundaries; case 4 proves truthful
+diagnosis only, not routing.

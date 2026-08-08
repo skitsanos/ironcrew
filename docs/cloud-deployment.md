@@ -413,7 +413,7 @@ the run ID and dropped-result count.
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | `1000` | Base delay for exponential connection-retry backoff, in milliseconds (range 1–30000). |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
 | `IRONCREW_INSTANCE_ID` | generated per process | Optional 1–255 byte printable ASCII runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
-| `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Range: 1–86400. |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Production range: 6–86400; owner heartbeat and replica maintenance cadence is TTL/3. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | unset | Secret JSON object of at most 8 key ids and canonical base64 32-byte keys; maximum 16 KiB. Enables the encrypted mailbox only when the active id is also set. |
 | `IRONCREW_HITL_ACTIVE_KEY_ID` | unset | Key id used for new HITL ciphertext. Configure identically on every replica. |
 | `IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` | `1048576` (1 MiB) | Aggregate serialized pending-question metadata per run; range 1 byte–16 MiB. PostgreSQL ciphertext admission also accounts for 28 AEAD bytes per allowed pending row. |
@@ -433,6 +433,60 @@ the run ID and dropped-result count.
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage
 features used by the runtime and the intended deployment target of
 extension-capable Postgres installs such as `pgvector`.
+
+### Lease maintenance, readiness, and owner loss
+
+Production lease TTLs must be 6–86400 seconds. IronCrew schedules owner
+heartbeats and replica maintenance every `TTL / 3` (2 seconds at the minimum;
+20 seconds at the 60-second default). Keyed-run and conversation fences start
+their local deadline when a storage claim or heartbeat is invoked, not when a
+slow response arrives, so database latency cannot extend local side effects
+past the durable lease window.
+
+PostgreSQL maintenance has an inner transaction-local `lock_timeout` and
+`statement_timeout`, followed by a larger outer Tokio watchdog that also covers
+pool acquisition and setup. With cadence `C`, the outer per-operation bound is
+`W = min(5 seconds, max(100 ms, C / 3))`; the inner database bound is
+`max(50 ms, 4W / 5)`. The heartbeat and reconciliation operations run
+sequentially. At the default TTL they are bounded to 5 seconds each outside the
+database and 4 seconds per statement inside it. The inner limit resolves one
+blocked statement; the outer limit also covers cumulative statement latency.
+If the outer watchdog wins before core reconciliation commits, the owned SQLx
+transaction is dropped and rolled back. PostgreSQL 15 regressions verify that
+atomic rollback and pool recovery. Best-effort run-event pruning happens in a
+later non-authoritative transaction: a timeout there cannot undo committed
+run/idempotency/HITL recovery, although readiness can remain down until the
+next complete maintenance cycle.
+
+Reconciliation retains at most 64 run IDs per transaction and scopes all
+dependent journal, idempotency, and mailbox writes to that batch. This bounds
+per-cycle query results and application RAM on Railway and OpenShift pods. At
+the default cadence, a saturated backlog drains at roughly 192 runs per minute;
+alert on persistent batch saturation rather than lowering the lease TTL.
+
+If startup reconciliation or PostgreSQL idempotency pruning times out, the HTTP
+process can still bind, but `/health/ready` reports `503` with
+`component: "storage_maintenance"`. A later bounded heartbeat or reconciliation
+failure drops readiness; one complete successful cycle is required to restore
+it. Healthy in-flight maintenance does not create a transient `503`. Keep
+`/health/live` as liveness so an advisory-lock or database incident withdraws
+an OpenShift/Kubernetes pod from Service routing without creating a restart
+loop.
+
+For a continuously running healthy peer, the nominal dead-owner observation
+window is `TTL + one cadence + two outer operation bounds` when the run fits in
+the next 64-row batch: at most about 90 seconds with the 60-second default, or
+9.332 seconds at the 6-second minimum. A larger expired backlog adds cadence
+windows. This is not execution failover and is not a hard bound during
+persistent database unavailability, repeated contention, or scheduler
+starvation. Size the TTL for measured database latency and scheduling jitter;
+do not lower it to accelerate platform replacement.
+
+OpenShift/Kubernetes readiness probes continuously observe this maintenance
+state. Railway's configured healthcheck is a deployment gate rather than a
+continuous runtime-routing control, so monitor `/health/ready` externally and
+alert on `storage_maintenance` after deployment. Neither platform should use
+the lease TTL as a substitute for its SIGTERM/drain/SIGKILL budget.
 
 ### HITL key rotation on Railway and OpenShift
 
@@ -514,7 +568,7 @@ All health endpoints are public and require no API token:
 | Endpoint | Meaning | Use |
 |---|---|---|
 | `GET /health/live` | Process is alive and the HTTP runtime can answer. It does not probe providers or storage. | Kubernetes/OpenShift liveness. |
-| `GET /health/ready` | Process is ready to accept traffic and the configured persistence store responds. Returns `503` when storage is unavailable. | Startup/readiness probes and Railway deployment healthcheck. |
+| `GET /health/ready` | Process accepts traffic, the configured persistence store responds, and run-lease maintenance is healthy. Returns `503` with a component label when any gate fails. | Startup/readiness probes and Railway deployment healthcheck. |
 | `GET /health` | Backwards-compatible lightweight liveness response. | Existing monitors only; do not use as a storage-aware readiness gate. |
 
 Provider APIs are intentionally excluded from readiness: a provider outage
@@ -675,6 +729,9 @@ production baseline. It deliberately uses:
 - one replica with Deployment strategy `Recreate` as the conservative baseline
   for applications that also use owner-local conversations or unkeyed controls
 - `/health/ready` for startup and readiness, and `/health/live` for liveness
+- readiness removes a pod from Service endpoints after a lease heartbeat or
+  reconciliation failure; liveness deliberately does not restart it for that
+  maintenance condition
 - a 300-second startup-probe budget, which is shorter than the approximately
   511-second worst-case default connection-retry envelope and excludes
   bootstrap advisory-lock and DDL wait time; tune the probe and database retry
@@ -947,7 +1004,10 @@ supported substitute today. See Railway's
 The checked-in healthcheck path is `/health/ready`. Railway waits for HTTP 200
 before making a new deployment active, and uses the injected `PORT` for that
 request. Railway healthchecks are deployment gates, **not continuous runtime
-monitoring**; use an external monitor for ongoing availability.
+monitoring**. A later lease-maintenance failure still changes the endpoint to
+`503`, but Railway does not continuously use that result to withdraw the active
+replica; use an external monitor for ongoing availability and alert on
+`component: "storage_maintenance"`.
 
 ### 4. SIGTERM grace
 
@@ -1034,7 +1094,12 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - `terminationGracePeriodSeconds` was too short. Raise it so IronCrew's drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) fits comfortably.
 
 ### `/health/live` passes but readiness is 503
-- The process is alive but its configured store is unavailable. Inspect PostgreSQL connectivity and the readiness response/logs. Provider APIs are not part of readiness.
+- The process is alive but a readiness gate failed. `component: "storage"`
+  points to the ordinary store probe. `component: "storage_maintenance"` means
+  startup or periodic lease heartbeat/reconciliation failed or timed out;
+  inspect PostgreSQL connectivity, pool saturation, held advisory locks, and
+  long transactions. Readiness recovers only after both maintenance operations
+  succeed in one cycle. Provider APIs are not part of readiness.
 
 ### Railway deployment passes but later becomes unhealthy
 - Railway's healthcheck is a deployment-time gate, not continuous monitoring. Add an external uptime monitor against `/health/ready`.

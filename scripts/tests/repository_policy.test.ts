@@ -1,0 +1,377 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { validatePlainMappingKeys } from "../validate_skills";
+
+const repository = join(import.meta.dir, "../..");
+
+describe("repository integration policy", () => {
+  test("skill metadata rejects duplicate mapping keys before YAML parsing", () => {
+    const source = "name: first\ndescription: valid\nname: shadowed\n";
+    expect(validatePlainMappingKeys(source, 0)).toEqual([
+      "line 3 duplicates mapping key 'name'",
+    ]);
+  });
+
+  test("CI retains pull-request coverage and least privilege", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const workflow = Bun.YAML.parse(source) as {
+      on: {
+        push: { branches: string[] };
+        pull_request: { branches: string[] };
+      };
+      permissions: Record<string, string>;
+    };
+
+    expect(workflow.on.push.branches).toEqual(["main", "develop"]);
+    expect(workflow.on.pull_request.branches).toEqual(["main", "develop"]);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+  });
+
+  test("CI runs the Bun repository policy and workflow lint", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const workflow = Bun.YAML.parse(source) as {
+      jobs: Record<string, {
+        env?: Record<string, string>;
+        steps: Array<{
+          name?: string;
+          uses?: string;
+          run?: string;
+          with?: Record<string, unknown>;
+          env?: Record<string, string>;
+        }>;
+      }>;
+    };
+    const policy = workflow.jobs["repository-policy"];
+    expect(policy).toBeDefined();
+    expect(
+      policy.steps.some(
+        (step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14",
+      ),
+    ).toBeTrue();
+    expect(
+      policy.steps.find((step) => step.uses === "actions/checkout@v7")?.with,
+    ).toEqual({ "fetch-depth": 0 });
+    const registry = policy.steps.find(
+      (step) => step.name === "Validate issue registry against trusted history",
+    );
+    expect(registry).toBeDefined();
+    expect(policy.env?.IRONCREW_POLICY_BASE_SHA).toBe(
+      "${{ github.event.pull_request.base.sha || github.event.before }}",
+    );
+    const commands = policy.steps.map((step) => step.run ?? "").join("\n");
+    expect(commands).toContain("bun run scripts/validate_skills.ts");
+    expect(commands).toContain("bun run scripts/issues_registry.ts check");
+    expect(commands).toContain("bun test scripts/tests/*.test.ts");
+    expect(commands).toContain("bun run scripts/check_worktree.ts");
+    expect(commands).toMatch(/actionlint"? \.github\/workflows\/\*\.yml/);
+  });
+
+  test("worktree validation covers untracked, staged, and committed whitespace", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "ironcrew-worktree-policy-"));
+    const checker = join(repository, "scripts/check_worktree.ts");
+    const emptyGitConfig = join(fixture, "empty.gitconfig");
+    const gitEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => !key.startsWith("GIT_CONFIG_") && key !== "IRONCREW_POLICY_BASE_SHA",
+      ),
+    );
+    gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
+    gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
+
+    async function check(extraEnvironment: Record<string, string> = {}): Promise<number> {
+      return await Bun.spawn(["bun", "run", checker, fixture], {
+        cwd: fixture,
+        env: { ...gitEnvironment, ...extraEnvironment },
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    }
+
+    async function git(...args: string[]): Promise<number> {
+      return await Bun.spawn(["git", ...args], {
+        cwd: fixture,
+        env: gitEnvironment,
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    }
+
+    async function head(): Promise<string> {
+      const process = Bun.spawn(["git", "rev-parse", "HEAD"], {
+        cwd: fixture,
+        env: gitEnvironment,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const output = await new Response(process.stdout).text();
+      expect(await process.exited).toBe(0);
+      return output.trim();
+    }
+
+    try {
+      await writeFile(emptyGitConfig, "");
+      expect(await git("init", "-b", "main")).toBe(0);
+      expect(await git("config", "user.name", "IronCrew Policy Test")).toBe(0);
+      expect(await git("config", "user.email", "policy-test@invalid.example")).toBe(0);
+      await writeFile(join(fixture, "new.md"), "clean\n");
+      expect(await check()).toBe(0);
+
+      await writeFile(join(fixture, "new.md"), "trailing space \n");
+      expect(await check()).not.toBe(0);
+
+      expect(await git("add", "new.md")).toBe(0);
+      expect(await check()).not.toBe(0);
+
+      await writeFile(join(fixture, "new.md"), "clean\n");
+      expect(await git("add", "new.md")).toBe(0);
+      expect(await git("commit", "-m", "clean baseline")).toBe(0);
+      const trustedBase = await head();
+      expect(await check({ IRONCREW_POLICY_BASE_SHA: trustedBase })).toBe(0);
+
+      await writeFile(join(fixture, "committed.md"), "committed trailing space \n");
+      expect(await git("add", "committed.md")).toBe(0);
+      expect(await git("commit", "-m", "bad committed whitespace")).toBe(0);
+      expect(await check({ IRONCREW_POLICY_BASE_SHA: trustedBase })).not.toBe(0);
+      expect(await check({
+        IRONCREW_POLICY_BASE_SHA: trustedBase,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.whitespace",
+        GIT_CONFIG_VALUE_0: "-trailing-space",
+      })).not.toBe(0);
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test("CI pins Rust and preserves the exact all-target gates", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const toolchain = await Bun.file(join(repository, "rust-toolchain.toml")).text();
+    expect(source).not.toContain("dtolnay/rust-toolchain@stable");
+
+    const workflow = Bun.YAML.parse(source) as {
+      jobs: Record<string, { steps: Array<{ uses?: string; run?: string }> }>;
+    };
+    const commands = workflow.jobs["rust-default"].steps
+      .map((step) => step.run ?? "")
+      .join("\n");
+    expect(commands).toContain("cargo fmt --all -- --check");
+    expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
+    expect(commands).toContain("cargo test --all-targets");
+    expect(commands).toContain("cargo test --doc");
+    expect(source).toContain("dtolnay/rust-toolchain@1.96.0");
+    expect(toolchain).toContain('channel = "1.96.0"');
+    expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
+  });
+
+  test("dependency audit warnings fail closed and the fixed transitive stays selected", async () => {
+    const workflow = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
+
+    expect(workflow).toContain("cargo audit --deny warnings");
+    expect(workflow).toContain("cargo-audit --version 0.22.1 --locked");
+    expect(lockfile).toContain('name = "event-listener"\nversion = "5.4.2"');
+    expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
+  });
+
+  test("PostgreSQL 15 process and soak gates remain in CI", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const workflow = Bun.YAML.parse(source) as {
+      jobs: Record<string, {
+        services?: Record<string, { image?: string }>;
+        steps: Array<{ run?: string }>;
+      }>;
+    };
+    const postgres = workflow.jobs["postgres-integration"];
+    expect(postgres.services?.postgres.image).toBe("postgres:15");
+    const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
+    expect(commands).toContain("--test two_process_replica_acceptance_test");
+    expect(commands).toContain("evaluations/replica-soak/soak.py");
+  });
+
+  test("release workflow gates builds and scopes publication authority", async () => {
+    const source = await Bun.file(
+      join(repository, ".github/workflows/release.yml"),
+    ).text();
+    const workflow = Bun.YAML.parse(source) as {
+      permissions: Record<string, string>;
+      jobs: Record<string, {
+        needs?: string;
+        permissions?: Record<string, string>;
+        steps: Array<{ name?: string; uses?: string; run?: string; with?: Record<string, string> }>;
+      }>;
+    };
+    const guardCommands = workflow.jobs.guard.steps
+      .map((step) => step.run ?? "")
+      .join("\n");
+
+    expect(workflow.permissions).toEqual({});
+    expect(workflow.jobs.guard.permissions).toEqual({ contents: "read" });
+    expect(workflow.jobs.build.permissions).toEqual({ contents: "read" });
+    expect(workflow.jobs.release.permissions).toEqual({
+      contents: "write",
+      "id-token": "write",
+    });
+    expect(workflow.jobs.build.needs).toBe("guard");
+    expect(guardCommands).toContain("git fetch --no-tags origin main");
+    expect(guardCommands).toContain(
+      "./scripts/verify_release_source.sh \"$TAG_NAME\" refs/remotes/origin/main",
+    );
+
+    const notes = workflow.jobs.release.steps.find(
+      (step) => step.name === "Write release notes from tag annotation",
+    );
+    expect(notes?.run).toContain("${RUNNER_TEMP}/ironcrew-release-body.md");
+    expect(notes?.run).not.toContain("GITHUB_OUTPUT");
+    expect(notes?.run).not.toContain("RELEASE_EOF");
+    expect(notes?.run).toContain(
+      "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}",
+    );
+    expect(notes?.run).toContain("--certificate-identity '$CERTIFICATE_IDENTITY'");
+    const publisher = workflow.jobs.release.steps.find(
+      (step) => step.uses === "softprops/action-gh-release@v3",
+    );
+    expect(publisher?.with?.body_path).toBe("${{ runner.temp }}/ironcrew-release-body.md");
+  });
+
+  test("release source verification rejects lightweight, version-drift, and off-main tags", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "ironcrew-release-policy-"));
+    const verifier = join(repository, "scripts/verify_release_source.sh");
+    const emptyGitConfig = join(fixture, "empty.gitconfig");
+    const gitEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_CONFIG_")),
+    );
+    gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
+    gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
+
+    async function git(...args: string[]): Promise<number> {
+      return await Bun.spawn(["git", ...args], {
+        cwd: fixture,
+        env: gitEnvironment,
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    }
+
+    async function verify(tag: string): Promise<number> {
+      return await Bun.spawn([verifier, tag, "refs/heads/main"], {
+        cwd: fixture,
+        env: gitEnvironment,
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    }
+
+    try {
+      await writeFile(emptyGitConfig, "");
+      expect(await git("init", "-b", "main")).toBe(0);
+      expect(await git("config", "user.name", "IronCrew Policy Test")).toBe(0);
+      expect(await git("config", "user.email", "policy-test@invalid.example")).toBe(0);
+      await writeFile(
+        join(fixture, "Cargo.toml"),
+        '[package]\nname = "fixture"\nversion = "1.2.3"\n',
+      );
+      expect(await git("add", "Cargo.toml")).toBe(0);
+      expect(await git("commit", "-m", "main release")).toBe(0);
+      expect(await git("tag", "v1.2.3")).toBe(0);
+      expect(await verify("v1.2.3")).not.toBe(0);
+      expect(await git("tag", "--delete", "v1.2.3")).toBe(0);
+      expect(await git("tag", "-a", "v1.2.3", "-m", "release")).toBe(0);
+      expect(await verify("v1.2.3")).toBe(0);
+
+      expect(await git("switch", "-c", "feature")).toBe(0);
+      await writeFile(
+        join(fixture, "Cargo.toml"),
+        '[package]\nname = "fixture"\nversion = "1.2.4"\n',
+      );
+      expect(await git("add", "Cargo.toml")).toBe(0);
+      expect(await git("commit", "-m", "unreviewed release")).toBe(0);
+      expect(await git("tag", "-a", "v1.2.4", "-m", "off-main")).toBe(0);
+      expect(await verify("v1.2.4")).not.toBe(0);
+      expect(await verify("v1.2.3")).not.toBe(0);
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test("Docker publication is manual, default-branch-only, and validates safe input", async () => {
+    const source = await Bun.file(
+      join(repository, ".github/workflows/docker-publish.yml"),
+    ).text();
+    const workflow = Bun.YAML.parse(source) as {
+      on: {
+        workflow_dispatch: {
+          inputs: Record<string, { required?: boolean; type?: string }>;
+        };
+      };
+      permissions: Record<string, string>;
+      concurrency: { group: string; "cancel-in-progress": boolean };
+      jobs: Record<string, {
+        if?: string;
+        permissions?: Record<string, string>;
+        steps: Array<{
+          name?: string;
+          run?: string;
+          env?: Record<string, string>;
+          with?: Record<string, string>;
+        }>;
+      }>;
+    };
+
+    expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
+    expect(workflow.on.workflow_dispatch.inputs.tag).toEqual({
+      description: "Exact stable release tag to publish (for example v2.24.0).",
+      required: true,
+      type: "string",
+    });
+    expect(workflow.permissions).toEqual({});
+    expect(workflow.concurrency).toEqual({
+      group: "docker-publish",
+      "cancel-in-progress": false,
+    });
+    expect(workflow.jobs.publish.if).toBe(
+      "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+    );
+    expect(workflow.jobs.publish.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+    });
+
+    const validation = workflow.jobs.publish.steps.find(
+      (step) => step.name === "Validate release tag",
+    );
+    expect(validation?.env?.RELEASE_TAG_INPUT).toBe("${{ inputs.tag }}");
+    expect(validation?.run).not.toContain("${{ inputs.tag }}");
+    expect(validation?.run).not.toContain("github.event.inputs.tag");
+    expect(validation?.run).toContain("Release tag must match stable tag form vX.Y.Z");
+    expect(validation?.run).toContain("--json tagName,isDraft,isPrerelease");
+
+    const build = workflow.jobs.publish.steps.find(
+      (step) => step.name === "Build & push multi-arch image",
+    );
+    expect(build?.with?.tags).toContain("${{ env.IMAGE }}:${{ steps.tag.outputs.version }}");
+    expect(build?.with?.tags).not.toContain(":latest");
+    const latest = workflow.jobs.publish.steps.find(
+      (step) => step.name === "Move latest alias only for the current GitHub release",
+    );
+    expect(latest?.run).toContain("releases/latest");
+    expect(latest?.run).toContain('current_tag" != "$RELEASE_TAG');
+    expect(latest?.run).toContain("docker buildx imagetools create");
+  });
+
+  test("release guidance preserves approval and manual publication boundaries", async () => {
+    const sources = await Promise.all([
+      Bun.file(join(repository, ".agents/skills/release-ironcrew/SKILL.md")).text(),
+      Bun.file(join(repository, ".claude/skills/release-workflow/SKILL.md")).text(),
+    ]);
+    for (const source of sources) {
+      expect(source).not.toContain("git reset --hard");
+      expect(source).not.toContain("git commit -am");
+      expect(source).not.toContain("git push --force");
+      expect(source).toContain("GITHUB_TOKEN");
+      expect(source).toContain("docker-publish.yml");
+      expect(source).toContain("protected `v*` tag rules");
+    }
+  });
+});

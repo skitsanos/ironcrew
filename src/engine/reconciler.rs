@@ -5,11 +5,40 @@
 //! a rolling deployment cannot sweep healthy work owned by another pod.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 
 use crate::engine::store::StateStore;
-use crate::utils::error::Result;
+use crate::utils::error::{IronCrewError, Result};
+
+#[derive(Debug)]
+pub struct MaintenanceCycle {
+    pub heartbeat: Result<usize>,
+    pub reconciliation: Result<usize>,
+}
+
+impl MaintenanceCycle {
+    pub fn healthy(&self) -> bool {
+        self.heartbeat.is_ok() && self.reconciliation.is_ok()
+    }
+}
+
+fn timeout_error(operation: &str, timeout: std::time::Duration) -> IronCrewError {
+    IronCrewError::Validation(format!(
+        "Run lease {operation} exceeded its {} ms maintenance timeout",
+        timeout.as_millis()
+    ))
+}
+
+pub async fn heartbeat_owned_runs_bounded(store: &Arc<dyn StateStore>) -> Result<usize> {
+    let Some(timeout) = store.run_maintenance_watchdog() else {
+        return store.heartbeat_owned_runs().await;
+    };
+    tokio::time::timeout(timeout, store.heartbeat_owned_runs())
+        .await
+        .map_err(|_| timeout_error("heartbeat", timeout))?
+}
 
 pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
@@ -17,7 +46,13 @@ pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> 
 }
 
 pub async fn reconcile_stuck_runs_at(store: &Arc<dyn StateStore>, now: &str) -> Result<usize> {
-    let count = store.reconcile_abandoned_runs(now).await?;
+    let count = if let Some(timeout) = store.run_maintenance_watchdog() {
+        tokio::time::timeout(timeout, store.reconcile_abandoned_runs(now))
+            .await
+            .map_err(|_| timeout_error("reconciliation", timeout))??
+    } else {
+        store.reconcile_abandoned_runs(now).await?
+    };
 
     if count > 0 {
         tracing::warn!(
@@ -28,6 +63,27 @@ pub async fn reconcile_stuck_runs_at(store: &Arc<dyn StateStore>, now: &str) -> 
         tracing::debug!("Stuck-run reconciler: no expired runs");
     }
     Ok(count)
+}
+
+/// Run one bounded periodic lease-maintenance cycle. A failed heartbeat drops
+/// readiness immediately; only a complete successful heartbeat+reconcile cycle
+/// can restore it.
+pub async fn maintain_run_leases(
+    store: &Arc<dyn StateStore>,
+    maintenance_healthy: &AtomicBool,
+) -> MaintenanceCycle {
+    let heartbeat = heartbeat_owned_runs_bounded(store).await;
+    if heartbeat.is_err() {
+        maintenance_healthy.store(false, Ordering::Release);
+    }
+
+    let reconciliation = reconcile_stuck_runs(store).await;
+    let cycle = MaintenanceCycle {
+        heartbeat,
+        reconciliation,
+    };
+    maintenance_healthy.store(cycle.healthy(), Ordering::Release);
+    cycle
 }
 
 #[cfg(test)]

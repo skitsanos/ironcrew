@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check IronCrew"
+  short_description: "Run IronCrew complete quality gates"
+  default_prompt: "Use $check-ironcrew to validate the current IronCrew worktree."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resolve IronCrew Issue"
+  short_description: "Implement and close one tracked IC issue"
+  default_prompt: "Use $resolve-ironcrew-issue to implement the next tracked IC issue end to end."

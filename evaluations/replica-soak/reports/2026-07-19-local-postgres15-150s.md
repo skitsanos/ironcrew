@@ -117,3 +117,14 @@ included in database-capacity estimates.
 3. Run a 30–60 minute provider/tool-free profile across the journal retention
    boundary, then add representative provider/tool and conversation profiles.
    The 150-second result does not establish a long-term storage steady state.
+
+Subsequent evidence on 2026-07-20 closed item 1 at the local process level.
+`tests/two_process_replica_acceptance_test.rs` passed 1/1 in 17.90 seconds
+against isolated PostgreSQL 15 after sending `SIGKILL` to an active owner. The
+surviving replica reconciled the original run to `Abandoned` after its real
+six-second database-clock lease expired. Same-key retries spanned the
+live-lease, expiry, and reconciliation boundaries, followed by four concurrent
+post-reconciliation retries; all replayed the original acceptance while exact
+durable run-row and run-event-row counts remained unchanged. This does not
+retroactively make this 150-second soak an owner-death or platform run. Items 2
+and 3 remain open.

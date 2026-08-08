@@ -8,6 +8,39 @@ const MAX_REQUEST_BODY_HARD_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
 const MAX_SHUTDOWN_DRAIN_MS: u64 = 30_000;
 
+enum StartupPruneOutcome {
+    Pruned(usize),
+    MaintenanceUnhealthy(IronCrewError),
+}
+
+async fn startup_prune_with_policy<F>(
+    maintenance_watchdog: Option<std::time::Duration>,
+    prune: F,
+) -> Result<StartupPruneOutcome>
+where
+    F: std::future::Future<Output = Result<usize>>,
+{
+    let prune_result = match maintenance_watchdog {
+        Some(timeout) => match tokio::time::timeout(timeout, prune).await {
+            Ok(result) => result,
+            Err(_) => Err(IronCrewError::Validation(format!(
+                "Startup idempotency pruning exceeded its {} ms maintenance timeout",
+                timeout.as_millis()
+            ))),
+        },
+        None => prune.await,
+    };
+    match prune_result {
+        Ok(count) => Ok(StartupPruneOutcome::Pruned(count)),
+        Err(error) if maintenance_watchdog.is_some() => {
+            Ok(StartupPruneOutcome::MaintenanceUnhealthy(error))
+        }
+        Err(error) => Err(IronCrewError::Validation(format!(
+            "Failed to prune the idempotency ledger at startup: {error}"
+        ))),
+    }
+}
+
 fn bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
     let value = match std::env::var(name) {
         Ok(value) => value.parse::<u64>().map_err(|_| {
@@ -160,25 +193,38 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
 
     // Reconcile only legacy or expired run leases. Healthy work owned by
     // another Railway/OpenShift replica remains untouched.
-    let _ = crate::engine::reconciler::reconcile_stuck_runs(&store)
-        .await
-        .map_err(|e| {
-            tracing::error!("Reconciler failed (non-fatal): {e}");
-        });
+    let mut initial_maintenance_healthy = match crate::engine::reconciler::reconcile_stuck_runs(
+        &store,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(%error, "Initial run reconciliation failed; readiness will stay down until maintenance recovers");
+            false
+        }
+    };
 
     let max_active_conversations = api::conversations::max_active_conversations();
     let max_active_runs = api::handlers::max_active_runs();
     let max_sse_connections = api::handlers::max_sse_connections();
     let max_run_lifetime = api::handlers::max_run_lifetime();
     let idempotency = api::idempotency::IdempotencyConfig::from_env(max_run_lifetime)?;
-    let pruned_idempotency_records = store
-        .prune_idempotency(&chrono::Utc::now().to_rfc3339(), idempotency.prune_batch)
-        .await
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "Failed to prune the idempotency ledger at startup: {error}"
-            ))
-        })?;
+    let prune_now = chrono::Utc::now().to_rfc3339();
+    let maintenance_watchdog = store.run_maintenance_watchdog();
+    let pruned_idempotency_records = match startup_prune_with_policy(
+        maintenance_watchdog,
+        store.prune_idempotency(&prune_now, idempotency.prune_batch),
+    )
+    .await?
+    {
+        StartupPruneOutcome::Pruned(count) => count,
+        StartupPruneOutcome::MaintenanceUnhealthy(error) => {
+            initial_maintenance_healthy = false;
+            tracing::error!(%error, "Startup idempotency pruning failed; readiness will stay down until maintenance recovers");
+            0
+        }
+    };
     if pruned_idempotency_records > 0 {
         tracing::info!(
             count = pruned_idempotency_records,
@@ -200,7 +246,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         sse_permits: Arc::new(tokio::sync::Semaphore::new(max_sse_connections)),
         max_run_lifetime,
         terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
-        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
+        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(initial_maintenance_healthy),
         readiness_cache: tokio::sync::Mutex::new(None),
         idempotency,
         store,
@@ -212,7 +258,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let heartbeat_store = state.store.clone();
     let heartbeat_state = state.clone();
     let heartbeat_interval =
-        (heartbeat_store.run_lease_ttl() / 3).max(std::time::Duration::from_secs(1));
+        crate::engine::store::run_lease_heartbeat_interval(heartbeat_store.run_lease_ttl());
     tracing::info!(
         instance_id = heartbeat_store.instance_id(),
         interval_seconds = heartbeat_interval.as_secs(),
@@ -223,32 +269,28 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let heartbeat_ok = match heartbeat_store.heartbeat_owned_runs().await {
+            let cycle = crate::engine::reconciler::maintain_run_leases(
+                &heartbeat_store,
+                &heartbeat_state.store_maintenance_healthy,
+            )
+            .await;
+            match cycle.heartbeat {
                 Ok(count) => {
                     tracing::trace!(count, "Refreshed owned run leases");
-                    true
                 }
                 Err(error) => {
                     tracing::error!(%error, "Failed to refresh owned run leases");
-                    false
                 }
-            };
-            let now = chrono::Utc::now().to_rfc3339();
-            let reconcile_ok = match heartbeat_store.reconcile_abandoned_runs(&now).await {
-                Ok(0) => true,
+            }
+            match cycle.reconciliation {
+                Ok(0) => {}
                 Ok(count) => {
                     tracing::warn!(count, "Reconciled expired run leases");
-                    true
                 }
                 Err(error) => {
                     tracing::error!(%error, "Failed to reconcile expired run leases");
-                    false
                 }
-            };
-            heartbeat_state.store_maintenance_healthy.store(
-                heartbeat_ok && reconcile_ok,
-                std::sync::atomic::Ordering::Release,
-            );
+            }
         }
     });
 
@@ -486,7 +528,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::public_bind_requires_auth;
+    use super::{StartupPruneOutcome, public_bind_requires_auth, startup_prune_with_policy};
+    use crate::utils::error::IronCrewError;
 
     #[test]
     fn loopback_binds_do_not_require_server_auth() {
@@ -500,5 +543,35 @@ mod tests {
         assert!(public_bind_requires_auth("0.0.0.0"));
         assert!(public_bind_requires_auth("::"));
         assert!(public_bind_requires_auth("ironcrew.internal"));
+    }
+
+    #[tokio::test]
+    async fn startup_prune_outer_timeout_is_a_watchdog_backend_soft_failure() {
+        let outcome = startup_prune_with_policy(
+            Some(std::time::Duration::from_millis(1)),
+            std::future::pending(),
+        )
+        .await
+        .expect("watchdog-backed startup pruning must degrade readiness");
+        let StartupPruneOutcome::MaintenanceUnhealthy(error) = outcome else {
+            panic!("outer timeout unexpectedly reported successful pruning");
+        };
+        assert!(error.to_string().contains("maintenance timeout"));
+    }
+
+    #[tokio::test]
+    async fn startup_prune_local_backend_error_remains_fatal() {
+        let result = startup_prune_with_policy(None, async {
+            Err(IronCrewError::Validation("local prune failed".into()))
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("local startup pruning unexpectedly became nonfatal");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to prune the idempotency ledger at startup")
+        );
     }
 }
