@@ -1,57 +1,66 @@
 name: Docker Publish
 
 # Publishes the multi-arch Docker image to Docker Hub. Deliberately decoupled
-# from release.yml (which builds binaries) so image pushes happen ONLY:
-#   1. Manually via the Actions tab (workflow_dispatch) — pushes :latest.
-#   2. Automatically when a GitHub Release is published — pushes :<version> + :latest.
+# from release.yml (which builds binaries): releases created with GITHUB_TOKEN
+# do not emit a cascading release event, and image publication requires its own
+# explicit authorization. This workflow therefore runs only by manual dispatch
+# from the default branch with an exact stable release tag.
 #
-# Both paths reuse the signed linux-amd64/arm64 tarballs release.yml already
+# The workflow reuses the signed linux-amd64/arm64 tarballs release.yml already
 # produced, so there is no recompilation here (~1-2 min end to end).
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v2.16.0). Defaults to the latest release."
-        required: false
+        description: "Exact stable release tag to publish (for example v2.24.0)."
+        required: true
         type: string
-  release:
-    types: [published]
 
-permissions:
-  contents: read # gh release download needs read access to release assets
-  id-token: write # keyless signing of the immutable pushed image digest
+permissions: {}
 
 env:
   IMAGE: skitsanos/ironcrew
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
     name: Build & push image
     runs-on: ubuntu-latest
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read # gh release download needs read access to release assets
+      id-token: write # keyless signing of the immutable pushed image digest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
-      # Resolve which release tag to publish:
-      #   - release event   -> the tag that triggered it
-      #   - manual + input   -> the provided tag
-      #   - manual, no input -> the latest published release
-      - name: Resolve release tag
+      - name: Validate release tag
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            tag="${{ github.event.inputs.tag }}"
-          else
-            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)
-          fi
-          if [ -z "$tag" ]; then
-            echo "::error::Could not resolve a release tag to publish"
+          tag="$RELEASE_TAG_INPUT"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag must match stable tag form vX.Y.Z"
             exit 1
           fi
+
+          release_state=$(gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+          IFS=$'\t' read -r resolved_tag is_draft is_prerelease <<< "$release_state"
+          if [[ "$resolved_tag" != "$tag" || "$is_draft" != "false" || "$is_prerelease" != "false" ]]; then
+            echo "::error::Tag $tag must identify a published stable GitHub release"
+            exit 1
+          fi
+
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -115,9 +124,23 @@ jobs:
           sbom: true
           tags: |
             ${{ env.IMAGE }}:${{ steps.tag.outputs.version }}
-            ${{ env.IMAGE }}:latest
 
       - name: Sign pushed image digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Move latest alias only for the current GitHub release
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          current_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          if [[ "$current_tag" != "$RELEASE_TAG" ]]; then
+            echo "Skipping latest alias: $RELEASE_TAG is not current ($current_tag)"
+            exit 0
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}@${DIGEST}"

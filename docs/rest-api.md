@@ -204,10 +204,17 @@ late SSE recovery and is cleaned up after 5 seconds.
 For a PostgreSQL-backed run created with an `Idempotency-Key`, another replica
 can durably request cancellation through the shared ledger. Its `200` response
 has `status: "cancellation_requested"`, `control_scope: "shared_store"`, the
-owner id, and an `already_requested` flag. The owner observes that request on
-its fenced heartbeat, stops the worker, and then persists `aborted`; therefore
-the cancellation response is an acknowledgement, not proof that the run is
-already terminal.
+owner id, and an `already_requested` flag. That transaction also removes the
+run's pending encrypted human-input rows before it acknowledges the request.
+The owner observes the cancellation on its fenced heartbeat, stops the worker,
+and then persists `aborted`; therefore the cancellation response is an
+acknowledgement, not proof that the run is already terminal.
+
+If the owner dies after that acknowledgement but before its terminal
+compare-and-set commits, lease reconciliation records `abandoned`, not
+`aborted`. No durable `run_complete` event is invented for the dead process;
+PostgreSQL SSE recovery instead emits one unnumbered fallback completion with
+`journal_complete: false` and `synthesized_from_run_record: true`.
 
 If an active run belongs to another instance and the configured backend has no
 durable cancellation mailbox (including JSON, SQLite, or an unkeyed run), the
@@ -220,6 +227,7 @@ A run can end with one of these statuses:
 - `success` / `partial_failure` / `failed` — normal completion
 - `timed_out` — configured maximum lifetime exceeded
 - `aborted` — cancelled via this endpoint
+- `abandoned` — the owning process disappeared before terminal persistence
 
 ## Mid-Run Questions (`crew:ask_human`)
 
@@ -367,8 +375,9 @@ the answer content. This does not sanitize arbitrary flow logs, model output,
 or tool output: flows and prompts must not echo sensitive answers themselves.
 
 Locally aborting a suspended run expires its pending questions before the
-response returns. A durable cross-instance cancellation only acknowledges the
-mailbox write; the questions expire when the owner observes it. Once terminal,
+response returns. A durable cross-instance cancellation atomically records the
+request and removes its pending encrypted question rows before returning
+`200`; the owner may observe and terminalize that request later. Once terminal,
 both question endpoints return `404`; the separate owner-local SSE event bus
 may remain available for JSON/SQLite during its short retention window, while
 PostgreSQL replay follows the durable journal contract below.

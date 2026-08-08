@@ -141,7 +141,7 @@ deliberately enabled. Local
 |--------|----------------------------------|-------------|
 | GET    | `/health`                        | Backwards-compatible lightweight liveness check |
 | GET    | `/health/live`                   | Process liveness check |
-| GET    | `/health/ready`                  | Storage-aware readiness check (`503` while unavailable) |
+| GET    | `/health/ready`                  | Storage- and lease-maintenance-aware readiness (`503` while unavailable or maintenance is unhealthy) |
 | GET    | `/metrics`                       | Protected Prometheus process/admission metrics |
 | POST   | `/flows/{flow}/run`              | Run a crew (async, returns run_id) |
 | GET    | `/flows/{flow}/events/{run_id}`  | SSE event stream for a run |
@@ -157,6 +157,14 @@ deliberately enabled. Local
 | DELETE | `/flows/{flow}/conversations/{id}`          | Drop handle + delete record |
 | GET    | `/flows/{flow}/conversations`               | Paginated list (filtered by flow) |
 | GET    | `/nodes`                         | List built-in tools |
+
+`/health/ready` is pessimistic about run-lease maintenance. A bounded startup
+reconciliation or PostgreSQL idempotency-prune failure allows the HTTP process
+to start, but readiness returns `503` with
+`component: "storage_maintenance"`. A periodic owner-heartbeat or abandoned-run
+reconciliation failure has the same effect. Readiness recovers only after one
+complete maintenance cycle succeeds; `/health/live` and the compatibility
+`/health` endpoint remain liveness-only checks.
 
 ### fmt
 
@@ -572,11 +580,24 @@ individual ranges stated in their descriptions.
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (default: `1000`; range: 1–30000) |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (default: `30`; range: 1–120 seconds) |
 | `IRONCREW_INSTANCE_ID` | Optional unique 1–255 byte printable ASCII process/pod identity stored as the owner of live runs. Generated once per process when unset |
-| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Seconds before an unrefreshed run lease is eligible for abandoned-run reconciliation; also the mandatory grace before explicit recovery of an indeterminate conversation turn (default: `60`, range: 1–86400) |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Seconds before an unrefreshed run lease is eligible for abandoned-run reconciliation; also the mandatory grace before explicit recovery of an indeterminate conversation turn (default: `60`, production range: 6–86400). Owner heartbeats and replica maintenance run every TTL/3 |
 | `IRONCREW_JSON_STORE_RECORD_MAX_BYTES` | Maximum bytes read/written for one JSON run record (default: `67108864` = 64 MiB; hard ceiling: `134217728`) |
 | `IRONCREW_JSON_STORE_MAX_SCAN_ENTRIES` | Maximum run files visited by one JSON-store list/count/clean scan (default: `10000`; hard ceiling: `100000`) |
 | `IRONCREW_RUNS_DEFAULT_LIMIT` | Default page size for `GET /flows/{flow}/runs` when `limit` is not provided. Default: `20` |
 | `IRONCREW_RUNS_MAX_LIMIT` | Hard cap on `limit` for `GET /flows/{flow}/runs`. A client asking for more is silently clamped. Default: `100` |
+
+For PostgreSQL, each broad owner heartbeat and reconciliation operation has a
+bounded transaction-local lock/statement timeout and a slightly larger outer
+watchdog. The limits are derived from the lease cadence and cap at 4 seconds
+per statement inside PostgreSQL and 5 seconds for the aggregate operation at
+the default TTL. Reconciliation processes at most 64 runs per cycle and keeps
+only those IDs in application memory. A dead owner is therefore nominally
+detected within the TTL, one additional cadence, and one bounded
+heartbeat-plus-reconciliation cycle when it fits in the next batch. Backlog or
+repeated database failures can extend that window; this mechanism records
+`abandoned` work and never resumes execution on another process. See
+[Storage Backends](storage.md#run-ownership-and-terminal-writes) for the exact
+formula and minimum-TTL example.
 
 **Crew memory:**
 

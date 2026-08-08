@@ -48,6 +48,7 @@ struct MessageIdempotencyAttempt {
     principal_id: PrincipalId,
     request_fingerprint: String,
     attempt_id: String,
+    lease_deadline: tokio::time::Instant,
 }
 
 fn replay_message(record: &IdempotencyRecord) -> MessageResult {
@@ -984,6 +985,7 @@ async fn execute_idempotent_message(
         attempt.key_hash.clone(),
         attempt.attempt_id.clone(),
         CONVERSATION_MESSAGE_OPERATION,
+        attempt.lease_deadline,
     );
     let mut claim_loss = heartbeat.loss_receiver();
     let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
@@ -1371,11 +1373,13 @@ pub async fn post_message(
 
     if let Some(request_key) = request_key {
         let scope = super::idempotency::conversation_scope(&key.0, &id);
+        let lease_started = tokio::time::Instant::now();
         let now = chrono::Utc::now();
+        let lease_ttl = state.store.run_lease_ttl();
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let lease_expires_at = now
             .checked_add_signed(
-                chrono::Duration::from_std(state.store.run_lease_ttl())
+                chrono::Duration::from_std(lease_ttl)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60)),
             )
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
@@ -1406,6 +1410,10 @@ pub async fn post_message(
             principal_id: principal.id().clone(),
             request_fingerprint,
             attempt_id,
+            lease_deadline: super::idempotency::conservative_lease_deadline(
+                lease_started,
+                lease_ttl,
+            ),
         };
         match state
             .store
@@ -1459,6 +1467,21 @@ pub async fn post_message(
                     retry_after_seconds,
                 ));
             }
+        }
+
+        if tokio::time::Instant::now() >= attempt.lease_deadline {
+            if let Err(error) = state
+                .store
+                .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
+                .await
+            {
+                tracing::error!(%error, "Failed to release an expired conversation idempotency claim");
+            }
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The durable message claim consumed its lease window before execution could start; retry with the same Idempotency-Key"
+                    .into(),
+            ));
         }
 
         let task_state = state.clone();

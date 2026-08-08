@@ -8,16 +8,25 @@
 
 use std::fs::{self, File};
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use ironcrew::engine::postgres_store::PostgresStore;
+use ironcrew::engine::store::RunLeaseConfig;
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
+
+#[cfg(unix)]
+#[path = "two_process_replica_acceptance/phase2/mod.rs"]
+mod phase2;
 
 const FLOW: &str = "replica-acceptance";
 const API_TOKEN: &str = "two-process-acceptance-token-32-bytes";
 const IDEMPOTENCY_KEY: &str = "two-process-replica-acceptance-key-0001";
 const CANCELLATION_IDEMPOTENCY_KEY: &str = "two-process-replica-cancellation-key-0002";
+const OWNER_DEATH_IDEMPOTENCY_KEY: &str = "two-process-owner-death-key-0003";
 const KEYRING_JSON: &str =
     r#"{"acceptance-key-v1":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#;
 const ACTIVE_KEY_ID: &str = "acceptance-key-v1";
@@ -96,10 +105,42 @@ impl ReplicaProcess {
         prefix: &str,
         log_dir: &Path,
     ) -> Self {
+        Self::spawn_with_policy(
+            name,
+            instance_id,
+            port,
+            flows_dir,
+            database_url,
+            prefix,
+            log_dir,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_policy(
+        name: &str,
+        instance_id: &str,
+        port: u16,
+        flows_dir: &Path,
+        database_url: &str,
+        prefix: &str,
+        log_dir: &Path,
+        require_idempotency_key: bool,
+    ) -> Self {
         let stdout_path = log_dir.join(format!("{name}.stdout.log"));
         let stderr_path = log_dir.join(format!("{name}.stderr.log"));
         let stdout = File::create(&stdout_path).expect("create replica stdout log");
         let stderr = File::create(&stderr_path).expect("create replica stderr log");
+
+        let process_database_url = url::Url::parse(database_url)
+            .map(|mut parsed| {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("application_name", instance_id);
+                parsed.to_string()
+            })
+            .expect("acceptance PostgreSQL URL");
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_ironcrew"));
         command
@@ -115,7 +156,7 @@ impl ReplicaProcess {
             ])
             .arg(flows_dir)
             .env("IRONCREW_STORE", "postgres")
-            .env("DATABASE_URL", database_url)
+            .env("DATABASE_URL", &process_database_url)
             .env("IRONCREW_PG_TABLE_PREFIX", prefix)
             .env("IRONCREW_INSTANCE_ID", instance_id)
             .env("IRONCREW_RUN_LEASE_TTL_SECONDS", "6")
@@ -131,7 +172,15 @@ impl ReplicaProcess {
             .env("IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS", "2000")
             .env("IRONCREW_API_TOKEN", API_TOKEN)
             .env("IRONCREW_API_PRINCIPAL", "acceptance-client")
-            .env("IRONCREW_REQUIRE_IDEMPOTENCY_KEY", "true")
+            // The owner-death gate deliberately drives retries across the
+            // reconciliation boundary. Keep this test focused on the durable
+            // idempotency fence instead of the orthogonal per-process bucket.
+            .env("IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE", "60000")
+            .env("IRONCREW_ADMISSION_WORK_BURST", "1000")
+            .env(
+                "IRONCREW_REQUIRE_IDEMPOTENCY_KEY",
+                require_idempotency_key.to_string(),
+            )
             .env("IRONCREW_MAX_ACTIVE_RUNS", "2")
             .env("IRONCREW_MAX_SSE_CONNECTIONS", "4")
             .env("IRONCREW_MAX_RUN_LIFETIME", "60")
@@ -154,6 +203,7 @@ impl ReplicaProcess {
         let child = command.spawn().expect("spawn ironcrew serve replica");
         let mut diagnostic_redactions = vec![
             database_url.to_string(),
+            process_database_url,
             API_TOKEN.to_string(),
             KEYRING_JSON.to_string(),
             "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string(),
@@ -221,6 +271,37 @@ impl ReplicaProcess {
         );
     }
 
+    async fn wait_until_live(&mut self, client: &Client) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_observation = String::from("no HTTP response");
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().expect("inspect replica process") {
+                panic!(
+                    "{} exited before liveness with {status}\n{}",
+                    self.name,
+                    self.logs()
+                );
+            }
+            match client
+                .get(format!("{}/health/live", self.base_url))
+                .send()
+                .await
+            {
+                Ok(response) if response.status() == StatusCode::OK => return,
+                Ok(response) => {
+                    last_observation = format!("HTTP {}", response.status());
+                }
+                Err(error) => last_observation = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "{} did not become live ({last_observation})\n{}",
+            self.name,
+            self.logs()
+        );
+    }
+
     fn shutdown(&mut self) -> ExitStatus {
         if let Some(status) = self
             .child
@@ -249,6 +330,70 @@ impl ReplicaProcess {
         }
         let _ = self.child.kill();
         self.child.wait().expect("reap timed-out replica")
+    }
+
+    fn sigkill(&mut self) -> ExitStatus {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .expect("inspect replica before SIGKILL")
+        {
+            panic!(
+                "{} exited before the owner-death injection with {status}\n{}",
+                self.name,
+                self.logs()
+            );
+        }
+
+        #[cfg(unix)]
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("send SIGKILL to owner replica");
+
+        #[cfg(not(unix))]
+        self.child.kill().expect("force-kill owner replica");
+
+        self.child.wait().expect("reap SIGKILLed owner replica")
+    }
+
+    #[cfg(unix)]
+    fn suspend_and_wait(&mut self) {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP)
+            .expect("send SIGSTOP to replica");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))
+                .expect("observe stopped replica")
+            {
+                WaitStatus::Stopped(observed, nix::sys::signal::Signal::SIGSTOP)
+                    if observed == pid =>
+                {
+                    return;
+                }
+                WaitStatus::StillAlive | WaitStatus::Continued(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!(
+                    "unexpected wait status after SIGSTOP for {}: {other:?}",
+                    self.name
+                ),
+            }
+        }
+        panic!("{} did not enter SIGSTOP state", self.name);
+    }
+
+    #[cfg(unix)]
+    fn resume(&mut self) {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        )
+        .expect("send SIGCONT to replica");
     }
 }
 
@@ -393,6 +538,113 @@ async fn wait_for_terminal(
     panic!("run did not terminalize through replica B; {last_observation}");
 }
 
+async fn wait_for_lease_renewal(
+    client: &Client,
+    base_url: &str,
+    run_id: &str,
+    previous_deadline: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_observation = String::from("no response");
+    while Instant::now() < deadline {
+        let response = authenticated(client.get(format!("{base_url}/flows/{FLOW}/runs/{run_id}")))
+            .send()
+            .await
+            .expect("poll run lease renewal through peer");
+        let status = response.status();
+        let body = response.text().await.expect("read run lease response");
+        last_observation = format!("HTTP {status}: {body}");
+        if status == StatusCode::OK {
+            let record: serde_json::Value =
+                serde_json::from_str(&body).expect("parse run lease response");
+            let renewed = record["lease_expires_at"]
+                .as_str()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc) > previous_deadline)
+                .unwrap_or(false);
+            if renewed {
+                return record;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run lease did not renew after the stopped owner resumed; {last_observation}");
+}
+
+async fn flow_run_total(client: &Client, base_url: &str) -> u64 {
+    authenticated(client.get(format!("{base_url}/flows/{FLOW}/runs?limit=100")))
+        .send()
+        .await
+        .expect("list flow runs through surviving replica")
+        .error_for_status()
+        .expect("flow run list response")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse flow run list")["total"]
+        .as_u64()
+        .expect("flow run total")
+}
+
+async fn durable_run_and_event_counts(database_url: &str, prefix: &str) -> (i64, i64) {
+    let pool = sqlx::PgPool::connect(database_url)
+        .await
+        .expect("connect for durable replay counts");
+    let statement = format!(
+        "SELECT (SELECT COUNT(*) FROM {prefix}runs), \
+                (SELECT COUNT(*) FROM {prefix}run_events)"
+    );
+    let counts = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(statement))
+        .fetch_one(&pool)
+        .await
+        .expect("read durable replay counts");
+    pool.close().await;
+    counts
+}
+
+async fn replay_empty_keyed_run(client: &Client, base_url: &str, key: &str) -> Response {
+    authenticated(client.post(format!("{base_url}/flows/{FLOW}/run")))
+        .header("Idempotency-Key", key)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("replay keyed run through surviving replica")
+}
+
+async fn assert_owner_death_replay(response: Response, expected_run_id: &str) {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("Idempotency-Replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let replay: serde_json::Value = response.json().await.expect("parse owner-death replay");
+    assert_eq!(replay["run_id"], expected_run_id);
+    assert_eq!(replay["owner_instance_id"], "acceptance-replica-a");
+    assert_eq!(replay["control_scope"], "process");
+    assert_ne!(
+        replay["owner_instance_id"], "acceptance-replica-b",
+        "replay must not transfer execution ownership to the surviving replica"
+    );
+}
+
+async fn replay_across_owner_reconciliation(
+    client: &Client,
+    base_url: &str,
+    expected_run_id: &str,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut replay_count = 0;
+    while Instant::now() < deadline {
+        let response = replay_empty_keyed_run(client, base_url, OWNER_DEATH_IDEMPOTENCY_KEY).await;
+        assert_owner_death_replay(response, expected_run_id).await;
+        replay_count += 1;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    replay_count
+}
+
 async fn abort_through_peer(
     client: &Client,
     base_url: &str,
@@ -434,8 +686,74 @@ async fn genuine_two_process_postgres_replica_acceptance() {
     let (port_a, port_b) = reserve_two_ports();
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(2))
+        // Bound connected stalls too. The longest intentional SSE read has a
+        // 20-second application deadline, leaving ten seconds for transport
+        // setup and teardown without permitting a hung CI job.
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("build acceptance HTTP client");
+
+    // Bootstrap the schema, then hold the exact global quota advisory lock
+    // used by both reconciliation and startup idempotency pruning. The child
+    // must still bind its liveness endpoint, advertise pessimistic readiness,
+    // and recover through its ordinary maintenance loop after lock release.
+    let bootstrap = PostgresStore::new_with_lease_config(
+        &database_url,
+        &prefix,
+        RunLeaseConfig::new("startup-bootstrap", Duration::from_secs(6)).unwrap(),
+    )
+    .await
+    .expect("bootstrap startup-lock acceptance schema");
+    drop(bootstrap);
+    let lock_pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect startup-lock holder");
+    let mut quota_lock = lock_pool.begin().await.expect("begin startup quota lock");
+    let quota_lock_name = format!("ironcrew:{prefix}idempotency:idempotency-quota:6:global");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&quota_lock_name)
+        .execute(&mut *quota_lock)
+        .await
+        .expect("hold startup idempotency quota lock");
+
+    let (startup_port, _) = reserve_two_ports();
+    let mut startup_probe = ReplicaProcess::spawn(
+        "startup-quota-lock",
+        "acceptance-startup-lock",
+        startup_port,
+        temp.path(),
+        &database_url,
+        &prefix,
+        temp.path(),
+    );
+    startup_probe.wait_until_live(&client).await;
+    let blocked_ready = client
+        .get(format!("{}/health/ready", startup_probe.base_url))
+        .send()
+        .await
+        .expect("query readiness while startup quota lock is held");
+    assert_eq!(blocked_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let blocked_ready: serde_json::Value = blocked_ready
+        .json()
+        .await
+        .expect("parse blocked startup readiness");
+    assert_eq!(blocked_ready["component"], "storage_maintenance");
+
+    quota_lock
+        .rollback()
+        .await
+        .expect("release startup idempotency quota lock");
+    lock_pool.close().await;
+    startup_probe.wait_until_ready(&client).await;
+    let startup_status = startup_probe.shutdown();
+    if cfg!(unix) {
+        assert!(
+            startup_status.success(),
+            "startup-lock replica shutdown failed: {}",
+            startup_probe.logs()
+        );
+    }
+
     let mut replica_a = ReplicaProcess::spawn(
         "replica-a",
         "acceptance-replica-a",
@@ -811,6 +1129,326 @@ async fn genuine_two_process_postgres_replica_acceptance() {
             status_a.success(),
             "replica A shutdown failed: {}",
             replica_a.logs()
+        );
+    }
+
+    // Start a fresh two-process pair after proving graceful shutdown above.
+    // This keeps the normal SIGTERM/reap coverage intact while the final run
+    // deliberately destroys its owner with SIGKILL.
+    let (owner_death_port_a, owner_death_port_b) = reserve_two_ports();
+    let mut owner_death_a = ReplicaProcess::spawn(
+        "owner-death-a",
+        "acceptance-replica-a",
+        owner_death_port_a,
+        temp.path(),
+        &database_url,
+        &prefix,
+        temp.path(),
+    );
+    let mut owner_death_b = ReplicaProcess::spawn(
+        "owner-death-b",
+        "acceptance-replica-b",
+        owner_death_port_b,
+        temp.path(),
+        &database_url,
+        &prefix,
+        temp.path(),
+    );
+    tokio::join!(
+        owner_death_a.wait_until_ready(&client),
+        owner_death_b.wait_until_ready(&client)
+    );
+    assert_ne!(
+        owner_death_a.id(),
+        owner_death_b.id(),
+        "owner-death replicas must be distinct PIDs"
+    );
+
+    let owner_death_started =
+        authenticated(client.post(format!("{}/flows/{FLOW}/run", owner_death_a.base_url)))
+            .header("Idempotency-Key", OWNER_DEATH_IDEMPOTENCY_KEY)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("start owner-death run on replica A");
+    assert_eq!(owner_death_started.status(), StatusCode::OK);
+    assert!(
+        owner_death_started
+            .headers()
+            .get("Idempotency-Replayed")
+            .is_none()
+    );
+    let owner_death_acceptance: serde_json::Value = owner_death_started
+        .json()
+        .await
+        .expect("parse owner-death run acceptance");
+    let owner_death_run_id = owner_death_acceptance["run_id"]
+        .as_str()
+        .expect("owner-death run id")
+        .to_string();
+    assert_eq!(
+        owner_death_acceptance["owner_instance_id"],
+        "acceptance-replica-a"
+    );
+
+    // Waiting for the encrypted question proves the Lua coroutine is live,
+    // durably owned by A, and parked long enough for the lease-expiry gate.
+    wait_for_question(
+        &client,
+        &owner_death_b.base_url,
+        &owner_death_run_id,
+        FIRST_PROMPT,
+    )
+    .await;
+    let active_before_kill: serde_json::Value = authenticated(client.get(format!(
+        "{}/flows/{FLOW}/runs/{owner_death_run_id}",
+        owner_death_b.base_url
+    )))
+    .send()
+    .await
+    .expect("observe owner-death run before SIGKILL")
+    .error_for_status()
+    .expect("active owner-death run")
+    .json()
+    .await
+    .expect("parse active owner-death run");
+    assert_eq!(active_before_kill["status"], "WaitingForInput");
+    assert_eq!(
+        active_before_kill["owner_instance_id"],
+        "acceptance-replica-a"
+    );
+
+    // At the production minimum lease, deliberately miss two two-second
+    // heartbeat opportunities without crossing the six-second fence. Resuming
+    // A must renew the same durable run before B can classify it as dead.
+    #[cfg(unix)]
+    {
+        let observed_deadline = chrono::DateTime::parse_from_rfc3339(
+            active_before_kill["lease_expires_at"]
+                .as_str()
+                .expect("active run lease deadline"),
+        )
+        .expect("parse active run lease deadline")
+        .with_timezone(&chrono::Utc);
+        wait_for_lease_renewal(
+            &client,
+            &owner_death_b.base_url,
+            &owner_death_run_id,
+            observed_deadline,
+        )
+        .await;
+        owner_death_a.suspend_and_wait();
+        let stopped_record: serde_json::Value = authenticated(client.get(format!(
+            "{}/flows/{FLOW}/runs/{owner_death_run_id}",
+            owner_death_b.base_url
+        )))
+        .send()
+        .await
+        .expect("observe the confirmed-stopped owner's lease")
+        .error_for_status()
+        .expect("stopped owner's run remains observable")
+        .json()
+        .await
+        .expect("parse stopped owner's run");
+        let lease_while_stopped = chrono::DateTime::parse_from_rfc3339(
+            stopped_record["lease_expires_at"]
+                .as_str()
+                .expect("stopped run lease deadline"),
+        )
+        .expect("parse stopped run lease deadline")
+        .with_timezone(&chrono::Utc);
+        assert!(
+            lease_while_stopped > chrono::Utc::now(),
+            "the confirmed-stopped owner must still have time to recover"
+        );
+        tokio::time::sleep(Duration::from_millis(4_250)).await;
+
+        let while_suspended: serde_json::Value = authenticated(client.get(format!(
+            "{}/flows/{FLOW}/runs/{owner_death_run_id}",
+            owner_death_b.base_url
+        )))
+        .send()
+        .await
+        .expect("observe run after two missed heartbeats")
+        .error_for_status()
+        .expect("healthy run after two missed heartbeats")
+        .json()
+        .await
+        .expect("parse run after two missed heartbeats");
+        assert_eq!(while_suspended["status"], "WaitingForInput");
+        assert_eq!(while_suspended["owner_instance_id"], "acceptance-replica-a");
+        assert_eq!(
+            while_suspended["lease_expires_at"], stopped_record["lease_expires_at"],
+            "a stopped keyed owner cannot renew through the peer's broad heartbeat"
+        );
+
+        owner_death_a.resume();
+        let renewed = wait_for_lease_renewal(
+            &client,
+            &owner_death_b.base_url,
+            &owner_death_run_id,
+            lease_while_stopped,
+        )
+        .await;
+        assert_eq!(renewed["status"], "WaitingForInput");
+        assert_eq!(renewed["owner_instance_id"], "acceptance-replica-a");
+        owner_death_a.wait_until_ready(&client).await;
+    }
+
+    // Baseline while A is demonstrably live so later reconciliation and retry
+    // traffic cannot hide a second durable launch behind the snapshot work.
+    let runs_before_replay = flow_run_total(&client, &owner_death_b.base_url).await;
+    let durable_counts_before_replay = durable_run_and_event_counts(&database_url, &prefix).await;
+
+    let killed_owner_pid = owner_death_a.id();
+    let killed_owner_status = owner_death_a.sigkill();
+    assert!(
+        !killed_owner_status.success(),
+        "SIGKILLed owner PID {killed_owner_pid} exited successfully"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        killed_owner_status.signal(),
+        Some(nix::sys::signal::Signal::SIGKILL as i32),
+        "owner PID {killed_owner_pid} did not exit from SIGKILL"
+    );
+
+    // Prove the retained response is already replay-safe before the dead
+    // owner's lease expires. The survivor must not wait for Abandoned before
+    // preventing a duplicate launch.
+    let pre_reconciliation_replay = replay_empty_keyed_run(
+        &client,
+        &owner_death_b.base_url,
+        OWNER_DEATH_IDEMPOTENCY_KEY,
+    )
+    .await;
+    assert_owner_death_replay(pre_reconciliation_replay, &owner_death_run_id).await;
+    let pre_reconciliation_run: serde_json::Value = authenticated(client.get(format!(
+        "{}/flows/{FLOW}/runs/{owner_death_run_id}",
+        owner_death_b.base_url
+    )))
+    .send()
+    .await
+    .expect("observe dead owner's run before lease reconciliation")
+    .error_for_status()
+    .expect("pre-reconciliation owner-death run")
+    .json()
+    .await
+    .expect("parse pre-reconciliation owner-death run");
+    assert_eq!(pre_reconciliation_run["status"], "WaitingForInput");
+    assert_eq!(
+        pre_reconciliation_run["owner_instance_id"],
+        "acceptance-replica-a"
+    );
+
+    // Replica B's normal heartbeat/reconciler loop uses the database clock.
+    // After A's six-second lease expires, B must terminalize the exact run as
+    // Abandoned, clear the mailbox, and complete the idempotency tombstone.
+    let (abandoned, reconciliation_replays) = tokio::join!(
+        wait_for_terminal(
+            &client,
+            &owner_death_b.base_url,
+            &owner_death_run_id,
+            "Abandoned",
+        ),
+        replay_across_owner_reconciliation(&client, &owner_death_b.base_url, &owner_death_run_id,)
+    );
+    assert!(
+        reconciliation_replays >= 4,
+        "expected sustained replay coverage across reconciliation, got {reconciliation_replays}"
+    );
+    assert_eq!(abandoned["run_id"], owner_death_run_id);
+    assert_eq!(abandoned["owner_instance_id"], "acceptance-replica-a");
+    assert_eq!(abandoned["lease_expires_at"], "");
+
+    let questions_after_reconcile = authenticated(client.get(format!(
+        "{}/flows/{FLOW}/questions/{owner_death_run_id}",
+        owner_death_b.base_url
+    )))
+    .send()
+    .await
+    .expect("query reconciled human-input mailbox");
+    assert_eq!(questions_after_reconcile.status(), StatusCode::NOT_FOUND);
+    let questions_after_reconcile = questions_after_reconcile
+        .text()
+        .await
+        .expect("read reconciled mailbox response");
+    assert!(!questions_after_reconcile.contains(FIRST_PROMPT));
+
+    let (replay_one, replay_two, replay_three, replay_four) = tokio::join!(
+        replay_empty_keyed_run(
+            &client,
+            &owner_death_b.base_url,
+            OWNER_DEATH_IDEMPOTENCY_KEY
+        ),
+        replay_empty_keyed_run(
+            &client,
+            &owner_death_b.base_url,
+            OWNER_DEATH_IDEMPOTENCY_KEY
+        ),
+        replay_empty_keyed_run(
+            &client,
+            &owner_death_b.base_url,
+            OWNER_DEATH_IDEMPOTENCY_KEY
+        ),
+        replay_empty_keyed_run(
+            &client,
+            &owner_death_b.base_url,
+            OWNER_DEATH_IDEMPOTENCY_KEY
+        )
+    );
+    for owner_death_replay in [replay_one, replay_two, replay_three, replay_four] {
+        assert_owner_death_replay(owner_death_replay, &owner_death_run_id).await;
+    }
+
+    // The ten-second transition-spanning replay loop plus this post-tombstone
+    // burst must not publish another durable run or Lua event.
+    assert_eq!(
+        flow_run_total(&client, &owner_death_b.base_url).await,
+        runs_before_replay,
+        "same-key replay created a second run"
+    );
+    assert_eq!(
+        durable_run_and_event_counts(&database_url, &prefix).await,
+        durable_counts_before_replay,
+        "same-key replay created a run row or published a durable run event"
+    );
+    let still_abandoned = wait_for_terminal(
+        &client,
+        &owner_death_b.base_url,
+        &owner_death_run_id,
+        "Abandoned",
+    )
+    .await;
+    assert_eq!(still_abandoned["owner_instance_id"], "acceptance-replica-a");
+
+    let questions_after_replay = authenticated(client.get(format!(
+        "{}/flows/{FLOW}/questions/{owner_death_run_id}",
+        owner_death_b.base_url
+    )))
+    .send()
+    .await
+    .expect("query human-input mailbox after replay");
+    assert_eq!(questions_after_replay.status(), StatusCode::NOT_FOUND);
+    let questions_after_replay = questions_after_replay
+        .text()
+        .await
+        .expect("read mailbox response after replay");
+    assert!(!questions_after_replay.contains(FIRST_PROMPT));
+    assert!(!questions_after_replay.contains(SECOND_PROMPT));
+
+    let survivor_ready = client
+        .get(format!("{}/health/ready", owner_death_b.base_url))
+        .send()
+        .await
+        .expect("query surviving replica readiness");
+    assert_eq!(survivor_ready.status(), StatusCode::OK);
+    let owner_death_b_status = owner_death_b.shutdown();
+    if cfg!(unix) {
+        assert!(
+            owner_death_b_status.success(),
+            "surviving replica shutdown failed: {}",
+            owner_death_b.logs()
         );
     }
 

@@ -24,6 +24,7 @@ const MAX_HUMAN_INPUT_READ_CONCURRENCY: usize = 64;
 const HUMAN_INPUT_READ_CONCURRENCY_ENV: &str = "IRONCREW_HITL_PG_MAX_CONCURRENT_READS";
 const MIN_ACCOUNTED_RUN_EVENT_BYTES: i64 = 1024;
 const MAX_EVICTED_RUN_EVENTS_PER_APPEND: u64 = 65_536;
+const RUN_RECONCILIATION_BATCH_SIZE: i64 = 64;
 const RUN_EVENT_SCHEMA_VERSION: i32 = 1;
 const IDEMPOTENCY_COLUMNS: &str = "key_hash, principal_id, request_fingerprint, operation, scope, \
     resource_id, exclusive_scope, attempt_id, owner_instance_id, base_revision, state, \
@@ -501,6 +502,33 @@ impl PostgresStore {
         Ok(())
     }
 
+    async fn configure_run_lease_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<()> {
+        // PostgreSQL applies these limits per statement, not to the aggregate
+        // transaction. The outer maintenance watchdog may therefore fire
+        // first after several individually successful statements. Dropping
+        // SQLx's owned transaction schedules a rollback before that pooled
+        // connection can be reused; the maintenance regression suite covers
+        // both the atomic rollback and subsequent pool recovery.
+        let timeout = crate::engine::store::run_maintenance_database_timeout(self.lease.ttl());
+        let timeout_value = format!("{}ms", timeout.as_millis());
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true), \
+                    set_config('statement_timeout', $1, true)",
+        )
+        .bind(timeout_value)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            IronCrewError::Validation(format!(
+                "Failed to configure PostgreSQL run-lease transaction timeouts: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
     async fn lock_idempotency_quota(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -576,6 +604,247 @@ impl PostgresStore {
                 ))
             })?;
         Ok(deleted.rows_affected())
+    }
+
+    async fn materialize_abandoned_claim_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        database_now: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "WITH candidates AS (\
+                 SELECT idem.resource_id, idem.scope, idem.created_at, \
+                        idem.owner_instance_id \
+                 FROM {idempotency} AS idem \
+                 WHERE idem.operation = $2 AND idem.state = 'claimed' \
+                   AND idem.lease_expires_at::timestamptz <= $3::timestamptz \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM {runs} AS run \
+                       WHERE run.run_id = idem.resource_id\
+                   ) \
+                 ORDER BY idem.lease_expires_at, idem.key_hash \
+                 LIMIT $4 FOR UPDATE OF idem SKIP LOCKED\
+             ) \
+             INSERT INTO {runs} (\
+                 run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
+                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
+                 owner_instance_id, lease_expires_at\
+             ) \
+             SELECT resource_id, scope, scope, 'abandoned', created_at, $1, 0, \
+                    '[]'::jsonb, 0, 0, 0, 0, '[]'::jsonb, owner_instance_id, '' \
+             FROM candidates \
+             ON CONFLICT (run_id) DO NOTHING \
+             RETURNING run_id",
+            runs = self.table_name,
+            idempotency = self.idempotency_table,
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(database_now)
+            .bind(RUN_OPERATION)
+            .bind(database_now)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!("PG idempotent run fallback: {error}"))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get("run_id").map_err(|error| {
+                    IronCrewError::Validation(format!("PostgreSQL fallback run id column: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    async fn reconcile_expired_run_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        database_now: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "WITH candidates AS (\
+                 SELECT run_id FROM {runs} \
+                 WHERE status IN ('running', 'waiting_for_input') \
+                   AND (lease_expires_at = '' OR \
+                        lease_expires_at::timestamptz <= $2::timestamptz) \
+                 ORDER BY lease_expires_at, run_id \
+                 LIMIT $3 FOR UPDATE SKIP LOCKED\
+             ) \
+             UPDATE {runs} AS run \
+             SET status = 'abandoned', finished_at = $1, lease_expires_at = '' \
+             FROM candidates \
+             WHERE run.run_id = candidates.run_id \
+             RETURNING run.run_id",
+            runs = self.table_name,
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(database_now)
+            .bind(database_now)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| IronCrewError::Validation(format!("PG reconcile: {error}")))?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get("run_id").map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PostgreSQL reconciled run id column: {error}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    async fn finalize_reconciled_runs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        database_now: &str,
+        run_ids: &[String],
+    ) -> Result<()> {
+        if run_ids.is_empty() {
+            return Ok(());
+        }
+        let journal_sql = format!(
+            "UPDATE {} SET journal_complete = FALSE, updated_at = clock_timestamp() \
+             WHERE run_id = ANY($1::text[])",
+            self.run_event_state_table,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(journal_sql))
+            .bind(run_ids)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL abandoned run-event journal update failed: {error}"
+                ))
+            })?;
+
+        let mapping_sql = format!(
+            "UPDATE {idempotency} \
+             SET state = 'completed', lease_expires_at = '', \
+                 updated_at = $2, completed_at = $2, \
+                 expires_at = to_char(\
+                     ($2::timestamptz + ttl_seconds * interval '1 second') \
+                         AT TIME ZONE 'UTC', \
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+                 ) \
+             WHERE operation = $1 AND resource_id = ANY($3::text[]) \
+               AND state IN ('claimed', 'running', 'indeterminate')",
+            idempotency = self.idempotency_table,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
+            .bind(RUN_OPERATION)
+            .bind(database_now)
+            .bind(run_ids)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PG reconciled run idempotency transition: {error}"
+                ))
+            })?;
+
+        let mailbox_sql = format!(
+            "DELETE FROM {} WHERE run_id = ANY($1::text[])",
+            self.human_inputs_table,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(mailbox_sql))
+            .bind(run_ids)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL reconciled run mailbox cleanup failed: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn reconcile_expired_conversation_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        database_now: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "WITH candidates AS (\
+                 SELECT key_hash FROM {idempotency} \
+                 WHERE operation = $2 AND state IN ('claimed', 'running') \
+                   AND lease_expires_at::timestamptz <= $1::timestamptz \
+                 ORDER BY lease_expires_at, key_hash \
+                 LIMIT $3 FOR UPDATE SKIP LOCKED\
+             ) \
+             UPDATE {idempotency} AS idem \
+             SET state = 'indeterminate', response_status = NULL, \
+                 response_body = NULL, lease_expires_at = '', updated_at = $1, \
+                 completed_at = $1, expires_at = to_char(\
+                     ($1::timestamptz + idem.ttl_seconds * interval '1 second') \
+                         AT TIME ZONE 'UTC', \
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
+                 ) \
+             FROM candidates \
+             WHERE idem.key_hash = candidates.key_hash",
+            idempotency = self.idempotency_table,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(database_now)
+            .bind(CONVERSATION_MESSAGE_OPERATION)
+            .bind(RUN_RECONCILIATION_BATCH_SIZE)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PG conversation idempotency reconciliation: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn delete_expired_human_input_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        database_now: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "WITH candidates AS (\
+                 SELECT human.run_id, human.question_id \
+                 FROM {human_inputs} AS human \
+                 WHERE (human.state = 'pending' AND \
+                        human.expires_at <= $1::timestamptz) \
+                    OR EXISTS (\
+                        SELECT 1 FROM {runs} AS run \
+                        WHERE run.run_id = human.run_id \
+                          AND run.status NOT IN ('running', 'waiting_for_input')\
+                    ) \
+                 ORDER BY human.expires_at, human.run_id, human.question_id \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED\
+             ) \
+             DELETE FROM {human_inputs} AS human \
+             USING candidates \
+             WHERE human.run_id = candidates.run_id \
+               AND human.question_id = candidates.question_id",
+            human_inputs = self.human_inputs_table,
+            runs = self.table_name,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(database_now)
+            .bind(RUN_RECONCILIATION_BATCH_SIZE)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL expired human-input mailbox cleanup failed: {error}"
+                ))
+            })?;
+        Ok(())
     }
 
     async fn lock_run_event_usage(
@@ -922,6 +1191,11 @@ impl PostgresStore {
                 return;
             }
         };
+        if let Err(error) = self.configure_run_lease_transaction(&mut tx).await {
+            let _ = tx.rollback().await;
+            tracing::warn!(%error, "PostgreSQL run-event maintenance timeout setup failed");
+            return;
+        }
         let lock_name = format!("ironcrew:{}:run-event-maintenance", self.run_events_table);
         let acquired: bool =
             match sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
@@ -940,7 +1214,7 @@ impl PostgresStore {
             let _ = tx.rollback().await;
             return;
         }
-        if let Err(error) = sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        if let Err(error) = sqlx::query("SELECT set_config('lock_timeout', '100ms', true)")
             .execute(&mut *tx)
             .await
         {
@@ -1892,6 +2166,11 @@ impl PostgresStore {
                  ON {it} (operation, scope, resource_id)"
             ),
             format!(
+                "CREATE INDEX IF NOT EXISTS {it}_lease_idx \
+                 ON {it} (operation, lease_expires_at, key_hash) \
+                 WHERE state IN ('claimed', 'running')"
+            ),
+            format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS {it}_scope_uidx \
                  ON {it} (exclusive_scope) \
                  WHERE exclusive_scope IS NOT NULL \
@@ -2183,6 +2462,11 @@ impl PostgresStore {
                  WHERE state = 'pending'"
             ),
             format!("CREATE INDEX IF NOT EXISTS {hit}_exp_idx ON {hit} (expires_at)"),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {hit}_pex_idx \
+                 ON {hit} (expires_at, run_id, question_id) \
+                 WHERE state = 'pending'"
+            ),
         ] {
             sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&mut *tx)
@@ -2683,6 +2967,7 @@ impl PostgresStore {
 
         let expires_index = format!("{}_exp_idx", self.idempotency_table);
         let resource_index = format!("{}_res_idx", self.idempotency_table);
+        let lease_index = format!("{}_lease_idx", self.idempotency_table);
         let scope_index = format!("{}_scope_uidx", self.idempotency_table);
         let valid_idempotency_indexes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) \
@@ -2700,7 +2985,15 @@ impl PostgresStore {
                    AND pg_get_indexdef(i.indexrelid, 2, TRUE) = 'scope' \
                    AND pg_get_indexdef(i.indexrelid, 3, TRUE) = 'resource_id') \
                  OR \
-                 (idx.relname = $4 AND i.indisunique AND i.indnkeyatts = 1 \
+                 (idx.relname = $4 AND i.indnkeyatts = 3 \
+                   AND pg_get_indexdef(i.indexrelid, 1, TRUE) = 'operation' \
+                   AND pg_get_indexdef(i.indexrelid, 2, TRUE) = 'lease_expires_at' \
+                   AND pg_get_indexdef(i.indexrelid, 3, TRUE) = 'key_hash' \
+                   AND i.indpred IS NOT NULL \
+                   AND pg_get_expr(i.indpred, i.indrelid) LIKE '%claimed%' \
+                   AND pg_get_expr(i.indpred, i.indrelid) LIKE '%running%') \
+                 OR \
+                 (idx.relname = $5 AND i.indisunique AND i.indnkeyatts = 1 \
                    AND pg_get_indexdef(i.indexrelid, 1, TRUE) = 'exclusive_scope' \
                    AND i.indpred IS NOT NULL \
                    AND pg_get_expr(i.indpred, i.indrelid) LIKE '%exclusive_scope IS NOT NULL%' \
@@ -2711,6 +3004,7 @@ impl PostgresStore {
         .bind(&self.idempotency_table)
         .bind(&expires_index)
         .bind(&resource_index)
+        .bind(&lease_index)
         .bind(&scope_index)
         .fetch_one(&self.pool)
         .await
@@ -2719,7 +3013,7 @@ impl PostgresStore {
                 "Failed to verify PostgreSQL idempotency indexes: {e}"
             ))
         })?;
-        if valid_idempotency_indexes != 3 {
+        if valid_idempotency_indexes != 4 {
             return Err(IronCrewError::Validation(format!(
                 "PostgreSQL table '{}' is missing one or more required idempotency indexes",
                 self.idempotency_table
@@ -2810,6 +3104,7 @@ impl PostgresStore {
 
         let human_run_index = format!("{}_run_idx", self.human_inputs_table);
         let human_expiry_index = format!("{}_exp_idx", self.human_inputs_table);
+        let human_pending_expiry_index = format!("{}_pex_idx", self.human_inputs_table);
         let human_input_indexes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_index AS i \
              JOIN pg_class AS idx ON idx.oid = i.indexrelid \
@@ -2822,12 +3117,19 @@ impl PostgresStore {
                   i.indpred IS NOT NULL AND \
                   pg_get_expr(i.indpred, i.indrelid) LIKE '%pending%') OR \
                  (idx.relname = $3 AND i.indnkeyatts = 1 AND \
-                  pg_get_indexdef(i.indexrelid, 1, TRUE) = 'expires_at')\
+                  pg_get_indexdef(i.indexrelid, 1, TRUE) = 'expires_at') OR \
+                 (idx.relname = $4 AND i.indnkeyatts = 3 AND \
+                  pg_get_indexdef(i.indexrelid, 1, TRUE) = 'expires_at' AND \
+                  pg_get_indexdef(i.indexrelid, 2, TRUE) = 'run_id' AND \
+                  pg_get_indexdef(i.indexrelid, 3, TRUE) = 'question_id' AND \
+                  i.indpred IS NOT NULL AND \
+                  pg_get_expr(i.indpred, i.indrelid) LIKE '%pending%')\
              )",
         )
         .bind(&self.human_inputs_table)
         .bind(&human_run_index)
         .bind(&human_expiry_index)
+        .bind(&human_pending_expiry_index)
         .fetch_one(&self.pool)
         .await
         .map_err(|error| {
@@ -2835,7 +3137,7 @@ impl PostgresStore {
                 "Failed to verify PostgreSQL human-input mailbox indexes: {error}"
             ))
         })?;
-        if human_input_indexes != 2 {
+        if human_input_indexes != 3 {
             return Err(IronCrewError::Validation(format!(
                 "PostgreSQL table '{}' is missing one or more required human-input mailbox indexes",
                 self.human_inputs_table
@@ -3160,7 +3462,8 @@ impl StateStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| IronCrewError::Validation(format!("PG insert intent: {}", e)))?;
-        if inserted.rows_affected() == 0 {
+        let inserted_new = inserted.rows_affected() == 1;
+        if !inserted_new {
             let hydrate_sql = format!(
                 "UPDATE {runs} AS run SET \
                      flow_name = $1, agent_count = $2, task_count = $3, \
@@ -3204,10 +3507,12 @@ impl StateStore for PostgresStore {
         let mapping_sql = format!(
             "UPDATE {} SET state = 'running', lease_expires_at = $1, updated_at = $2 \
              WHERE operation = $3 AND scope = $4 AND resource_id = $5 \
-               AND owner_instance_id = $6 AND state = 'claimed'",
+               AND owner_instance_id = $6 AND state = 'claimed' \
+               AND cancel_requested_at IS NULL \
+               AND lease_expires_at::timestamptz > $2::timestamptz",
             self.idempotency_table
         );
-        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
+        let mapped = sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
             .bind(&lease_expires_at)
             .bind(&database_now)
             .bind(RUN_OPERATION)
@@ -3219,6 +3524,31 @@ impl StateStore for PostgresStore {
             .map_err(|error| {
                 IronCrewError::Validation(format!("PG run idempotency mapping transition: {error}"))
             })?;
+        if inserted_new && mapped.rows_affected() == 0 {
+            let linked_sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {} \
+                 WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
+                   AND owner_instance_id = $4)",
+                self.idempotency_table
+            );
+            let linked: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(linked_sql))
+                .bind(RUN_OPERATION)
+                .bind(&intent.flow)
+                .bind(&run_id)
+                .bind(self.lease.instance_id())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "PG run idempotency mapping verification: {error}"
+                    ))
+                })?;
+            if linked {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run '{run_id}' cannot start because its idempotency claim expired or was cancelled"
+                )));
+            }
+        }
         tx.commit().await.map_err(|error| {
             IronCrewError::Validation(format!("PG insert intent commit: {error}"))
         })?;
@@ -3374,6 +3704,12 @@ impl StateStore for PostgresStore {
 
     fn run_lease_ttl(&self) -> Duration {
         self.lease.ttl()
+    }
+
+    fn run_maintenance_watchdog(&self) -> Option<Duration> {
+        Some(crate::engine::store::run_maintenance_timeout(
+            self.lease.ttl(),
+        ))
     }
 
     fn supports_durable_human_input(&self) -> bool {
@@ -4172,6 +4508,7 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG heartbeat transaction: {error}"))
         })?;
+        self.configure_run_lease_transaction(&mut tx).await?;
         self.lock_run_fence(&mut tx, true).await?;
         let (_, deadline) = self
             .database_clock_with_deadline(
@@ -4285,6 +4622,7 @@ impl StateStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(|error| {
             IronCrewError::Validation(format!("PG reconcile transaction: {error}"))
         })?;
+        self.configure_run_lease_transaction(&mut tx).await?;
         self.lock_idempotency_quota(&mut tx).await?;
         self.lock_run_fence(&mut tx, false).await?;
         let (database_now, _) = self
@@ -4292,139 +4630,45 @@ impl StateStore for PostgresStore {
             .await?;
 
         // A process may die after durably allocating/replying with a run id
-        // but before publishing the normal run intent. Materialize a minimal
-        // terminal run so retries can replay that id without re-executing and
-        // callers can observe an explicit Abandoned outcome instead of 404.
-        let fallback_sql = format!(
-            "INSERT INTO {runs} (\
-                 run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
-                 owner_instance_id, lease_expires_at\
-             ) \
-             SELECT idem.resource_id, idem.scope, idem.scope, 'abandoned', \
-                    idem.created_at, $1, 0, '[]'::jsonb, 0, 0, 0, 0, '[]'::jsonb, \
-                    idem.owner_instance_id, '' \
-             FROM {idempotency} AS idem \
-             WHERE idem.operation = $2 AND idem.state = 'claimed' \
-               AND idem.lease_expires_at::timestamptz <= $3::timestamptz \
-               AND NOT EXISTS (SELECT 1 FROM {runs} AS run WHERE run.run_id = idem.resource_id) \
-             ON CONFLICT (run_id) DO NOTHING",
-            runs = self.table_name,
-            idempotency = self.idempotency_table
-        );
-        let inserted = sqlx::query(sqlx::AssertSqlSafe(fallback_sql))
-            .bind(&database_now)
-            .bind(RUN_OPERATION)
-            .bind(&database_now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!("PG idempotent run fallback: {error}"))
+        // but before publishing the normal run intent. Materialize those
+        // tombstones and reconcile existing expired runs under one shared
+        // fixed-size budget so a large history cannot repeatedly roll back
+        // without making progress.
+        let reserved = RUN_RECONCILIATION_BATCH_SIZE / 2;
+        let mut fallback_ids = self
+            .materialize_abandoned_claim_batch(&mut tx, &database_now, reserved)
+            .await?;
+        let mut expired_ids = self
+            .reconcile_expired_run_batch(&mut tx, &database_now, reserved)
+            .await?;
+        let selected = i64::try_from(fallback_ids.len().saturating_add(expired_ids.len()))
+            .map_err(|_| {
+                IronCrewError::Validation("PostgreSQL reconciliation batch size overflow".into())
             })?;
+        let remaining = RUN_RECONCILIATION_BATCH_SIZE.saturating_sub(selected);
+        if remaining > 0 && fallback_ids.len() == reserved as usize {
+            fallback_ids.extend(
+                self.materialize_abandoned_claim_batch(&mut tx, &database_now, remaining)
+                    .await?,
+            );
+        } else if remaining > 0 && expired_ids.len() == reserved as usize {
+            expired_ids.extend(
+                self.reconcile_expired_run_batch(&mut tx, &database_now, remaining)
+                    .await?,
+            );
+        }
+        let reconciled = fallback_ids.len().saturating_add(expired_ids.len());
+        fallback_ids.append(&mut expired_ids);
 
-        let sql = format!(
-            "UPDATE {}
-             SET status = 'abandoned', finished_at = $1, lease_expires_at = ''
-             WHERE status IN ('running', 'waiting_for_input')
-               AND (lease_expires_at = '' \
-                    OR lease_expires_at::timestamptz <= $2::timestamptz)",
-            self.table_name
-        );
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(&database_now)
-            .bind(&database_now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PG reconcile: {}", e)))?;
-
-        let journal_sql = format!(
-            "UPDATE {state} AS journal SET journal_complete = FALSE, \
-                 updated_at = clock_timestamp() \
-             FROM {runs} AS run \
-             WHERE journal.run_id = run.run_id AND run.status = 'abandoned'",
-            state = self.run_event_state_table,
-            runs = self.table_name,
-        );
-        sqlx::query(sqlx::AssertSqlSafe(journal_sql))
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL abandoned run-event journal update failed: {error}"
-                ))
-            })?;
-
-        let mapping_sql = format!(
-            "UPDATE {idempotency} AS idem \
-             SET state = 'completed', lease_expires_at = '', \
-                 updated_at = $2, completed_at = $2, \
-                 expires_at = to_char(\
-                     ($2::timestamptz + idem.ttl_seconds * interval '1 second') \
-                         AT TIME ZONE 'UTC', \
-                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
-                 ) \
-             FROM {runs} AS run \
-             WHERE idem.operation = $1 AND idem.resource_id = run.run_id \
-               AND idem.state IN ('claimed', 'running', 'indeterminate') \
-               AND run.status NOT IN ('running', 'waiting_for_input')",
-            idempotency = self.idempotency_table,
-            runs = self.table_name
-        );
-        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
-            .bind(RUN_OPERATION)
-            .bind(&database_now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PG reconciled run idempotency transition: {error}"
-                ))
-            })?;
-
-        // Conversation effects cannot be reconstructed after their exclusive
-        // lease expires. Preserve a terminal tombstone so the same request is
-        // never executed a second time.
-        let conversation_sql = format!(
-            "UPDATE {} SET state = 'indeterminate', response_status = NULL, \
-             response_body = NULL, lease_expires_at = '', updated_at = $1, \
-             completed_at = $1, expires_at = to_char(\
-                 ($1::timestamptz + ttl_seconds * interval '1 second') AT TIME ZONE 'UTC', \
-                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
-             ) \
-             WHERE operation = $2 AND state IN ('claimed', 'running') \
-               AND lease_expires_at::timestamptz <= $1::timestamptz",
-            self.idempotency_table
-        );
-        sqlx::query(sqlx::AssertSqlSafe(conversation_sql))
-            .bind(&database_now)
-            .bind(CONVERSATION_MESSAGE_OPERATION)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PG conversation idempotency reconciliation: {error}"
-                ))
-            })?;
-        let human_input_cleanup = format!(
-            "DELETE FROM {human_inputs} AS human \
-             USING {runs} AS run \
-             WHERE human.run_id = run.run_id AND (\
-                 run.status NOT IN ('running', 'waiting_for_input') OR \
-                 (human.state = 'pending' AND human.expires_at <= $1::timestamptz)\
-             )",
-            human_inputs = self.human_inputs_table,
-            runs = self.table_name,
-        );
-        sqlx::query(sqlx::AssertSqlSafe(human_input_cleanup))
-            .bind(&database_now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL reconciled human-input mailbox cleanup failed: {error}"
-                ))
-            })?;
-        let reconciled = (inserted.rows_affected() + result.rows_affected()) as usize;
+        // Keep every dependent write within the same transaction, but scope
+        // it to this batch. Independent conversation tombstones and mailbox
+        // expiry/terminal repair each receive their own fixed-size budget.
+        self.finalize_reconciled_runs(&mut tx, &database_now, &fallback_ids)
+            .await?;
+        self.reconcile_expired_conversation_batch(&mut tx, &database_now)
+            .await?;
+        self.delete_expired_human_input_batch(&mut tx, &database_now)
+            .await?;
         tx.commit()
             .await
             .map_err(|error| IronCrewError::Validation(format!("PG reconcile commit: {error}")))?;
@@ -5051,6 +5295,7 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotency heartbeat transaction failed: {error}"
             ))
         })?;
+        self.configure_run_lease_transaction(&mut tx).await?;
         self.lock_idempotency_key(&mut tx, key_hash).await?;
         let (database_now, database_deadline) = self
             .database_clock_with_deadline(
@@ -5128,6 +5373,7 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotent run heartbeat transaction failed: {error}"
             ))
         })?;
+        self.configure_run_lease_transaction(&mut tx).await?;
         self.lock_run_fence(&mut tx, true).await?;
         self.lock_resource(&mut tx, RUN_OPERATION, "", run_id)
             .await?;
@@ -6871,6 +7117,11 @@ impl StateStore for PostgresStore {
                 "PostgreSQL idempotency prune transaction failed: {error}"
             ))
         })?;
+        // Startup invokes this through the same outer watchdog used by lease
+        // maintenance. Keep the transaction itself bounded as well so a
+        // quota-lock holder is cancelled inside PostgreSQL before the outer
+        // future has to drop the transaction.
+        self.configure_run_lease_transaction(&mut tx).await?;
         self.lock_idempotency_quota(&mut tx).await?;
         let (database_now, _) = self
             .database_clock_with_deadline(&mut tx, 0, "idempotency pruning")

@@ -45,7 +45,7 @@ Environment variables control storage:
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | Base delay for exponential PostgreSQL connection-retry backoff, in milliseconds (range 1–30000) | `1000` |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | PostgreSQL connect/acquire timeout (range 1–120 seconds) | `30` |
 | `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable ASCII process/pod owner identity; generated once per process when absent | generated |
-| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (range 1–86400 seconds) | `60` |
+| `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (production range 6–86400 seconds); owner heartbeats and replica maintenance run every TTL/3 | `60` |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | Secret JSON keyring for the PostgreSQL human-input mailbox: at most 8 key ids mapped to canonical base64 32-byte keys; maximum 16 KiB | unset (mailbox disabled) |
 | `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id used to encrypt new human-input metadata and answers; must be set with the keyring | unset |
 | `IRONCREW_HITL_POLL_INTERVAL_MS` | Owner poll interval per pending durable question (effective range 50–5000 ms) | `500` |
@@ -523,6 +523,75 @@ compare-and-set: the first terminal writer wins, and a later timeout, abort,
 panic, or completion cannot replace that terminal payload. This protects
 restart recovery, but does not make process-local HTTP control state
 horizontally scalable.
+
+Production startup accepts `IRONCREW_RUN_LEASE_TTL_SECONDS` values from 6 to
+86400 seconds; the default is 60. Values below 6 are rejected because they do
+not leave a safe initial fence plus multiple scheduled renewal opportunities.
+Heartbeats and the replica maintenance loop run every
+`max(TTL / 3, 1 second)`, which is 2 seconds at the minimum production TTL and
+20 seconds at the default.
+
+For keyed runs and conversation operations, the process-local monotonic fence
+starts when the durable claim or heartbeat is invoked. A successful renewal
+moves that local deadline to `heartbeat invocation time + TTL`, never to
+`response arrival time + TTL`. A slow successful PostgreSQL transaction
+therefore consumes the local safety window instead of extending owner-side
+work beyond the durable database lease. If the local deadline is reached, the
+worker stops even when a heartbeat tick becomes ready at the same instant.
+
+PostgreSQL bounds each broad owner heartbeat and abandoned-run reconciliation
+operation twice. Let `C` be the heartbeat cadence and
+`W = min(5 seconds, max(100 ms, C / 3))`:
+
+- the transaction sets both `lock_timeout` and `statement_timeout` to
+  `max(50 ms, 4W / 5)`; and
+- the maintenance loop applies the larger outer watchdog `W`, including pool
+  acquisition and transaction setup.
+
+The smaller database limit resolves an individual blocked lock or statement
+inside PostgreSQL. Because `statement_timeout` is not a transaction-wide
+deadline, the outer watchdog can still win after several individually timely
+statements. If that happens before the core reconciliation commit, dropping
+the owned SQLx transaction rolls the aggregate attempt back; live PostgreSQL
+tests verify both no partial transition and subsequent pool reuse. The later
+best-effort run-event pruning uses a separate transaction, so an outer timeout
+there does not undo already-committed run, idempotency, or HITL recovery and
+may still make readiness pessimistic until the next successful cycle. At the
+6-second minimum TTL, `C` is 2 seconds, the outer
+per-operation bound is 666 ms, and the database timeout is 532 ms. At the
+60-second default, those values are 20 seconds, 5 seconds, and 4 seconds
+respectively. Heartbeat and reconciliation run sequentially, so one normal
+maintenance cycle consumes at most `2W`.
+
+Each PostgreSQL reconciliation transaction holds at most 64 run IDs in memory.
+It reserves half the batch for expired pre-intent claims and half for existing
+expired runs, then uses unused capacity for the non-empty side. Journal,
+idempotency, and HITL cleanup is scoped to those IDs; expired conversation
+ledgers and mailbox rows have independent 64-row budgets. A healthy cycle
+therefore makes bounded progress instead of scanning and rewriting all history.
+At the default 20-second cadence, a continuously saturated run backlog drains
+at roughly 192 runs per minute, subject to database latency and contention.
+
+Initial reconciliation or PostgreSQL idempotency-prune failure no longer
+prevents the HTTP process from binding indefinitely, but `/health/ready`
+remains `503` with `component: "storage_maintenance"`. Local JSON/SQLite prune
+failures remain startup-fatal because those backends do not enable the
+cancellable PostgreSQL watchdog. Any later heartbeat or reconciliation failure
+makes readiness pessimistic as soon as its bounded operation returns. Healthy
+in-flight maintenance does not create a transient readiness failure. Only a
+complete cycle in which both operations succeed restores readiness;
+`/health/live` remains a process-liveness check.
+
+In steady state, a peer nominally observes a dead owner within
+`TTL + one cadence + 2W` when the run fits in the next reconciliation batch:
+the last lease must first expire, a peer can just miss that expiry on one
+maintenance tick, and its next heartbeat plus reconciliation are bounded work.
+That is approximately 9.332 seconds at the 6-second minimum and 90 seconds at
+the 60-second default. This is not a hard availability SLA: a backlog beyond 64
+runs adds later cadence windows, while persistent database failure, repeated
+lock contention, or scheduler starvation can defer a successful cycle.
+Reconciliation marks work `abandoned`; it does not resume the Lua VM or provide
+execution failover.
 
 ## The StateStore Trait
 

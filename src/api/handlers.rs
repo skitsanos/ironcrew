@@ -39,6 +39,7 @@ struct RunIdempotencyAttempt {
     request_fingerprint: String,
     attempt_id: String,
     response_body: String,
+    lease_deadline: tokio::time::Instant,
 }
 
 type RunFlowResult =
@@ -909,6 +910,23 @@ impl<T> Drop for AbortTaskOnDrop<T> {
     }
 }
 
+async fn execute_after_worker_start<T, F>(
+    start: Option<tokio::sync::oneshot::Receiver<()>>,
+    work: F,
+) -> std::result::Result<T, IronCrewError>
+where
+    F: std::future::Future<Output = std::result::Result<T, IronCrewError>>,
+{
+    if let Some(start) = start {
+        start.await.map_err(|_| {
+            IronCrewError::Conflict(
+                "Run execution start gate closed before durable fence admission".into(),
+            )
+        })?;
+    }
+    work.await
+}
+
 fn classify_work_result(
     join_result: std::result::Result<
         std::result::Result<RunWorkResult, IronCrewError>,
@@ -1106,11 +1124,13 @@ pub async fn run_flow(
                 "Run acceptance response exceeded the idempotency response limit".into(),
             )
         })?;
+        let lease_started = tokio::time::Instant::now();
         let now = chrono::Utc::now();
+        let lease_ttl = state.store.run_lease_ttl();
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let lease_expires_at = now
             .checked_add_signed(
-                chrono::Duration::from_std(state.store.run_lease_ttl())
+                chrono::Duration::from_std(lease_ttl)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60)),
             )
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
@@ -1146,6 +1166,10 @@ pub async fn run_flow(
                 request_fingerprint: request_fingerprint.clone(),
                 attempt_id,
                 response_body,
+                lease_deadline: super::idempotency::conservative_lease_deadline(
+                    lease_started,
+                    lease_ttl,
+                ),
             }),
             IdempotencyClaimOutcome::Replay(record) => return replay_run(&record),
             IdempotencyClaimOutcome::InProgress(_) => {
@@ -1183,6 +1207,41 @@ pub async fn run_flow(
                     scope,
                     resource,
                     retry_after_seconds,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if idempotency_attempt
+        .as_ref()
+        .is_some_and(|attempt| tokio::time::Instant::now() >= attempt.lease_deadline)
+    {
+        release_run_idempotency(&state, idempotency_attempt.as_ref()).await;
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The durable run claim consumed its lease window before execution could start; retry with the same Idempotency-Key"
+                .into(),
+        ));
+    }
+    let run_heartbeat = if let Some(attempt) = idempotency_attempt.as_ref() {
+        match super::idempotency::RunLeaseHeartbeat::start(
+            state.store.clone(),
+            run_id.clone(),
+            attempt.key_hash.clone(),
+            attempt.attempt_id.clone(),
+            attempt.lease_deadline,
+        )
+        .await
+        {
+            Ok(heartbeat) => Some(heartbeat),
+            Err(error) => {
+                tracing::error!(%error, run_id, "Failed to establish the initial durable run fence");
+                release_run_idempotency(&state, idempotency_attempt.as_ref()).await;
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The durable run fence could not be established before execution; retry with the same Idempotency-Key"
+                        .into(),
                 ));
             }
         }
@@ -1234,6 +1293,12 @@ pub async fn run_flow(
         } else {
             (None, None)
         };
+    let (worker_start_tx, worker_start_rx) = if run_heartbeat.is_some() {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        (Some(start_tx), Some(start_rx))
+    } else {
+        (None, None)
+    };
     let (work_handle, terminal_tx) = {
         let mut active_runs = state.active_runs.write().await;
         if !state
@@ -1263,18 +1328,21 @@ pub async fn run_flow(
         }
 
         let work_handle = tokio::spawn(async move {
-            execute_crew_from_path_with_events(
-                &flow_path,
-                &eventbus_inner,
-                &run_id_for_work,
-                input.as_ref(),
-                RunExecutionContext {
-                    shared_store: Some(store_for_work),
-                    input_bridge: Some(bridge_for_work),
-                    run_intent_signal,
-                    api_lifecycle: lifecycle_for_work,
-                },
-            )
+            execute_after_worker_start(worker_start_rx, async move {
+                execute_crew_from_path_with_events(
+                    &flow_path,
+                    &eventbus_inner,
+                    &run_id_for_work,
+                    input.as_ref(),
+                    RunExecutionContext {
+                        shared_store: Some(store_for_work),
+                        input_bridge: Some(bridge_for_work),
+                        run_intent_signal,
+                        api_lifecycle: lifecycle_for_work,
+                    },
+                )
+                .await
+            })
             .await
         });
         let abort_handle = work_handle.abort_handle();
@@ -1341,53 +1409,37 @@ pub async fn run_flow(
         let max_lifetime = state_clone.max_run_lifetime;
         let mut work_handle = AbortTaskOnDrop::new(work_handle);
 
-        // Keep the operation claim live independently of the client
-        // connection. Losing the fence actively aborts Lua: continuing tools
-        // or provider calls after another attempt owns the claim is unsafe.
-        let run_heartbeat = idempotency_for_monitor.as_ref().map(|attempt| {
-            super::idempotency::RunLeaseHeartbeat::spawn(
-                state_clone.store.clone(),
-                run_id_clone.clone(),
-                attempt.key_hash.clone(),
-                attempt.attempt_id.clone(),
-            )
-        });
+        // The keyed operation fence was established before the worker was
+        // spawned. Keep it alive independently of the client connection;
+        // losing it actively aborts Lua before another attempt can take over.
         let mut fence_outcome = run_heartbeat
             .as_ref()
             .map(super::idempotency::RunLeaseHeartbeat::outcome_receiver);
+        let immediate_fence_outcome = match (run_heartbeat.as_ref(), worker_start_tx) {
+            (Some(heartbeat), Some(start)) => heartbeat.admit_execution(start),
+            (Some(_), None) => {
+                tracing::error!(
+                    run_id = %run_id_clone,
+                    "Keyed run worker was created without its start gate"
+                );
+                Some(RunFenceHeartbeat::Lost)
+            }
+            (None, Some(start)) => {
+                let _ = start.send(());
+                None
+            }
+            (None, None) => None,
+        };
 
         let (requested_status, duration_ms, total_tokens, error_message, fence_result) = tokio::select! {
-            join_result = work_handle.handle_mut() => {
-                let outcome = classify_work_result(
-                    join_result,
-                    started.elapsed().as_millis() as u64,
-                );
-                (
-                    outcome.status,
-                    outcome.duration_ms,
-                    outcome.total_tokens,
-                    outcome.error_message,
-                    None,
-                )
-            }
-            _ = tokio::time::sleep(max_lifetime) => {
-                work_handle.abort();
-                // Wait until cancellation has completed before touching the
-                // record, so Lua cannot race a later completion write.
-                let _ = work_handle.handle_mut().await;
-                tracing::warn!("Run {} timed out after {}s", run_id_clone, max_lifetime.as_secs());
-                (
-                    RunStatus::TimedOut,
-                    started.elapsed().as_millis() as u64,
-                    0,
-                    None,
-                    None,
-                )
-            }
+            biased;
             outcome = async {
-                match fence_outcome.as_mut() {
-                    Some(outcome) => super::idempotency::wait_for_run_fence_outcome(outcome).await,
-                    None => std::future::pending::<RunFenceHeartbeat>().await,
+                match immediate_fence_outcome {
+                    Some(outcome) => outcome,
+                    None => match fence_outcome.as_mut() {
+                        Some(outcome) => super::idempotency::wait_for_run_fence_outcome(outcome).await,
+                        None => std::future::pending::<RunFenceHeartbeat>().await,
+                    },
                 }
             } => {
                 work_handle.abort();
@@ -1450,6 +1502,33 @@ pub async fn run_flow(
                         )
                     }
                 }
+            }
+            join_result = work_handle.handle_mut() => {
+                let outcome = classify_work_result(
+                    join_result,
+                    started.elapsed().as_millis() as u64,
+                );
+                (
+                    outcome.status,
+                    outcome.duration_ms,
+                    outcome.total_tokens,
+                    outcome.error_message,
+                    None,
+                )
+            }
+            _ = tokio::time::sleep(max_lifetime) => {
+                work_handle.abort();
+                // Wait until cancellation has completed before touching the
+                // record, so Lua cannot race a later completion write.
+                let _ = work_handle.handle_mut().await;
+                tracing::warn!("Run {} timed out after {}s", run_id_clone, max_lifetime.as_secs());
+                (
+                    RunStatus::TimedOut,
+                    started.elapsed().as_millis() as u64,
+                    0,
+                    None,
+                    None,
+                )
             }
         };
         let staged_completion = lifecycle_for_monitor.take_completion().await;
@@ -3114,22 +3193,64 @@ mod truncate_tests {
     use super::{
         RunWorkResult, TERMINAL_RESULT_RETRY_RETAINED_BYTES, TerminalPersistence,
         TerminalResultRetention, classify_work_result, cursor_acknowledges_terminal,
-        cursor_error_response, persist_terminal_outcome, replay_run, truncate_utf8,
-        validate_run_id, validate_run_tags,
+        cursor_error_response, execute_after_worker_start, persist_terminal_outcome, replay_run,
+        truncate_utf8, validate_run_id, validate_run_tags,
     };
+    use crate::api::idempotency::RunLeaseHeartbeat;
     use crate::engine::idempotency::{
-        IdempotencyRecord, IdempotencyState, PrincipalId, RUN_OPERATION,
+        IdempotencyRecord, IdempotencyState, PrincipalId, RUN_OPERATION, RunFenceHeartbeat,
     };
     use crate::engine::run_events::RunEventCursorError;
     use crate::engine::run_history::{JsonFileStore, RunCompletion, RunStatus};
     use crate::engine::store::StateStore;
     use crate::engine::task::TaskResult;
     use crate::utils::error::IronCrewError;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn ascii_under_limit_returns_full() {
         assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[tokio::test]
+    async fn expired_fence_keeps_keyed_worker_body_unpolled() {
+        let heartbeat = RunLeaseHeartbeat::for_test_with_deadline(tokio::time::Instant::now());
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let body_polls_for_worker = body_polls.clone();
+        let worker = tokio::spawn(execute_after_worker_start(Some(start_rx), async move {
+            body_polls_for_worker.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), IronCrewError>(())
+        }));
+
+        assert_eq!(
+            heartbeat.admit_execution(start_tx),
+            Some(RunFenceHeartbeat::Lost)
+        );
+        assert!(worker.await.expect("worker task must finish").is_err());
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            heartbeat.outcome_receiver().borrow().clone(),
+            Some(RunFenceHeartbeat::Lost)
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_worker_runs_without_a_start_gate() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let body_polls_for_worker = body_polls.clone();
+
+        execute_after_worker_start(None, async move {
+            body_polls_for_worker.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), IronCrewError>(())
+        })
+        .await
+        .expect("unkeyed worker must not wait for fence admission");
+
+        assert_eq!(body_polls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

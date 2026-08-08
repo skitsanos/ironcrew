@@ -12,6 +12,7 @@
 //! are isolated and can run in parallel against one database.
 #![cfg(feature = "postgres")]
 
+use ironcrew::api::idempotency::RunLeaseHeartbeat;
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
 use ironcrew::engine::human_input::{
     DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputKeyring,
@@ -25,6 +26,9 @@ use ironcrew::engine::idempotency::{
 };
 use ironcrew::engine::input_bridge::QuestionInfo;
 use ironcrew::engine::postgres_store::PostgresStore;
+use ironcrew::engine::reconciler::{
+    heartbeat_owned_runs_bounded, maintain_run_leases, reconcile_stuck_runs_at,
+};
 use ironcrew::engine::run_events::{
     EventJournalScope, RunEventAppendBatch, RunEventAppendEntry, RunEventGapReason,
     RunEventJournalConfig,
@@ -33,11 +37,14 @@ use ironcrew::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunStatus, RunTransition,
 };
 use ironcrew::engine::sessions::{ConversationRecord, DialogStateRecord};
-use ironcrew::engine::store::{RunLeaseConfig, StateStore};
+use ironcrew::engine::store::{RunLeaseConfig, StateStore, run_maintenance_database_timeout};
 use ironcrew::engine::task::TaskResult;
 use ironcrew::llm::provider::ChatMessage;
 use ironcrew::lua::dialog::DialogTurn;
-use std::time::Duration;
+use ironcrew::utils::error::IronCrewError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 fn pg_url() -> Option<String> {
     std::env::var("IRONCREW_TEST_PG_URL")
@@ -350,6 +357,52 @@ async fn create_keyed_run(store: &PostgresStore, run_id: &str, key: char) -> Ide
         .await
         .unwrap();
     claim
+}
+
+fn assert_database_maintenance_timeout(error: &IronCrewError, operation: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains("timeout"),
+        "{operation} must report the PostgreSQL timeout, got: {message}"
+    );
+    assert!(
+        !message.contains("Run lease"),
+        "{operation} hit the outer watchdog before PostgreSQL cancelled and returned its connection: {message}"
+    );
+}
+
+fn configured_postgres_pool_size() -> usize {
+    std::env::var("IRONCREW_DB_POOL_SIZE")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("IRONCREW_DB_POOL_SIZE must be numeric when live PostgreSQL tests run")
+        })
+        .unwrap_or(10)
+}
+
+async fn wait_for_blocked_health_probes(pool: &sqlx::PgPool, table_name: &str, expected: usize) {
+    let query_pattern = format!("%UPDATE {table_name} SET lease_expires_at%");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query LIKE $1",
+            )
+            .bind(&query_pattern)
+            .fetch_one(pool)
+            .await
+            .expect("inspect blocked PostgreSQL health probes");
+            if blocked >= i64::try_from(expected).expect("pool size fits i64") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all store connections must reach the held table lock");
 }
 
 fn idempotency_claim(
@@ -936,7 +989,7 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(idempotency_indexes, 4, "primary key plus three indexes");
+    assert_eq!(idempotency_indexes, 5, "primary key plus four indexes");
     let accounting_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns \
          WHERE table_schema = current_schema() AND table_name = $1",
@@ -1232,6 +1285,808 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
         owner_a.get_run("owned-run").await.unwrap().status,
         RunStatus::Abandoned
     );
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_advisory_lock_timeout_recovers_pool() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_advisory_lock_timeout_recovers_pool: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_adv_";
+    reset(&url, prefix).await;
+    let store = Arc::new(
+        PostgresStore::new_with_lease_config(
+            &url,
+            prefix,
+            RunLeaseConfig::new("maintenance-owner", Duration::from_secs(12)).unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    store
+        .save_run_intent(intent(
+            "maintenance-run",
+            "demo",
+            "2026-08-07T10:00:00Z",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    let maintenance: Arc<dyn StateStore> = store.clone();
+    let watchdog = store.run_maintenance_watchdog().unwrap();
+    let maintenance_healthy = AtomicBool::new(true);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    let lock_name = format!("ironcrew:{prefix}idempotency:run-fence:6:global");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_name)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let failed_cycle = maintain_run_leases(&maintenance, &maintenance_healthy).await;
+    let heartbeat_error = failed_cycle
+        .heartbeat
+        .expect_err("the held run-fence advisory lock must time out the heartbeat");
+    assert_database_maintenance_timeout(&heartbeat_error, "heartbeat advisory lock");
+    let reconcile_error = failed_cycle
+        .reconciliation
+        .expect_err("the held run-fence advisory lock must also time out reconciliation");
+    assert_database_maintenance_timeout(&reconcile_error, "reconciliation advisory lock");
+    assert!(
+        !maintenance_healthy.load(Ordering::Acquire),
+        "a timed-out maintenance cycle must make readiness pessimistic"
+    );
+    assert!(
+        started.elapsed() < watchdog + watchdog + Duration::from_secs(1),
+        "the contended maintenance cycle exceeded two bounded operation windows"
+    );
+
+    blocker.rollback().await.unwrap();
+    let recovered_cycle = maintain_run_leases(&maintenance, &maintenance_healthy).await;
+    assert_eq!(
+        recovered_cycle.heartbeat.unwrap(),
+        1,
+        "the released pool must renew its owned run"
+    );
+    assert_eq!(
+        recovered_cycle.reconciliation.unwrap(),
+        0,
+        "a successful cycle must preserve the healthy owner's run"
+    );
+    assert!(
+        maintenance_healthy.load(Ordering::Acquire),
+        "only a complete successful maintenance cycle may restore readiness"
+    );
+    assert_eq!(
+        store.get_run("maintenance-run").await.unwrap().status,
+        RunStatus::Running
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_row_lock_statement_timeout_recovers_pool() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_row_lock_statement_timeout_recovers_pool: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_row_";
+    reset(&url, prefix).await;
+    let store = Arc::new(
+        PostgresStore::new_with_lease_config(
+            &url,
+            prefix,
+            RunLeaseConfig::new("maintenance-owner", Duration::from_secs(12)).unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    store
+        .save_run_intent(intent("locked-run", "demo", "2026-08-07T10:00:00Z", vec![]))
+        .await
+        .unwrap();
+    let before = chrono::DateTime::parse_from_rfc3339(
+        &store.get_run("locked-run").await.unwrap().lease_expires_at,
+    )
+    .unwrap();
+    let maintenance: Arc<dyn StateStore> = store.clone();
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    let lock_sql = format!("SELECT run_id FROM {prefix}runs WHERE run_id = $1 FOR UPDATE");
+    sqlx::query(sqlx::AssertSqlSafe(lock_sql))
+        .bind("locked-run")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let error = heartbeat_owned_runs_bounded(&maintenance)
+        .await
+        .expect_err("the held run row must time out the heartbeat statement");
+    assert_database_maintenance_timeout(&error, "heartbeat row lock");
+    assert!(
+        error.to_string().contains("statement timeout"),
+        "the row-lock wait must be cancelled by PostgreSQL statement_timeout: {error}"
+    );
+
+    blocker.rollback().await.unwrap();
+    assert_eq!(heartbeat_owned_runs_bounded(&maintenance).await.unwrap(), 1);
+    let after = chrono::DateTime::parse_from_rfc3339(
+        &store.get_run("locked-run").await.unwrap().lease_expires_at,
+    )
+    .unwrap();
+    assert!(after > before, "the recovered pool must renew the held run");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_pool_acquisition_is_bounded_and_reusable() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_pool_acquisition_is_bounded_and_reusable: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_pool_";
+    reset(&url, prefix).await;
+    let store = Arc::new(
+        PostgresStore::new_with_lease_config(
+            &url,
+            prefix,
+            RunLeaseConfig::new("maintenance-owner", Duration::from_secs(12)).unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let maintenance: Arc<dyn StateStore> = store.clone();
+    let pool_size = configured_postgres_pool_size();
+    assert!((1..=128).contains(&pool_size));
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    let table_name = format!("{prefix}runs");
+    let lock_sql = format!("LOCK TABLE {table_name} IN ACCESS EXCLUSIVE MODE");
+    sqlx::query(sqlx::AssertSqlSafe(lock_sql))
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let mut probes = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let store = store.clone();
+        probes.push(tokio::spawn(async move { store.health_check().await }));
+    }
+    wait_for_blocked_health_probes(&pool, &table_name, pool_size).await;
+
+    let watchdog = store.run_maintenance_watchdog().unwrap();
+    let started = Instant::now();
+    let error = heartbeat_owned_runs_bounded(&maintenance)
+        .await
+        .expect_err("pool acquisition must not outlive the maintenance watchdog");
+    assert!(
+        error
+            .to_string()
+            .contains("Run lease heartbeat exceeded its"),
+        "pool exhaustion must report the outer maintenance watchdog: {error}"
+    );
+    assert!(
+        started.elapsed() < watchdog + Duration::from_secs(1),
+        "pool acquisition exceeded its bounded maintenance window"
+    );
+
+    blocker.rollback().await.unwrap();
+    for probe in probes {
+        tokio::time::timeout(Duration::from_secs(10), probe)
+            .await
+            .expect("released health probe must finish")
+            .expect("health probe task must not panic")
+            .expect("health probe must reuse its released connection");
+    }
+    assert_eq!(heartbeat_owned_runs_bounded(&maintenance).await.unwrap(), 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_keyed_heartbeat_keeps_database_sampled_deadline() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_keyed_heartbeat_keeps_database_sampled_deadline: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_latency_";
+    reset(&url, prefix).await;
+    let lease_ttl = Duration::from_secs(12);
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", lease_ttl).unwrap(),
+    )
+    .await
+    .unwrap();
+    let claim = create_keyed_run(&store, "latency-run", 'a').await;
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let function_name = format!("{prefix}delay_heartbeat_fn");
+    let trigger_name = format!("{prefix}delay_heartbeat");
+    let table_name = format!("{prefix}runs");
+    let function_sql = format!(
+        "CREATE OR REPLACE FUNCTION {function_name}() RETURNS trigger \
+         LANGUAGE plpgsql AS $function$ \
+         BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END \
+         $function$"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(function_sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let trigger_sql = format!(
+        "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF lease_expires_at ON {table_name} \
+         FOR EACH ROW WHEN (OLD.run_id = 'latency-run') \
+         EXECUTE FUNCTION {function_name}()"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let outcome = store
+        .heartbeat_idempotent_run(
+            "latency-run",
+            &claim.key_hash,
+            &claim.attempt_id,
+            "9999-08-07T10:00:00Z",
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(matches!(outcome, RunFenceHeartbeat::Owned));
+    assert!(
+        elapsed >= Duration::from_millis(450),
+        "the injected post-sampling database latency did not execute: {elapsed:?}"
+    );
+
+    let observed_at = postgres_now(&url).await;
+    let record = store.get_run("latency-run").await.unwrap();
+    let durable_deadline = chrono::DateTime::parse_from_rfc3339(&record.lease_expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let remaining = durable_deadline.signed_duration_since(observed_at);
+    let configured_ttl = chrono::Duration::seconds(lease_ttl.as_secs() as i64);
+    assert!(remaining > chrono::Duration::zero());
+    assert!(
+        remaining < configured_ttl - chrono::Duration::milliseconds(350),
+        "the durable lease was reset from response time instead of retaining the database-sampled deadline: {remaining}"
+    );
+
+    let ledger_sql =
+        format!("SELECT lease_expires_at FROM {prefix}idempotency WHERE key_hash = $1");
+    let ledger_deadline: String = sqlx::query_scalar(sqlx::AssertSqlSafe(ledger_sql))
+        .bind(&claim.key_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ledger_deadline, record.lease_expires_at);
+
+    let drop_trigger_sql = format!("DROP TRIGGER {trigger_name} ON {table_name}");
+    sqlx::query(sqlx::AssertSqlSafe(drop_trigger_sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let drop_function_sql = format!("DROP FUNCTION {function_name}()");
+    sqlx::query(sqlx::AssertSqlSafe(drop_function_sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_high_cardinality_reconciliation_makes_bounded_progress() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_high_cardinality_reconciliation_makes_bounded_progress: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_batch_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new_with_lease_config(
+        &url,
+        prefix,
+        RunLeaseConfig::new("maintenance-owner", Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let per_kind = 65_i64;
+
+    for (kind, lease) in [
+        ("expired", "2000-01-01T00:00:00Z"),
+        ("live", "9999-01-01T00:00:00Z"),
+    ] {
+        let insert_runs = format!(
+            "INSERT INTO {prefix}runs (\
+                 run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
+                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
+                 owner_instance_id, lease_expires_at\
+             ) \
+             SELECT $2 || '-' || fixture.number::text, 'flow-a', 'flow-a', 'running', \
+                    '2026-08-07T10:00:00Z', '', 0, '[]'::jsonb, 1, 1, 0, 0, \
+                    '[]'::jsonb, 'dead-owner', $3 \
+             FROM generate_series(1, $1::bigint) AS fixture(number)"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(insert_runs))
+            .bind(per_kind)
+            .bind(kind)
+            .bind(lease)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let insert_run_ledgers = format!(
+        "INSERT INTO {prefix}idempotency (\
+             key_hash, principal_id, request_fingerprint, operation, scope, resource_id, \
+             attempt_id, owner_instance_id, state, lease_expires_at, created_at, \
+             updated_at, ttl_seconds\
+         ) \
+         SELECT md5('expired-key-' || fixture.number::text) || \
+                    md5('expired-key-tail-' || fixture.number::text), \
+                $2, \
+                md5('expired-fingerprint-' || fixture.number::text) || \
+                    md5('expired-fingerprint-tail-' || fixture.number::text), \
+                $3, 'flow-a', 'expired-' || fixture.number::text, \
+                'expired-attempt-' || fixture.number::text, 'dead-owner', 'running', \
+                '2000-01-01T00:00:00Z', '2026-08-07T10:00:00Z', \
+                '2026-08-07T10:00:00Z', 86400 \
+         FROM generate_series(1, $1::bigint) AS fixture(number)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert_run_ledgers))
+        .bind(per_kind)
+        .bind(PrincipalId::legacy().as_str())
+        .bind(RUN_OPERATION)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let insert_fallback_ledgers = format!(
+        "INSERT INTO {prefix}idempotency (\
+             key_hash, principal_id, request_fingerprint, operation, scope, resource_id, \
+             attempt_id, owner_instance_id, state, lease_expires_at, created_at, \
+             updated_at, ttl_seconds\
+         ) \
+         SELECT md5('fallback-key-' || fixture.number::text) || \
+                    md5('fallback-key-tail-' || fixture.number::text), \
+                $2, \
+                md5('fallback-fingerprint-' || fixture.number::text) || \
+                    md5('fallback-fingerprint-tail-' || fixture.number::text), \
+                $3, 'flow-a', 'fallback-' || fixture.number::text, \
+                'fallback-attempt-' || fixture.number::text, 'dead-owner', 'claimed', \
+                '2000-01-01T00:00:00Z', '2026-08-07T10:00:00Z', \
+                '2026-08-07T10:00:00Z', 86400 \
+         FROM generate_series(1, $1::bigint) AS fixture(number)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert_fallback_ledgers))
+        .bind(per_kind)
+        .bind(PrincipalId::legacy().as_str())
+        .bind(RUN_OPERATION)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let insert_conversation_ledgers = format!(
+        "INSERT INTO {prefix}idempotency (\
+             key_hash, principal_id, request_fingerprint, operation, scope, resource_id, \
+             attempt_id, owner_instance_id, state, lease_expires_at, created_at, \
+             updated_at, ttl_seconds\
+         ) \
+         SELECT md5('conversation-key-' || fixture.number::text) || \
+                    md5('conversation-key-tail-' || fixture.number::text), \
+                $2, \
+                md5('conversation-fingerprint-' || fixture.number::text) || \
+                    md5('conversation-fingerprint-tail-' || fixture.number::text), \
+                $3, 'flow-a', 'conversation-' || fixture.number::text, \
+                'conversation-attempt-' || fixture.number::text, 'dead-owner', 'claimed', \
+                '2000-01-01T00:00:00Z', '2026-08-07T10:00:00Z', \
+                '2026-08-07T10:00:00Z', 86400 \
+         FROM generate_series(1, $1::bigint) AS fixture(number)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert_conversation_ledgers))
+        .bind(per_kind)
+        .bind(PrincipalId::legacy().as_str())
+        .bind(CONVERSATION_MESSAGE_OPERATION)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let insert_journals = format!(
+        "INSERT INTO {prefix}run_event_state (run_id, flow, owner_instance_id) \
+         SELECT 'expired-' || fixture.number::text, 'flow-a', 'dead-owner' \
+         FROM generate_series(1, $1::bigint) AS fixture(number)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert_journals))
+        .bind(per_kind)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (kind, created_at, expires_at) in [
+        (
+            "expired",
+            "clock_timestamp()",
+            "clock_timestamp() + interval '1 hour'",
+        ),
+        (
+            "live",
+            "clock_timestamp() - interval '2 hours'",
+            "clock_timestamp() - interval '1 hour'",
+        ),
+    ] {
+        let insert_mailboxes = format!(
+            "INSERT INTO {prefix}human_inputs (\
+                 run_id, question_id, flow, owner_instance_id, key_hash, attempt_id, \
+                 question_digest, question_key_fingerprint, question_nonce, \
+                 question_ciphertext, state, created_at, expires_at\
+             ) \
+             SELECT $2 || '-' || fixture.number::text, 'question-1', 'flow-a', \
+                    'dead-owner', \
+                    md5($2 || '-key-' || fixture.number::text) || \
+                        md5($2 || '-key-tail-' || fixture.number::text), \
+                    $2 || '-attempt-' || fixture.number::text, \
+                    md5($2 || '-question-' || fixture.number::text) || \
+                        md5($2 || '-question-tail-' || fixture.number::text), \
+                    'fixture-key', decode('000000000000000000000000', 'hex'), \
+                    decode('01', 'hex'), 'pending', {created_at}, {expires_at} \
+             FROM generate_series(1, $1::bigint) AS fixture(number)"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(insert_mailboxes))
+            .bind(per_kind)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let first = store
+        .reconcile_abandoned_runs("1900-08-07T10:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(first, 64, "the first run batch must stay at its fixed cap");
+    let fallback_after_first: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}runs \
+         WHERE run_id LIKE 'fallback-%' AND status = 'abandoned'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let expired_after_first: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}runs \
+         WHERE run_id LIKE 'expired-%' AND status = 'abandoned'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((fallback_after_first, expired_after_first), (32, 32));
+
+    let completed_run_ledgers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}idempotency \
+         WHERE operation = $1 AND state = 'completed'"
+    )))
+    .bind(RUN_OPERATION)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let incomplete_journals: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_event_state WHERE NOT journal_complete"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let remaining_expired_run_mailboxes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id LIKE 'expired-%'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let indeterminate_conversations: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}idempotency \
+         WHERE operation = $1 AND state = 'indeterminate'"
+    )))
+    .bind(CONVERSATION_MESSAGE_OPERATION)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let remaining_expired_live_mailboxes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id LIKE 'live-%'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(completed_run_ledgers, first as i64);
+    assert_eq!(incomplete_journals, expired_after_first);
+    assert_eq!(
+        remaining_expired_run_mailboxes,
+        per_kind - expired_after_first
+    );
+    assert_eq!(indeterminate_conversations, 64);
+    assert_eq!(remaining_expired_live_mailboxes, 1);
+
+    let mut total = first;
+    for _ in 0..8 {
+        if total == usize::try_from(per_kind * 2).unwrap() {
+            break;
+        }
+        total += store
+            .reconcile_abandoned_runs("1900-08-07T10:00:00Z")
+            .await
+            .unwrap();
+    }
+    assert_eq!(total, usize::try_from(per_kind * 2).unwrap());
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("1900-08-07T10:00:00Z")
+            .await
+            .unwrap(),
+        0
+    );
+
+    let abandoned: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}runs WHERE status = 'abandoned'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let live: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}runs \
+         WHERE run_id LIKE 'live-%' AND status = 'running'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let incomplete_journals: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_event_state WHERE NOT journal_complete"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let completed_run_ledgers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}idempotency \
+         WHERE operation = $1 AND state = 'completed'"
+    )))
+    .bind(RUN_OPERATION)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let indeterminate_conversations: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}idempotency \
+         WHERE operation = $1 AND state = 'indeterminate'"
+    )))
+    .bind(CONVERSATION_MESSAGE_OPERATION)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mailboxes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(abandoned, per_kind * 2);
+    assert_eq!(live, per_kind);
+    assert_eq!(incomplete_journals, per_kind);
+    assert_eq!(completed_run_ledgers, per_kind * 2);
+    assert_eq!(indeterminate_conversations, per_kind);
+    assert_eq!(mailboxes, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_run_maintenance_aggregate_delay_rolls_back_and_recovers_pool() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_maintenance_aggregate_delay_rolls_back_and_recovers_pool: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "maint_agg_";
+    reset(&url, prefix).await;
+    let lease_ttl = Duration::from_secs(12);
+    let per_statement_delay = Duration::from_millis(500);
+    assert!(per_statement_delay < run_maintenance_database_timeout(lease_ttl));
+    let store = Arc::new(
+        PostgresStore::new_with_runtime_config(
+            &url,
+            prefix,
+            RunLeaseConfig::new("owner-a", lease_ttl).unwrap(),
+            Some(human_input_keyring()),
+            run_event_config(),
+        )
+        .await
+        .unwrap(),
+    );
+    let claim = create_keyed_run(&store, "aggregate-run", 'c').await;
+    store
+        .append_run_events(&run_event_batch(
+            "aggregate-run",
+            "owner-a",
+            vec![run_event(1, "run_started", 0)],
+        ))
+        .await
+        .unwrap();
+    store
+        .register_human_input(&human_input_registration(
+            "aggregate-run",
+            "aggregate-question",
+            &claim.key_hash,
+            &claim.attempt_id,
+        ))
+        .await
+        .unwrap();
+    expire_run_lease(&url, prefix, "aggregate-run").await;
+    expire_idempotency_lease(&url, prefix, &claim.key_hash).await;
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let function_name = format!("{prefix}delay_reconcile_fn");
+    let function_sql = format!(
+        "CREATE OR REPLACE FUNCTION {function_name}() RETURNS trigger \
+         LANGUAGE plpgsql AS $function$ \
+         BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END \
+         $function$"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(function_sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (trigger, table, column, predicate) in [
+        (
+            format!("{prefix}delay_run"),
+            format!("{prefix}runs"),
+            "status",
+            "OLD.run_id = 'aggregate-run'",
+        ),
+        (
+            format!("{prefix}delay_journal"),
+            format!("{prefix}run_event_state"),
+            "journal_complete",
+            "OLD.run_id = 'aggregate-run'",
+        ),
+        (
+            format!("{prefix}delay_ledger"),
+            format!("{prefix}idempotency"),
+            "state",
+            "OLD.resource_id = 'aggregate-run'",
+        ),
+    ] {
+        let trigger_sql = format!(
+            "CREATE TRIGGER {trigger} BEFORE UPDATE OF {column} ON {table} \
+             FOR EACH ROW WHEN ({predicate}) EXECUTE FUNCTION {function_name}()"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let maintenance: Arc<dyn StateStore> = store.clone();
+    let watchdog = store.run_maintenance_watchdog().unwrap();
+    let started = Instant::now();
+    let error = reconcile_stuck_runs_at(&maintenance, "1900-08-07T10:00:00Z")
+        .await
+        .expect_err("aggregate statement latency must hit the outer watchdog");
+    assert!(
+        error
+            .to_string()
+            .contains("Run lease reconciliation exceeded its"),
+        "aggregate latency must report the outer transaction watchdog: {error}"
+    );
+    assert!(started.elapsed() >= watchdog);
+    assert!(started.elapsed() < watchdog + Duration::from_secs(1));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (trigger, table) in [
+            (format!("{prefix}delay_run"), format!("{prefix}runs")),
+            (
+                format!("{prefix}delay_journal"),
+                format!("{prefix}run_event_state"),
+            ),
+            (
+                format!("{prefix}delay_ledger"),
+                format!("{prefix}idempotency"),
+            ),
+        ] {
+            let drop_trigger_sql = format!("DROP TRIGGER {trigger} ON {table}");
+            sqlx::query(sqlx::AssertSqlSafe(drop_trigger_sql))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let drop_function_sql = format!("DROP FUNCTION {function_name}()");
+        sqlx::query(sqlx::AssertSqlSafe(drop_function_sql))
+            .execute(&pool)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("SQLx must finish the cancelled statement and roll back its transaction");
+
+    let run_status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT status FROM {prefix}runs WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let journal_complete: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT journal_complete FROM {prefix}run_event_state \
+         WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ledger_state: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT state FROM {prefix}idempotency WHERE key_hash = $1"
+    )))
+    .bind(&claim.key_hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mailbox_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(run_status, "running");
+    assert!(journal_complete);
+    assert_eq!(ledger_state, "running");
+    assert_eq!(mailbox_rows, 1);
+
+    assert_eq!(
+        reconcile_stuck_runs_at(&maintenance, "1900-08-07T10:00:00Z")
+            .await
+            .unwrap(),
+        1,
+        "the same store pool must recover after the cancelled transaction"
+    );
+    store.health_check().await.unwrap();
+    let run_status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT status FROM {prefix}runs WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let journal_complete: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT journal_complete FROM {prefix}run_event_state \
+         WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ledger_state: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT state FROM {prefix}idempotency WHERE key_hash = $1"
+    )))
+    .bind(&claim.key_hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mailbox_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}human_inputs WHERE run_id = 'aggregate-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(run_status, "abandoned");
+    assert!(!journal_complete);
+    assert_eq!(ledger_state, "completed");
+    assert_eq!(mailbox_rows, 0);
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -2405,13 +3260,15 @@ async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
     };
     let prefix = "idem_run_";
     reset(&url, prefix).await;
-    let store = PostgresStore::new_with_lease_config(
-        &url,
-        prefix,
-        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
-    )
-    .await
-    .unwrap();
+    let store = Arc::new(
+        PostgresStore::new_with_lease_config(
+            &url,
+            prefix,
+            RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
 
     let mut live = idempotency_claim(
         'e',
@@ -2475,6 +3332,61 @@ async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
         IdempotencyLookup::Replay(record) => assert_eq!(record.state, IdempotencyState::Completed),
         other => panic!("expected completed replay, got {other:?}"),
     }
+
+    let mut expired_before_intent = idempotency_claim(
+        'd',
+        'c',
+        RUN_OPERATION,
+        "expired-before-intent",
+        None,
+        None,
+        "2026-07-19T12:10:00Z",
+    );
+    expired_before_intent.response_status = Some(202);
+    expired_before_intent.response_body = Some("{\"run_id\":\"expired-before-intent\"}".into());
+    store
+        .claim_idempotency_with_limits(expired_before_intent.clone(), default_idempotency_limits())
+        .await
+        .unwrap();
+    let established_fence = RunLeaseHeartbeat::start(
+        store.clone(),
+        "expired-before-intent".into(),
+        expired_before_intent.key_hash.clone(),
+        expired_before_intent.attempt_id.clone(),
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    )
+    .await
+    .expect("the fresh claimed ledger must establish its pre-execution fence");
+    drop(established_fence);
+    expire_idempotency_lease(&url, prefix, &expired_before_intent.key_hash).await;
+    let stale_start = store
+        .save_run_intent(intent(
+            "expired-before-intent",
+            "flow-a",
+            "2026-07-19T12:02:01Z",
+            vec![],
+        ))
+        .await
+        .expect_err("an expired keyed claim must not publish a live run intent");
+    assert!(matches!(
+        stale_start,
+        ironcrew::utils::error::IronCrewError::Conflict(_)
+    ));
+    assert!(
+        store.get_run("expired-before-intent").await.is_err(),
+        "the rejected intent transaction must roll back its provisional run row"
+    );
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("1900-07-19T12:04:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_run("expired-before-intent").await.unwrap().status,
+        RunStatus::Abandoned
+    );
 
     let mut orphan = idempotency_claim(
         'f',
@@ -3117,7 +4029,7 @@ async fn pg_human_input_mailbox_is_encrypted_and_cross_replica() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(index_count, 3, "primary key plus two bounded indexes");
+    assert_eq!(index_count, 4, "primary key plus three bounded indexes");
     let cascading_fk: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_constraint AS con \
          JOIN pg_class AS tbl ON tbl.oid = con.conrelid \

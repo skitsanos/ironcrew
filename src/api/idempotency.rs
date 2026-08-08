@@ -32,6 +32,53 @@ const HARD_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const HARD_MAX_TOTAL_RESPONSE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
+/// Begin the process-local fence at the storage invocation, never when its
+/// response arrives. Every backend commits a deadline sampled at or after this
+/// point, so this monotonic deadline cannot outlive the durable renewal.
+pub(crate) fn conservative_lease_deadline(
+    heartbeat_started: tokio::time::Instant,
+    lease_ttl: Duration,
+) -> tokio::time::Instant {
+    heartbeat_started + lease_ttl
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatWake {
+    LeaseExpired,
+    Tick,
+}
+
+async fn wait_for_heartbeat_or_expiry(
+    interval: &mut tokio::time::Interval,
+    lease_deadline: tokio::time::Instant,
+) -> HeartbeatWake {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(lease_deadline) => HeartbeatWake::LeaseExpired,
+        _ = interval.tick() => HeartbeatWake::Tick,
+    }
+}
+
+/// PostgreSQL heartbeats install an earlier database timeout and may be
+/// cancelled at the local fence. Local stores finish their owned synchronous
+/// or blocking work first, then reject a result that arrived after expiry so a
+/// dropped `spawn_blocking` handle cannot leave an orphaned transaction.
+async fn heartbeat_before_deadline<T, F>(
+    cancellable: bool,
+    lease_deadline: tokio::time::Instant,
+    future: F,
+) -> Option<Result<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    if cancellable {
+        tokio::time::timeout_at(lease_deadline, future).await.ok()
+    } else {
+        let result = future.await;
+        (tokio::time::Instant::now() < lease_deadline).then_some(result)
+    }
+}
+
 /// A fenced lease heartbeat whose worker cannot outlive the request task that
 /// owns it. Consumers select on `loss_receiver()` and stop external work as
 /// soon as another attempt owns the claim, or once storage errors have lasted
@@ -47,17 +94,28 @@ impl LeaseHeartbeat {
         key_hash: String,
         attempt_id: String,
         operation: &'static str,
+        initial_lease_deadline: tokio::time::Instant,
     ) -> Self {
         let (loss_tx, loss) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             let lease_ttl = store.run_lease_ttl();
-            let heartbeat_every = (lease_ttl / 3).max(Duration::from_secs(1));
-            let mut lease_deadline = tokio::time::Instant::now() + lease_ttl;
+            let heartbeat_every = crate::engine::store::run_lease_heartbeat_interval(lease_ttl);
+            let mut lease_deadline = initial_lease_deadline;
             let mut interval = tokio::time::interval(heartbeat_every);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                if wait_for_heartbeat_or_expiry(&mut interval, lease_deadline).await
+                    == HeartbeatWake::LeaseExpired
+                {
+                    tracing::warn!(
+                        operation,
+                        "Idempotency lease expired before the next heartbeat completed"
+                    );
+                    let _ = loss_tx.send(true);
+                    return;
+                }
+                let heartbeat_started = tokio::time::Instant::now();
                 let deadline = chrono::Utc::now()
                     .checked_add_signed(
                         chrono::Duration::from_std(lease_ttl)
@@ -65,21 +123,22 @@ impl LeaseHeartbeat {
                     )
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
                     .to_rfc3339();
-                match tokio::time::timeout_at(
+                match heartbeat_before_deadline(
+                    store.run_maintenance_watchdog().is_some(),
                     lease_deadline,
                     store.heartbeat_idempotency(&key_hash, &attempt_id, &deadline),
                 )
                 .await
                 {
-                    Ok(Ok(true)) => {
-                        lease_deadline = tokio::time::Instant::now() + lease_ttl;
+                    Some(Ok(true)) => {
+                        lease_deadline = conservative_lease_deadline(heartbeat_started, lease_ttl);
                     }
-                    Ok(Ok(false)) | Ok(Err(IronCrewError::Conflict(_))) => {
+                    Some(Ok(false)) | Some(Err(IronCrewError::Conflict(_))) => {
                         tracing::warn!(operation, "Idempotency claim was fenced during execution");
                         let _ = loss_tx.send(true);
                         return;
                     }
-                    Ok(Err(error)) => {
+                    Some(Err(error)) => {
                         tracing::error!(operation, %error, "Failed to heartbeat idempotency claim");
                         if tokio::time::Instant::now() >= lease_deadline {
                             tracing::warn!(
@@ -90,7 +149,7 @@ impl LeaseHeartbeat {
                             return;
                         }
                     }
-                    Err(_) => {
+                    None => {
                         tracing::warn!(
                             operation,
                             "Idempotency heartbeat exceeded the remaining lease window"
@@ -131,25 +190,231 @@ pub async fn wait_for_lease_loss(loss: &mut tokio::sync::watch::Receiver<bool>) 
 pub struct RunLeaseHeartbeat {
     task: tokio::task::JoinHandle<()>,
     outcome: tokio::sync::watch::Receiver<Option<RunFenceHeartbeat>>,
+    coordinator: Arc<RunFenceCoordinator>,
+}
+
+struct RunFenceState {
+    lease_deadline: tokio::time::Instant,
+    outcome: Option<RunFenceHeartbeat>,
+}
+
+struct RunFenceCoordinator {
+    state: std::sync::Mutex<RunFenceState>,
+    outcome_tx: tokio::sync::watch::Sender<Option<RunFenceHeartbeat>>,
+}
+
+impl RunFenceCoordinator {
+    fn new(
+        lease_deadline: tokio::time::Instant,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::watch::Receiver<Option<RunFenceHeartbeat>>,
+    ) {
+        let (outcome_tx, outcome) = tokio::sync::watch::channel(None);
+        (
+            Arc::new(Self {
+                state: std::sync::Mutex::new(RunFenceState {
+                    lease_deadline,
+                    outcome: None,
+                }),
+                outcome_tx,
+            }),
+            outcome,
+        )
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RunFenceState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn current_deadline(&self) -> tokio::time::Instant {
+        self.state().lease_deadline
+    }
+
+    fn publish_locked(&self, state: &mut RunFenceState, outcome: RunFenceHeartbeat) {
+        if state.outcome.is_some() {
+            return;
+        }
+        state.outcome = Some(outcome.clone());
+        let _ = self.outcome_tx.send(Some(outcome));
+    }
+
+    fn publish(&self, outcome: RunFenceHeartbeat) {
+        let mut state = self.state();
+        self.publish_locked(&mut state, outcome);
+    }
+
+    fn lose_if_expired(&self, expected_deadline: tokio::time::Instant) -> bool {
+        let mut state = self.state();
+        if state.outcome.is_some() {
+            return true;
+        }
+        if state.lease_deadline != expected_deadline
+            || tokio::time::Instant::now() < state.lease_deadline
+        {
+            return false;
+        }
+        self.publish_locked(&mut state, RunFenceHeartbeat::Lost);
+        true
+    }
+
+    fn renew_if_live(
+        &self,
+        expected_deadline: tokio::time::Instant,
+        renewed_deadline: tokio::time::Instant,
+    ) -> bool {
+        let mut state = self.state();
+        let now = tokio::time::Instant::now();
+        if state.outcome.is_some() {
+            return false;
+        }
+        if state.lease_deadline != expected_deadline
+            || now >= state.lease_deadline
+            || now >= renewed_deadline
+        {
+            self.publish_locked(&mut state, RunFenceHeartbeat::Lost);
+            return false;
+        }
+        state.lease_deadline = renewed_deadline;
+        true
+    }
+
+    /// Release the keyed worker only while holding the same lock used to
+    /// publish loss and renew the conservative local deadline. Returning an
+    /// outcome leaves the oneshot sender unopened, so the worker body cannot
+    /// be polled after an already-observed fence loss.
+    fn admit_execution(
+        &self,
+        start: tokio::sync::oneshot::Sender<()>,
+    ) -> Option<RunFenceHeartbeat> {
+        let mut state = self.state();
+        if let Some(outcome) = state.outcome.clone() {
+            return Some(outcome);
+        }
+        if tokio::time::Instant::now() >= state.lease_deadline {
+            self.publish_locked(&mut state, RunFenceHeartbeat::Lost);
+            return Some(RunFenceHeartbeat::Lost);
+        }
+        // `send` is synchronous. A concurrent heartbeat cannot publish loss
+        // between this live-fence check and opening the worker gate.
+        let _ = start.send(());
+        None
+    }
+}
+
+/// The shared watch sender must remain available for synchronous admission.
+/// This guard preserves the fail-closed channel contract if the heartbeat
+/// task is cancelled or panics before publishing its own outcome.
+struct RunFenceTaskGuard {
+    coordinator: Arc<RunFenceCoordinator>,
+}
+
+impl Drop for RunFenceTaskGuard {
+    fn drop(&mut self) {
+        self.coordinator.publish(RunFenceHeartbeat::Lost);
+    }
 }
 
 impl RunLeaseHeartbeat {
-    pub fn spawn(
+    /// Confirm the claimed run fence before any Lua work is admitted, then
+    /// keep it alive in the background. A claimed ledger without a run row is
+    /// a valid pre-execution fence; the subsequent run-intent transaction
+    /// atomically advances that same claim to `running`.
+    pub async fn start(
         store: Arc<dyn StateStore>,
         run_id: String,
         key_hash: String,
         attempt_id: String,
+        initial_lease_deadline: tokio::time::Instant,
+    ) -> Result<Self> {
+        let lease_ttl = store.run_lease_ttl();
+        let heartbeat_started = tokio::time::Instant::now();
+        let deadline = chrono::Utc::now()
+            .checked_add_signed(
+                chrono::Duration::from_std(lease_ttl)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
+            )
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            .to_rfc3339();
+        let established = heartbeat_before_deadline(
+            store.run_maintenance_watchdog().is_some(),
+            initial_lease_deadline,
+            store.heartbeat_idempotent_run(&run_id, &key_hash, &attempt_id, &deadline),
+        )
+        .await
+        .ok_or_else(|| {
+            IronCrewError::Validation(
+                "The initial run-fence heartbeat exceeded the remaining lease window".into(),
+            )
+        })??;
+        match established {
+            RunFenceHeartbeat::Owned => {}
+            RunFenceHeartbeat::CancelRequested => {
+                return Err(IronCrewError::Conflict(
+                    "Run cancellation was requested before execution started".into(),
+                ));
+            }
+            RunFenceHeartbeat::Terminal(status) => {
+                return Err(IronCrewError::Conflict(format!(
+                    "Run became {status} before execution started"
+                )));
+            }
+            RunFenceHeartbeat::Lost => {
+                return Err(IronCrewError::Conflict(
+                    "The durable run fence was lost before execution started".into(),
+                ));
+            }
+        }
+
+        let established_deadline = conservative_lease_deadline(heartbeat_started, lease_ttl);
+        Ok(Self::spawn_loop(
+            store,
+            run_id,
+            key_hash,
+            attempt_id,
+            established_deadline,
+        ))
+    }
+
+    fn spawn_loop(
+        store: Arc<dyn StateStore>,
+        run_id: String,
+        key_hash: String,
+        attempt_id: String,
+        initial_lease_deadline: tokio::time::Instant,
     ) -> Self {
-        let (outcome_tx, outcome) = tokio::sync::watch::channel(None);
+        let (coordinator, outcome) = RunFenceCoordinator::new(initial_lease_deadline);
+        let task_coordinator = coordinator.clone();
+        let task_guard = RunFenceTaskGuard {
+            coordinator: coordinator.clone(),
+        };
         let task = tokio::spawn(async move {
+            let _task_guard = task_guard;
             let lease_ttl = store.run_lease_ttl();
-            let heartbeat_every = (lease_ttl / 3).max(Duration::from_secs(1));
-            let mut lease_deadline = tokio::time::Instant::now() + lease_ttl;
-            let mut interval = tokio::time::interval(heartbeat_every);
+            let heartbeat_every = crate::engine::store::run_lease_heartbeat_interval(lease_ttl);
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + heartbeat_every,
+                heartbeat_every,
+            );
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                let lease_deadline = task_coordinator.current_deadline();
+                if wait_for_heartbeat_or_expiry(&mut interval, lease_deadline).await
+                    == HeartbeatWake::LeaseExpired
+                {
+                    if task_coordinator.lose_if_expired(lease_deadline) {
+                        tracing::warn!(
+                            run_id,
+                            "Run fence expired before the next heartbeat completed"
+                        );
+                        return;
+                    }
+                    continue;
+                }
+                let heartbeat_started = tokio::time::Instant::now();
                 let deadline = chrono::Utc::now()
                     .checked_add_signed(
                         chrono::Duration::from_std(lease_ttl)
@@ -157,57 +422,95 @@ impl RunLeaseHeartbeat {
                     )
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
                     .to_rfc3339();
-                match tokio::time::timeout_at(
+                match heartbeat_before_deadline(
+                    store.run_maintenance_watchdog().is_some(),
                     lease_deadline,
                     store.heartbeat_idempotent_run(&run_id, &key_hash, &attempt_id, &deadline),
                 )
                 .await
                 {
-                    Ok(Ok(RunFenceHeartbeat::Owned)) => {
-                        lease_deadline = tokio::time::Instant::now() + lease_ttl;
+                    Some(Ok(RunFenceHeartbeat::Owned)) => {
+                        let renewed_deadline =
+                            conservative_lease_deadline(heartbeat_started, lease_ttl);
+                        if !task_coordinator.renew_if_live(lease_deadline, renewed_deadline) {
+                            tracing::warn!(
+                                run_id,
+                                "Run fence expired while its heartbeat response was being admitted"
+                            );
+                            return;
+                        }
                     }
-                    Ok(Ok(RunFenceHeartbeat::CancelRequested)) => {
+                    Some(Ok(RunFenceHeartbeat::CancelRequested)) => {
                         tracing::info!(run_id, "Durable run cancellation was requested");
-                        let _ = outcome_tx.send(Some(RunFenceHeartbeat::CancelRequested));
+                        task_coordinator.publish(RunFenceHeartbeat::CancelRequested);
                         return;
                     }
-                    Ok(Ok(outcome @ RunFenceHeartbeat::Terminal(_))) => {
+                    Some(Ok(outcome @ RunFenceHeartbeat::Terminal(_))) => {
                         tracing::debug!(run_id, "Run heartbeat observed a terminal run fence");
-                        let _ = outcome_tx.send(Some(outcome));
+                        task_coordinator.publish(outcome);
                         return;
                     }
-                    Ok(Ok(RunFenceHeartbeat::Lost)) | Ok(Err(IronCrewError::Conflict(_))) => {
+                    Some(Ok(RunFenceHeartbeat::Lost)) | Some(Err(IronCrewError::Conflict(_))) => {
                         tracing::warn!(run_id, "Idempotent run fence was lost during execution");
-                        let _ = outcome_tx.send(Some(RunFenceHeartbeat::Lost));
+                        task_coordinator.publish(RunFenceHeartbeat::Lost);
                         return;
                     }
-                    Ok(Err(error)) => {
+                    Some(Err(error)) => {
                         tracing::error!(run_id, %error, "Failed to heartbeat idempotent run fence");
-                        if tokio::time::Instant::now() >= lease_deadline {
+                        if task_coordinator.lose_if_expired(lease_deadline) {
                             tracing::warn!(
                                 run_id,
                                 "Run-fence storage remained unavailable through the lease deadline"
                             );
-                            let _ = outcome_tx.send(Some(RunFenceHeartbeat::Lost));
                             return;
                         }
                     }
-                    Err(_) => {
+                    None => {
                         tracing::warn!(
                             run_id,
                             "Run-fence heartbeat exceeded the remaining lease window"
                         );
-                        let _ = outcome_tx.send(Some(RunFenceHeartbeat::Lost));
+                        task_coordinator.publish(RunFenceHeartbeat::Lost);
                         return;
                     }
                 }
             }
         });
-        Self { task, outcome }
+        Self {
+            task,
+            outcome,
+            coordinator,
+        }
     }
 
     pub fn outcome_receiver(&self) -> tokio::sync::watch::Receiver<Option<RunFenceHeartbeat>> {
         self.outcome.clone()
+    }
+
+    /// Atomically admit a keyed worker against the latest conservative local
+    /// deadline, or return the fence outcome that must be finalized instead.
+    pub(crate) fn admit_execution(
+        &self,
+        start: tokio::sync::oneshot::Sender<()>,
+    ) -> Option<RunFenceHeartbeat> {
+        self.coordinator.admit_execution(start)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_deadline(lease_deadline: tokio::time::Instant) -> Self {
+        let (coordinator, outcome) = RunFenceCoordinator::new(lease_deadline);
+        let task_guard = RunFenceTaskGuard {
+            coordinator: coordinator.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _task_guard = task_guard;
+            std::future::pending::<()>().await;
+        });
+        Self {
+            task,
+            outcome,
+            coordinator,
+        }
     }
 }
 
@@ -716,5 +1019,75 @@ mod tests {
         let response = serde_json::json!({"value": "x".repeat(100)});
         assert!(bounded_response_json(&response, 256).unwrap().is_some());
         assert!(bounded_response_json(&response, 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn conservative_deadline_does_not_grant_response_latency() {
+        let started = tokio::time::Instant::now();
+        let ttl = Duration::from_secs(6);
+        let response_arrived = started + Duration::from_secs(4);
+        let deadline = conservative_lease_deadline(started, ttl);
+
+        assert_eq!(deadline, started + ttl);
+        assert_eq!(deadline - response_arrived, Duration::from_secs(2));
+        assert_ne!(deadline, response_arrived + ttl);
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_wins_over_an_already_ready_heartbeat_tick() {
+        let deadline = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        assert_eq!(
+            wait_for_heartbeat_or_expiry(&mut interval, deadline).await,
+            HeartbeatWake::LeaseExpired
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_heartbeat_tick_wins_while_the_lease_is_live() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        assert_eq!(
+            wait_for_heartbeat_or_expiry(&mut interval, deadline).await,
+            HeartbeatWake::Tick
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fence_admission_uses_the_latest_successful_renewal() {
+        let now = tokio::time::Instant::now();
+        let initial_deadline = now + Duration::from_millis(5);
+        let renewed_deadline = now + Duration::from_secs(60);
+        let (coordinator, _outcome) = RunFenceCoordinator::new(initial_deadline);
+
+        assert!(coordinator.renew_if_live(initial_deadline, renewed_deadline));
+        tokio::time::sleep_until(initial_deadline).await;
+        assert!(tokio::time::Instant::now() >= initial_deadline);
+
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(coordinator.admit_execution(start_tx), None);
+        assert_eq!(start_rx.await, Ok(()));
+    }
+
+    #[test]
+    fn failed_heartbeat_keeps_the_old_deadline_and_timely_retry_recovers() {
+        let started = tokio::time::Instant::now();
+        let ttl = Duration::from_secs(6);
+        let initial_deadline = conservative_lease_deadline(started, ttl);
+
+        // A failed first scheduled heartbeat does not grant more lease time.
+        let failed_at = started + Duration::from_secs(2);
+        let mut lease_deadline = initial_deadline;
+        assert!(failed_at < lease_deadline);
+        assert_eq!(lease_deadline, initial_deadline);
+
+        // The following scheduled attempt succeeds before expiry and starts a
+        // fresh conservative window at invocation, not response arrival.
+        let retry_started = started + Duration::from_secs(4);
+        lease_deadline = conservative_lease_deadline(retry_started, ttl);
+        assert_eq!(lease_deadline, started + Duration::from_secs(10));
+        assert!(initial_deadline < lease_deadline);
     }
 }
