@@ -5,5 +5,6 @@ pub mod llm;
 pub mod lua;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod metrics;
 pub mod tools;
 pub mod utils;

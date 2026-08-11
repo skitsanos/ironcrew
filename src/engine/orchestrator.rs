@@ -209,6 +209,7 @@ fn filter_eligible_tasks<'a>(
 
         // Check if any dependency failed
         if let Some(failed_dep) = task.depends_on.iter().find(|d| failed_tasks.contains(*d)) {
+            crate::engine::task_observation::record_skipped();
             let reason = format!("dependency '{}' failed", failed_dep);
             crew.eventbus.emit(CrewEvent::TaskSkipped {
                 task: task.name.clone(),
@@ -238,6 +239,7 @@ fn filter_eligible_tasks<'a>(
             let interpolated_condition = interpolate(condition, results);
             let should_run = evaluate_condition(&interpolated_condition, results);
             if !should_run {
+                crate::engine::task_observation::record_skipped();
                 crew.eventbus.emit(CrewEvent::TaskSkipped {
                     task: task.name.clone(),
                     reason: format!("condition '{}' evaluated to false", condition),
@@ -516,7 +518,8 @@ pub async fn run_crew(
                     .map(|v| v.as_slice());
                 let after_hook = crew.after_task_hooks.get(&agent.name).map(|v| v.as_slice());
 
-                let foreach_result = execute_foreach_task(
+                let task_observation = crate::engine::task_observation::TaskObservation::start();
+                let foreach_result = match execute_foreach_task(
                     task,
                     agent,
                     provider.as_ref(),
@@ -532,12 +535,30 @@ pub async fn run_crew(
                     after_hook,
                     crew.ask_human.as_ref(),
                 )
-                .await?;
-
-                if !foreach_result.success
-                    && foreach_result.output.starts_with("Skipped: foreach source")
-                    && foreach_result.agent.is_empty()
+                .await
                 {
+                    Ok(result) => result,
+                    Err(error) => {
+                        task_observation.finish(crate::metrics::TaskOutcome::Error);
+                        return Err(error);
+                    }
+                };
+
+                // The foreach executor leaves the agent empty only for its two
+                // explicit skip paths (missing/non-array input and empty input).
+                // Do not derive metric semantics from human-readable output.
+                let foreach_skipped = foreach_result.agent.is_empty();
+                if foreach_skipped {
+                    task_observation.finish_skipped();
+                } else {
+                    task_observation.finish(if foreach_result.success {
+                        crate::metrics::TaskOutcome::Success
+                    } else {
+                        crate::metrics::TaskOutcome::Error
+                    });
+                }
+
+                if !foreach_result.success && foreach_skipped {
                     crew.eventbus.emit(CrewEvent::TaskFailed {
                         task: task.name.clone(),
                         agent: agent.name.clone(),
@@ -615,6 +636,7 @@ pub async fn run_crew(
                 };
 
                 let start = Instant::now();
+                let task_observation = crate::engine::task_observation::TaskObservation::start();
                 match execute_collaborative_task(
                     &collab_agents,
                     &task.name,
@@ -630,6 +652,7 @@ pub async fn run_crew(
                 .await
                 {
                     Ok((output, collab_usage)) => {
+                        task_observation.finish(crate::metrics::TaskOutcome::Success);
                         let duration_ms = start.elapsed().as_millis() as u64;
                         crew.eventbus.emit(CrewEvent::TaskCompleted {
                             task: task.name.clone(),
@@ -664,6 +687,7 @@ pub async fn run_crew(
                         )?;
                     }
                     Err(e) => {
+                        task_observation.finish(crate::metrics::TaskOutcome::Error);
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let error_msg = e.to_string();
 
@@ -703,6 +727,8 @@ pub async fn run_crew(
                                 let error_model =
                                     resolve_model(&error_task, error_agent, crew, "task_execution");
                                 let error_start = Instant::now();
+                                let handler_observation =
+                                    crate::engine::task_observation::TaskObservation::start();
                                 match execute_task_standalone(
                                     &error_task,
                                     error_agent,
@@ -718,6 +744,8 @@ pub async fn run_crew(
                                 .await
                                 {
                                     Ok((output, handler_reasoning, handler_usage)) => {
+                                        handler_observation
+                                            .finish(crate::metrics::TaskOutcome::Success);
                                         result_budget.insert(
                                             &mut results,
                                             task.name.clone(),
@@ -751,6 +779,8 @@ pub async fn run_crew(
                                         continue;
                                     }
                                     Err(handler_err) => {
+                                        handler_observation
+                                            .finish(crate::metrics::TaskOutcome::Error);
                                         tracing::error!(
                                             "Error handler '{}' also failed: {}",
                                             error_handler_name,
@@ -905,6 +935,7 @@ pub async fn run_crew(
         .collect();
     for handler_name in &all_error_handler_names {
         if !results.contains_key(handler_name) {
+            crate::engine::task_observation::record_skipped();
             result_budget.insert(
                 &mut results,
                 handler_name.clone(),

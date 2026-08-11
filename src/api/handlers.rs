@@ -95,6 +95,11 @@ fn idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorRespo
     )
 }
 
+fn run_idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
+    idempotency_store_error(error)
+}
+
 fn idempotency_quota_error(
     state: &AppState,
     scope: IdempotencyQuotaScope,
@@ -134,6 +139,7 @@ async fn release_run_idempotency(state: &AppState, attempt: Option<&RunIdempoten
         .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
         .await
     {
+        crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
         tracing::error!(%error, "Failed to release an unstarted run idempotency claim");
     }
 }
@@ -159,7 +165,15 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
             .complete_idempotency_with_limits(completion.clone(), state.idempotency.limits())
             .await
         {
-            Ok(_) => {
+            Ok(outcome) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIdempotency,
+                    if outcome.already_completed {
+                        crate::metrics::TerminalOutcome::Fenced
+                    } else {
+                        crate::metrics::TerminalOutcome::Success
+                    },
+                );
                 if persistence_degraded {
                     state
                         .terminal_persistence_failures
@@ -168,6 +182,10 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
                 return;
             }
             Err(error @ IronCrewError::Conflict(_)) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIdempotency,
+                    crate::metrics::TerminalOutcome::Fenced,
+                );
                 tracing::warn!(%error, "Run idempotency completion was fenced");
                 if persistence_degraded {
                     state
@@ -177,6 +195,13 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
                 return;
             }
             Err(error) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIdempotency,
+                    crate::metrics::TerminalOutcome::Error,
+                );
+                crate::metrics::record_store_failure(
+                    crate::metrics::StoreOperation::TerminalPersistence,
+                );
                 if !persistence_degraded {
                     persistence_degraded = true;
                     state
@@ -217,7 +242,15 @@ async fn mark_run_idempotency_indeterminate(
             )
             .await
         {
-            Ok(_) => {
+            Ok(updated) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIndeterminate,
+                    if updated {
+                        crate::metrics::TerminalOutcome::Success
+                    } else {
+                        crate::metrics::TerminalOutcome::Fenced
+                    },
+                );
                 if persistence_degraded {
                     state
                         .terminal_persistence_failures
@@ -226,6 +259,10 @@ async fn mark_run_idempotency_indeterminate(
                 return;
             }
             Err(error @ IronCrewError::Conflict(_)) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIndeterminate,
+                    crate::metrics::TerminalOutcome::Fenced,
+                );
                 tracing::warn!(%error, "Indeterminate run finalization was fenced");
                 if persistence_degraded {
                     state
@@ -235,6 +272,13 @@ async fn mark_run_idempotency_indeterminate(
                 return;
             }
             Err(error) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::RunIndeterminate,
+                    crate::metrics::TerminalOutcome::Error,
+                );
+                crate::metrics::record_store_failure(
+                    crate::metrics::StoreOperation::TerminalPersistence,
+                );
                 if !persistence_degraded {
                     persistence_degraded = true;
                     state
@@ -546,6 +590,7 @@ pub async fn readiness(
             component: "flows",
         }
     } else if let Err(error) = state.store.health_check().await {
+        crate::metrics::record_store_failure(crate::metrics::StoreOperation::Readiness);
         tracing::warn!(%error, "Readiness check failed: state store is unavailable");
         super::CachedReadiness {
             checked_at: std::time::Instant::now(),
@@ -700,10 +745,20 @@ fn run_location_error(
 }
 
 fn run_location_store_error(error: IronCrewError) -> (StatusCode, Json<serde_json::Value>) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::Run, &error);
     tracing::warn!(%error, "Failed to classify durable run ownership");
     structured_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "Run ownership is temporarily unavailable",
+    )
+}
+
+fn human_input_store_error(error: IronCrewError) -> (StatusCode, Json<serde_json::Value>) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::HumanInput, &error);
+    tracing::warn!(%error, "Durable human-input storage operation failed");
+    structured_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Durable human-input transport is temporarily unavailable",
     )
 }
 
@@ -858,7 +913,7 @@ struct TerminalPersistence<'a> {
 async fn persist_terminal_outcome(
     store: &Arc<dyn crate::engine::store::StateStore>,
     terminal: TerminalPersistence<'_>,
-) -> Result<RunStatus, IronCrewError> {
+) -> Result<(RunStatus, bool), IronCrewError> {
     let synthesized;
     let completion = match terminal.completion {
         Some(completion) => completion,
@@ -880,10 +935,10 @@ async fn persist_terminal_outcome(
         .update_run_completion(terminal.run_id, completion.clone())
         .await
     {
-        Ok(RunTransition::Applied) => return Ok(completion_status.clone()),
-        Ok(RunTransition::AlreadyTerminal(status)) => return Ok(status),
+        Ok(RunTransition::Applied) => return Ok((completion_status.clone(), true)),
+        Ok(RunTransition::AlreadyTerminal(status)) => return Ok((status, false)),
         Err(update_error) => match store.get_run(terminal.run_id).await {
-            Ok(record) if record.status.is_terminal() => return Ok(record.status),
+            Ok(record) if record.status.is_terminal() => return Ok((record.status, false)),
             Ok(record) => {
                 return Err(IronCrewError::Validation(format!(
                     "Failed to persist terminal outcome for run '{}': {}; durable status remains '{}'",
@@ -923,8 +978,8 @@ async fn persist_terminal_outcome(
         .update_run_completion(terminal.run_id, completion.clone())
         .await
     {
-        Ok(RunTransition::Applied) => Ok(completion_status),
-        Ok(RunTransition::AlreadyTerminal(status)) => Ok(status),
+        Ok(RunTransition::Applied) => Ok((completion_status, true)),
+        Ok(RunTransition::AlreadyTerminal(status)) => Ok((status, false)),
         Err(error) => Err(IronCrewError::Validation(format!(
             "Failed to persist terminal outcome for fallback run '{}': {}",
             terminal.run_id, error
@@ -1074,7 +1129,7 @@ pub async fn run_flow(
                 &now,
             )
             .await
-            .map_err(idempotency_store_error)?
+            .map_err(run_idempotency_store_error)?
         {
             IdempotencyLookup::Miss => {}
             IdempotencyLookup::Replay(record) => return replay_run(&record),
@@ -1222,7 +1277,7 @@ pub async fn run_flow(
             .store
             .claim_idempotency_with_limits(claim, state.idempotency.limits())
             .await
-            .map_err(idempotency_store_error)?
+            .map_err(run_idempotency_store_error)?
         {
             IdempotencyClaimOutcome::Claimed(_) => Some(RunIdempotencyAttempt {
                 key_hash: key.key_hash.clone(),
@@ -1536,6 +1591,9 @@ pub async fn run_flow(
                                 (started.elapsed().as_millis() as u64, 0)
                             }
                             Err(error) => {
+                                crate::metrics::record_store_failure(
+                                    crate::metrics::StoreOperation::Run,
+                                );
                                 tracing::error!(
                                     run_id = %run_id_clone,
                                     %error,
@@ -1592,6 +1650,9 @@ pub async fn run_flow(
                 )
             }
         };
+        if matches!(fence_result, Some(RunFenceHeartbeat::Lost)) {
+            crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Run);
+        }
         let staged_completion = lifecycle_for_monitor.take_completion().await;
         let run_completion = if matches!(&fence_result, Some(RunFenceHeartbeat::Terminal(_))) {
             // Another durable writer won. Its terminal payload is the fence;
@@ -1667,7 +1728,23 @@ pub async fn run_flow(
             )
             .await
             {
-                Ok(status) => {
+                Ok((status, applied)) => {
+                    crate::metrics::record_terminal_persistence(
+                        crate::metrics::TerminalScope::RunRecord,
+                        if applied {
+                            crate::metrics::TerminalOutcome::Success
+                        } else {
+                            crate::metrics::TerminalOutcome::Fenced
+                        },
+                    );
+                    if applied
+                        && let Some(outcome) = crate::metrics::RunOutcome::from_status(&status)
+                    {
+                        crate::metrics::record_run(
+                            outcome,
+                            Some(std::time::Duration::from_millis(duration_ms)),
+                        );
+                    }
                     if persistence_degraded {
                         state_clone
                             .terminal_persistence_failures
@@ -1677,6 +1754,10 @@ pub async fn run_flow(
                     break status;
                 }
                 Err(IronCrewError::OwnerDraining { owner_instance_id }) => {
+                    crate::metrics::record_terminal_persistence(
+                        crate::metrics::TerminalScope::RunRecord,
+                        crate::metrics::TerminalOutcome::Fenced,
+                    );
                     owner_drain_rejected_intent = true;
                     tracing::warn!(
                         run_id = %run_id_clone,
@@ -1686,6 +1767,13 @@ pub async fn run_flow(
                     break RunStatus::Abandoned;
                 }
                 Err(error) => {
+                    crate::metrics::record_terminal_persistence(
+                        crate::metrics::TerminalScope::RunRecord,
+                        crate::metrics::TerminalOutcome::Error,
+                    );
+                    crate::metrics::record_store_failure(
+                        crate::metrics::StoreOperation::TerminalPersistence,
+                    );
                     if let Some(released) = terminal_results.record_failure() {
                         tracing::warn!(
                             run_id = %run_id_clone,
@@ -1835,7 +1923,13 @@ async fn execute_crew_from_path_with_events(
                 request_fingerprint,
                 &started_at,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                crate::metrics::record_store_error(
+                    crate::metrics::StoreOperation::Idempotency,
+                    error,
+                );
+            })?;
         match lookup {
             IdempotencyLookup::Replay(record) if signal.matches_running(&record, run_id) => {
                 signal.notify();
@@ -2188,7 +2282,7 @@ pub async fn list_questions(
             .store
             .list_human_inputs(&flow_slug, &run_id)
             .await
-            .map_err(run_location_store_error)?
+            .map_err(human_input_store_error)?
         {
             HumanInputListOutcome::Shared {
                 owner_instance_id,
@@ -2419,6 +2513,10 @@ pub async fn answer_question(
                 Err(run_location_error(&state, &run_id, location))
             }
             Err(error) => {
+                crate::metrics::record_store_error(
+                    crate::metrics::StoreOperation::HumanInput,
+                    &error,
+                );
                 tracing::warn!(%error, "Durable human-input answer enqueue failed");
                 Err(structured_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2543,8 +2641,14 @@ async fn read_journal_page(
     .await
     {
         Ok(Ok(page)) => Ok(page),
-        Ok(Err(error)) => Err(JournalPageReadError::Store(error)),
-        Err(_) => Err(JournalPageReadError::TimedOut),
+        Ok(Err(error)) => {
+            crate::metrics::record_store_failure(crate::metrics::StoreOperation::EventRead);
+            Err(JournalPageReadError::Store(error))
+        }
+        Err(_) => {
+            crate::metrics::record_store_failure(crate::metrics::StoreOperation::EventRead);
+            Err(JournalPageReadError::TimedOut)
+        }
     }
 }
 
@@ -2600,7 +2704,14 @@ pub async fn flow_events(
         .transpose()
         .map_err(cursor_error_response)?;
 
+    let shared_journal = state.store.event_journal_scope() == EventJournalScope::SharedStore;
+    let sse_scope = if shared_journal {
+        crate::metrics::SseScope::RunShared
+    } else {
+        crate::metrics::SseScope::RunProcess
+    };
     let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
+        crate::metrics::record_sse(sse_scope, crate::metrics::SseOutcome::Limited);
         structured_error(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -2610,7 +2721,7 @@ pub async fn flow_events(
         )
     })?;
 
-    if state.store.event_journal_scope() == EventJournalScope::SharedStore {
+    if shared_journal {
         match durable_run_location(&state, &flow_slug, &run_id)
             .await
             .map_err(run_location_store_error)?
@@ -2676,6 +2787,9 @@ pub async fn flow_events(
                             page
                         }
                         Ok(Err(error)) => {
+                            crate::metrics::record_store_failure(
+                                crate::metrics::StoreOperation::EventRead,
+                            );
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
                                 tracing::warn!(
@@ -2696,6 +2810,9 @@ pub async fn flow_events(
                             continue;
                         }
                         Err(_) => {
+                            crate::metrics::record_store_failure(
+                                crate::metrics::StoreOperation::EventRead,
+                            );
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
                                 tracing::warn!(
@@ -2813,6 +2930,7 @@ pub async fn flow_events(
                     .text("keep-alive"),
             )
             .into_response();
+        crate::metrics::record_sse(sse_scope, crate::metrics::SseOutcome::Accepted);
         return Ok(super::sse::hardened_response(response));
     }
 
@@ -2916,6 +3034,7 @@ pub async fn flow_events(
                 .text("keep-alive"),
         )
         .into_response();
+    crate::metrics::record_sse(sse_scope, crate::metrics::SseOutcome::Accepted);
     Ok(super::sse::hardened_response(response))
 }
 
@@ -3265,8 +3384,9 @@ mod truncate_tests {
     use super::{
         RunWorkResult, TERMINAL_RESULT_RETRY_RETAINED_BYTES, TerminalPersistence,
         TerminalResultRetention, classify_work_result, cursor_acknowledges_terminal,
-        cursor_error_response, execute_after_worker_start, persist_terminal_outcome, replay_run,
-        truncate_utf8, validate_run_id, validate_run_tags,
+        cursor_error_response, execute_after_worker_start, human_input_store_error,
+        persist_terminal_outcome, replay_run, run_idempotency_store_error,
+        run_location_store_error, truncate_utf8, validate_run_id, validate_run_tags,
     };
     use crate::api::idempotency::RunLeaseHeartbeat;
     use crate::engine::idempotency::{
@@ -3281,6 +3401,36 @@ mod truncate_tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn store_failure_value(operation: &str) -> u64 {
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let series = format!("ironcrew_store_failures_total{{operation=\"{operation}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&series)?.parse().ok())
+            .unwrap_or_else(|| panic!("missing store failure series for {operation}"))
+    }
+
+    #[test]
+    fn storage_error_helpers_record_fixed_semantic_classes() {
+        let before = store_failure_value("idempotency");
+        let _ = run_idempotency_store_error(IronCrewError::Io(std::io::Error::other(
+            "idempotency unavailable",
+        )));
+        assert!(store_failure_value("idempotency") > before);
+
+        let before = store_failure_value("run");
+        let _ = run_location_store_error(IronCrewError::Io(std::io::Error::other(
+            "run store unavailable",
+        )));
+        assert!(store_failure_value("run") > before);
+
+        let before = store_failure_value("human_input");
+        let _ = human_input_store_error(IronCrewError::Io(std::io::Error::other(
+            "human input store unavailable",
+        )));
+        assert!(store_failure_value("human_input") > before);
+    }
 
     #[test]
     fn ascii_under_limit_returns_full() {
@@ -3513,7 +3663,7 @@ mod truncate_tests {
         let temp = tempfile::tempdir().unwrap();
         let store: Arc<dyn StateStore> =
             Arc::new(JsonFileStore::new(temp.path().join(".ironcrew")).unwrap());
-        let status = persist_terminal_outcome(
+        let (status, applied) = persist_terminal_outcome(
             &store,
             TerminalPersistence {
                 run_id: "panic-run",
@@ -3530,6 +3680,7 @@ mod truncate_tests {
         .unwrap();
 
         assert_eq!(status, RunStatus::Failed);
+        assert!(applied);
         assert_eq!(
             store.get_run("panic-run").await.unwrap().status,
             RunStatus::Failed

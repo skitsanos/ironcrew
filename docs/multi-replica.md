@@ -95,7 +95,7 @@ process to another.
 | PostgreSQL conversation SSE | Unsupported | An existing shared-store conversation returns `409`; clients recover messages from durable history. |
 | Live conversation VM, turn lock, lifecycle gate, and idle timer | Process-local cache plus shared keyed turn fence | A PostgreSQL `/messages` request does not use another process's handle. It claims the durable incarnation/revision, then reconstructs a compatible local handle when needed. No in-flight provider/tool state moves between processes. |
 | Active-run, active-conversation, and SSE semaphores | Process-local | Limits apply per replica. Two replicas can admit up to twice a configured per-process limit. |
-| Principal token buckets and process metrics | Process-local | Admission rate and burst settings are multiplied by replica count. Durable idempotency quotas remain shared. |
+| Principal token buckets and process execution/resource metrics | Process-local | Admission rate and burst settings are multiplied by replica count. Counters and histograms reset independently per process; durable idempotency quotas and their store-backed utilization snapshot remain shared. |
 
 All replicas must use the same flow files, authentication/principal mapping,
 idempotency policy, table prefix, and relevant limits. A shared database does
@@ -281,6 +281,37 @@ The process-local token buckets and provider pacing variables are safe overload
 controls, but they must never be advertised as cluster-wide quotas. PostgreSQL
 coordinates durable identity and bounded shared state; it is not the right
 place to hold a database transaction open around provider execution.
+
+### Metrics aggregation ownership
+
+Every `ironcrew_runs_total`, task, tool, provider, token, SSE, lease-loss,
+reconciliation, terminal-persistence, and store-failure sample belongs to the
+single process that served that scrape. The duration histograms have the same
+scope. Their counters, buckets, sums, and counts reset independently whenever
+that process restarts; PostgreSQL does not merge or restore them.
+
+Scrape every pod/instance as a unique authenticated target, preserve that
+identity in the monitoring system, and aggregate only after target
+deduplication:
+
+- compute fleet totals from `sum` of per-target `rate()`/`increase()` values,
+  including old and new deployment pods only when the question intentionally
+  covers the overlap window;
+- compute a fleet histogram quantile by summing bucket rates by `le` plus the
+  closed dimensions to retain, then apply `histogram_quantile`;
+- evaluate maintenance health per pod or take its minimum, group the one-hot
+  lifecycle gauge by `state`, and do not sum either boolean contract; and
+- do not sum the store-backed `ironcrew_idempotency_*` gauges. Each replica with
+  the same PostgreSQL table prefix reports the same shared snapshot, so use one
+  target or `max` after verifying configuration parity.
+
+Railway's public load balancer can repeatedly return the same replica, so a
+public `/metrics` request is not fleet evidence. Use private/platform target
+discovery that reaches each Railway instance. On OpenShift/Kubernetes, discover
+and scrape each pod with the bearer credential and a narrowly scoped
+NetworkPolicy allowance; a single Service/Route sample does not prove pod
+coverage. IronCrew intentionally supplies fixed-cardinality process telemetry,
+not a hosted Prometheus backend or cross-replica collector.
 
 ## Durable keyed-run cancellation slice
 

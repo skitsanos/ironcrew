@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::engine::crew::Crew;
 use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
-use crate::engine::run_history::RunCompletion;
+use crate::engine::run_history::{RunCompletion, RunTransition};
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
@@ -937,10 +937,42 @@ impl UserData for LuaCrew {
                     } else {
                         // CLI-owned runs finish at `crew:run()`, so preserve
                         // their historical immediate persistence behavior.
-                        store
+                        let status = completion.status.clone();
+                        let transition = store
                             .update_run_completion(&run_id, completion)
                             .await
-                            .map_err(mlua::Error::external)?;
+                            .map_err(|error| {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Error,
+                                );
+                                crate::metrics::record_store_failure(
+                                    crate::metrics::StoreOperation::TerminalPersistence,
+                                );
+                                mlua::Error::external(error)
+                            })?;
+                        match transition {
+                            RunTransition::Applied => {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Success,
+                                );
+                                if let Some(outcome) =
+                                    crate::metrics::RunOutcome::from_status(&status)
+                                {
+                                    crate::metrics::record_run(
+                                        outcome,
+                                        Some(std::time::Duration::from_millis(total_ms)),
+                                    );
+                                }
+                            }
+                            RunTransition::AlreadyTerminal(_) => {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Fenced,
+                                );
+                            }
+                        }
                     }
                     results
                 }
@@ -959,7 +991,33 @@ impl UserData for LuaCrew {
                         // Best-effort completion on the error path: swallow
                         // persistence errors because the crew failure takes
                         // precedence for CLI callers.
-                        let _ = store.update_run_completion(&run_id, completion).await;
+                        match store.update_run_completion(&run_id, completion).await {
+                            Ok(RunTransition::Applied) => {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Success,
+                                );
+                                crate::metrics::record_run(
+                                    crate::metrics::RunOutcome::Failed,
+                                    Some(std::time::Duration::from_millis(total_ms)),
+                                );
+                            }
+                            Ok(RunTransition::AlreadyTerminal(_)) => {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Fenced,
+                                );
+                            }
+                            Err(_) => {
+                                crate::metrics::record_terminal_persistence(
+                                    crate::metrics::TerminalScope::RunRecord,
+                                    crate::metrics::TerminalOutcome::Error,
+                                );
+                                crate::metrics::record_store_failure(
+                                    crate::metrics::StoreOperation::TerminalPersistence,
+                                );
+                            }
+                        }
                     }
                     return Err(mlua::Error::external(e));
                 }

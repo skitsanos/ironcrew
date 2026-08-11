@@ -30,6 +30,33 @@ impl MetricsServer {
             "error('intentional fast terminal run')\n",
         )
         .expect("write fast terminal flow");
+        let skipped_flow = workspace.path().join("skipped");
+        fs::create_dir(&skipped_flow).expect("create skipped-task flow");
+        fs::write(
+            skipped_flow.join("crew.lua"),
+            r#"
+local crew = Crew.new({ goal = "metrics", provider = "openai", model = "test", api_key = "test" })
+crew:add_agent(Agent.new({ name = "offline", goal = "metrics", capabilities = { "testing" } }))
+crew:add_task_if("false", {
+    name = "skipped",
+    agent = "offline",
+    description = "provider-free skipped task",
+    expected_output = "none",
+})
+crew:run()
+"#,
+        )
+        .expect("write skipped-task flow");
+        let parked_flow = workspace.path().join("parked");
+        fs::create_dir(&parked_flow).expect("create parked flow");
+        fs::write(
+            parked_flow.join("crew.lua"),
+            r#"
+local crew = Crew.new({ goal = "metrics", provider = "openai", model = "test", api_key = "test" })
+crew:ask_human({ prompt = "Hold the metrics stream", timeout_s = 600 })
+"#,
+        )
+        .expect("write parked flow");
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve metrics port");
         let port = listener.local_addr().expect("metrics port address").port();
         drop(listener);
@@ -53,6 +80,7 @@ impl MetricsServer {
             .env("IRONCREW_API_PRINCIPAL", "metrics-scraper")
             .env("OPENAI_API_KEY", "unused-process-test-key")
             .env("IRONCREW_MAX_ACTIVE_RUNS", "1")
+            .env("IRONCREW_MAX_SSE_CONNECTIONS", "1")
             .env(
                 "IRONCREW_RUN_SSE_RETENTION_SECS",
                 retention_secs.to_string(),
@@ -116,6 +144,27 @@ fn gauge(body: &str, name: &str) -> u64 {
             (candidate == name).then(|| value.parse().expect("integer gauge"))
         })
         .unwrap_or_else(|| panic!("missing gauge {name}"))
+}
+
+fn labeled_counter(body: &str, series: &str) -> u64 {
+    body.lines()
+        .find_map(|line| {
+            let (candidate, value) = line.split_once(' ')?;
+            (candidate == series).then(|| value.parse().expect("integer counter"))
+        })
+        .unwrap_or_else(|| panic!("missing counter {series}"))
+}
+
+fn sample_count(body: &str, metric: &str) -> usize {
+    body.lines()
+        .filter(|line| {
+            line.starts_with(metric)
+                && line
+                    .as_bytes()
+                    .get(metric.len())
+                    .is_some_and(|byte| matches!(byte, b'{' | b' '))
+        })
+        .count()
 }
 
 async fn scrape(client: &reqwest::Client, server: &MetricsServer) -> String {
@@ -233,6 +282,103 @@ async fn metrics_require_authentication_and_keep_the_existing_contract() {
     }
     assert!(!body.contains(TOKEN));
     assert!(!body.contains("metrics-scraper"));
+
+    for (metric, expected_samples) in [
+        ("ironcrew_runs_total", 6),
+        ("ironcrew_tasks_total", 4),
+        ("ironcrew_tool_calls_total", 3),
+        ("ironcrew_provider_requests_total", 36),
+        ("ironcrew_provider_tokens_total", 12),
+        ("ironcrew_sse_connections_total", 6),
+        ("ironcrew_lease_losses_total", 2),
+        ("ironcrew_reconciliation_cycles_total", 2),
+        ("ironcrew_terminal_persistence_total", 15),
+        ("ironcrew_store_failures_total", 13),
+    ] {
+        assert_eq!(
+            sample_count(&body, metric),
+            expected_samples,
+            "unexpected fixed-cardinality sample count for {metric}"
+        );
+    }
+    assert!(
+        labeled_counter(
+            &body,
+            "ironcrew_reconciliation_cycles_total{outcome=\"success\"}"
+        ) >= 1,
+        "startup reconciliation must be observable"
+    );
+
+    let skipped = client
+        .post(format!("{}/flows/skipped/run", server.base_url))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("start skipped-task run");
+    assert_eq!(skipped.status(), reqwest::StatusCode::OK);
+    let skipped_metrics = wait_for_terminal_bus(&client, &server).await;
+    assert_eq!(
+        labeled_counter(
+            &skipped_metrics,
+            "ironcrew_tasks_total{outcome=\"skipped\"}"
+        ),
+        1,
+    );
+
+    let parked = client
+        .post(format!("{}/flows/parked/run", server.base_url))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("start parked run");
+    assert_eq!(parked.status(), reqwest::StatusCode::OK);
+    let parked: serde_json::Value = parked.json().await.expect("decode parked run");
+    let parked_run_id = parked["run_id"].as_str().expect("parked run id");
+    let events_url = parked["events_url"].as_str().expect("parked events URL");
+    let first_stream = client
+        .get(format!("{}{}", server.base_url, events_url))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("open first SSE stream");
+    assert_eq!(first_stream.status(), reqwest::StatusCode::OK);
+    let limited = client
+        .get(format!("{}{}", server.base_url, events_url))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("open over-limit SSE stream");
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    let sse_metrics = scrape(&client, &server).await;
+    assert_eq!(
+        labeled_counter(
+            &sse_metrics,
+            "ironcrew_sse_connections_total{scope=\"run_process\",outcome=\"accepted\"}"
+        ),
+        1,
+    );
+    assert_eq!(
+        labeled_counter(
+            &sse_metrics,
+            "ironcrew_sse_connections_total{scope=\"run_process\",outcome=\"limited\"}"
+        ),
+        1,
+    );
+    let aborted = client
+        .post(format!(
+            "{}/flows/parked/abort/{}",
+            server.base_url, parked_run_id
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("abort parked run");
+    assert_eq!(aborted.status(), reqwest::StatusCode::OK);
+    drop(first_stream);
 }
 
 #[tokio::test]
@@ -257,6 +403,17 @@ async fn terminal_eventbus_retention_has_one_owner_and_remains_replayable() {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let started: serde_json::Value = response.json().await.expect("decode run start");
         let terminal = wait_for_terminal_bus(&client, &server).await;
+        assert_eq!(
+            labeled_counter(&terminal, "ironcrew_runs_total{outcome=\"failed\"}"),
+            run_index + 1,
+        );
+        assert_eq!(
+            labeled_counter(
+                &terminal,
+                "ironcrew_terminal_persistence_total{scope=\"run_record\",outcome=\"success\"}"
+            ),
+            run_index + 1,
+        );
         assert_eq!(
             gauge(&terminal, "ironcrew_process_eventbus_instances"),
             1,
@@ -292,6 +449,14 @@ async fn terminal_eventbus_retention_has_one_owner_and_remains_replayable() {
                     .await
                     .expect("read late replay")
                     .contains("event: run_complete")
+            );
+            let after_replay = scrape(&client, &server).await;
+            assert_eq!(
+                labeled_counter(
+                    &after_replay,
+                    "ironcrew_sse_connections_total{scope=\"run_process\",outcome=\"accepted\"}"
+                ),
+                1,
             );
         }
     }

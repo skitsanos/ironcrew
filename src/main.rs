@@ -5,6 +5,7 @@ mod llm;
 mod lua;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod metrics;
 mod tools;
 mod utils;
 

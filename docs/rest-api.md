@@ -34,6 +34,7 @@ and process-local boundary is documented in the
 |----------|----------------------------------------------------|-----------------------------------------------------|
 | GET      | `/health`                                          | Health check (returns version)                      |
 | GET      | `/capabilities`                                    | Authenticated instance/control-scope diagnostics    |
+| GET      | `/metrics`                                         | Authenticated Prometheus process, execution, and storage metrics |
 | POST     | `/flows/{flow}/run`                                | Start a crew run (async)                            |
 | POST     | `/flows/{flow}/abort/{run_id}`                     | Abort a running crew                                |
 | GET      | `/flows/{flow}/events/{run_id}`                    | SSE event stream for a run                          |
@@ -1034,6 +1035,63 @@ of `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
 Without the env var set, an attacker hitting the server directly could
 forge their IP by sending an `X-Forwarded-For` header; the gate
 prevents that.
+
+## GET /metrics
+
+Returns Prometheus text for the process that handled the request. The endpoint
+uses the normal bearer authentication policy, returns `Cache-Control: no-store`,
+and remains observable while the process is draining. An unauthenticated or
+invalid request returns `401` without metric samples:
+
+```bash
+curl http://localhost:3000/metrics \
+  -H "Authorization: Bearer $IRONCREW_API_TOKEN"
+```
+
+The response preserves the existing build, lifecycle, admission, resource, and
+durable-idempotency series. It also exposes these execution and storage
+families; every label value is from the closed vocabulary shown here:
+
+| Prometheus series and type | Fixed labels |
+|---|---|
+| `ironcrew_runs_total` (counter), `ironcrew_run_duration_seconds` (histogram) | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
+| `ironcrew_tasks_total` (counter), `ironcrew_task_duration_seconds` (histogram) | `outcome`: `success`, `error`, `skipped`, `cancelled` |
+| `ironcrew_tool_calls_total` (counter), `ironcrew_tool_call_duration_seconds` (histogram) | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_provider_requests_total` (counter), `ironcrew_provider_request_duration_seconds` (histogram) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_sse_connections_total` (counter) | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
+| `ironcrew_lease_losses_total` (counter) | `scope`: `run`, `conversation` |
+| `ironcrew_reconciliation_cycles_total` (counter) | `outcome`: `success`, `error` |
+| `ironcrew_reconciliation_records_total` (counter) | no labels |
+| `ironcrew_terminal_persistence_total` (counter) | `scope`: `run_record`, `run_idempotency`, `run_indeterminate`, `conversation_commit`, `conversation_indeterminate`; `outcome`: `success`, `error`, `fenced` |
+| `ironcrew_store_failures_total` (counter) | `operation`: `metrics_snapshot`, `readiness`, `maintenance_heartbeat`, `reconciliation`, `lease_heartbeat`, `terminal_persistence`, `event_append`, `event_read`, `audit`, `run`, `idempotency`, `conversation`, `human_input` |
+
+All combinations are emitted, including zero-valued combinations. Caller
+values cannot create new labels: run IDs, principal names, bearer tokens,
+flow/task/tool names, URLs, errors, prompts, provider output, and secrets never
+become metric labels.
+
+The four duration histograms use cumulative second buckets at `0.005`, `0.01`,
+`0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`,
+`120`, `300`, and `+Inf`, with the normal `_bucket`, `_sum`, and `_count`
+series. A reconciler can count multiple abandoned runs without fabricating
+durations, so `ironcrew_runs_total{outcome="abandoned"}` may exceed the matching
+histogram `_count`. Skipped tasks record a zero-second duration. Provider token
+counters advance only when a successful provider response reports usage; they
+are usage telemetry, not invoice or billing data.
+
+These counters and histograms are in-memory, process-local, saturating, and
+reset on every process start. They are not persisted or cluster-global. Record
+publication uses non-blocking atomic updates outside correctness-critical store
+transitions. `ironcrew_store_failures_total` covers the explicitly instrumented
+operation failure paths, not every database, network, or platform incident.
+
+The durable-idempotency snapshot is still store-backed and coalesced for one
+second. If that snapshot fails, `/metrics` fails closed with `503` instead of
+returning stale or fabricated durable utilization; a later successful scrape
+can expose the accumulated `operation="metrics_snapshot"` failure count. See
+[Cloud Deployment: Metrics](cloud-deployment.md#metrics) for the complete
+existing series, alerting guidance, and per-pod aggregation rules.
 
 ## Health Check
 

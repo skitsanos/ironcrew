@@ -892,6 +892,7 @@ async fn append_durable_batch_with_retries(
         match append {
             Ok(Ok(_)) => return true,
             Ok(Err(error)) => {
+                crate::metrics::record_store_failure(crate::metrics::StoreOperation::EventAppend);
                 let retryable = durable_append_error_is_retryable(&error);
                 tracing::warn!(
                     run_id = %batch.run_id,
@@ -906,6 +907,7 @@ async fn append_durable_batch_with_retries(
                 }
             }
             Err(_) => {
+                crate::metrics::record_store_failure(crate::metrics::StoreOperation::EventAppend);
                 tracing::warn!(
                     run_id = %batch.run_id,
                     attempt,

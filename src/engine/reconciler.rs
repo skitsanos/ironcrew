@@ -32,12 +32,18 @@ fn timeout_error(operation: &str, timeout: std::time::Duration) -> IronCrewError
 }
 
 pub async fn heartbeat_owned_runs_bounded(store: &Arc<dyn StateStore>) -> Result<usize> {
-    let Some(timeout) = store.run_maintenance_watchdog() else {
-        return store.heartbeat_owned_runs().await;
+    let result = if let Some(timeout) = store.run_maintenance_watchdog() {
+        match tokio::time::timeout(timeout, store.heartbeat_owned_runs()).await {
+            Ok(result) => result,
+            Err(_) => Err(timeout_error("heartbeat", timeout)),
+        }
+    } else {
+        store.heartbeat_owned_runs().await
     };
-    tokio::time::timeout(timeout, store.heartbeat_owned_runs())
-        .await
-        .map_err(|_| timeout_error("heartbeat", timeout))?
+    if result.is_err() {
+        crate::metrics::record_store_failure(crate::metrics::StoreOperation::MaintenanceHeartbeat);
+    }
+    result
 }
 
 pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> {
@@ -46,12 +52,29 @@ pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> 
 }
 
 pub async fn reconcile_stuck_runs_at(store: &Arc<dyn StateStore>, now: &str) -> Result<usize> {
-    let count = if let Some(timeout) = store.run_maintenance_watchdog() {
-        tokio::time::timeout(timeout, store.reconcile_abandoned_runs(now))
-            .await
-            .map_err(|_| timeout_error("reconciliation", timeout))??
+    let result = if let Some(timeout) = store.run_maintenance_watchdog() {
+        match tokio::time::timeout(timeout, store.reconcile_abandoned_runs(now)).await {
+            Ok(result) => result,
+            Err(_) => Err(timeout_error("reconciliation", timeout)),
+        }
     } else {
-        store.reconcile_abandoned_runs(now).await?
+        store.reconcile_abandoned_runs(now).await
+    };
+
+    let count = match result {
+        Ok(count) => {
+            crate::metrics::record_reconciliation(
+                crate::metrics::ReconciliationOutcome::Success,
+                count,
+            );
+            crate::metrics::record_run_count(crate::metrics::RunOutcome::Abandoned, count);
+            count
+        }
+        Err(error) => {
+            crate::metrics::record_reconciliation(crate::metrics::ReconciliationOutcome::Error, 0);
+            crate::metrics::record_store_failure(crate::metrics::StoreOperation::Reconciliation);
+            return Err(error);
+        }
     };
 
     if count > 0 {

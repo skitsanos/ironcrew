@@ -7,6 +7,7 @@ pub mod deployment;
 pub mod handlers;
 pub mod idempotency;
 pub mod lifecycle;
+mod metrics;
 mod resource_metrics;
 mod sse;
 mod state;
@@ -202,7 +203,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // non-cacheable because transcripts and model output are sensitive.
         .merge(sensitive_conversation_control)
         .route("/audit", get(handlers::list_audit))
-        .route("/metrics", get(admission::metrics))
+        .route("/metrics", get(metrics::metrics))
         .route("/nodes", get(list_nodes))
         .layer(axum::middleware::from_fn_with_state(
             state.admission.clone(),

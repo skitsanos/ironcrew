@@ -97,6 +97,7 @@ pub async fn run_single_task(
     Option<TaskTokenUsage>,
     Option<String>,
 ) {
+    let task_observation = crate::engine::task_observation::TaskObservation::start();
     // Build memory context for this task
     let memory_context = memory.build_context(&task.description, 5).await;
 
@@ -192,6 +193,11 @@ pub async fn run_single_task(
     };
 
     let duration = start.elapsed().as_millis() as u64;
+    task_observation.finish(if output.is_ok() {
+        crate::metrics::TaskOutcome::Success
+    } else {
+        crate::metrics::TaskOutcome::Error
+    });
     (
         task_owned.name.clone(),
         agent_owned.name.clone(),
@@ -275,6 +281,7 @@ pub async fn handle_task_error(
     // Provide empty memory_context placeholder (consistent with original)
     let _memory = memory;
 
+    let task_observation = crate::engine::task_observation::TaskObservation::start();
     match execute_task_standalone(
         &error_task,
         error_agent,
@@ -290,6 +297,7 @@ pub async fn handle_task_error(
     .await
     {
         Ok((output, reasoning, token_usage)) => {
+            task_observation.finish(crate::metrics::TaskOutcome::Success);
             tracing::info!(
                 "Error handler '{}' succeeded, task '{}' recovered",
                 error_handler_name,
@@ -316,6 +324,7 @@ pub async fn handle_task_error(
             Some((recovered_result, Some(handler_result)))
         }
         Err(handler_err) => {
+            task_observation.finish(crate::metrics::TaskOutcome::Error);
             tracing::error!(
                 "Error handler '{}' also failed: {}",
                 error_handler_name,

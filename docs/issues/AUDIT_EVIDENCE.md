@@ -166,6 +166,45 @@ prefix/functions, quota, local staging/cache, and attributable Docker objects
 returned to zero, with the namespace baseline restored at
 `sha256:ce9697dfb8eb519641338240dcbb0ab328952ebc8b07c9500a511101d774d4dd`.
 
+## Execution and storage metrics closure — 2026-08-11
+
+The reviewed worktree extends the authenticated `/metrics` response with
+fixed-cardinality, process-local counters and histograms for run, task, tool,
+provider, provider-token, SSE, lease-loss, reconciliation, terminal-persistence,
+and explicitly instrumented storage outcomes. Closed enums own every label;
+caller-controlled identifiers, names, URLs, errors, content, and secrets cannot
+enter the metric surface. Fixed cumulative duration buckets cover 5 ms through
+300 seconds plus `+Inf`, and all counters, sums, counts, and buckets reset on
+process restart.
+
+The focused Rust evidence passed closed-vocabulary and exact-cardinality checks,
+provider usage aggregation, cumulative histogram monotonicity during
+concurrent record/scrape races, durationless abandoned-run accounting,
+in-flight status exclusion, provider success/error/cancellation, and tool
+error/cancellation without tool-name exposure. The real protected-endpoint test
+retained authentication, `no-store`, existing-series compatibility, zero-valued
+fixed combinations, and principal/token omission. Exact all-target Clippy and
+the complete all-target Rust suite also passed:
+
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all-targets`
+
+A disposable PostgreSQL 15.18 run additionally passed 48 PostgreSQL-store,
+two multi-replica HTTP, and ten separate-process replica tests. A bounded
+two-process soak completed two runs with no failures or deadlocks and observed
+both replicas exactly 16 times across 32 capability probes. The dedicated
+database container was removed afterward; the retained `postgres:15` image was
+not pruned.
+
+Publication remains behind the store-backed durable snapshot. A snapshot error
+still returns `503` instead of stale/fabricated utilization, while its fixed
+`metrics_snapshot` operation counter becomes visible after recovery. This is
+local implementation and regression evidence, not proof that a hosted metrics
+backend, dashboard, Railway/OpenShift per-pod scraper, billing pipeline, or
+production alert policy exists. IC-010 is resolved on implementation, local
+regression, disposable PostgreSQL, and bounded separate-process evidence; no
+deployed per-pod scraper or release is claimed.
+
 ## Current evidence boundaries
 
 The following remain explicitly unproven, incomplete, or unsupported. Tracked
@@ -180,6 +219,7 @@ gaps retain their issue-registry owners:
   in-flight turn takeover and durable PostgreSQL conversation SSE remain
   unsupported;
 - broader, repeated crew-effectiveness evidence;
-- broader execution, provider/tool, lease, reconciliation, and storage metrics;
+- deployment-specific authenticated per-pod metrics collection, a hosted
+  telemetry backend/dashboard, and billing remain external operator concerns;
 - an honest module-size baseline ratchet for legacy oversized Rust modules; and
 - a platform-enforced trusted release control plane.

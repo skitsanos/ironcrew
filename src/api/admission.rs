@@ -5,7 +5,6 @@
 //! shed abusive request bursts before expensive flow/provider work begins.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,9 +14,9 @@ use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use super::AppState;
 use super::auth::Principal;
-use crate::engine::idempotency::{IdempotencyUsage, PrincipalId};
+use crate::engine::idempotency::{IdempotencyLimits, IdempotencyUsage, PrincipalId};
+use crate::engine::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
 const TOKEN_UNITS: u128 = 1_000_000_000;
@@ -199,6 +198,21 @@ impl AdmissionMetrics {
     }
 }
 
+pub(super) struct AdmissionPrometheusSnapshot {
+    pub(super) tracked_buckets: usize,
+    pub(super) work: RatePolicy,
+    pub(super) control: RatePolicy,
+    pub(super) observation: RatePolicy,
+    pub(super) work_admitted: u64,
+    pub(super) work_limited: u64,
+    pub(super) control_admitted: u64,
+    pub(super) control_limited: u64,
+    pub(super) observation_admitted: u64,
+    pub(super) observation_limited: u64,
+    pub(super) internal_errors: u64,
+    pub(super) quota_rejections: [u64; 3],
+}
+
 pub struct AdmissionController {
     config: AdmissionConfig,
     observation: RatePolicy,
@@ -254,6 +268,50 @@ impl AdmissionController {
 
     pub fn metrics(&self) -> &AdmissionMetrics {
         &self.metrics
+    }
+
+    pub(super) fn prometheus_snapshot(&self) -> AdmissionPrometheusSnapshot {
+        AdmissionPrometheusSnapshot {
+            tracked_buckets: self.tracked_buckets(),
+            work: self.config.work,
+            control: self.config.control,
+            observation: self.observation,
+            work_admitted: self.metrics.work_admitted.load(Ordering::Relaxed),
+            work_limited: self.metrics.work_limited.load(Ordering::Relaxed),
+            control_admitted: self.metrics.control_admitted.load(Ordering::Relaxed),
+            control_limited: self.metrics.control_limited.load(Ordering::Relaxed),
+            observation_admitted: self.metrics.observation_admitted.load(Ordering::Relaxed),
+            observation_limited: self.metrics.observation_limited.load(Ordering::Relaxed),
+            internal_errors: self.metrics.internal_errors.load(Ordering::Relaxed),
+            quota_rejections: std::array::from_fn(|index| {
+                self.metrics.quota_rejections[index].load(Ordering::Relaxed)
+            }),
+        }
+    }
+
+    pub(super) async fn cached_idempotency_usage(
+        &self,
+        store: &dyn StateStore,
+        principal: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage> {
+        let mut cache = self.durable_usage.lock().await;
+        if let Some((checked_at, snapshot)) = *cache
+            && checked_at.elapsed() < Duration::from_secs(1)
+        {
+            return Ok(snapshot);
+        }
+
+        match store.idempotency_usage(principal, limits).await {
+            Ok(snapshot) => {
+                *cache = Some((Instant::now(), snapshot));
+                Ok(snapshot)
+            }
+            Err(error) => {
+                self.metrics.record_internal_error();
+                Err(error)
+            }
+        }
     }
 
     fn admit(
@@ -434,361 +492,6 @@ fn rate_limited_response(class: MutationClass, retry_after_seconds: u64) -> Resp
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
-}
-
-/// Protected Prometheus text exposition. Labels are fixed and deliberately do
-/// not include principal ids, audit actors, idempotency keys, flow names, or
-/// any other attacker-controlled/high-cardinality value.
-pub async fn metrics(
-    State(state): State<std::sync::Arc<AppState>>,
-    Extension(principal): Extension<Principal>,
-) -> Response {
-    let run_registry_entries = state.active_runs.read().await.len();
-    let conversation_registry_entries = state.active_conversations.read().await.len();
-    let active_runs = state
-        .max_active_runs
-        .saturating_sub(state.run_permits.available_permits());
-    let active_conversations = state
-        .max_active_conversations
-        .saturating_sub(state.conversation_permits.available_permits());
-    let active_sse = state
-        .max_sse_connections
-        .saturating_sub(state.sse_permits.available_permits());
-    let metrics = state.admission.metrics();
-    let durable_usage = {
-        let mut cache = state.admission.durable_usage.lock().await;
-        if let Some((checked_at, snapshot)) = *cache
-            && checked_at.elapsed() < Duration::from_secs(1)
-        {
-            snapshot
-        } else {
-            match state
-                .store
-                .idempotency_usage(principal.id(), state.idempotency.limits())
-                .await
-            {
-                Ok(snapshot) => {
-                    *cache = Some((Instant::now(), snapshot));
-                    snapshot
-                }
-                Err(error) => {
-                    metrics.record_internal_error();
-                    tracing::warn!(%error, "Failed to read idempotency saturation metrics");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [(header::CACHE_CONTROL, "no-store")],
-                        axum::Json(serde_json::json!({
-                            "error": "Metrics storage snapshot is temporarily unavailable"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    };
-    let mut body = String::with_capacity(4 * 1024);
-
-    writeln!(body, "# TYPE ironcrew_build_info gauge").unwrap();
-    writeln!(
-        body,
-        "ironcrew_build_info{{version=\"{}\"}} 1",
-        env!("CARGO_PKG_VERSION")
-    )
-    .unwrap();
-    write_gauge(&mut body, "ironcrew_process_active_runs", active_runs);
-    write_gauge(
-        &mut body,
-        "ironcrew_process_active_runs_limit",
-        state.max_active_runs,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_run_registry_entries",
-        run_registry_entries,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_active_conversations",
-        active_conversations,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_active_conversations_limit",
-        state.max_active_conversations,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_conversation_registry_entries",
-        conversation_registry_entries,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_active_sse_connections",
-        active_sse,
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_process_active_sse_connections_limit",
-        state.max_sse_connections,
-    );
-    super::resource_metrics::append(&mut body, &state).await;
-    write_helped_gauge(
-        &mut body,
-        "ironcrew_store_maintenance_healthy",
-        "Whether the latest completed store maintenance cycle succeeded (1 healthy, 0 unhealthy).",
-        u8::from(state.store_maintenance_healthy.load(Ordering::Acquire)),
-    );
-    write_helped_gauge(
-        &mut body,
-        "ironcrew_process_terminal_persistence_degraded_finalizers",
-        "Current run or conversation finalizers retrying durable persistence in this process.",
-        state.terminal_persistence_failures.load(Ordering::Acquire),
-    );
-    writeln!(
-        body,
-        "# HELP ironcrew_process_lifecycle_state Current process lifecycle as a fixed one-hot gauge."
-    )
-    .unwrap();
-    writeln!(body, "# TYPE ironcrew_process_lifecycle_state gauge").unwrap();
-    let lifecycle_phase = state.lifecycle.phase();
-    for phase in super::lifecycle::LifecyclePhase::ALL {
-        writeln!(
-            body,
-            "ironcrew_process_lifecycle_state{{state=\"{}\"}} {}",
-            phase.as_str(),
-            u8::from(phase == lifecycle_phase),
-        )
-        .unwrap();
-    }
-    writeln!(
-        body,
-        "# HELP ironcrew_process_lifecycle_rejections_total Mutation requests rejected by the process lifecycle boundary."
-    )
-    .unwrap();
-    writeln!(
-        body,
-        "# TYPE ironcrew_process_lifecycle_rejections_total counter"
-    )
-    .unwrap();
-    for class in [MutationClass::Work, MutationClass::Control] {
-        writeln!(
-            body,
-            "ironcrew_process_lifecycle_rejections_total{{class=\"{}\"}} {}",
-            class.label(),
-            state.lifecycle.rejection_count(class),
-        )
-        .unwrap();
-    }
-    write_gauge(
-        &mut body,
-        "ironcrew_auth_configured_principals",
-        state.auth.principal_count(),
-    );
-    write_gauge(
-        &mut body,
-        "ironcrew_admission_tracked_buckets",
-        state.admission.tracked_buckets(),
-    );
-    writeln!(body, "# TYPE ironcrew_admission_rate_per_minute gauge").unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_rate_per_minute{{class=\"work\"}} {}",
-        state.admission.config.work.rate_per_minute
-    )
-    .unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_rate_per_minute{{class=\"control\"}} {}",
-        state.admission.config.control.rate_per_minute
-    )
-    .unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_rate_per_minute{{class=\"observation\"}} {}",
-        state.admission.observation.rate_per_minute
-    )
-    .unwrap();
-    writeln!(body, "# TYPE ironcrew_admission_burst gauge").unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_burst{{class=\"work\"}} {}",
-        state.admission.config.work.burst
-    )
-    .unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_burst{{class=\"control\"}} {}",
-        state.admission.config.control.burst
-    )
-    .unwrap();
-    writeln!(
-        body,
-        "ironcrew_admission_burst{{class=\"observation\"}} {}",
-        state.admission.observation.burst
-    )
-    .unwrap();
-    writeln!(body, "# TYPE ironcrew_admission_requests_total counter").unwrap();
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"work\",outcome=\"admitted\"}",
-        metrics.work_admitted.load(Ordering::Relaxed),
-    );
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"work\",outcome=\"limited\"}",
-        metrics.work_limited.load(Ordering::Relaxed),
-    );
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"control\",outcome=\"admitted\"}",
-        metrics.control_admitted.load(Ordering::Relaxed),
-    );
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"control\",outcome=\"limited\"}",
-        metrics.control_limited.load(Ordering::Relaxed),
-    );
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"observation\",outcome=\"admitted\"}",
-        metrics.observation_admitted.load(Ordering::Relaxed),
-    );
-    write_counter(
-        &mut body,
-        "ironcrew_admission_requests_total{class=\"observation\",outcome=\"limited\"}",
-        metrics.observation_limited.load(Ordering::Relaxed),
-    );
-    writeln!(
-        body,
-        "# TYPE ironcrew_admission_internal_errors_total counter"
-    )
-    .unwrap();
-    write_counter(
-        &mut body,
-        "ironcrew_admission_internal_errors_total",
-        metrics.internal_errors.load(Ordering::Relaxed),
-    );
-    writeln!(
-        body,
-        "# TYPE ironcrew_idempotency_quota_rejections_total counter"
-    )
-    .unwrap();
-    for (metric, index) in [
-        ("global_records", QuotaMetric::GlobalRecords as usize),
-        ("principal_records", QuotaMetric::PrincipalRecords as usize),
-        (
-            "principal_in_flight",
-            QuotaMetric::PrincipalInFlight as usize,
-        ),
-    ] {
-        writeln!(
-            body,
-            "ironcrew_idempotency_quota_rejections_total{{resource=\"{metric}\"}} {}",
-            metrics.quota_rejections[index].load(Ordering::Relaxed)
-        )
-        .unwrap();
-    }
-
-    let limits = state.idempotency.limits();
-    for (name, used, limit) in [
-        (
-            "records",
-            durable_usage.global_records,
-            limits.global_max_records,
-        ),
-        (
-            "response_bytes",
-            durable_usage.global_response_bytes,
-            limits.global_max_response_bytes,
-        ),
-    ] {
-        writeln!(
-            body,
-            "ironcrew_idempotency_global_usage{{resource=\"{name}\"}} {used}"
-        )
-        .unwrap();
-        writeln!(
-            body,
-            "ironcrew_idempotency_global_limit{{resource=\"{name}\"}} {limit}"
-        )
-        .unwrap();
-    }
-    write_gauge(
-        &mut body,
-        "ironcrew_idempotency_global_in_flight",
-        durable_usage.global_in_flight,
-    );
-    for (name, used, limit) in [
-        (
-            "records",
-            durable_usage.max_principal_records,
-            limits.principal_max_records,
-        ),
-        (
-            "in_flight",
-            durable_usage.max_principal_in_flight,
-            limits.principal_max_in_flight,
-        ),
-        (
-            "response_bytes",
-            durable_usage.max_principal_response_bytes,
-            limits.principal_max_response_bytes,
-        ),
-    ] {
-        writeln!(
-            body,
-            "ironcrew_idempotency_max_principal_usage{{resource=\"{name}\"}} {used}"
-        )
-        .unwrap();
-        writeln!(
-            body,
-            "ironcrew_idempotency_principal_limit{{resource=\"{name}\"}} {limit}"
-        )
-        .unwrap();
-    }
-    write_gauge(
-        &mut body,
-        "ironcrew_idempotency_principals",
-        durable_usage.principal_count,
-    );
-    for (threshold, count) in [
-        ("80", durable_usage.principals_at_or_above_80_percent),
-        ("90", durable_usage.principals_at_or_above_90_percent),
-        ("100", durable_usage.principals_at_or_above_100_percent),
-    ] {
-        writeln!(
-            body,
-            "ironcrew_idempotency_saturated_principals{{threshold_percent=\"{threshold}\"}} {count}"
-        )
-        .unwrap();
-    }
-
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-fn write_gauge<T: std::fmt::Display>(body: &mut String, name: &str, value: T) {
-    writeln!(body, "# TYPE {name} gauge").unwrap();
-    writeln!(body, "{name} {value}").unwrap();
-}
-
-fn write_helped_gauge<T: std::fmt::Display>(body: &mut String, name: &str, help: &str, value: T) {
-    writeln!(body, "# HELP {name} {help}").unwrap();
-    write_gauge(body, name, value);
-}
-
-fn write_counter<T: std::fmt::Display>(body: &mut String, name: &str, value: T) {
-    writeln!(body, "{name} {value}").unwrap();
 }
 
 fn bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
