@@ -129,12 +129,13 @@ same PostgreSQL 15+ database and give every replica the same HITL keyring:
 export IRONCREW_STORE=postgres
 export DATABASE_URL='postgres://user:password@host/ironcrew'
 
-# Generate once, then store these two values in your platform secret manager.
+# Local bootstrap only. Generate once, then store both values in your platform
+# secret manager and restart every IronCrew process that should read them.
 hitl_key=$(openssl rand -base64 32)
 export IRONCREW_HITL_ENCRYPTION_KEYS=$(jq -nc \
-  --arg key "$hitl_key" '{"2026-07": $key}')
+  --arg key "$hitl_key" '{"hitl-v1": $key}')
 unset hitl_key
-export IRONCREW_HITL_ACTIVE_KEY_ID='2026-07'
+export IRONCREW_HITL_ACTIVE_KEY_ID='hitl-v1'
 ```
 
 The run request must keep its `Idempotency-Key`. A question GET through either
@@ -143,6 +144,12 @@ returns HTTP `202` with `status: "queued"`. PostgreSQL stores encrypted
 question metadata and answer ciphertext, and the owning replica polls and
 resumes the Lua coroutine. A second answer returns `404` because the first
 writer wins.
+
+IronCrew reads the keyring once at process startup. A safe rotation first
+restarts every replica with an expanded old+new keyring, then changes the active
+id in another rollout, and removes the old key only after all old-active writers
+have exited and no retained question or answer fingerprint references it. See
+[Cloud Deployment](../../docs/cloud-deployment.md#hitl-key-rotation-on-railway-and-openshift).
 
 PostgreSQL also journals bounded run events in plaintext JSONB. Any replica can
 serve the run SSE endpoint and resume retained events with an id such as

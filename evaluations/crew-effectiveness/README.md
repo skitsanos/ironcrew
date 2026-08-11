@@ -50,7 +50,31 @@ Contract scores prove only that CLI execution, Lua orchestration, run-record
 persistence, token accounting, structured output parsing, and scoring remain
 wired together. They must never be cited as evidence that crews outperform a
 single agent. Before succeeding, `evaluate.py` also runs the generated document
-through IronCrew's own JSON Schema validator using `report-v1.schema.json`.
+through IronCrew's own JSON Schema validator using `report-v2.schema.json`. The
+v1 schema remains tracked for historical receipts.
+
+## Predeclared execution and selection plan
+
+`decision-plan.v1.json` is validated strictly before IronCrew or a provider is
+started. It caps selected case bytes, CLI runs, planned model calls, and the
+sum of the Lua flows' requested maximum output tokens. Inspect the exact
+workload without requiring a built binary or writing a report:
+
+```bash
+python3 evaluations/crew-effectiveness/evaluate.py \
+  --mode live \
+  --provider-id openai-api \
+  --repetitions 5 \
+  --dry-run-plan
+```
+
+The checked-in plan admits at most 90 CLI runs, 240 planned model calls, and
+147,000 requested maximum output tokens. The plan also pins the SHA-256 of
+`crew.lua` and its per-variant call/token accounting, so an unreviewed flow
+change fails before provider execution. These are workload ceilings, not a
+currency estimate: provider pricing and actual usage can change independently.
+Increasing repetitions, cases, prompt bytes, calls, or token caps requires an
+explicitly reviewed plan change before any provider request can run.
 
 ## Opt-in live exploratory run
 
@@ -62,19 +86,31 @@ evaluator neither parses nor prints the API key.
 python3 evaluations/crew-effectiveness/evaluate.py \
   --mode live \
   --binary target/debug/ironcrew \
+  --provider-id openai-api \
   --model gpt-4.1-mini \
-  --repetitions 2 \
+  --repetitions 5 \
   --report evaluations/crew-effectiveness/reports/live-pilot.json
 ```
 
-Six cases with two repetitions produce 36 CLI runs and 96 planned model calls.
-Variant order is deterministically shuffled to reduce ordering bias. The model
-name, binary hash, Git revision/dirty state, dataset hashes, run order seed,
-and all raw scored outputs are retained in the report.
+Six cases with five repetitions produce the plan maximum of 90 CLI runs and
+240 planned model calls. Live mode requires both the repetition count and a
+non-secret, operator-declared provider identity; it will not silently use a
+non-decision-grade default. Run this paid path only after approving the
+provider, model, and plan shown by `--dry-run-plan`. Variant order is deterministically
+shuffled to reduce ordering bias. The model name, binary hash, Git
+revision/dirty state, dataset and plan hashes, run order seed, and all raw
+scored outputs are retained in the report.
 
 This is intentionally described as exploratory evidence. The corpus is too
 small to establish broad superiority, temperature zero is not a model seed,
-and provider/network variance still affects latency.
+and provider/network variance still affects latency. The report therefore
+records a deterministic bootstrap interval over independent case-level mean
+deltas. The two topology comparisons use a Bonferroni-adjusted per-comparison
+confidence level to preserve the plan's family-wise confidence target. Each
+topology is evaluated against predeclared unique-case, paired-sample, success,
+quality, confidence, token, and latency thresholds. Its decision is one of `insufficient_evidence`,
+`single_preferred`, or `crew_qualified`; contract mode always reports
+`not_applicable`. A qualified result applies only to this dataset and model.
 
 ## Metrics
 
@@ -87,10 +123,16 @@ separate:
 - execution, JSON parse, and output-schema success
 - run latency median and p95
 - median and total provider-reported tokens
-- paired grounded-correctness wins, ties, losses, and mean delta versus single
+- paired grounded-correctness wins, ties, losses, mean delta, and deterministic
+  percentile-bootstrap interval versus single
+- matched-pair mean token and latency multipliers versus single
+- predeclared topology checks and the resulting bounded recommendation
 
 No LLM judge is used. Token counts come from provider usage fields surfaced by
 IronCrew; contract-mode token values are deterministic synthetic fixture data.
+If a paid CLI process exits, times out, or returns a non-success run status,
+aggregate token usage is recorded as unknown (`null`), never as zero or as a
+potentially partial lower bound.
 
 ### Exact option-ID scoring
 

@@ -157,6 +157,12 @@ class ReplicaSoakUnitTests(unittest.TestCase):
         metrics.record("health_readiness_probe", 1.0, 200, True)
         report = {
             "workload": {"attempted_runs": 2, "failed_runs": 0},
+            "replica_topology": {
+                "passed": True,
+                "expected_instance_count": 2,
+                "observed_instance_count": 2,
+                "total_samples": 4,
+            },
             "postgres": {
                 "delta": {
                     "database_activity": {"deadlocks": 0},
@@ -177,6 +183,9 @@ class ReplicaSoakUnitTests(unittest.TestCase):
         self.assertTrue(criteria["overall_passed"])
         self.assertFalse(
             criteria["host_process_rss_comparator"]["comparator_enforced_by_runner"]
+        )
+        self.assertFalse(
+            criteria["host_process_rss_comparator"]["platform_resource_proof"]
         )
 
 

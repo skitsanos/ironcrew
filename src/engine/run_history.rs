@@ -4,6 +4,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::engine::conversation_json::preflight_conversation_record_json;
+use crate::engine::conversation_record::{
+    validate_conversation_record_after_decode, validate_conversation_record_for_write,
+};
 use crate::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
@@ -135,6 +139,12 @@ fn serialize_json_record<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>
 
 fn write_serialized_record_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<()> {
     let bytes = serialize_json_record(value, label)?;
+    if label == "conversation" {
+        let json = std::str::from_utf8(&bytes).map_err(|error| {
+            IronCrewError::Validation(format!("Serialized conversation was not UTF-8: {error}"))
+        })?;
+        preflight_conversation_record_json(json)?;
+    }
     let parent = path.parent().ok_or_else(|| {
         IronCrewError::Validation(format!(
             "JSON record path '{}' has no parent",
@@ -343,9 +353,11 @@ fn load_conversation_file(path: &Path, id: &str) -> Result<Option<ConversationRe
         return Ok(None);
     }
     let data = read_json_record(path)?;
+    preflight_conversation_record_json(&data)?;
     let record: ConversationRecord = serde_json::from_str(&data).map_err(|e| {
         IronCrewError::Validation(format!("Failed to parse conversation '{}': {}", id, e))
     })?;
+    validate_conversation_record_after_decode(&record)?;
     Ok(Some(record))
 }
 
@@ -395,7 +407,10 @@ fn walk_conversation_records(
 
 fn read_record_for_walk(path: &Path) -> Option<ConversationRecord> {
     let data = read_json_record(path).ok()?;
-    serde_json::from_str::<ConversationRecord>(&data).ok()
+    preflight_conversation_record_json(&data).ok()?;
+    let record = serde_json::from_str::<ConversationRecord>(&data).ok()?;
+    validate_conversation_record_after_decode(&record).ok()?;
+    Some(record)
 }
 
 fn flow_filter_matches(record: &ConversationRecord, flow_path: Option<&str>) -> bool {
@@ -1762,10 +1777,18 @@ impl StateStore for JsonFileStore {
                 Some(&claim.scope),
                 &claim.resource_id,
             );
-            let current_revision = load_conversation_file(&conversation_path, &claim.resource_id)?
-                .map(|conversation| conversation.revision)
-                .unwrap_or(0);
-            if current_revision != expected_revision {
+            let current = load_conversation_file(&conversation_path, &claim.resource_id)?;
+            let valid = current.as_ref().is_some_and(|conversation| {
+                let expected_scope = super::sessions::conversation_mutation_scope(
+                    &claim.scope,
+                    &claim.resource_id,
+                    &conversation.execution.incarnation_id,
+                );
+                conversation.execution.validate().is_ok()
+                    && conversation.revision == expected_revision
+                    && claim.exclusive_scope.as_deref() == Some(expected_scope.as_str())
+            });
+            if !valid {
                 return Ok(IdempotencyClaimOutcome::Conflict);
             }
         }
@@ -2063,7 +2086,7 @@ impl StateStore for JsonFileStore {
     ) -> Result<ConversationIdempotencyCommit> {
         completion.validate()?;
         limits.validate()?;
-        validate_session_id(&conversation.id)?;
+        validate_conversation_record_for_write(conversation)?;
         let ledger_path = idempotency_path(&self.idempotency_dir, &completion.key_hash)?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
@@ -2075,9 +2098,15 @@ impl StateStore for JsonFileStore {
         }
         let idempotency = read_idempotency_record(&ledger_path)?;
         ensure_idempotency_completion_fence(&idempotency, &completion)?;
+        let expected_scope = super::sessions::conversation_mutation_scope(
+            conversation.flow_path.as_deref().unwrap_or(""),
+            &conversation.id,
+            &conversation.execution.incarnation_id,
+        );
         if idempotency.operation != CONVERSATION_MESSAGE_OPERATION
             || idempotency.resource_id != conversation.id
             || idempotency.scope != conversation.flow_path.as_deref().unwrap_or("")
+            || idempotency.exclusive_scope.as_deref() != Some(expected_scope.as_str())
         {
             return Err(IronCrewError::Conflict(
                 "Idempotency claim does not match the conversation scope".into(),
@@ -2111,10 +2140,9 @@ impl StateStore for JsonFileStore {
             &conversation.id,
         );
         let current = load_conversation_file(&conversation_path, &conversation.id)?;
-        let current_revision = current.as_ref().map(|saved| saved.revision).unwrap_or(0);
-        if current.is_some() && current_revision != expected_revision
-            || current.is_none() && expected_revision != 0
-        {
+        if !current.as_ref().is_some_and(|saved| {
+            saved.revision == expected_revision && saved.execution == conversation.execution
+        }) {
             return Err(IronCrewError::Conflict(format!(
                 "Conversation '{}' changed since revision {expected_revision}",
                 conversation.id
@@ -2296,7 +2324,7 @@ impl StateStore for JsonFileStore {
     // tell "first time this id is used" apart from real I/O errors.
 
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
-        validate_session_id(&record.id)?;
+        validate_conversation_record_for_write(record)?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))
         })?;
@@ -2319,9 +2347,9 @@ impl StateStore for JsonFileStore {
             &record.id,
         );
         let current = load_conversation_file(&path, &record.id)?;
-        let current_revision = current.as_ref().map(|saved| saved.revision).unwrap_or(0);
-        if current.is_some() && current_revision != record.revision
-            || current.is_none() && record.revision != 0
+        if current.as_ref().is_some_and(|saved| {
+            saved.revision != record.revision || saved.execution != record.execution
+        }) || current.is_none() && record.revision != 0
         {
             return Err(IronCrewError::Conflict(format!(
                 "Conversation '{}' changed since revision {}; reopen it before saving",

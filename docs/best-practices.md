@@ -148,12 +148,17 @@ due to transient issues (rate limits, network errors). The engine emits
 
 **Timeouts.** Set `timeout_secs` on long-running tasks to prevent them from
 blocking the entire crew. The server enforces a 30-minute maximum run lifetime
-(`IRONCREW_MAX_RUN_LIFETIME`). The server handles `SIGTERM` and `Ctrl+C`
-by actively dropping active chat sessions and aborting active runs so SSE
-streams terminate immediately; remaining non-SSE in-flight requests finish
-via Axum's graceful shutdown. A hard deadline
-(`IRONCREW_SHUTDOWN_TIMEOUT_SECS`, default 10 s) forces the process to
-exit if graceful shutdown overruns. See
+(`IRONCREW_MAX_RUN_LIFETIME`). `SIGUSR1` explicitly withdraws one Unix replica:
+readiness fails, owned keyed attempts are fenced, and new mutations are
+rejected while already accepted work and observation endpoints remain
+available. `SIGTERM` and Ctrl+C start the bounded routing deadline
+(`IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS`) and stop by cancelling active work and
+closing SSE only after the durable fence has committed and any remaining
+routing interval has elapsed. A fence that commits after the deadline leaves
+no remaining routing wait. Fence failures keep the replica non-accepting and
+retry rather than falsely advance to stopping. A hard deadline
+(`IRONCREW_SHUTDOWN_TIMEOUT_SECS`) forces the process to exit if shutdown
+overruns. See
 [Cloud Deployment – Graceful shutdown](cloud-deployment.md#graceful-shutdown)
 for the full sequence.
 
@@ -313,10 +318,16 @@ durable cloud records and restart recovery. PostgreSQL coordinates
 idempotency-keyed cancellation and, with the shared HITL encryption keyring,
 encrypted cross-replica question listing/answer delivery. Its bounded run-event
 journal also supports cross-replica run SSE replay with `Last-Event-ID`;
-JSON/SQLite run SSE and every conversation SSE stream remain process-local.
-PostgreSQL does not distribute the active Lua VM or conversation handles, so
-keep one replica when clients require those surfaces through arbitrary
-routing. Pool size is configurable via
+JSON/SQLite run and conversation SSE remain process-local, while PostgreSQL
+conversation SSE returns `409` unsupported. The reviewed worktree lets a keyed
+PostgreSQL conversation message cold-rehydrate from its
+incarnation/revision-fenced transcript on either replica. Its local two-process
+gate and affinity-free OpenShift canary pass; Railway remains unrun, and the
+tested dirty artifact was unpublished and removed. PostgreSQL still does not
+distribute an in-flight Lua/provider/tool turn, and shared conversation SSE is
+unsupported. Keep one replica until the behavior is released, on Railway until
+its own IC-008 canary passes, or whenever clients require the remaining
+owner-local surfaces through arbitrary routing. Pool size is configurable via
 `IRONCREW_DB_POOL_SIZE` (default 10). Table prefix (`IRONCREW_PG_TABLE_PREFIX`)
 allows sharing a database across projects — at most 37 lowercase ASCII letters,
 digits, and underscores are allowed.
@@ -403,9 +414,12 @@ docker run -p 3000:3000 \
 Bind to `0.0.0.0` inside the container so the port mapping works. Always set
 `IRONCREW_API_TOKEN` and `IRONCREW_CORS_ORIGINS` in production deployments.
 
-**Kubernetes.** The server handles `SIGTERM` gracefully, completing in-flight
-requests before shutdown. Set `terminationGracePeriodSeconds` in your pod spec
-to allow sufficient time for long-running crew executions to finish.
+**Kubernetes.** Endpoint removal and the pod's `SIGTERM` lifecycle overlap;
+readiness failure is not proof that every ingress path has already stopped
+routing. Configure the routing-drain interval and
+`terminationGracePeriodSeconds` together. Termination eventually cancels
+active work within IronCrew's shutdown bound, so do not size the grace period
+as a promise that every long-running crew execution will finish.
 
 ## Cost Optimization
 

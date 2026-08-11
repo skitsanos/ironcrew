@@ -53,23 +53,133 @@ and event row counts stayed unchanged and the HITL mailbox was cleared.
 
 This proves no second durable IronCrew execution for that retained principal,
 key, and request within the tested idempotency window. It does not make
-arbitrary external provider/tool effects exactly once, and it is local process
-evidence rather than Railway or OpenShift routing evidence.
+arbitrary external provider/tool effects exactly once.
+
+Temporary deployed canaries on 2026-08-10 then observed two identities through
+both Railway and an affinity-disabled OpenShift Route. Short provider-free v2
+target runs passed 8/8 and 20/20 shared HITL/SSE cases respectively. Railway
+also passed replay, conflict, cancellation, auth, and protected-metrics probes;
+OpenShift passed replay, conflict, cancellation, and authentication probes plus
+a real owner `SIGKILL`/`Abandoned` gate and the staged encrypted-HITL key
+rotation through new-only. These were disposable
+canaries, not long-duration production monitoring or provider/resource-ceiling
+evidence. Attributable table prefixes and active platform resources were
+removed afterward; at that interim checkpoint, Railway still exposed one
+asynchronous pending-deletion volume record.
+
+A follow-up IC-020 gate added monotonic replica draining, exact PostgreSQL
+owner fences, authenticated lifecycle/resource metrics, and bounded local
+`R=1/2/3` capacity evidence. Temporary Railway and OpenShift canaries then
+passed `1 -> 2 -> 1`, direct/peer draining-control rejection, clean
+signal-driven terminalization, and same-key replay. Railway continued routing
+to its drained process, so the application fence—not readiness withdrawal—is
+the safety boundary there. OpenShift's first rollout exposed a contention-only
+readiness flap; bounded singleflight plus `minReadySeconds: 10` corrected it,
+after which the affinity-free shared Route passed 180/180 readiness, liveness,
+and capability probes during a homogeneous rollout. A retiring direct route
+was not zero-gap. Both platform stacks and database prefixes were removed and
+their attributable baselines restored.
+
+The authoritative OpenShift IC-007 v7 canary then repeated the complete
+applicable matrix with an independently attested dirty-worktree artifact. An
+affinity-free Route returned 64/64 capability responses across two verified
+pod/process identities (33/31). Counted replay/conflict, encrypted HITL,
+numbered SSE and cursor edges, cancellation/race behavior, local admission,
+shared quota, real owner `SIGKILL` and replacement, staged key rotation, and
+explicit drain/replacement passed. The seven-phase rotation rerun retained 14
+complete process inventories. Unkeyed run control and live conversation
+message/SSE returned their intended process-local boundaries rather than false
+success.
+
+The OpenShift result is temporary platform evidence, not a release, long soak,
+or reproducible/downloadable artifact claim. Exact scans found no canary
+credentials or HITL plaintext, but the receipt retains five unfixed
+HIGH/CRITICAL operating-system findings and the shared namespace's additive
+same-namespace ingress allowance. Cleanup returned both exact selectors, all
+three attributable database prefixes, and quota use to zero while preserving
+the namespace baseline and authorized OAuth session.
+
+Railway v7 then passed the literal remaining rotation requirement without being
+misrepresented as a full matrix rerun. A retained overlap snapshot contained
+two independently attested expanded/old-active and two expanded/new-active
+processes. New answered old-owned work, old answered new-owned work, both runs
+reached `Success` with complete seven-event barriers, and the scoped observer
+captured one old and one new ciphertext fingerprint without fixed plaintext.
+Observer objects and old references returned to zero before a final
+two-process new-only peer run completed with the same barrier. Earlier retained
+Railway receipts remain the separately dated evidence for routed replay,
+conflict, cancellation, HITL/SSE, owner replacement, and lifecycle.
+
+Railway rebuilt the verified ten-file v7 context, and every accepted process
+matched its independently computed binary, flow, 113-field config, keyring,
+helper, build-attestation, deployment, and process-start identity. The receipt
+reports six database prefixes plus every active service, instance, domain,
+proxy, volume, and bucket returned to zero; it also reports zero attributable
+local staging/cache/scratch/Docker objects. The project, environment, two
+pre-existing volume tombstones, and `postgres:15` remain. No broad delete or
+prune was used. Independent final audit confirmed those cleanup facts, closing
+IC-007's platform-evidence gap; a duplicate full Railway v7 matrix was not
+invented as an added acceptance criterion.
+
+The final local closure gate passed formatting, exact all-target Clippy, 969
+Rust tests with 3 intentional ignores, doc tests, dependency audit over 431
+packages, and a locked release build. Repository policy passed 3 skill checks,
+20 registry tests, 21 Bun tests with 155 expectations, `actionlint`, worktree,
+and diff validation. The Lua gate covered 66 files and 5 runtime probes;
+Python passed 29 crew, 15 soak, 8 lifecycle, and 34 platform tests. The crew
+contract completed 18 runs, 48 requests, and 36 grounded decisions. The live
+PostgreSQL 15.18 gate passed 57/57 tests, the short soak passed 2/2, and all 3
+lifecycle phases passed with exact cleanup. These local results do not replace
+either platform receipt.
+
+IC-008 then resolved the narrower committed-boundary conversation gap in the
+reviewed, unpublished worktree. Two real `ironcrew serve` processes sharing
+PostgreSQL 15.18 passed peer start, required-key message/replay, history,
+same- and peer-process active-delete fencing, delete/recreate incarnation
+fencing, restart, owner `SIGKILL` between turns, and the truthful PostgreSQL
+conversation-SSE `409` boundary. The final serial PostgreSQL gate passed
+60/60 tests, the release-binary two-process soak passed 2/2, and all exact
+database/container/cache artifacts were removed while retaining the
+`postgres:15` image.
+
+The separately dated
+[IC-008 OpenShift receipt](../../evaluations/platform-canary/reports/ic008-openshift.md)
+then passed the applicable case-9 matrix through affinity-free Routes using an
+independently attested but unpublished dirty-worktree artifact. Initial route
+sampling was 64/64 with a 32/32 A/B split; replacement sampling was 32/32 with
+a 16/16 B/C split. The canary retained exact replay/effect counts, history,
+active-delete fences, delete/recreate incarnation fencing, the shared-store
+conversation-SSE `409`, and a separate cold keyed recovery after the only
+prior owner was force-deleted between committed turns. The human and machine
+receipts hash to
+`sha256:acff73fd9e7f6233a45c00791892813941ad4441e2d8e2810a3133502d098dcb`
+and
+`sha256:069848c1d1cc598743d9207350079b3a78919916c11e260202339b737315a6e4`.
+
+This is OpenShift evidence, not a published/downloadable artifact or Railway
+result. It does not prove in-flight Lua/provider/tool takeover, shared
+conversation SSE, or general exactly-once effects. The shared namespace had an
+additive same-namespace NetworkPolicy; deleted A/B final log tails and the
+inline controller bytes were unavailable; and Docker Scout retained four
+unfixed Debian-base HIGH/CRITICAL findings. Exact labeled objects, database
+prefix/functions, quota, local staging/cache, and attributable Docker objects
+returned to zero, with the namespace baseline restored at
+`sha256:ce9697dfb8eb519641338240dcbb0ab328952ebc8b07c9500a511101d774d4dd`.
 
 ## Current evidence boundaries
 
-The following remain explicitly unproven or incomplete and are tracked in the
-issue registry:
+The following remain explicitly unproven, incomplete, or unsupported. Tracked
+gaps retain their issue-registry owners:
 
-- bounded maintenance query/advisory-lock waits and safe lease timing;
-- kill-during-cancellation and separate-process unkeyed wrong-owner cases;
-- real Railway/OpenShift routing without affinity;
-- staged mixed-revision HITL key rotation;
-- separate-process durable-SSE cursor/gap coverage and a retention-boundary soak;
-- measured process-local versus shared admission saturation;
-- cluster-wide admission and graceful drain/scale lifecycle evidence;
-- distributed live conversation control;
+- execution takeover/checkpoint resume and exactly-once arbitrary external
+  provider/tool effects, neither of which follows from replica routing;
+- a retention-boundary steady-state soak with predeclared ceilings;
+- an attributed Railway load-balancer canary and a published release for
+  arbitrary-routed keyed conversation turns. IC-008's local PostgreSQL and
+  OpenShift dirty-artifact results are green, but Railway remains unrun;
+  in-flight turn takeover and durable PostgreSQL conversation SSE remain
+  unsupported;
 - broader, repeated crew-effectiveness evidence;
-- execution and storage-health metric coverage;
+- broader execution, provider/tool, lease, reconciliation, and storage metrics;
 - an honest module-size baseline ratchet for legacy oversized Rust modules; and
 - a platform-enforced trusted release control plane.

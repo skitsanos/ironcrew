@@ -56,11 +56,17 @@ fn app_state(root: &std::path::Path, store: Arc<dyn StateStore>) -> Arc<AppState
     );
     Arc::new(AppState {
         flows_dir: root.to_path_buf(),
+        runtime_identity: ironcrew::api::deployment::RuntimeIdentity::disabled(),
         auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
         admission: Arc::new(admission),
-        accepting_traffic: std::sync::atomic::AtomicBool::new(true),
+        lifecycle: ironcrew::api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            ironcrew::api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                ironcrew::api::conversation_lifecycle::max_active_conversation_lifecycles(),
+            ),
+        ),
         max_active_conversations: 4,
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_active_runs: 4,

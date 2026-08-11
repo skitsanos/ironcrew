@@ -1,6 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::engine::conversation_definition::{
+    ConversationSourceContext, FlowSourceRoles, FlowSourceSnapshot, SnapshotLuaSource,
+};
 use crate::engine::runtime::Runtime;
 use crate::llm::openai::OpenAiProvider;
 use crate::lua::api::{
@@ -9,7 +12,8 @@ use crate::lua::api::{
 };
 use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::loader::ProjectLoader;
-use crate::lua::sandbox::create_crew_lua_with_lib_dirs;
+use crate::lua::sandbox::create_crew_lua_with_policy;
+use crate::tools::runtime_policy::RuntimeExecutionPolicy;
 use crate::utils::error::{IronCrewError, Result};
 
 /// Load `.env` files into the process environment.
@@ -64,16 +68,73 @@ pub fn load_project(path: &Path) -> Result<ProjectLoader> {
 ///
 /// Returns the configured Lua VM and the shared Runtime.
 pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runtime>)> {
-    let lib_dir = loader.project_dir().join("_lib");
-    let lua = create_crew_lua_with_lib_dirs(vec![lib_dir]).map_err(IronCrewError::Lua)?;
+    let (lua, runtime, _) = setup_crew_runtime_inner(loader, None)?;
+    Ok((lua, runtime))
+}
+
+/// Set up the runtime used only to discover an HTTP conversation definition.
+/// The purity marker is installed before config/definition evaluation and is
+/// left in place for the caller to remove after the entrypoint returns.
+pub(crate) fn setup_http_conversation_runtime(
+    loader: &ProjectLoader,
+    snapshot: Arc<FlowSourceSnapshot>,
+) -> Result<(mlua::Lua, Arc<Runtime>, SnapshotLuaSource)> {
+    if snapshot.root() != loader.project_dir() {
+        return Err(IronCrewError::Validation(
+            "conversation source snapshot does not belong to the loaded flow".into(),
+        ));
+    }
+    let roles = snapshot.roles()?;
+    let (lua, runtime, entrypoint) = setup_crew_runtime_inner(
+        loader,
+        Some((ConversationSourceContext::root(snapshot), roles)),
+    )?;
+    Ok((
+        lua,
+        runtime,
+        entrypoint.expect("snapshot runtime always has an entrypoint"),
+    ))
+}
+
+fn setup_crew_runtime_inner(
+    loader: &ProjectLoader,
+    snapshot: Option<(ConversationSourceContext, FlowSourceRoles)>,
+) -> Result<(mlua::Lua, Arc<Runtime>, Option<SnapshotLuaSource>)> {
+    let lib_dirs = if snapshot.is_none() {
+        vec![loader.project_dir().join("_lib")]
+    } else {
+        Vec::new()
+    };
+    let execution_policy = RuntimeExecutionPolicy::capture();
+    let lua = create_crew_lua_with_policy(lib_dirs, execution_policy.lua_vm_policy()?)
+        .map_err(IronCrewError::Lua)?;
+    if let Some((context, _)) = &snapshot {
+        lua.set_app_data(crate::lua::bootstrap::HttpConversationBootstrap);
+        crate::lua::snapshot_require::install_snapshot_require(&lua, context.clone())
+            .map_err(IronCrewError::Lua)?;
+    }
 
     // Optionally load config.lua and store the resulting table as a Lua global.
     // Crew.new() will shallow-merge missing keys from this table at call time.
-    if let Some(cfg_path) = loader.config_lua_path() {
-        let content = crate::lua::source::read_lua_source(&cfg_path)?;
+    let snapshot_config = snapshot
+        .as_ref()
+        .and_then(|(_, roles)| roles.config.as_ref());
+    let live_config = snapshot
+        .is_none()
+        .then(|| loader.config_lua_path())
+        .flatten();
+    if snapshot_config.is_some() || live_config.is_some() {
+        let cfg_path = snapshot_config
+            .map(|source| source.relative_path().to_path_buf())
+            .or(live_config)
+            .expect("checked config source");
+        let content = match snapshot_config {
+            Some(source) => source.shared_source(),
+            None => Arc::from(crate::lua::source::read_lua_source(&cfg_path)?),
+        };
         let table: mlua::Table = {
             let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
-            lua.load(&content)
+            lua.load(content.as_ref())
                 .set_name(format!("config:{}", cfg_path.display()))
                 .eval()
                 .map_err(|e| {
@@ -96,17 +157,34 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
     // Create provider
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let base_url = std::env::var("OPENAI_BASE_URL").ok();
+    if let Some(endpoint) = base_url.as_deref() {
+        crate::engine::conversation_provider::validate_provider_endpoint(endpoint)?;
+    }
     let provider = Box::new(OpenAiProvider::new(api_key, base_url));
 
     // Load declarative agents from agents/ directory
-    let preloaded_agents = load_agents_from_files(loader.agent_files())?;
+    let preloaded_agents = if let Some((_, roles)) = &snapshot {
+        crate::lua::parsers::load_agents_from_snapshot(&roles.agents)?
+    } else {
+        load_agents_from_files(loader.agent_files())?
+    };
     tracing::info!("Loaded {} agent(s) from files", preloaded_agents.len());
 
     // Load Lua tool definitions
-    let tool_defs = load_tool_defs_from_files(loader.tool_files())?;
+    let tool_defs = if let Some((_, roles)) = &snapshot {
+        crate::lua::parsers::load_tool_defs_from_snapshot(&roles.tools)?
+    } else {
+        load_tool_defs_from_files(loader.tool_files())?
+    };
 
     // Create runtime with built-in + Lua tools
-    let mut runtime = Runtime::new(provider, Some(loader.project_dir()));
+    let conversation_source = snapshot.as_ref().map(|(context, _)| context.clone());
+    let mut runtime = Runtime::new_with_conversation_source_and_execution_policy(
+        provider,
+        Some(loader.project_dir()),
+        conversation_source.clone(),
+        execution_policy,
+    );
     runtime.register_lua_tools(tool_defs)?;
     let runtime = Arc::new(runtime);
     // Propagate the weak self-ref into every registered LuaScriptTool so
@@ -122,6 +200,9 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
     lua.set_app_data(runtime.clone());
     lua.set_app_data(project_dir_arc.clone());
     lua.set_app_data(crate::lua::subflow::SubflowDepth(0));
+    if let Some(context) = conversation_source {
+        lua.set_app_data(context);
+    }
 
     // Register Crew.new() with preloaded agents auto-injected
     register_crew_constructor(
@@ -137,5 +218,9 @@ pub fn setup_crew_runtime(loader: &ProjectLoader) -> Result<(mlua::Lua, Arc<Runt
     // this before executing the entrypoint.
     set_ironcrew_mode(&lua, "run").map_err(IronCrewError::Lua)?;
 
-    Ok((lua, runtime))
+    let entrypoint = snapshot.map(|(_, roles)| roles.entrypoint);
+    Ok((lua, runtime, entrypoint))
 }
+
+#[cfg(test)]
+mod snapshot_tests;

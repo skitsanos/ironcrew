@@ -2,7 +2,9 @@
 //! `StateStore::count_conversations`, added with Phase-1 HITL support.
 
 use ironcrew::engine::run_history::JsonFileStore;
-use ironcrew::engine::sessions::ConversationRecord;
+use ironcrew::engine::sessions::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
 
@@ -31,10 +33,22 @@ fn conv(
         flow_name: "flow".into(),
         flow_path: flow_path.map(|s| s.into()),
         agent_name: "assistant".into(),
+        execution: conversation_execution(),
         messages,
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: updated_at.into(),
         revision: 0,
+    }
+}
+
+fn conversation_execution() -> ConversationExecution {
+    ConversationExecution {
+        schema_version: CONVERSATION_EXECUTION_SCHEMA_VERSION,
+        incarnation_id: "00000000-0000-4000-8000-000000000001".into(),
+        source_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        definition_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        max_history: 50,
+        history_max_bytes: 1024 * 1024,
     }
 }
 

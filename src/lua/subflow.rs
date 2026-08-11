@@ -27,24 +27,21 @@
 //!   Lua value in the caller's VM. Tables round-trip as tables, primitives
 //!   as primitives, everything else collapses to `nil`.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Value};
 
+use crate::engine::conversation_definition::ConversationSourceContext;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::runtime::Runtime;
 use crate::utils::error::IronCrewError;
 
-use super::api::{register_agent_constructor, register_crew_constructor};
-use super::json::{json_value_to_lua, lua_table_to_json};
+use super::json::{
+    json_value_to_lua_with_limits, lua_table_to_json_with_limits, lua_value_to_json_with_limits,
+};
 use super::limits::LuaExecutionGuard;
-use super::parsers::load_agents_from_files;
-use super::sandbox::create_crew_lua_with_lib_dirs;
-
-/// Default maximum recursive `run_flow` depth. Overridable via the
-/// `IRONCREW_MAX_FLOW_DEPTH` environment variable.
-const DEFAULT_MAX_FLOW_DEPTH: usize = 5;
+use super::subflow_setup::prepare_subflow;
 
 /// Newtype stashed in `Lua::app_data` to carry the current sub-flow nesting
 /// depth between VMs. Starts at `0` in the top-level VM and increments by one
@@ -61,6 +58,9 @@ pub struct SubflowContext {
     pub project_dir: Arc<PathBuf>,
     pub depth: usize,
     pub eventbus: Option<EventBus>,
+    /// Immutable source and lexical directory for HTTP conversations. `None`
+    /// preserves the ordinary filesystem-backed CLI/runtime behavior.
+    pub source_context: Option<ConversationSourceContext>,
     /// Optional `output_key` — when set, the return value is wrapped in a
     /// single-field table `{ [key] = <serialized sub-flow result> }`. Only
     /// the legacy `crew:subworkflow` API uses this; `run_flow` always passes
@@ -68,9 +68,7 @@ pub struct SubflowContext {
     pub output_key: Option<String>,
 }
 
-/// Resolve the max flow depth from the environment, falling back to
-/// `DEFAULT_MAX_FLOW_DEPTH`. Parsed on each call so tests can adjust the cap
-/// via `std::env::set_var` without restarting the process.
+/// Resolve the max flow depth used when a new runtime snapshots its policy.
 ///
 /// Public so `AgentAsTool` can share the same cap when guarding
 /// agent-as-tool delegation depth (see
@@ -78,51 +76,8 @@ pub struct SubflowContext {
 pub fn max_flow_depth() -> usize {
     std::env::var("IRONCREW_MAX_FLOW_DEPTH")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_FLOW_DEPTH)
-}
-
-/// Validate and canonicalize a sub-flow path against the caller's project
-/// directory. Returns the canonical absolute path or a validation error.
-fn validate_subflow_path(project_dir: &Path, path: &str) -> Result<PathBuf, IronCrewError> {
-    let flow_path = Path::new(path);
-    if flow_path.as_os_str().is_empty()
-        || flow_path.is_absolute()
-        || flow_path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
-                    | Component::CurDir
-            )
-        })
-    {
-        return Err(IronCrewError::Validation("Invalid subworkflow path".into()));
-    }
-
-    let candidate = project_dir.join(flow_path);
-    let base = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-    let canonical = candidate.canonicalize().map_err(|e| {
-        IronCrewError::Validation(format!("Failed to resolve subworkflow '{}': {}", path, e))
-    })?;
-
-    if !canonical.starts_with(&base) {
-        return Err(IronCrewError::Validation(
-            "Subworkflow path escapes project directory".into(),
-        ));
-    }
-
-    if !canonical.is_file() {
-        return Err(IronCrewError::Validation(format!(
-            "Subworkflow not found: {}",
-            canonical.display()
-        )));
-    }
-
-    Ok(canonical)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5)
 }
 
 /// Invoke a sub-flow. This is the shared implementation behind both
@@ -138,17 +93,18 @@ pub async fn invoke_subflow(
     ctx: &SubflowContext,
 ) -> LuaResult<Value> {
     // ── Depth cap ──────────────────────────────────────────────────────────
-    let cap = max_flow_depth();
+    let cap = ctx.runtime.tool_registry.max_flow_depth();
     if ctx.depth >= cap {
         return Err(mlua::Error::external(IronCrewError::Validation(format!(
             "run_flow depth exceeded: already at {} (limit {})",
             ctx.depth, cap
         ))));
     }
-
-    // ── Path validation ────────────────────────────────────────────────────
-    let flow_path =
-        validate_subflow_path(&ctx.project_dir, &path).map_err(mlua::Error::external)?;
+    let json_limits = ctx
+        .runtime
+        .lua_vm_policy()
+        .map_err(mlua::Error::external)?
+        .json_limits();
 
     let span = tracing::info_span!(
         "run_flow",
@@ -165,55 +121,25 @@ pub async fn invoke_subflow(
         });
     }
 
-    // ── Build the sub-flow VM ──────────────────────────────────────────────
-    // Compute the sub-flow's own directory first so its `_lib` (and its own
-    // `run_flow`) resolve against the sub-flow, not the parent.
-    let sub_dir = flow_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| ctx.project_dir.as_ref().clone());
-
-    let sub_lua =
-        create_crew_lua_with_lib_dirs(vec![sub_dir.join("_lib")]).map_err(mlua::Error::external)?;
-
-    let sub_project_dir_arc = Arc::new(sub_dir.clone());
-    sub_lua.set_app_data(ctx.runtime.clone());
-    sub_lua.set_app_data(sub_project_dir_arc.clone());
-    sub_lua.set_app_data(SubflowDepth(ctx.depth + 1));
-    if let Some(ref bus) = ctx.eventbus {
-        sub_lua.set_app_data(bus.clone());
-    }
-
-    register_agent_constructor(&sub_lua)?;
-
-    // Auto-load agents from `<sub_dir>/agents/` (mirrors top-level loader).
-    let agents_dir = sub_dir.join("agents");
-    let agent_files = if agents_dir.is_dir() {
-        std::fs::read_dir(&agents_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lua"))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let sub_agents = load_agents_from_files(&agent_files).map_err(mlua::Error::external)?;
-
-    register_crew_constructor(&sub_lua, ctx.runtime.clone(), sub_agents, sub_dir)?;
+    // Select one source branch. Conversation execution uses only captured
+    // bytes; ordinary CLI/runtime subflows retain the filesystem behavior.
+    let prepared = prepare_subflow(&path, ctx)?;
+    let sub_lua = prepared.lua;
 
     // ── Inject input ───────────────────────────────────────────────────────
     if let Some(ref json) = input_json {
-        let input_value = json_value_to_lua(&sub_lua, json)?;
+        let input_value = json_value_to_lua_with_limits(&sub_lua, json, json_limits)?;
         sub_lua.globals().set("input", input_value)?;
     }
 
     // ── Execute the sub-flow script ────────────────────────────────────────
-    let script = crate::lua::source::read_lua_source(&flow_path).map_err(mlua::Error::external)?;
     let sub_result: Value = {
         let _execution = LuaExecutionGuard::begin(&sub_lua)?;
-        sub_lua.load(&script).eval_async().await?
+        sub_lua
+            .load(prepared.script.as_ref())
+            .set_name(prepared.source_name)
+            .eval_async()
+            .await?
     };
 
     // ── Marshal the result back across VMs via JSON ───────────────────────
@@ -222,7 +148,7 @@ pub async fn invoke_subflow(
             let wrapper = lua.create_table()?;
             let json_str = match sub_result {
                 Value::Table(t) => {
-                    let json = lua_table_to_json(&t)?;
+                    let json = lua_table_to_json_with_limits(&t, json_limits)?;
                     serde_json::to_string(&json).map_err(|e| {
                         mlua::Error::external(IronCrewError::Validation(format!(
                             "Failed to serialize subworkflow output: {}",
@@ -238,8 +164,8 @@ pub async fn invoke_subflow(
         }
         None => match sub_result {
             Value::Table(t) => {
-                let json = lua_table_to_json(&t)?;
-                json_value_to_lua(lua, &json)?
+                let json = lua_table_to_json_with_limits(&t, json_limits)?;
+                json_value_to_lua_with_limits(lua, &json, json_limits)?
             }
             Value::String(s) => {
                 let s = s.to_str()?.to_string();
@@ -277,6 +203,7 @@ pub async fn invoke_subflow(
 pub fn register_run_flow(lua: &Lua) -> LuaResult<()> {
     let run_flow = lua.create_async_function(
         move |lua, (path, input): (String, Option<mlua::Value>)| async move {
+            crate::lua::bootstrap::reject_effect(&lua, "run_flow")?;
             // Pull everything out of app-data up front so the borrows drop
             // before we await — mlua's app_data_ref is a RefCell, not Send.
             let runtime = match lua.app_data_ref::<Arc<Runtime>>() {
@@ -297,12 +224,19 @@ pub fn register_run_flow(lua: &Lua) -> LuaResult<()> {
             };
             let depth = lua.app_data_ref::<SubflowDepth>().map(|d| d.0).unwrap_or(0);
             let eventbus = lua.app_data_ref::<EventBus>().map(|e| e.clone());
+            let source_context = lua
+                .app_data_ref::<ConversationSourceContext>()
+                .map(|context| context.clone());
+            let json_limits = runtime
+                .lua_vm_policy()
+                .map_err(mlua::Error::external)?
+                .json_limits();
 
             // Normalize the optional input arg into JSON.
             let input_json: Option<serde_json::Value> = match input {
-                Some(Value::Table(t)) => Some(lua_table_to_json(&t)?),
+                Some(Value::Table(t)) => Some(lua_table_to_json_with_limits(&t, json_limits)?),
                 Some(Value::Nil) | None => None,
-                Some(other) => Some(crate::lua::json::lua_value_to_json(other)?),
+                Some(other) => Some(lua_value_to_json_with_limits(other, json_limits)?),
             };
 
             let ctx = SubflowContext {
@@ -310,6 +244,7 @@ pub fn register_run_flow(lua: &Lua) -> LuaResult<()> {
                 project_dir,
                 depth,
                 eventbus,
+                source_context,
                 output_key: None,
             };
 

@@ -4,6 +4,17 @@ use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::conversation_json::{
+    preflight_conversation_execution_json, preflight_conversation_messages_json,
+};
+use super::conversation_record::{
+    HARD_STORED_CONVERSATION_EXECUTION_BYTES, HARD_STORED_CONVERSATION_MESSAGES,
+    HARD_STORED_CONVERSATION_MESSAGES_BYTES, HARD_STORED_CONVERSATION_METADATA_BYTES,
+    serialize_conversation_execution, serialize_conversation_messages,
+    validate_conversation_record_after_decode, validate_conversation_record_for_write,
+    validate_stored_conversation_envelope, validate_stored_conversation_messages_envelope,
+    validate_stored_conversation_metadata_bytes,
+};
 use super::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
@@ -25,6 +36,124 @@ use crate::utils::error::{IronCrewError, Result};
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     lease: RunLeaseConfig,
+}
+
+struct BoundedConversationRow {
+    id: String,
+    flow_name: Option<String>,
+    flow_name_bytes: i64,
+    flow_path: Option<String>,
+    flow_path_bytes: Option<i64>,
+    agent_name: Option<String>,
+    agent_name_bytes: i64,
+    execution: Option<String>,
+    execution_bytes: i64,
+    messages: Option<String>,
+    messages_bytes: i64,
+    message_count: Option<i64>,
+    created_at: Option<String>,
+    created_at_bytes: i64,
+    updated_at: Option<String>,
+    updated_at_bytes: i64,
+    revision: i64,
+}
+
+struct BoundedConversationSummaryRow {
+    id: Option<String>,
+    id_bytes: i64,
+    flow_path: Option<String>,
+    flow_path_bytes: Option<i64>,
+    agent_name: Option<String>,
+    agent_name_bytes: i64,
+    turn_count: i64,
+    messages_bytes: i64,
+    message_count: Option<i64>,
+    created_at: Option<String>,
+    created_at_bytes: i64,
+    updated_at: Option<String>,
+    updated_at_bytes: i64,
+}
+
+fn sqlite_stored_bytes(value: i64, label: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        IronCrewError::Validation(format!(
+            "SQLite stored conversation {label} has an invalid byte count"
+        ))
+    })
+}
+
+fn sqlite_bounded_metadata(value: Option<String>, bytes: i64, label: &str) -> Result<String> {
+    let bytes = sqlite_stored_bytes(bytes, label)?;
+    validate_stored_conversation_metadata_bytes(label, bytes)?;
+    value.ok_or_else(|| {
+        IronCrewError::Validation(format!(
+            "SQLite stored conversation {label} could not be materialized safely"
+        ))
+    })
+}
+
+fn sqlite_bounded_optional_metadata(
+    value: Option<String>,
+    bytes: Option<i64>,
+    label: &str,
+) -> Result<Option<String>> {
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    sqlite_bounded_metadata(value, bytes, label).map(Some)
+}
+
+fn sqlite_bounded_conversation_execution(
+    value: Option<String>,
+    bytes: i64,
+    column: usize,
+) -> Result<super::sessions::ConversationExecution> {
+    let bytes = sqlite_stored_bytes(bytes, "execution")?;
+    super::conversation_record::validate_stored_conversation_execution_bytes(bytes)?;
+    let value = value.ok_or_else(|| {
+        IronCrewError::Validation(
+            "SQLite stored conversation execution identity could not be materialized safely".into(),
+        )
+    })?;
+    preflight_conversation_execution_json(&value)?;
+    decode_stored_json(&value, column).map_err(|error| {
+        IronCrewError::Validation(format!(
+            "SQLite stored conversation execution identity has an invalid shape: {error}"
+        ))
+    })
+}
+
+fn sqlite_conversation_summary(row: BoundedConversationSummaryRow) -> Result<ConversationSummary> {
+    let messages_bytes = sqlite_stored_bytes(row.messages_bytes, "messages")?;
+    let message_count = row
+        .message_count
+        .map(|count| sqlite_stored_bytes(count, "message count"))
+        .transpose()?;
+    validate_stored_conversation_messages_envelope(messages_bytes, message_count)?;
+    let id = sqlite_bounded_metadata(row.id, row.id_bytes, "id")?;
+    validate_session_id(&id)?;
+    Ok(ConversationSummary {
+        id,
+        flow_path: sqlite_bounded_optional_metadata(
+            row.flow_path,
+            row.flow_path_bytes,
+            "flow path",
+        )?,
+        agent_name: sqlite_bounded_metadata(row.agent_name, row.agent_name_bytes, "agent name")?,
+        created_at: sqlite_bounded_metadata(
+            row.created_at,
+            row.created_at_bytes,
+            "created timestamp",
+        )?,
+        updated_at: sqlite_bounded_metadata(
+            row.updated_at,
+            row.updated_at_bytes,
+            "updated timestamp",
+        )?,
+        turn_count: usize::try_from(row.turn_count).map_err(|_| {
+            IronCrewError::Validation("SQLite conversation turn count is out of range".into())
+        })?,
+    })
 }
 
 /// Map the shared `SqlParam` values to boxed `rusqlite::ToSql` trait objects so
@@ -90,6 +219,7 @@ impl SqliteStore {
                 id TEXT PRIMARY KEY,
                 flow_name TEXT NOT NULL,
                 agent_name TEXT NOT NULL,
+                execution TEXT NOT NULL DEFAULT '{}',
                 messages TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -166,17 +296,20 @@ impl SqliteStore {
 
         // Idempotent ALTER TABLE migrations for schemas predating the
         // `flow_path` column. SQLite's ADD COLUMN is atomic and safe to
-        // retry; errors ("duplicate column name") are swallowed.
+        // retry; only the expected "duplicate column name" error is ignored.
         for sql in [
             "ALTER TABLE conversations ADD COLUMN flow_path TEXT",
+            "ALTER TABLE conversations ADD COLUMN execution TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE dialogs ADD COLUMN flow_path TEXT",
             "ALTER TABLE conversations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
         ] {
-            if let Err(e) = conn.execute(sql, []) {
-                let msg = e.to_string();
+            if let Err(error) = conn.execute(sql, []) {
+                let msg = error.to_string();
                 if !msg.contains("duplicate column") {
-                    tracing::debug!("SQLite ADD COLUMN skipped: {}", msg);
+                    return Err(IronCrewError::Validation(format!(
+                        "SQLite session column migration failed: {error}"
+                    )));
                 }
             }
         }
@@ -201,7 +334,6 @@ impl SqliteStore {
                 "SQLite idempotency principal index failed: {error}"
             ))
         })?;
-
         // Add the `flow` column to existing `runs` tables (flow-scoping the run
         // history). Detected via PRAGMA so we only ALTER when absent — mirrors
         // `migrate_sessions_to_composite_unique`'s "check first" style.
@@ -314,6 +446,7 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
              flow_name   TEXT NOT NULL,
              flow_path   TEXT,
              agent_name  TEXT NOT NULL,
+             execution   TEXT NOT NULL DEFAULT '{}',
              messages    TEXT NOT NULL,
              created_at  TEXT NOT NULL,
              updated_at  TEXT NOT NULL,
@@ -321,8 +454,8 @@ fn migrate_sessions_to_composite_unique(conn: &rusqlite::Connection) -> Result<(
              UNIQUE (flow_path, id)
          );
          INSERT OR IGNORE INTO conversations_new
-             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision)
-             SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision
+             (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision)
+             SELECT id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision
              FROM conversations;
          DROP TABLE conversations;
          ALTER TABLE conversations_new RENAME TO conversations;
@@ -382,11 +515,30 @@ fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError
     }
 }
 
-const IDEMPOTENCY_SELECT_COLUMNS: &str = "key_hash, request_fingerprint, operation, scope, resource_id, exclusive_scope, \
-     attempt_id, owner_instance_id, base_revision, state, response_status, response_body, \
-     lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds, principal_id";
+fn sqlite_idempotency_select_columns() -> String {
+    format!(
+        "key_hash, request_fingerprint, operation, scope, resource_id, exclusive_scope, \
+         attempt_id, owner_instance_id, base_revision, state, response_status, \
+         CASE WHEN response_body IS NULL OR length(CAST(response_body AS BLOB)) <= {limit} \
+              THEN response_body END AS response_body, \
+         lease_expires_at, created_at, updated_at, completed_at, expires_at, ttl_seconds, \
+         principal_id, COALESCE(length(CAST(response_body AS BLOB)), 0) AS response_body_bytes",
+        limit = super::idempotency::HARD_IDEMPOTENCY_RESPONSE_BYTES,
+    )
+}
 
 fn sqlite_idempotency_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdempotencyRecord> {
+    let response_body_bytes = usize::try_from(row.get::<_, i64>(19)?)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(19, i64::MIN))?;
+    if response_body_bytes > super::idempotency::HARD_IDEMPOTENCY_RESPONSE_BYTES {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            19,
+            rusqlite::types::Type::Integer,
+            Box::new(IronCrewError::Validation(
+                "Stored idempotency response body exceeds the hard byte limit".into(),
+            )),
+        ));
+    }
     let state_raw: String = row.get(9)?;
     let state = state_raw.parse::<IdempotencyState>().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
@@ -436,7 +588,8 @@ fn sqlite_idempotency_record(
     conn: &rusqlite::Connection,
     key_hash: &str,
 ) -> Result<Option<IdempotencyRecord>> {
-    let sql = format!("SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency WHERE key_hash = ?1");
+    let columns = sqlite_idempotency_select_columns();
+    let sql = format!("SELECT {columns} FROM idempotency WHERE key_hash = ?1");
     match conn.query_row(&sql, rusqlite::params![key_hash], sqlite_idempotency_row) {
         Ok(record) => {
             record.validate()?;
@@ -453,8 +606,9 @@ fn sqlite_active_exclusive_record(
     conn: &rusqlite::Connection,
     exclusive_scope: &str,
 ) -> Result<Option<IdempotencyRecord>> {
+    let columns = sqlite_idempotency_select_columns();
     let sql = format!(
-        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+        "SELECT {columns} FROM idempotency \
          WHERE exclusive_scope = ?1 AND state IN ('claimed', 'running')"
     );
     match conn.query_row(
@@ -477,8 +631,9 @@ fn sqlite_indeterminate_exclusive_records(
     conn: &rusqlite::Connection,
     exclusive_scope: &str,
 ) -> Result<Vec<IdempotencyRecord>> {
+    let columns = sqlite_idempotency_select_columns();
     let sql = format!(
-        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+        "SELECT {columns} FROM idempotency \
          WHERE exclusive_scope = ?1 AND state = 'indeterminate'"
     );
     let mut statement = conn.prepare(&sql).map_err(|error| {
@@ -917,8 +1072,9 @@ fn sqlite_reconcile_expired_conversation_idempotency(
     conn: &rusqlite::Connection,
     now: &str,
 ) -> Result<usize> {
+    let columns = sqlite_idempotency_select_columns();
     let sql = format!(
-        "SELECT {IDEMPOTENCY_SELECT_COLUMNS} FROM idempotency \
+        "SELECT {columns} FROM idempotency \
          WHERE operation = ?1 AND state IN ('claimed', 'running')"
     );
     let mut statement = conn.prepare(&sql).map_err(|error| {
@@ -1840,25 +1996,56 @@ impl StateStore for SqliteStore {
                             "Conversation idempotency claim has no base revision".into(),
                         )
                     })?;
-                    let current_revision = match tx.query_row(
-                        "SELECT revision FROM conversations \
+                    let current = match tx.query_row(
+                        "SELECT revision, \
+                                CASE WHEN length(CAST(execution AS BLOB)) <= ?3 THEN execution END, \
+                                length(CAST(execution AS BLOB)) \
+                         FROM conversations \
                          WHERE id = ?1 AND flow_path IS ?2",
-                        rusqlite::params![&claim.resource_id, &claim.scope],
-                        |row| row.get::<_, i64>(0),
+                        rusqlite::params![
+                            &claim.resource_id,
+                            &claim.scope,
+                            i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES)
+                                .unwrap_or(i64::MAX),
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
                     ) {
-                        Ok(revision) => u64::try_from(revision).map_err(|_| {
-                            IronCrewError::Validation(
-                                "SQLite conversation revision is negative".into(),
-                            )
-                        })?,
-                        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+                        Ok((revision, execution, execution_bytes)) => Some((
+                            u64::try_from(revision).map_err(|_| {
+                                IronCrewError::Validation(
+                                    "SQLite conversation revision is negative".into(),
+                                )
+                            })?,
+                            sqlite_bounded_conversation_execution(
+                                execution,
+                                execution_bytes,
+                                1,
+                            )?,
+                        )),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
                         Err(error) => {
                             return Err(IronCrewError::Validation(format!(
                                 "SQLite conversation idempotency revision query error: {error}"
                             )));
                         }
                     };
-                    if current_revision != expected_revision {
+                    let valid = current.as_ref().is_some_and(|(revision, execution)| {
+                        let expected_scope = super::sessions::conversation_mutation_scope(
+                            &claim.scope,
+                            &claim.resource_id,
+                            &execution.incarnation_id,
+                        );
+                        execution.validate().is_ok()
+                            && *revision == expected_revision
+                            && claim.exclusive_scope.as_deref() == Some(expected_scope.as_str())
+                    });
+                    if !valid {
                         tx.commit().map_err(|error| {
                             IronCrewError::Validation(format!(
                                 "SQLite conversation idempotency conflict commit error: {error}"
@@ -2357,11 +2544,11 @@ impl StateStore for SqliteStore {
     ) -> Result<ConversationIdempotencyCommit> {
         completion.validate()?;
         limits.validate()?;
-        validate_session_id(&conversation.id)?;
         let conn = Arc::clone(&self.conn);
         let conversation = conversation.clone();
         flatten_join(
             tokio::task::spawn_blocking(move || {
+                validate_conversation_record_for_write(&conversation)?;
                 let mut conn = conn
                     .lock()
                     .map_err(|error| IronCrewError::Validation(format!("SQLite lock error: {error}")))?;
@@ -2378,9 +2565,15 @@ impl StateStore for SqliteStore {
                     ));
                 };
                 sqlite_completion_fence(&record, &completion)?;
+                let expected_scope = super::sessions::conversation_mutation_scope(
+                    conversation.flow_path.as_deref().unwrap_or(""),
+                    &conversation.id,
+                    &conversation.execution.incarnation_id,
+                );
                 if record.operation != CONVERSATION_MESSAGE_OPERATION
                     || record.resource_id != conversation.id
                     || record.scope != conversation.flow_path.as_deref().unwrap_or("")
+                    || record.exclusive_scope.as_deref() != Some(expected_scope.as_str())
                 {
                     return Err(IronCrewError::Conflict(
                         "Idempotency claim does not match the conversation scope".into(),
@@ -2410,16 +2603,33 @@ impl StateStore for SqliteStore {
                     ));
                 }
 
-                let current_revision = match tx.query_row(
-                    "SELECT revision FROM conversations WHERE id = ?1 AND flow_path IS ?2",
-                    rusqlite::params![&conversation.id, &conversation.flow_path],
-                    |row| row.get::<_, i64>(0),
+                let current = match tx.query_row(
+                    "SELECT revision, \
+                            CASE WHEN length(CAST(execution AS BLOB)) <= ?3 THEN execution END, \
+                            length(CAST(execution AS BLOB)) \
+                     FROM conversations WHERE id = ?1 AND flow_path IS ?2",
+                    rusqlite::params![
+                        &conversation.id,
+                        &conversation.flow_path,
+                        i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES)
+                            .unwrap_or(i64::MAX),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 ) {
-                    Ok(value) => Some(u64::try_from(value).map_err(|_| {
-                        IronCrewError::Validation(
-                            "SQLite conversation revision is negative".into(),
-                        )
-                    })?),
+                    Ok((revision, execution, execution_bytes)) => Some((
+                        u64::try_from(revision).map_err(|_| {
+                            IronCrewError::Validation(
+                                "SQLite conversation revision is negative".into(),
+                            )
+                        })?,
+                        sqlite_bounded_conversation_execution(execution, execution_bytes, 1)?,
+                    )),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
                     Err(error) => {
                         return Err(IronCrewError::Validation(format!(
@@ -2427,9 +2637,9 @@ impl StateStore for SqliteStore {
                         )));
                     }
                 };
-                if current_revision.is_some() && current_revision != Some(expected_revision)
-                    || current_revision.is_none() && expected_revision != 0
-                {
+                if !current.as_ref().is_some_and(|(revision, execution)| {
+                    *revision == expected_revision && execution == &conversation.execution
+                }) {
                     return Err(IronCrewError::Conflict(format!(
                         "Conversation '{}' changed since revision {expected_revision}",
                         conversation.id
@@ -2438,20 +2648,19 @@ impl StateStore for SqliteStore {
                 let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
                     IronCrewError::Validation("Conversation revision overflow".into())
                 })?;
-                let messages = serde_json::to_string(&conversation.messages).map_err(|error| {
-                    IronCrewError::Validation(format!(
-                        "Failed to serialize conversation messages: {error}"
-                    ))
-                })?;
-                if current_revision.is_none() {
-                    tx.execute(
-                        "INSERT INTO conversations (id, flow_name, flow_path, agent_name, messages, \
-                         created_at, updated_at, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                let messages = serialize_conversation_messages(&conversation.messages)?;
+                let execution = serialize_conversation_execution(&conversation.execution)?;
+                let changed = tx
+                    .execute(
+                        "UPDATE conversations SET flow_name = ?3, agent_name = ?4, execution = ?5, messages = ?6, \
+                         created_at = ?7, updated_at = ?8, revision = ?9 \
+                         WHERE id = ?1 AND flow_path IS ?2 AND revision = ?10",
                         rusqlite::params![
                             &conversation.id,
-                            &conversation.flow_name,
                             &conversation.flow_path,
+                            &conversation.flow_name,
                             &conversation.agent_name,
+                            &execution,
                             &messages,
                             &conversation.created_at,
                             &conversation.updated_at,
@@ -2460,50 +2669,23 @@ impl StateStore for SqliteStore {
                                     "Conversation revision is out of range".into(),
                                 )
                             })?,
+                            i64::try_from(expected_revision).map_err(|_| {
+                                IronCrewError::Validation(
+                                    "Conversation revision is out of range".into(),
+                                )
+                            })?,
                         ],
                     )
                     .map_err(|error| {
                         IronCrewError::Validation(format!(
-                            "SQLite conversation idempotency insert error: {error}"
+                            "SQLite conversation idempotency update error: {error}"
                         ))
                     })?;
-                } else {
-                    let changed = tx
-                        .execute(
-                            "UPDATE conversations SET flow_name = ?3, agent_name = ?4, messages = ?5, \
-                             created_at = ?6, updated_at = ?7, revision = ?8 \
-                             WHERE id = ?1 AND flow_path IS ?2 AND revision = ?9",
-                            rusqlite::params![
-                                &conversation.id,
-                                &conversation.flow_path,
-                                &conversation.flow_name,
-                                &conversation.agent_name,
-                                &messages,
-                                &conversation.created_at,
-                                &conversation.updated_at,
-                                i64::try_from(next_revision).map_err(|_| {
-                                    IronCrewError::Validation(
-                                        "Conversation revision is out of range".into(),
-                                    )
-                                })?,
-                                i64::try_from(expected_revision).map_err(|_| {
-                                    IronCrewError::Validation(
-                                        "Conversation revision is out of range".into(),
-                                    )
-                                })?,
-                            ],
-                        )
-                        .map_err(|error| {
-                            IronCrewError::Validation(format!(
-                                "SQLite conversation idempotency update error: {error}"
-                            ))
-                        })?;
-                    if changed != 1 {
-                        return Err(IronCrewError::Conflict(format!(
-                            "Conversation '{}' changed during idempotent commit",
-                            conversation.id
-                        )));
-                    }
+                if changed != 1 {
+                    return Err(IronCrewError::Conflict(format!(
+                        "Conversation '{}' changed during idempotent commit",
+                        conversation.id
+                    )));
                 }
 
                 let (stored_bytes, principal_stored_bytes) = sqlite_response_bytes(
@@ -2797,7 +2979,6 @@ impl StateStore for SqliteStore {
     }
 
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
-        validate_session_id(&record.id)?;
         let conn = Arc::clone(&self.conn);
         let record = record.clone();
         let next_revision = record
@@ -2807,6 +2988,7 @@ impl StateStore for SqliteStore {
 
         flatten_join(
             tokio::task::spawn_blocking(move || {
+                validate_conversation_record_for_write(&record)?;
                 let mut conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
@@ -2830,15 +3012,31 @@ impl StateStore for SqliteStore {
                     )));
                 }
 
-                let messages_json = serde_json::to_string(&record.messages).map_err(|e| {
-                    IronCrewError::Validation(format!("Failed to serialize messages: {}", e))
-                })?;
-                let current_revision = match tx.query_row(
-                    "SELECT revision FROM conversations WHERE id = ?1 AND flow_path IS ?2",
-                    rusqlite::params![&record.id, &record.flow_path],
-                    |row| row.get::<_, i64>(0),
+                let messages_json = serialize_conversation_messages(&record.messages)?;
+                let execution_json = serialize_conversation_execution(&record.execution)?;
+                let current = match tx.query_row(
+                    "SELECT revision, \
+                            CASE WHEN length(CAST(execution AS BLOB)) <= ?3 THEN execution END, \
+                            length(CAST(execution AS BLOB)) \
+                     FROM conversations WHERE id = ?1 AND flow_path IS ?2",
+                    rusqlite::params![
+                        &record.id,
+                        &record.flow_path,
+                        i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES)
+                            .unwrap_or(i64::MAX),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 ) {
-                    Ok(value) => Some(value),
+                    Ok((revision, execution, execution_bytes)) => Some((
+                        revision,
+                        sqlite_bounded_conversation_execution(execution, execution_bytes, 1)?,
+                    )),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
                     Err(error) => {
                         return Err(IronCrewError::Validation(format!(
@@ -2852,17 +3050,18 @@ impl StateStore for SqliteStore {
                 let next_revision_i64 = i64::try_from(next_revision).map_err(|_| {
                     IronCrewError::Validation("Conversation revision is out of range".into())
                 })?;
-                match current_revision {
+                match current {
                     None if record.revision == 0 => {
                         tx.execute(
                             "INSERT INTO conversations \
-                             (id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                             (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             rusqlite::params![
                                 &record.id,
                                 &record.flow_name,
                                 &record.flow_path,
                                 &record.agent_name,
+                                &execution_json,
                                 &messages_json,
                                 &record.created_at,
                                 &record.updated_at,
@@ -2875,18 +3074,22 @@ impl StateStore for SqliteStore {
                             ))
                         })?;
                     }
-                    Some(current) if current == expected_revision => {
+                    Some((current_revision, current_execution))
+                        if current_revision == expected_revision
+                            && current_execution == record.execution =>
+                    {
                         let affected = tx
                             .execute(
                                 "UPDATE conversations SET \
-                                 flow_name = ?3, agent_name = ?4, messages = ?5, \
-                                 created_at = ?6, updated_at = ?7, revision = ?8 \
-                                 WHERE id = ?1 AND flow_path IS ?2 AND revision = ?9",
+                                 flow_name = ?3, agent_name = ?4, execution = ?5, messages = ?6, \
+                                 created_at = ?7, updated_at = ?8, revision = ?9 \
+                                 WHERE id = ?1 AND flow_path IS ?2 AND revision = ?10",
                                 rusqlite::params![
                                     &record.id,
                                     &record.flow_path,
                                     &record.flow_name,
                                     &record.agent_name,
+                                    &execution_json,
                                     &messages_json,
                                     &record.created_at,
                                     &record.updated_at,
@@ -2929,6 +3132,7 @@ impl StateStore for SqliteStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<ConversationRecord>> {
+        validate_session_id(id)?;
         let conn = Arc::clone(&self.conn);
         let flow_path = flow_path.map(|s| s.to_string());
         let id = id.to_string();
@@ -2943,28 +3147,74 @@ impl StateStore for SqliteStore {
                 // match. The SQL guards prevent cross-flow reads on the same id.
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id, flow_name, flow_path, agent_name, messages, created_at, updated_at, revision \
+                        "SELECT id, \
+                                CASE WHEN length(CAST(flow_name AS BLOB)) <= ?3 THEN flow_name END, \
+                                length(CAST(flow_name AS BLOB)), \
+                                CASE WHEN flow_path IS NULL OR length(CAST(flow_path AS BLOB)) <= ?3 THEN flow_path END, \
+                                length(CAST(flow_path AS BLOB)), \
+                                CASE WHEN length(CAST(agent_name AS BLOB)) <= ?3 THEN agent_name END, \
+                                length(CAST(agent_name AS BLOB)), \
+                                CASE WHEN length(CAST(execution AS BLOB)) <= ?4 THEN execution END, \
+                                length(CAST(execution AS BLOB)), \
+                                CASE \
+                                  WHEN length(CAST(messages AS BLOB)) <= ?5 \
+                                   AND CASE WHEN json_valid(messages) \
+                                            THEN CASE WHEN json_type(messages) = 'array' \
+                                                      THEN json_array_length(messages) <= ?6 \
+                                                      ELSE 0 END \
+                                            ELSE 0 END \
+                                  THEN messages \
+                                END, \
+                                length(CAST(messages AS BLOB)), \
+                                CASE WHEN json_valid(messages) \
+                                     THEN CASE WHEN json_type(messages) = 'array' \
+                                               THEN json_array_length(messages) END \
+                                END, \
+                                CASE WHEN length(CAST(created_at AS BLOB)) <= ?3 THEN created_at END, \
+                                length(CAST(created_at AS BLOB)), \
+                                CASE WHEN length(CAST(updated_at AS BLOB)) <= ?3 THEN updated_at END, \
+                                length(CAST(updated_at AS BLOB)), revision \
                          FROM conversations \
                          WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
 
                 let row = stmt
-                    .query_row(rusqlite::params![id, flow_path], |row| {
-                        let messages_json: String = row.get(4)?;
-                        Ok(ConversationRecord {
-                            id: row.get(0)?,
-                            flow_name: row.get(1)?,
-                            flow_path: row.get(2)?,
-                            agent_name: row.get(3)?,
-                            messages: decode_stored_json(&messages_json, 4)?,
-                            created_at: row.get(5)?,
-                            updated_at: row.get(6)?,
-                            revision: u64::try_from(row.get::<_, i64>(7)?).map_err(|_| {
-                                rusqlite::Error::IntegralValueOutOfRange(7, i64::MIN)
-                            })?,
-                        })
-                    })
+                    .query_row(
+                        rusqlite::params![
+                            id,
+                            flow_path,
+                            i64::try_from(HARD_STORED_CONVERSATION_METADATA_BYTES)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_MESSAGES_BYTES)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_MESSAGES)
+                                .unwrap_or(i64::MAX),
+                        ],
+                        |row| {
+                            Ok(BoundedConversationRow {
+                                id: row.get(0)?,
+                                flow_name: row.get(1)?,
+                                flow_name_bytes: row.get(2)?,
+                                flow_path: row.get(3)?,
+                                flow_path_bytes: row.get(4)?,
+                                agent_name: row.get(5)?,
+                                agent_name_bytes: row.get(6)?,
+                                execution: row.get(7)?,
+                                execution_bytes: row.get(8)?,
+                                messages: row.get(9)?,
+                                messages_bytes: row.get(10)?,
+                                message_count: row.get(11)?,
+                                created_at: row.get(12)?,
+                                created_at_bytes: row.get(13)?,
+                                updated_at: row.get(14)?,
+                                updated_at_bytes: row.get(15)?,
+                                revision: row.get(16)?,
+                            })
+                        },
+                    )
                     .map(Some)
                     .or_else(|e| match e {
                         rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -2973,7 +3223,78 @@ impl StateStore for SqliteStore {
                             other
                         ))),
                     })?;
-                Ok(row)
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let execution_bytes = sqlite_stored_bytes(row.execution_bytes, "execution")?;
+                let messages_bytes = sqlite_stored_bytes(row.messages_bytes, "messages")?;
+                let message_count = row
+                    .message_count
+                    .map(|count| sqlite_stored_bytes(count, "message count"))
+                    .transpose()?;
+                validate_stored_conversation_envelope(
+                    execution_bytes,
+                    messages_bytes,
+                    message_count,
+                )?;
+                let execution_json = row.execution.ok_or_else(|| {
+                    IronCrewError::Validation(
+                        "SQLite stored conversation execution identity could not be materialized safely"
+                            .into(),
+                    )
+                })?;
+                let messages_json = row.messages.ok_or_else(|| {
+                    IronCrewError::Validation(
+                        "SQLite stored conversation messages could not be materialized safely".into(),
+                    )
+                })?;
+                preflight_conversation_execution_json(&execution_json)?;
+                preflight_conversation_messages_json(&messages_json)?;
+                let record = ConversationRecord {
+                    id: row.id,
+                    flow_name: sqlite_bounded_metadata(
+                        row.flow_name,
+                        row.flow_name_bytes,
+                        "flow name",
+                    )?,
+                    flow_path: sqlite_bounded_optional_metadata(
+                        row.flow_path,
+                        row.flow_path_bytes,
+                        "flow path",
+                    )?,
+                    agent_name: sqlite_bounded_metadata(
+                        row.agent_name,
+                        row.agent_name_bytes,
+                        "agent name",
+                    )?,
+                    execution: decode_stored_json(&execution_json, 7).map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite stored conversation execution identity has an invalid shape: {error}"
+                        ))
+                    })?,
+                    messages: decode_stored_json(&messages_json, 9).map_err(|error| {
+                        IronCrewError::Validation(format!(
+                            "SQLite stored conversation messages have an invalid shape: {error}"
+                        ))
+                    })?,
+                    created_at: sqlite_bounded_metadata(
+                        row.created_at,
+                        row.created_at_bytes,
+                        "created timestamp",
+                    )?,
+                    updated_at: sqlite_bounded_metadata(
+                        row.updated_at,
+                        row.updated_at_bytes,
+                        "updated timestamp",
+                    )?,
+                    revision: u64::try_from(row.revision).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite stored conversation revision is negative".into(),
+                        )
+                    })?,
+                };
+                validate_conversation_record_after_decode(&record)?;
+                Ok(Some(record))
             })
             .await,
         )
@@ -3034,55 +3355,102 @@ impl StateStore for SqliteStore {
                 let conn = conn
                     .lock()
                     .map_err(|e| IronCrewError::Validation(format!("SQLite lock error: {}", e)))?;
-
-                let mut sql = String::from(
-                    "SELECT c.id, c.flow_path, c.agent_name, \
-                            (SELECT COUNT(*) FROM json_each(c.messages) AS message \
-                             WHERE json_extract(message.value, '$.role') = 'user') AS turn_count, \
-                            c.created_at, c.updated_at \
-                     FROM conversations AS c",
-                );
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                let mut next_idx = 1usize;
-
-                if let Some(fp) = flow_path {
-                    sql.push_str(&format!(" WHERE flow_path = ?{}", next_idx));
-                    params.push(Box::new(fp));
-                    next_idx += 1;
-                }
-                sql.push_str(" ORDER BY updated_at DESC");
-                if limit > 0 {
-                    sql.push_str(&format!(" LIMIT ?{}", next_idx));
-                    params.push(Box::new(limit as i64));
-                    next_idx += 1;
-                    if offset > 0 {
-                        sql.push_str(&format!(" OFFSET ?{}", next_idx));
-                        params.push(Box::new(offset as i64));
-                    }
-                }
-
-                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT \
+                           CASE WHEN length(CAST(c.id AS BLOB)) <= ?4 THEN c.id END, \
+                           length(CAST(c.id AS BLOB)), \
+                           CASE WHEN c.flow_path IS NULL OR length(CAST(c.flow_path AS BLOB)) <= ?4 \
+                                THEN c.flow_path END, \
+                           length(CAST(c.flow_path AS BLOB)), \
+                           CASE WHEN length(CAST(c.agent_name AS BLOB)) <= ?4 THEN c.agent_name END, \
+                           length(CAST(c.agent_name AS BLOB)), \
+                           (SELECT COUNT(*) FROM json_each( \
+                              CASE WHEN length(CAST(c.messages AS BLOB)) <= ?5 \
+                                THEN CASE WHEN json_valid(c.messages) \
+                                  THEN CASE WHEN json_type(c.messages) = 'array' \
+                                    THEN CASE WHEN json_array_length(c.messages) <= ?6 \
+                                      THEN c.messages ELSE '[]' END \
+                                    ELSE '[]' END \
+                                  ELSE '[]' END \
+                                ELSE '[]' END \
+                            ) AS message \
+                            WHERE CASE WHEN message.type = 'object' \
+                                       THEN json_extract(message.value, '$.role') END = 'user'), \
+                           length(CAST(c.messages AS BLOB)), \
+                           CASE WHEN json_valid(c.messages) \
+                                THEN CASE WHEN json_type(c.messages) = 'array' \
+                                          THEN json_array_length(c.messages) END END, \
+                           CASE WHEN length(CAST(c.created_at AS BLOB)) <= ?4 THEN c.created_at END, \
+                           length(CAST(c.created_at AS BLOB)), \
+                           CASE WHEN length(CAST(c.updated_at AS BLOB)) <= ?4 THEN c.updated_at END \
+                                AS bounded_updated_at, \
+                           length(CAST(c.updated_at AS BLOB)) \
+                         FROM conversations AS c \
+                         WHERE (?1 IS NULL OR c.flow_path = ?1) \
+                         ORDER BY bounded_updated_at DESC \
+                         LIMIT ?2 OFFSET ?3",
+                    )
+                    .map_err(|e| {
                     IronCrewError::Validation(format!("SQLite prepare error: {}", e))
                 })?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-
+                let limit = if limit == 0 {
+                    i64::MAX
+                } else {
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                };
                 let rows = stmt
-                    .query_map(param_refs.as_slice(), |row| {
-                        Ok(ConversationSummary {
-                            id: row.get(0)?,
-                            flow_path: row.get(1)?,
-                            agent_name: row.get(2)?,
-                            created_at: row.get(4)?,
-                            updated_at: row.get(5)?,
-                            turn_count: row.get::<_, i64>(3)? as usize,
-                        })
-                    })
-                    .map_err(|e| IronCrewError::Validation(format!("SQLite query error: {}", e)))?;
+                    .query_map(
+                        rusqlite::params![
+                            flow_path,
+                            limit,
+                            i64::try_from(offset).unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_METADATA_BYTES)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_MESSAGES_BYTES)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(HARD_STORED_CONVERSATION_MESSAGES)
+                                .unwrap_or(i64::MAX),
+                        ],
+                        |row| {
+                            Ok(BoundedConversationSummaryRow {
+                                id: row.get(0)?,
+                                id_bytes: row.get(1)?,
+                                flow_path: row.get(2)?,
+                                flow_path_bytes: row.get(3)?,
+                                agent_name: row.get(4)?,
+                                agent_name_bytes: row.get(5)?,
+                                turn_count: row.get(6)?,
+                                messages_bytes: row.get(7)?,
+                                message_count: row.get(8)?,
+                                created_at: row.get(9)?,
+                                created_at_bytes: row.get(10)?,
+                                updated_at: row.get(11)?,
+                                updated_at_bytes: row.get(12)?,
+                            })
+                        },
+                    )
+                    .map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite stored conversation summary is corrupt or exceeds hard limits"
+                                .into(),
+                        )
+                    })?;
 
                 let mut summaries = Vec::new();
-                for s in rows.flatten() {
-                    summaries.push(s);
+                for row in rows {
+                    let row = row.map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite stored conversation summary is corrupt or exceeds hard limits"
+                                .into(),
+                        )
+                    })?;
+                    summaries.push(sqlite_conversation_summary(row).map_err(|_| {
+                        IronCrewError::Validation(
+                            "SQLite stored conversation summary is corrupt or exceeds hard limits"
+                                .into(),
+                        )
+                    })?);
                 }
                 Ok(summaries)
             })

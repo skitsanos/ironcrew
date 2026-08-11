@@ -9,10 +9,9 @@ use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
-const MAX_TIMEOUT_SECS: u64 = 3_600;
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-const HARD_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+mod policy;
+use policy::{MAX_TIMEOUT_SECS, ShellPolicy};
+
 const HARD_MAX_COMMAND_BYTES: usize = 64 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -24,57 +23,7 @@ fn shell_error(message: impl Into<String>) -> IronCrewError {
     }
 }
 
-fn requested_timeout(args: &serde_json::Value) -> Result<Duration> {
-    if let Some(value) = args.get("timeout_secs") {
-        let seconds = value.as_u64().ok_or_else(|| {
-            shell_error(format!(
-                "'timeout_secs' must be a positive integer no greater than {MAX_TIMEOUT_SECS}"
-            ))
-        })?;
-        if !(1..=MAX_TIMEOUT_SECS).contains(&seconds) {
-            return Err(shell_error(format!(
-                "'timeout_secs' must be from 1 to {MAX_TIMEOUT_SECS}"
-            )));
-        }
-        return Ok(Duration::from_secs(seconds));
-    }
-
-    let seconds = match std::env::var("IRONCREW_SHELL_TIMEOUT_SECS") {
-        Ok(raw) => raw.parse::<u64>().map_err(|_| {
-            shell_error(format!(
-                "IRONCREW_SHELL_TIMEOUT_SECS must be an integer from 1 to {MAX_TIMEOUT_SECS}"
-            ))
-        })?,
-        Err(_) => DEFAULT_TIMEOUT_SECS,
-    };
-    if !(1..=MAX_TIMEOUT_SECS).contains(&seconds) {
-        return Err(shell_error(format!(
-            "IRONCREW_SHELL_TIMEOUT_SECS must be from 1 to {MAX_TIMEOUT_SECS}"
-        )));
-    }
-    Ok(Duration::from_secs(seconds))
-}
-
-fn max_output_bytes() -> Result<usize> {
-    let value = match std::env::var("IRONCREW_SHELL_MAX_OUTPUT_BYTES") {
-        Ok(raw) => raw.parse::<usize>().map_err(|_| {
-            shell_error(format!(
-                "IRONCREW_SHELL_MAX_OUTPUT_BYTES must be an integer from 1 to {HARD_MAX_OUTPUT_BYTES}"
-            ))
-        })?,
-        Err(_) => DEFAULT_MAX_OUTPUT_BYTES,
-    };
-    if !(1..=HARD_MAX_OUTPUT_BYTES).contains(&value) {
-        return Err(shell_error(format!(
-            "IRONCREW_SHELL_MAX_OUTPUT_BYTES must be from 1 to {HARD_MAX_OUTPUT_BYTES}"
-        )));
-    }
-    Ok(value)
-}
-
-/// Synchronous fallback cleanup for cancellation/drop paths. The shell is
-/// placed in its own process group, so killing the group also terminates any
-/// grandchildren that inherited stdout/stderr or outlived the shell process.
+/// Process-group cleanup for cancellation and drop paths.
 struct ProcessGroupGuard {
     #[cfg(unix)]
     pgid: Option<i32>,
@@ -117,9 +66,7 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Read from an async reader into a byte buffer until `max` bytes are
-/// collected. If `max` is reached, discard the rest of the stream and set
-/// `truncated` to true. Returns (bytes, truncated).
+/// Read at most `max` bytes while draining the stream to let the child exit.
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     max: usize,
@@ -146,7 +93,9 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     Ok((buf, truncated))
 }
 
-pub struct ShellTool;
+pub struct ShellTool {
+    policy: ShellPolicy,
+}
 
 impl Default for ShellTool {
     fn default() -> Self {
@@ -156,7 +105,16 @@ impl Default for ShellTool {
 
 impl ShellTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            policy: ShellPolicy::capture(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_policy_for_test(timeout_secs: u64, max_output_bytes: usize) -> Self {
+        Self {
+            policy: ShellPolicy::from_values(timeout_secs, max_output_bytes),
+        }
     }
 }
 
@@ -193,10 +151,18 @@ impl Tool for ShellTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "policy": self.policy.definition()?,
+        }))
+    }
+
     fn dispatch_timeout(&self, args: &serde_json::Value) -> Option<Duration> {
         // Let the shell's own timeout path terminate and reap the process group
         // before the generic dispatcher cancels this future.
-        requested_timeout(args)
+        self.policy
+            .requested_timeout(args)
             .ok()
             .and_then(|timeout| timeout.checked_add(READER_DRAIN_GRACE + TERMINATION_GRACE))
     }
@@ -211,10 +177,10 @@ impl Tool for ShellTool {
             )));
         }
 
-        let timeout = requested_timeout(&args)?;
+        let timeout = self.policy.requested_timeout(&args)?;
 
         // Cap each output stream independently (default 1 MB per stream).
-        let max_output = max_output_bytes()?;
+        let max_output = self.policy.max_output_bytes()?;
 
         let mut command_builder = Command::new("sh");
         command_builder
@@ -264,9 +230,7 @@ impl Tool for ShellTool {
             }
         };
 
-        // Always kill any background descendants left in the command's group.
-        // This also forces inherited stdout/stderr descriptors closed so output
-        // draining cannot hang indefinitely.
+        // Close descendant-held output descriptors before draining.
         process_group.kill_and_disarm();
 
         let reader_results = tokio::time::timeout(READER_DRAIN_GRACE, async {
@@ -339,11 +303,26 @@ mod tests {
 
     #[test]
     fn timeout_must_be_positive_and_capped() {
-        assert!(requested_timeout(&json!({"timeout_secs": 0})).is_err());
-        assert!(requested_timeout(&json!({"timeout_secs": MAX_TIMEOUT_SECS + 1})).is_err());
-        assert!(requested_timeout(&json!({"timeout_secs": 1.5})).is_err());
+        let policy = ShellPolicy::capture();
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": 0}))
+                .is_err()
+        );
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": MAX_TIMEOUT_SECS + 1}))
+                .is_err()
+        );
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": 1.5}))
+                .is_err()
+        );
         assert_eq!(
-            requested_timeout(&json!({"timeout_secs": 2})).unwrap(),
+            policy
+                .requested_timeout(&json!({"timeout_secs": 2}))
+                .unwrap(),
             Duration::from_secs(2)
         );
     }

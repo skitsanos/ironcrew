@@ -32,6 +32,8 @@ use super::{
     error_response, resolve_flow_path,
 };
 
+const READINESS_CHECK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone)]
 struct RunIdempotencyAttempt {
     key_hash: String,
@@ -391,11 +393,23 @@ pub async fn capabilities(
         EventJournalScope::SharedStore => "shared_store",
         EventJournalScope::ProcessLocal => "process",
     };
+    let (conversation_message_scope, conversation_sse_scope) =
+        match state.store.conversation_coordination_scope() {
+            crate::engine::store::ConversationCoordinationScope::SharedStore => {
+                ("shared_store_keyed", "unsupported_shared_store")
+            }
+            crate::engine::store::ConversationCoordinationScope::ProcessLocal => {
+                ("process", "process_no_cursor_replay")
+            }
+        };
     (
         headers,
         Json(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "instance_id": state.store.instance_id(),
+            "process_start_id": state.runtime_identity.process_start_id(),
+            "deployment": state.runtime_identity.deployment(),
+            "lifecycle_state": state.lifecycle.phase().as_str(),
             "topology": "single_executor",
             "control_scope": "process",
             "multi_replica_control": false,
@@ -406,8 +420,23 @@ pub async fn capabilities(
                 },
                 "human_input": human_input_scope,
                 "sse_replay": sse_replay_scope,
-                "conversations": "process",
+                "conversations": conversation_message_scope,
+                "conversation_sse": conversation_sse_scope,
             },
+        })),
+    )
+}
+
+fn lifecycle_not_ready(
+    lifecycle_phase: super::lifecycle::LifecyclePhase,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "status": "not_ready",
+            "component": "lifecycle",
+            "lifecycle_state": lifecycle_phase.as_str(),
+            "version": env!("CARGO_PKG_VERSION"),
         })),
     )
 }
@@ -418,18 +447,9 @@ pub async fn capabilities(
 pub async fn readiness(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !state
-        .accepting_traffic
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "status": "not_ready",
-                "component": "shutdown",
-                "version": env!("CARGO_PKG_VERSION"),
-            })),
-        );
+    let lifecycle_phase = state.lifecycle.phase();
+    if lifecycle_phase != super::lifecycle::LifecyclePhase::Accepting {
+        return lifecycle_not_ready(lifecycle_phase);
     }
 
     if state
@@ -461,7 +481,17 @@ pub async fn readiness(
         );
     }
 
-    let mut cache = match state.readiness_cache.try_lock() {
+    // Coalesce overlapping kubelet, router, and operator probes behind the
+    // single storage check. Returning 503 merely because another healthy
+    // probe owns this lock can flap a replacement pod after it first becomes
+    // Ready and leave a rolling deployment with no routable endpoint. The
+    // bounded wait still fails closed when the active check is genuinely slow.
+    let mut cache = match tokio::time::timeout(
+        READINESS_CHECK_WAIT_TIMEOUT,
+        state.readiness_cache.lock(),
+    )
+    .await
+    {
         Ok(cache) => cache,
         Err(_) => {
             return (
@@ -474,6 +504,13 @@ pub async fn readiness(
             );
         }
     };
+    // A probe can start while Accepting and then wait behind an in-flight
+    // storage check. Re-read the monotonic lifecycle after that wait so a
+    // drain that fenced the process in the meantime cannot publish Ready.
+    let lifecycle_phase = state.lifecycle.phase();
+    if lifecycle_phase != super::lifecycle::LifecyclePhase::Accepting {
+        return lifecycle_not_ready(lifecycle_phase);
+    }
     let cache_ttl = std::time::Duration::from_millis(positive_bounded_env(
         "IRONCREW_READINESS_CACHE_MS",
         1_000,
@@ -523,6 +560,14 @@ pub async fn readiness(
         }
     };
     *cache = Some(snapshot);
+
+    // The flows/store checks can also overlap a drain transition. Treat the
+    // lifecycle read here as the final readiness decision point rather than
+    // returning a stale healthy storage result after fencing has begun.
+    let lifecycle_phase = state.lifecycle.phase();
+    if lifecycle_phase != super::lifecycle::LifecyclePhase::Accepting {
+        return lifecycle_not_ready(lifecycle_phase);
+    }
 
     let status = if snapshot.ready {
         StatusCode::OK
@@ -662,6 +707,22 @@ fn run_location_store_error(error: IronCrewError) -> (StatusCode, Json<serde_jso
     )
 }
 
+fn run_owner_draining_error(
+    run_id: &str,
+    owner_instance_id: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "Run owner is draining and cannot accept control",
+            "code": "run_owner_draining",
+            "run_id": run_id,
+            "owner_instance_id": owner_instance_id,
+            "control_scope": "shared_store",
+        })),
+    )
+}
+
 async fn request_foreign_run_abort(
     state: &AppState,
     flow_slug: &str,
@@ -689,6 +750,9 @@ async fn request_foreign_run_abort(
             "status": status.to_string(),
             "terminal": true,
         }))),
+        RunCancellationRequest::OwnerDraining { owner_instance_id } => {
+            Err(run_owner_draining_error(run_id, owner_instance_id))
+        }
         RunCancellationRequest::NotFound => Err(structured_error(
             StatusCode::NOT_FOUND,
             format!("Run '{}' not found or already completed", run_id),
@@ -846,6 +910,9 @@ async fn persist_terminal_outcome(
         tags: terminal.tags.to_vec(),
     };
     if let Err(error) = store.save_run_intent(fallback).await {
+        if matches!(error, IronCrewError::OwnerDraining { .. }) {
+            return Err(error);
+        }
         return Err(IronCrewError::Validation(format!(
             "Failed to create fallback intent for terminal run '{}': {}",
             terminal.run_id, error
@@ -1065,10 +1132,7 @@ pub async fn run_flow(
         }
     };
 
-    if !state
-        .accepting_traffic
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server is shutting down".into(),
@@ -1301,10 +1365,7 @@ pub async fn run_flow(
     };
     let (work_handle, terminal_tx) = {
         let mut active_runs = state.active_runs.write().await;
-        if !state
-            .accepting_traffic
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !state.lifecycle.is_accepting_mutations() {
             drop(active_runs);
             release_run_idempotency(&state, idempotency_attempt.as_ref()).await;
             return Err(error_response(
@@ -1589,6 +1650,7 @@ pub async fn run_flow(
 
         let mut persistence_degraded = false;
         let mut retry_delay = std::time::Duration::from_millis(250);
+        let mut owner_drain_rejected_intent = false;
         let terminal_status = loop {
             match persist_terminal_outcome(
                 &state_clone.store,
@@ -1613,6 +1675,15 @@ pub async fn run_flow(
                         tracing::info!(run_id = %run_id_clone, "Terminal persistence recovered");
                     }
                     break status;
+                }
+                Err(IronCrewError::OwnerDraining { owner_instance_id }) => {
+                    owner_drain_rejected_intent = true;
+                    tracing::warn!(
+                        run_id = %run_id_clone,
+                        %owner_instance_id,
+                        "Run intent was fenced during drain before durable acceptance"
+                    );
+                    break RunStatus::Abandoned;
                 }
                 Err(error) => {
                     if let Some(released) = terminal_results.record_failure() {
@@ -1645,7 +1716,8 @@ pub async fn run_flow(
         };
 
         if let Some(attempt) = idempotency_for_monitor {
-            if matches!(fence_result, Some(RunFenceHeartbeat::Lost)) {
+            if owner_drain_rejected_intent || matches!(fence_result, Some(RunFenceHeartbeat::Lost))
+            {
                 mark_run_idempotency_indeterminate(&state_clone, &attempt).await;
             } else {
                 complete_run_idempotency(&state_clone, attempt).await;
@@ -1673,6 +1745,12 @@ pub async fn run_flow(
                 "Terminal run record is durable but its replay-journal event was not confirmed"
             );
         }
+        // The active-run tombstone is the sole replay-retention owner. Drop
+        // the monitor's clone before publishing terminal state so admission
+        // can reclaim a terminal bus immediately when capacity is needed.
+        // Otherwise rapid short runs accumulate one hidden replay buffer per
+        // sleeping monitor until IRONCREW_RUN_SSE_RETENTION_SECS elapses.
+        drop(eventbus);
         let _ = terminal_tx.send(true);
         drop(admission_permit);
 
@@ -2251,6 +2329,9 @@ pub async fn answer_question(
                         }),
                     ))
                 }
+                Ok(HumanInputAnswerOutcome::OwnerDraining { owner_instance_id }) => {
+                    Err(run_owner_draining_error(&run_id, owner_instance_id))
+                }
                 Ok(HumanInputAnswerOutcome::NotDurable) => Ok(human_input_response(
                     StatusCode::OK,
                     serde_json::json!({
@@ -2314,6 +2395,9 @@ pub async fn answer_question(
                     "control_scope": "shared_store",
                 }),
             )),
+            Ok(HumanInputAnswerOutcome::OwnerDraining { owner_instance_id }) => {
+                Err(run_owner_draining_error(&run_id, owner_instance_id))
+            }
             Ok(HumanInputAnswerOutcome::AlreadyAnswered) => Err(structured_error(
                 StatusCode::NOT_FOUND,
                 format!(
@@ -2439,18 +2523,6 @@ fn cursor_error_response(error: RunEventCursorError) -> (StatusCode, Json<serde_
             "code": code,
         })),
     )
-}
-
-fn hardened_sse_response(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store, no-transform"),
-    );
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-accel-buffering"),
-        axum::http::HeaderValue::from_static("no"),
-    );
-    response
 }
 
 enum JournalPageReadError {
@@ -2741,7 +2813,7 @@ pub async fn flow_events(
                     .text("keep-alive"),
             )
             .into_response();
-        return Ok(hardened_sse_response(response));
+        return Ok(super::sse::hardened_response(response));
     }
 
     if cursor.is_some() {
@@ -2844,7 +2916,7 @@ pub async fn flow_events(
                 .text("keep-alive"),
         )
         .into_response();
-    Ok(hardened_sse_response(response))
+    Ok(super::sse::hardened_response(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,7 +2948,7 @@ pub fn max_active_runs() -> usize {
     positive_bounded_env("IRONCREW_MAX_ACTIVE_RUNS", 4, 1024)
 }
 
-/// Global cap for long-lived run and conversation SSE connections.
+/// Process-wide cap for long-lived run and conversation SSE connections.
 pub fn max_sse_connections() -> usize {
     positive_bounded_env("IRONCREW_MAX_SSE_CONNECTIONS", 16, 1024)
 }

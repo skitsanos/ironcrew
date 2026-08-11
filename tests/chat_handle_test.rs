@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ironcrew::engine::run_history::JsonFileStore;
-use ironcrew::engine::sessions::ConversationRecord;
+use ironcrew::engine::sessions::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
 
@@ -37,6 +39,7 @@ async fn restart_after_eviction_rehydrates_from_store() {
         flow_name: "chat-cli".into(),
         flow_path: Some("chat-cli".into()),
         agent_name: "tutor".into(),
+        execution: conversation_execution(),
         messages: vec![
             ChatMessage::system("you are helpful"),
             ChatMessage::user("hi"),
@@ -61,21 +64,16 @@ async fn restart_after_eviction_rehydrates_from_store() {
 
 #[tokio::test]
 async fn session_cap_rejects_when_full() {
-    // Pure HashMap + cap arithmetic — this is exactly the check
-    // `start_conversation` performs under the write lock.
-    let cap: usize = 2;
-    let mut map: HashMap<(String, String), ()> = HashMap::new();
-    map.insert(("flow-a".into(), "s1".into()), ());
-    map.insert(("flow-a".into(), "s2".into()), ());
+    // The handler reserves an owned semaphore permit before constructing a
+    // new Lua VM, so concurrent starts cannot oversubscribe the process cap.
+    let permits = Arc::new(tokio::sync::Semaphore::new(2));
+    let first = permits.clone().try_acquire_owned().unwrap();
+    let second = permits.clone().try_acquire_owned().unwrap();
+    assert!(permits.clone().try_acquire_owned().is_err());
 
-    let new_key = ("flow-a".to_string(), "s3".to_string());
-    let rejected = map.len() >= cap && !map.contains_key(&new_key);
-    assert!(rejected, "new session should be rejected at cap");
-
-    // Reopening an already-active session is always allowed (idempotent).
-    let existing_key = ("flow-a".to_string(), "s1".to_string());
-    let rejected_reopen = map.len() >= cap && !map.contains_key(&existing_key);
-    assert!(!rejected_reopen, "reopening an existing session is allowed");
+    drop(first);
+    assert!(permits.clone().try_acquire_owned().is_ok());
+    drop(second);
 }
 
 #[tokio::test]
@@ -117,6 +115,7 @@ async fn capped_out_start_must_not_leak_persisted_record() {
         flow_name: "flow-a-goal".into(),
         flow_path: Some("flow-a".into()),
         agent_name: "tutor".into(),
+        execution: conversation_execution(),
         messages: vec![ChatMessage::system("sys")],
         created_at: "2026-04-18T00:00:00Z".into(),
         updated_at: "2026-04-18T00:00:00Z".into(),
@@ -129,6 +128,17 @@ async fn capped_out_start_must_not_leak_persisted_record() {
         .unwrap();
     assert_eq!(listed_after.len(), 1);
     assert_eq!(listed_after[0].id, "accepted");
+}
+
+fn conversation_execution() -> ConversationExecution {
+    ConversationExecution {
+        schema_version: CONVERSATION_EXECUTION_SCHEMA_VERSION,
+        incarnation_id: "00000000-0000-4000-8000-000000000001".into(),
+        source_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        definition_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        max_history: 50,
+        history_max_bytes: 1024 * 1024,
+    }
 }
 
 #[tokio::test]

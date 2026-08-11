@@ -55,6 +55,7 @@ pub struct AnthropicProvider {
     api_key: String,
     rate_limit: Option<RateLimiter>,
     config: AnthropicConfig,
+    execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
 impl AnthropicProvider {
@@ -66,11 +67,8 @@ impl AnthropicProvider {
         .build()
         .expect("Failed to build HTTP client");
 
-        let rate_limit = std::env::var("IRONCREW_RATE_LIMIT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(RateLimiter::new);
+        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
             client,
@@ -78,6 +76,7 @@ impl AnthropicProvider {
             api_key,
             rate_limit,
             config,
+            execution_policy,
         }
     }
 
@@ -296,15 +295,9 @@ impl AnthropicProvider {
 
         let status = resp.status();
         let response_limit = if status.is_success() {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_RESPONSE_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_RESPONSE_BYTES,
-            )
+            self.execution_policy.response_bytes()
         } else {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            )
+            self.execution_policy.error_bytes()
         };
         let bytes =
             crate::utils::http::read_response_bytes(resp, response_limit, "Anthropic response")
@@ -369,10 +362,7 @@ impl AnthropicProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let limit = crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            );
+            let limit = self.execution_policy.error_bytes();
             let bytes =
                 crate::utils::http::read_response_bytes(resp, limit, "Anthropic error response")
                     .await
@@ -393,10 +383,7 @@ impl AnthropicProvider {
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
-        let output_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_OUTPUT_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_OUTPUT_BYTES,
-        );
+        let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
         let mut block_states: HashMap<usize, BlockState> = HashMap::new();
         let mut input_tokens: u32 = 0;
@@ -406,10 +393,7 @@ impl AnthropicProvider {
         // Read SSE stream — Anthropic uses `event: <type>\ndata: <json>` format
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        let stream_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_STREAM_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_STREAM_BYTES,
-        );
+        let stream_limit = self.execution_policy.stream_bytes();
         let mut buffer =
             crate::utils::http::BoundedLineBuffer::new(stream_limit, "Anthropic stream");
         let mut current_event_type = String::new();
@@ -809,6 +793,29 @@ fn merge_consecutive_roles(messages: Vec<Value>) -> Vec<Value> {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn execution_fingerprint(&self) -> Result<String> {
+        let server_tools = self
+            .config
+            .server_tools
+            .iter()
+            .map(|tool| match tool {
+                ServerTool::WebSearch { max_uses } => {
+                    json!({"type": "web_search", "max_uses": max_uses})
+                }
+                ServerTool::CodeExecution => json!({"type": "code_execution"}),
+            })
+            .collect::<Vec<_>>();
+        crate::engine::conversation_provider::provider_execution_fingerprint(
+            "anthropic",
+            &self.base_url,
+            &json!({
+                "thinking_budget": self.config.thinking_budget,
+                "server_tools": server_tools,
+                "execution_policy": self.execution_policy.definition(),
+            }),
+        )
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         tracing::debug!(
             provider = "anthropic",

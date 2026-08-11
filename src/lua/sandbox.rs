@@ -6,8 +6,12 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::lua::api::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
-use crate::lua::limits::{LuaLimits, install_lua_limits};
+use crate::lua::json::{
+    json_value_to_lua_with_limits, lua_table_to_json_with_limits, lua_value_to_json_with_limits,
+};
+use crate::lua::json_policy::JsonLimits;
+use crate::lua::limits::install_lua_limits;
+use crate::tools::runtime_policy::LuaVmPolicy;
 
 // Regexes are cached per worker thread. Bound both the number and compiled
 // program size so a flow cannot turn distinct patterns into persistent pod RSS.
@@ -33,10 +37,6 @@ const DEFAULT_LUA_FS_MAX_BYTES: usize = 1024 * 1024;
 const HARD_LUA_FS_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LUA_HTTP_URL_BYTES: usize = 8 * 1024;
 const MAX_LUA_HTTP_REQUEST_HEADERS: usize = 128;
-const DEFAULT_LUA_HTTP_REQUEST_HEADER_BYTES: usize = 64 * 1024;
-const HARD_LUA_HTTP_REQUEST_HEADER_BYTES: usize = 1024 * 1024;
-const DEFAULT_LUA_HTTP_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
-const HARD_LUA_HTTP_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static REGEX_CACHE: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
@@ -403,12 +403,19 @@ fn lua_fs_limit(name: &str) -> LuaResult<usize> {
     Ok(value)
 }
 
-fn lua_http_request_limit(name: &str, default: usize, hard_max: usize) -> usize {
-    crate::utils::http::byte_limit_from_env(name, default).min(hard_max)
+/// Register utility global functions available in all Lua sandboxes.
+#[cfg(test)]
+pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
+    let policy = crate::tools::runtime_policy::RuntimeExecutionPolicy::capture()
+        .lua_vm_policy()
+        .map_err(mlua::Error::external)?;
+    register_lua_globals_with_policy(lua, policy)
 }
 
-/// Register utility global functions available in all Lua sandboxes.
-pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
+fn register_lua_globals_with_policy(lua: &Lua, vm_policy: LuaVmPolicy) -> LuaResult<()> {
+    let http_policy = vm_policy.http();
+    let json_limits = vm_policy.json_limits();
+    let env_policy = vm_policy.env();
     // env() — fail-closed allowlist. Lua can read ONLY the environment
     // variables whose exact names appear in IRONCREW_ENV_ALLOWLIST
     // (comma-separated, case-insensitive). Every other name returns nil.
@@ -420,7 +427,12 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // `_KEY`/`_CREDENTIALS`. An allowlist matches the fail-closed posture of
     // the rest of the sandbox: operators opt specific, non-secret vars in per
     // deployment (e.g. `IRONCREW_ENV_ALLOWLIST=APP_REGION,FEATURE_FLAGS`).
-    let env_fn = lua.create_function(|_, name: LuaString| {
+    let env_fn = lua.create_function(move |_, name: LuaString| {
+        if env_policy == crate::tools::runtime_policy::LuaEnvPolicy::PersistentConversationBlocked {
+            return Err(mlua::Error::external(
+                "env() is unavailable in persistent conversation tool and subflow execution",
+            ));
+        }
         let name = name.to_str()?;
         ensure_input_limit(&name, 256, "environment variable name")?;
         let value = crate::utils::env::read_allowlisted(name.as_ref());
@@ -449,17 +461,17 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     lua.globals().set("now_unix_ms", now_unix_ms_fn)?;
 
     // json_parse(str) -> Lua value
-    let json_parse_fn = lua.create_function(|lua, s: LuaString| {
+    let json_parse_fn = lua.create_function(move |lua, s: LuaString| {
         let s = s.to_str()?;
         ensure_input_limit(&s, MAX_LUA_JSON_INPUT_BYTES, "json_parse input")?;
         let value: serde_json::Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
-        json_value_to_lua(lua, &value)
+        json_value_to_lua_with_limits(lua, &value, json_limits)
     })?;
     lua.globals().set("json_parse", json_parse_fn)?;
 
     // json_stringify(value) -> JSON string
-    let json_stringify_fn = lua.create_function(|_, value: Value| {
-        let json = lua_value_to_json(value)?;
+    let json_stringify_fn = lua.create_function(move |_, value: Value| {
+        let json = lua_value_to_json_with_limits(value, json_limits)?;
         serialize_json_limited(&json)
     })?;
     lua.globals().set("json_stringify", json_stringify_fn)?;
@@ -721,13 +733,13 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     lua.globals().set("regex", regex_table)?;
 
     // validate_json(json_string, schema_table) -> {valid=bool, errors=table}
-    let validate_json_fn =
-        lua.create_function(|lua, (data_str, schema_table): (LuaString, mlua::Table)| {
+    let validate_json_fn = lua.create_function(
+        move |lua, (data_str, schema_table): (LuaString, mlua::Table)| {
             let data_str = data_str.to_str()?;
             ensure_input_limit(&data_str, MAX_LUA_JSON_INPUT_BYTES, "validate_json input")?;
             let data: serde_json::Value =
                 serde_json::from_str(&data_str).map_err(mlua::Error::external)?;
-            let schema = lua_table_to_json(&schema_table)?;
+            let schema = lua_table_to_json_with_limits(&schema_table, json_limits)?;
 
             let compiled = crate::tools::validate_schema::compile_local_draft7(&schema)
                 .map_err(|e| mlua::Error::external(format!("Invalid schema: {}", e)))?;
@@ -778,14 +790,15 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
             }
 
             Ok(result_table)
-        })?;
+        },
+    )?;
     lua.globals().set("validate_json", validate_json_fn)?;
 
     // template(template_string, data_table) -> rendered string
-    let template_fn = lua.create_function(|_, (tpl, data): (LuaString, mlua::Table)| {
+    let template_fn = lua.create_function(move |_, (tpl, data): (LuaString, mlua::Table)| {
         let tpl = tpl.to_str()?;
         ensure_input_limit(&tpl, MAX_LUA_TEMPLATE_BYTES, "template source")?;
-        let json_data = lua_table_to_json(&data)?;
+        let json_data = lua_table_to_json_with_limits(&data, json_limits)?;
         let mut tera = tera::Tera::default();
         tera.add_raw_template("inline", &tpl)
             .map_err(|e| mlua::Error::external(format!("Template error: {}", e)))?;
@@ -807,77 +820,91 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
     // http namespace — async HTTP client for Lua scripts
     let http_table = lua.create_table()?;
 
-    // Shared reqwest client (singleton) for all http.* calls
-    let client = crate::tools::http_request::SHARED_HTTP_CLIENT.clone();
+    let client = crate::tools::http_request::client_for_policy(&http_policy);
 
     // http.get(url, options?) -> {status, headers, body}
     let client_get = client.clone();
+    let policy_get = http_policy.clone();
     let http_get =
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_get.clone();
+            let policy = policy_get.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "http.get")?;
                 let mut req = client.get(&url);
-                req = apply_http_options(req, &options)?;
-                validate_lua_url(&url)?;
-                execute_http_request(lua, req).await
+                req = apply_http_options(req, &options, &policy)?;
+                validate_lua_url(&url, &policy)?;
+                execute_http_request(lua, req, &policy, json_limits).await
             }
         })?;
     http_table.set("get", http_get)?;
 
     // http.post(url, options?) -> {status, headers, body}
     let client_post = client.clone();
+    let policy_post = http_policy.clone();
     let http_post =
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_post.clone();
+            let policy = policy_post.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "http.post")?;
                 let mut req = client.post(&url);
-                req = apply_http_options(req, &options)?;
+                req = apply_http_options(req, &options, &policy)?;
                 if let Some(ref opts) = options {
-                    req = apply_http_body(req, opts)?;
+                    req = apply_http_body(req, opts, &policy, json_limits)?;
                 }
-                validate_lua_url(&url)?;
-                execute_http_request(lua, req).await
+                validate_lua_url(&url, &policy)?;
+                execute_http_request(lua, req, &policy, json_limits).await
             }
         })?;
     http_table.set("post", http_post)?;
 
     // http.put(url, options?) -> {status, headers, body}
     let client_put = client.clone();
+    let policy_put = http_policy.clone();
     let http_put =
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_put.clone();
+            let policy = policy_put.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "http.put")?;
                 let mut req = client.put(&url);
-                req = apply_http_options(req, &options)?;
+                req = apply_http_options(req, &options, &policy)?;
                 if let Some(ref opts) = options {
-                    req = apply_http_body(req, opts)?;
+                    req = apply_http_body(req, opts, &policy, json_limits)?;
                 }
-                validate_lua_url(&url)?;
-                execute_http_request(lua, req).await
+                validate_lua_url(&url, &policy)?;
+                execute_http_request(lua, req, &policy, json_limits).await
             }
         })?;
     http_table.set("put", http_put)?;
 
     // http.delete(url, options?) -> {status, headers, body}
     let client_delete = client.clone();
+    let policy_delete = http_policy.clone();
     let http_delete =
         lua.create_async_function(move |lua, (url, options): (String, Option<mlua::Table>)| {
             let client = client_delete.clone();
+            let policy = policy_delete.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "http.delete")?;
                 let mut req = client.delete(&url);
-                req = apply_http_options(req, &options)?;
-                validate_lua_url(&url)?;
-                execute_http_request(lua, req).await
+                req = apply_http_options(req, &options, &policy)?;
+                validate_lua_url(&url, &policy)?;
+                execute_http_request(lua, req, &policy, json_limits).await
             }
         })?;
     http_table.set("delete", http_delete)?;
 
     // http.request(method, url, options?) -> {status, headers, body}
     let client_any = client;
+    let policy_any = http_policy;
     let http_request = lua.create_async_function(
         move |lua, (method, url, options): (String, String, Option<mlua::Table>)| {
             let client = client_any.clone();
+            let policy = policy_any.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "http.request")?;
                 let mut req = match method.to_uppercase().as_str() {
                     "GET" => client.get(&url),
                     "POST" => client.post(&url),
@@ -892,12 +919,12 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
                         )));
                     }
                 };
-                req = apply_http_options(req, &options)?;
+                req = apply_http_options(req, &options, &policy)?;
                 if let Some(ref opts) = options {
-                    req = apply_http_body(req, opts)?;
+                    req = apply_http_body(req, opts, &policy, json_limits)?;
                 }
-                validate_lua_url(&url)?;
-                execute_http_request(lua, req).await
+                validate_lua_url(&url, &policy)?;
+                execute_http_request(lua, req, &policy, json_limits).await
             }
         },
     )?;
@@ -918,6 +945,7 @@ pub fn register_lua_globals(lua: &Lua) -> LuaResult<()> {
 fn apply_http_options(
     mut req: reqwest::RequestBuilder,
     options: &Option<mlua::Table>,
+    policy: &crate::tools::http_request::HttpToolPolicy,
 ) -> mlua::Result<reqwest::RequestBuilder> {
     if let Some(opts) = options {
         // Headers
@@ -926,11 +954,7 @@ fn apply_http_options(
             let mlua::Value::Table(headers) = headers_value else {
                 return Err(mlua::Error::external("HTTP headers must be a table"));
             };
-            let byte_limit = lua_http_request_limit(
-                "IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES",
-                DEFAULT_LUA_HTTP_REQUEST_HEADER_BYTES,
-                HARD_LUA_HTTP_REQUEST_HEADER_BYTES,
-            );
+            let byte_limit = policy.request_header_bytes();
             let mut count = 0usize;
             let mut bytes = 0usize;
             for pair in headers.pairs::<mlua::Value, mlua::Value>() {
@@ -996,6 +1020,8 @@ fn apply_http_options(
 fn apply_http_body(
     mut req: reqwest::RequestBuilder,
     opts: &mlua::Table,
+    policy: &crate::tools::http_request::HttpToolPolicy,
+    json_limits: JsonLimits,
 ) -> mlua::Result<reqwest::RequestBuilder> {
     let body_value = opts.raw_get::<mlua::Value>("body")?;
     let json_value = opts.raw_get::<mlua::Value>("json")?;
@@ -1004,11 +1030,7 @@ fn apply_http_body(
             "HTTP options must provide only one of body or json",
         ));
     }
-    let body_limit = lua_http_request_limit(
-        "IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES",
-        DEFAULT_LUA_HTTP_REQUEST_BODY_BYTES,
-        HARD_LUA_HTTP_REQUEST_BODY_BYTES,
-    );
+    let body_limit = policy.request_body_bytes();
     match body_value {
         mlua::Value::Nil => {}
         mlua::Value::String(body) => {
@@ -1028,7 +1050,7 @@ fn apply_http_body(
     match json_value {
         mlua::Value::Nil => {}
         mlua::Value::Table(json_table) => {
-            let json_value = lua_table_to_json(&json_table)?;
+            let json_value = lua_table_to_json_with_limits(&json_table, json_limits)?;
             let json_string = crate::utils::http::to_json_pretty_limited(&json_value, body_limit)
                 .map_err(|error| {
                 mlua::Error::external(format!(
@@ -1045,25 +1067,34 @@ fn apply_http_body(
 }
 
 /// Validate a URL for SSRF before making a request from Lua.
-fn validate_lua_url(url: &str) -> mlua::Result<()> {
+fn validate_lua_url(
+    url: &str,
+    policy: &crate::tools::http_request::HttpToolPolicy,
+) -> mlua::Result<()> {
     if url.len() > MAX_LUA_HTTP_URL_BYTES {
         return Err(mlua::Error::external(format!(
             "HTTP URL exceeds the {MAX_LUA_HTTP_URL_BYTES}-byte hard limit"
         )));
     }
-    crate::utils::network::validate_url_not_private(url)
-        .map_err(|e| mlua::Error::external(format!("SSRF blocked: {}", e)))
+    crate::utils::network::validate_url_with_private_access(
+        url,
+        crate::utils::network::OutboundNetworkPolicy::PublicOnly,
+        policy.allow_private(),
+    )
+    .map_err(|e| mlua::Error::external(format!("SSRF blocked: {}", e)))
 }
 
 /// Execute an HTTP request and return the result as a Lua table.
-async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::Result<mlua::Table> {
+async fn execute_http_request(
+    lua: Lua,
+    req: reqwest::RequestBuilder,
+    policy: &crate::tools::http_request::HttpToolPolicy,
+    json_limits: JsonLimits,
+) -> mlua::Result<mlua::Table> {
     let resp = req.send().await.map_err(mlua::Error::external)?;
 
     let status = resp.status().as_u16();
-    let max_header_bytes = crate::utils::http::byte_limit_from_env(
-        "IRONCREW_HTTP_MAX_HEADER_BYTES",
-        crate::utils::http::DEFAULT_HTTP_HEADER_BYTES,
-    );
+    let max_header_bytes = policy.response_header_bytes();
     let headers = crate::utils::http::collect_response_headers(
         resp.headers(),
         max_header_bytes,
@@ -1075,11 +1106,7 @@ async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::R
         headers_table.set(key, value)?;
     }
 
-    let max_response_size = crate::utils::http::byte_limit_from_env_with_legacy(
-        "IRONCREW_HTTP_MAX_RESPONSE_BYTES",
-        "IRONCREW_MAX_RESPONSE_SIZE",
-        crate::utils::http::DEFAULT_HTTP_TOOL_RESPONSE_BYTES,
-    );
+    let max_response_size = policy.response_bytes();
     let body_bytes =
         crate::utils::http::read_response_bytes(resp, max_response_size, "Lua HTTP response")
             .await
@@ -1092,14 +1119,11 @@ async fn execute_http_request(lua: Lua, req: reqwest::RequestBuilder) -> mlua::R
     // Converting JSON into both serde and Lua trees amplifies memory beyond the
     // raw body. Keep the convenience field for bounded responses only; callers
     // always retain the body string.
-    let max_json_bytes = crate::utils::http::byte_limit_from_env(
-        "IRONCREW_HTTP_MAX_JSON_BYTES",
-        crate::utils::http::DEFAULT_HTTP_JSON_PARSE_BYTES,
-    );
+    let max_json_bytes = policy.json_bytes();
     let json_value = if body_text.len() <= max_json_bytes {
         serde_json::from_str::<serde_json::Value>(&body_text)
             .ok()
-            .map(|value| json_value_to_lua(&lua, &value))
+            .map(|value| json_value_to_lua_with_limits(&lua, &value, json_limits))
             .transpose()?
     } else {
         None
@@ -1130,11 +1154,21 @@ pub fn create_crew_lua() -> LuaResult<Lua> {
 /// (typically `<flow-dir>/_lib`). When `lib_dirs` is empty, `require` is not
 /// installed.
 pub fn create_crew_lua_with_lib_dirs(lib_dirs: Vec<PathBuf>) -> LuaResult<Lua> {
+    let policy = crate::tools::runtime_policy::RuntimeExecutionPolicy::capture()
+        .lua_vm_policy()
+        .map_err(mlua::Error::external)?;
+    create_crew_lua_with_policy(lib_dirs, policy)
+}
+
+pub(crate) fn create_crew_lua_with_policy(
+    lib_dirs: Vec<PathBuf>,
+    vm_policy: LuaVmPolicy,
+) -> LuaResult<Lua> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::COROUTINE | StdLib::OS,
         mlua::LuaOptions::default(),
     )?;
-    install_lua_limits(&lua, LuaLimits::from_env()?)?;
+    install_lua_limits(&lua, vm_policy.limits())?;
 
     // Block dangerous os functions, keep os.clock and os.time
     lua.load(
@@ -1159,7 +1193,7 @@ pub fn create_crew_lua_with_lib_dirs(lib_dirs: Vec<PathBuf>) -> LuaResult<Lua> {
     )
     .exec()?;
 
-    register_lua_globals(&lua)?;
+    register_lua_globals_with_policy(&lua, vm_policy)?;
     crate::lua::require::install_require(&lua, lib_dirs)?;
 
     Ok(lua)
@@ -1182,11 +1216,53 @@ pub fn create_tool_lua_with_fs_roots(
     read_base_dir: Option<PathBuf>,
     write_base_dir: Option<PathBuf>,
 ) -> LuaResult<Lua> {
+    let (read_limit, write_limit) = if read_base_dir.is_some() || write_base_dir.is_some() {
+        (
+            lua_fs_limit("IRONCREW_LUA_FS_MAX_READ_BYTES")?,
+            lua_fs_limit("IRONCREW_LUA_FS_MAX_WRITE_BYTES")?,
+        )
+    } else {
+        (DEFAULT_LUA_FS_MAX_BYTES, DEFAULT_LUA_FS_MAX_BYTES)
+    };
+    create_tool_lua_with_fs_policy(read_base_dir, write_base_dir, read_limit, write_limit)
+}
+
+pub(crate) fn create_tool_lua_with_fs_policy(
+    read_base_dir: Option<PathBuf>,
+    write_base_dir: Option<PathBuf>,
+    read_limit: usize,
+    write_limit: usize,
+) -> LuaResult<Lua> {
+    create_tool_lua_with_execution_policy(
+        read_base_dir,
+        write_base_dir,
+        read_limit,
+        write_limit,
+        crate::tools::runtime_policy::RuntimeExecutionPolicy::capture()
+            .lua_vm_policy()
+            .map_err(mlua::Error::external)?,
+    )
+}
+
+pub(crate) fn create_tool_lua_with_execution_policy(
+    read_base_dir: Option<PathBuf>,
+    write_base_dir: Option<PathBuf>,
+    read_limit: usize,
+    write_limit: usize,
+    vm_policy: LuaVmPolicy,
+) -> LuaResult<Lua> {
+    if !(1..=HARD_LUA_FS_MAX_BYTES).contains(&read_limit)
+        || !(1..=HARD_LUA_FS_MAX_BYTES).contains(&write_limit)
+    {
+        return Err(mlua::Error::external(
+            "Lua filesystem policy is outside its hard bounds",
+        ));
+    }
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH,
         mlua::LuaOptions::default(),
     )?;
-    install_lua_limits(&lua, LuaLimits::from_env()?)?;
+    install_lua_limits(&lua, vm_policy.limits())?;
 
     // Remove any potentially dangerous globals
     lua.load(
@@ -1200,12 +1276,10 @@ pub fn create_tool_lua_with_fs_roots(
     )
     .exec()?;
 
-    register_lua_globals(&lua)?;
+    register_lua_globals_with_policy(&lua, vm_policy)?;
 
     if read_base_dir.is_some() || write_base_dir.is_some() {
         let fs_table = lua.create_table()?;
-        let read_limit = lua_fs_limit("IRONCREW_LUA_FS_MAX_READ_BYTES")?;
-        let write_limit = lua_fs_limit("IRONCREW_LUA_FS_MAX_WRITE_BYTES")?;
 
         if let Some(read_base_dir) = read_base_dir {
             let read_root = crate::tools::project_fs::open_root(Some(&read_base_dir))
@@ -1227,7 +1301,8 @@ pub fn create_tool_lua_with_fs_roots(
             let write_root = crate::tools::project_fs::open_root(Some(&write_base_dir))
                 .map_err(mlua::Error::external)?;
             let fs_write =
-                lua.create_function(move |_, (path, content): (String, mlua::LuaString)| {
+                lua.create_function(move |lua, (path, content): (String, mlua::LuaString)| {
+                    crate::lua::bootstrap::reject_effect(lua, "fs.write")?;
                     let path = Path::new(&path);
                     crate::tools::project_fs::validate_agent_write_path(path)
                         .map_err(mlua::Error::external)?;

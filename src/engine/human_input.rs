@@ -139,9 +139,10 @@ impl fmt::Debug for DurableHumanInputQuestion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HumanInputRegistrationOutcome {
     Registered,
+    OwnerDraining { owner_instance_id: String },
     NotDurable,
 }
 
@@ -157,6 +158,7 @@ pub enum HumanInputListOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HumanInputAnswerOutcome {
     Queued { owner_instance_id: String },
+    OwnerDraining { owner_instance_id: String },
     AlreadyAnswered,
     NotFound,
     NotDurable,
@@ -387,8 +389,36 @@ impl HumanInputKeyring {
         &self.active_key().fingerprint
     }
 
+    pub(crate) fn fingerprints(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys.iter().map(|key| key.fingerprint.as_str())
+    }
+
     pub fn seal_json(&self, aad: &HumanInputAad, answer: &Value) -> Result<EncryptedHumanInput> {
-        self.seal_serialized(
+        self.seal_serialized_with_key(
+            self.active_key(),
+            aad,
+            answer,
+            configured_max_answer_bytes(),
+            "human-input answer",
+            AAD_PURPOSE_ANSWER,
+        )
+    }
+
+    /// Encrypt an answer with the key that encrypted its retained question.
+    ///
+    /// During a staged rotation, replicas may intentionally select different
+    /// active keys while every replica still carries the complete overlap
+    /// keyring. Keeping the answer on the question's key guarantees that the
+    /// owning process can consume it even when a newer peer accepts it.
+    pub(crate) fn seal_json_for_fingerprint(
+        &self,
+        aad: &HumanInputAad,
+        answer: &Value,
+        key_fingerprint: &str,
+    ) -> Result<EncryptedHumanInput> {
+        let key = self.key_for_fingerprint(key_fingerprint)?;
+        self.seal_serialized_with_key(
+            key,
             aad,
             answer,
             configured_max_answer_bytes(),
@@ -408,7 +438,8 @@ impl HumanInputKeyring {
                 "human-input question metadata does not match its authenticated digest".into(),
             ));
         }
-        self.seal_serialized(
+        self.seal_serialized_with_key(
+            self.active_key(),
             aad,
             question,
             HARD_MAX_QUESTION_METADATA_BYTES,
@@ -417,16 +448,16 @@ impl HumanInputKeyring {
         )
     }
 
-    fn seal_serialized<T: Serialize>(
+    fn seal_serialized_with_key<T: Serialize>(
         &self,
+        key: &HumanInputKey,
         aad: &HumanInputAad,
         payload: &T,
         max_plaintext_bytes: usize,
         payload_name: &str,
         purpose: &[u8],
     ) -> Result<EncryptedHumanInput> {
-        let active_key = self.active_key();
-        let associated_data = aad.encode(&active_key.fingerprint, purpose)?;
+        let associated_data = aad.encode(&key.fingerprint, purpose)?;
         let mut plaintext = Zeroizing::new(serialize_bounded(
             payload,
             max_plaintext_bytes,
@@ -437,7 +468,7 @@ impl HumanInputKeyring {
             IronCrewError::Validation("secure human-input nonce generation failed".into())
         })?;
 
-        let sealing_key = aead_key(&active_key.material)?;
+        let sealing_key = aead_key(&key.material)?;
         if sealing_key
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce_bytes),
@@ -452,7 +483,7 @@ impl HumanInputKeyring {
         }
 
         Ok(EncryptedHumanInput {
-            key_fingerprint: active_key.fingerprint.clone(),
+            key_fingerprint: key.fingerprint.clone(),
             nonce: nonce_bytes.to_vec(),
             ciphertext: std::mem::take(&mut *plaintext),
         })
@@ -514,16 +545,7 @@ impl HumanInputKeyring {
             return Err(authentication_error());
         }
 
-        let key = self
-            .inner
-            .keys
-            .iter()
-            .find(|key| key.fingerprint == key_fingerprint)
-            .ok_or_else(|| {
-                IronCrewError::Conflict(format!(
-                    "human-input encryption key fingerprint '{key_fingerprint}' is unavailable"
-                ))
-            })?;
+        let key = self.key_for_fingerprint(key_fingerprint)?;
         let associated_data = aad.encode(key_fingerprint, purpose)?;
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
         nonce_bytes.copy_from_slice(nonce);
@@ -552,6 +574,19 @@ impl HumanInputKeyring {
             .iter()
             .find(|key| key.id == self.inner.active_key_id)
             .expect("validated keyring must contain its active key")
+    }
+
+    fn key_for_fingerprint(&self, key_fingerprint: &str) -> Result<&HumanInputKey> {
+        validate_fingerprint("key fingerprint", key_fingerprint)?;
+        self.inner
+            .keys
+            .iter()
+            .find(|key| key.fingerprint == key_fingerprint)
+            .ok_or_else(|| {
+                IronCrewError::Conflict(format!(
+                    "human-input encryption key fingerprint '{key_fingerprint}' is unavailable"
+                ))
+            })
     }
 
     fn read_env() -> std::result::Result<Option<Self>, String> {
@@ -1098,6 +1133,34 @@ mod tests {
         let new_encrypted = rotated.seal_json(&aad(), &json!("new answer")).unwrap();
         assert_eq!(new_encrypted.key_fingerprint, rotated.active_fingerprint());
         assert_ne!(new_encrypted.key_fingerprint, old_encrypted.key_fingerprint);
+
+        let pinned_answer = rotated
+            .seal_json_for_fingerprint(
+                &aad(),
+                &json!("answer for an old-key question"),
+                &old_encrypted.key_fingerprint,
+            )
+            .unwrap();
+        assert_eq!(pinned_answer.key_fingerprint, old_encrypted.key_fingerprint);
+        assert_eq!(
+            old.open_json(
+                &aad(),
+                &pinned_answer.key_fingerprint,
+                &pinned_answer.nonce,
+                &pinned_answer.ciphertext,
+            )
+            .unwrap(),
+            json!("answer for an old-key question")
+        );
+        assert!(
+            rotated
+                .seal_json_for_fingerprint(
+                    &aad(),
+                    &json!("unavailable"),
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                )
+                .is_err()
+        );
     }
 
     #[test]

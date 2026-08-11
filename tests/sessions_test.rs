@@ -5,7 +5,10 @@
 //! validator has its own tests inside `src/engine/sessions.rs`.
 
 use ironcrew::engine::run_history::JsonFileStore;
-use ironcrew::engine::sessions::{ConversationRecord, DialogStateRecord};
+use ironcrew::engine::sessions::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+    DialogStateRecord,
+};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
 use ironcrew::lua::dialog::DialogTurn;
@@ -22,6 +25,7 @@ fn sample_conversation(id: &str) -> ConversationRecord {
         flow_name: "test flow".into(),
         flow_path: None,
         agent_name: "assistant".into(),
+        execution: conversation_execution(),
         messages: vec![
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hi"),
@@ -30,6 +34,17 @@ fn sample_conversation(id: &str) -> ConversationRecord {
         created_at: "2026-04-09T08:00:00Z".into(),
         updated_at: "2026-04-09T08:00:01Z".into(),
         revision: 0,
+    }
+}
+
+fn conversation_execution() -> ConversationExecution {
+    ConversationExecution {
+        schema_version: CONVERSATION_EXECUTION_SCHEMA_VERSION,
+        incarnation_id: "00000000-0000-4000-8000-000000000001".into(),
+        source_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        definition_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        max_history: 50,
+        history_max_bytes: 1024 * 1024,
     }
 }
 

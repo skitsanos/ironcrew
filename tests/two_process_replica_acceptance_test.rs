@@ -114,6 +114,7 @@ impl ReplicaProcess {
             prefix,
             log_dir,
             true,
+            &[],
         )
     }
 
@@ -127,6 +128,7 @@ impl ReplicaProcess {
         prefix: &str,
         log_dir: &Path,
         require_idempotency_key: bool,
+        extra_env: &[(&str, &str)],
     ) -> Self {
         let stdout_path = log_dir.join(format!("{name}.stdout.log"));
         let stderr_path = log_dir.join(format!("{name}.stderr.log"));
@@ -191,6 +193,8 @@ impl ReplicaProcess {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
 
+        command.envs(extra_env.iter().copied());
+
         // Windows process creation and temporary-file resolution rely on
         // these host variables. The absolute IronCrew binary path means PATH
         // is not otherwise needed, but retaining it helps platform tooling.
@@ -214,6 +218,19 @@ impl ReplicaProcess {
         {
             diagnostic_redactions.push(password.to_string());
         }
+        for (name, value) in extra_env {
+            if *name != "IRONCREW_HITL_ENCRYPTION_KEYS" {
+                continue;
+            }
+            diagnostic_redactions.push((*value).to_string());
+            if let Ok(entries) =
+                serde_json::from_str::<std::collections::HashMap<String, String>>(value)
+            {
+                diagnostic_redactions.extend(entries.into_values());
+            }
+        }
+        diagnostic_redactions.sort();
+        diagnostic_redactions.dedup();
         Self {
             name: name.to_string(),
             base_url: format!("http://127.0.0.1:{port}"),

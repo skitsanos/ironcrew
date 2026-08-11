@@ -46,7 +46,7 @@ local crew = Crew.new({
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
 | `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results; `1..=1000` |
 | `model`                  | string   | `"gpt-4.1-mini"`    | Non-empty default model for task execution; maximum 1024 bytes |
-| `base_url`               | string   | env `OPENAI_BASE_URL` | HTTP(S) API endpoint, maximum 4096 bytes; embedded credentials are rejected |
+| `base_url`               | string   | env `OPENAI_BASE_URL` | HTTP(S) API endpoint, maximum 4096 bytes; userinfo, query strings, and fragments are rejected |
 | `api_key`                | string   | env `OPENAI_API_KEY`  | API key, maximum 16 KiB; padding/control characters are rejected |
 | `stream`                 | bool     | `false`            | Stream LLM responses token-by-token |
 | `max_concurrent`         | number   | `4`                | Maximum tasks to run in parallel per phase. Overrides `IRONCREW_DEFAULT_MAX_CONCURRENT` env var |
@@ -56,7 +56,7 @@ local crew = Crew.new({
 | `prompt_cache_key`       | string   | `nil`              | Provider-side prompt cache identifier |
 | `prompt_cache_retention` | string   | `nil`              | Cache retention hint (e.g. `"1h"`) |
 | `models`                 | table    | `{}`               | Model router mapping (purpose -> model) |
-| `mcp_servers`            | table    | `{}`               | External [MCP](#mcp-model-context-protocol-tool-servers) tool servers (stdio / HTTP) to connect on first `crew:run()` |
+| `mcp_servers`            | table    | `{}`               | External [MCP](#mcp-model-context-protocol-tool-servers) tool servers (stdio / HTTP) connected when tools are first finalized for a run or conversation |
 
 ---
 
@@ -244,8 +244,17 @@ chat:send("I'm seeing 504s from the billing API")
 ```
 
 When the same code runs again with the same `id`, IronCrew loads the prior
-message history from the store and the conversation picks up mid-thread.
+message history from the store only when its versioned execution identity still
+matches. That identity binds the Lua source tree, selected Agent, resolved
+model/system prompt, transcript limits, tool rounds, effective non-secret
+provider endpoint/options, and resolved tool graph. API keys are excluded.
 Omit `id` to get the pre-2.8 ephemeral behavior.
+
+Direct Lua/CLI turns on a persistent PostgreSQL conversation fail closed.
+Shared-store turns must use the HTTP `/messages` endpoint with an
+`Idempotency-Key`, which acquires the durable incarnation/revision fence before
+rehydrating or invoking the provider and tools. JSON and SQLite retain the
+single-process direct `send()`/`ask()` behavior.
 
 **Session methods:**
 
@@ -269,9 +278,10 @@ for a full walkthrough.
 
 **Gotchas:** IDs are restricted to alphanumerics plus `-`, `_`, `.` (1-128
 chars) to prevent path traversal and SQL oddness; violations fail loud at
-the Lua layer. Saves carry an optimistic revision. If two processes resume the
-same `(flow_path, id)`, the first save wins and the stale process receives a
-conflict; reopen the session before retrying rather than replaying tool effects.
+the Lua layer. Saves carry an optimistic revision and a UUID incarnation.
+Delete/recreate assigns a new incarnation so stale responses cannot cross that
+boundary. Identity-less records from older versions remain available for
+history export/delete but cannot resume; recreate them after exporting.
 
 **SSE events:** Conversations emit `conversation_started`, `conversation_turn`,
 and `conversation_thinking` events through the EventBus. REST API subscribers
@@ -291,6 +301,11 @@ The same `crew:conversation({})` primitive is exposed over HTTP by
 `POST /start`; only one turn may mutate an id at a time (overlap returns
 `409`, never a queued request); and state persists through the same
 `StateStore` used by `ironcrew chat`.
+
+With PostgreSQL, `/messages` always requires an `Idempotency-Key` and can
+cold-rehydrate on either replica. Conversation SSE is not shared: PostgreSQL
+returns `409` for `/events`, while JSON/SQLite provide process-local streams
+without `Last-Event-ID` replay.
 
 | Method | Path                                                | Purpose                           |
 | ------ | --------------------------------------------------- | --------------------------------- |
@@ -767,7 +782,8 @@ machinery treat it like any other failure.
   `GET /flows/{flow}/questions/{run_id}`. For an idempotency-keyed HTTP run,
   PostgreSQL plus the shared HITL encryption keyring lets either endpoint enter
   through any replica. PostgreSQL-backed run SSE can also replay through any
-  replica; execution and conversation SSE still remain on the owner. See
+  replica; execution remains on the owner, PostgreSQL conversation SSE is
+  unsupported, and JSON/SQLite conversation SSE remains process-local. See
   [cross-replica delivery](rest-api.md#cross-replica-delivery).
 - **CLI mode** (`ironcrew run`): the prompt (and numbered choices) print to
   stderr and the answer is read from stdin. A bare number picks the matching
@@ -1063,6 +1079,8 @@ local crew = Crew.new({
         -- Label must match ^[a-z][a-z0-9_-]{0,15}$
         git = {
             transport = "stdio",
+            -- Required if this server's tools are reachable from a persistent conversation.
+            execution_identity = "mcp-server-git@2026-08",
             command   = "uvx",
             args      = { "mcp-server-git" },
         },
@@ -1086,6 +1104,7 @@ crew:add_agent({
 mcp_servers = {
     mypkg = {
         transport   = "stdio",
+        execution_identity = "mypkg@2.4.1+config-v3",
         command     = "uvx",            -- binary to spawn
         args        = { "mcp-server-git" },
         env         = { MY_VAR = "val" },  -- extra env vars for child (optional)
@@ -1104,6 +1123,7 @@ Set `inherit_env = true` to opt in to full inheritance (not recommended in produ
 mcp_servers = {
     myapi = {
         transport = "http",
+        execution_identity = "catalog-api-v3",
         url       = "https://mcp.example.com/mcp",
         headers   = {
             authorization = "Bearer " .. env("MCP_API_TOKEN"),
@@ -1114,6 +1134,26 @@ mcp_servers = {
 
 HTTP URLs are validated against the SSRF filter (private IPs blocked by default).
 Localhost is blocked unless `IRONCREW_MCP_ALLOW_LOCALHOST=1` is set.
+
+### Persistent-conversation execution identity
+
+MCP discovery describes tool names and schemas, but it cannot prove that two
+replicas are connected to behaviorally equivalent server code or data. If an
+MCP tool is reachable from a persistent conversation's selected agent tool
+graph, its server must set `execution_identity` to a stable, non-secret value
+(maximum 4096 bytes, no control characters). IronCrew hashes the value and
+binds that fingerprint, the discovered tool schema, server/tool names, and the
+resolved dependency graph into the conversation definition. The raw identity
+is not persisted.
+
+Change the value whenever the executable/image, API implementation, relevant
+non-secret configuration, or data contract changes. Do not put bearer tokens,
+API keys, header values, raw environment secrets, or hashes of guessable
+secrets in it. For example, use a package/image digest plus a configuration
+revision for stdio, or a deployment/API-contract revision for HTTP. An MCP
+server without this field can still serve ordinary runs and ephemeral
+conversations; persistent conversation construction fails closed if the
+selected tool graph reaches it.
 
 ### Tool naming
 
@@ -1129,7 +1169,8 @@ Constraints:
 
 ### Connection lifecycle
 
-- MCP servers are **connected in parallel** on the first `crew:run()` call.
+- MCP servers are **connected in parallel** when tools are first finalized for
+  a run or conversation.
 - Any handshake failure aborts the run with a clear error.
 - The connection is **cached** for the crew's lifetime — subsequent `crew:run()` calls
   reuse the same connections without reconnecting.

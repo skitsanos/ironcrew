@@ -7,7 +7,10 @@ metadata:
 spec:
   # Conservative general-purpose baseline: PostgreSQL run SSE and keyed
   # cancellation/HITL are shared, but execution and conversations remain
-  # process-owned. Stop the old pod before creating its replacement.
+  # process-owned. Stop the old pod before creating its replacement. Keep this
+  # Recreate shape for the first drain-aware/mixed-version rollout; the bounded
+  # two-replica RollingUpdate overlay and surge arithmetic are documented in
+  # docs/cloud-deployment.md.
   replicas: 1
   strategy:
     type: Recreate
@@ -127,8 +130,8 @@ spec:
               value: "1000"
             - name: IRONCREW_HITL_READ_TIMEOUT_MS
               value: "2000"
-            # Match durable question-list read concurrency to this pod's small
-            # PostgreSQL pool; owner answer polling is separately bounded.
+            # Match durable question-list/answer-auth concurrency to this pod's
+            # small PostgreSQL pool; owner answer polling is separately bounded.
             - name: IRONCREW_HITL_PG_MAX_CONCURRENT_READS
               value: "2"
             - name: IRONCREW_TOOL_TIMEOUT
@@ -289,6 +292,11 @@ spec:
               value: "1000"
             - name: IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS
               value: "2000"
+            # Managed PostgreSQL may briefly contend during a rollout. This is
+            # the outer bound for one append attempt; PostgreSQL statements use
+            # a derived 4-second transaction-local timeout.
+            - name: IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS
+              value: "5000"
             - name: IRONCREW_EVENT_JOURNAL_PRUNE_BATCH
               value: "500"
             - name: IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES
@@ -335,6 +343,12 @@ spec:
               value: "131072"
             - name: IRONCREW_JSON_SCHEMA_MAX_BYTES
               value: "131072"
+            # 5s routing grace + 30s stopping deadline + 1s cleanup + 5s
+            # operator margin = 41s inside terminationGracePeriodSeconds=45.
+            # Keep the container stop signal as SIGTERM: SIGUSR1 drains but
+            # intentionally does not exit.
+            - name: IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS
+              value: "5"
             - name: IRONCREW_SHUTDOWN_TIMEOUT_SECS
               value: "30"
             - name: IRONCREW_SHUTDOWN_DRAIN_MS
@@ -356,8 +370,10 @@ spec:
                 secretKeyRef:
                   name: ironcrew-secrets
                   key: api-token
-            # Optional as a pair. If either key is supplied, both must exist
-            # and every replica must receive the same staged keyring.
+            # Optional as a pair. If either key is supplied, both must exist.
+            # Secret-backed env values are read only when this process starts;
+            # each rotation phase needs an explicit rollout/restart. Every
+            # replica must have the expanded keyring before active ids differ.
             - name: IRONCREW_HITL_ENCRYPTION_KEYS
               valueFrom:
                 secretKeyRef:
@@ -463,7 +479,10 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    # OpenShift DNS. TCP is required for large answers and retry fallback.
+    # OpenShift DNS. OVN-Kubernetes can translate the Service destination to
+    # the DNS pods' 5353 target port before NetworkPolicy evaluation, so allow
+    # both the Service port and target port. TCP is required for large answers
+    # and retry fallback.
     - to:
         - namespaceSelector:
             matchLabels:
@@ -473,6 +492,10 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
     # Compatibility for clusters that retain CoreDNS in kube-system.
     - to:
         - namespaceSelector:
@@ -513,15 +536,20 @@ spec:
       ports:
         - protocol: TCP
           port: 443
-    # On dual-stack clusters, permit public IPv6 HTTPS while excluding local,
-    # private, documentation, mapped-IPv4, and multicast destinations.
+    # On dual-stack clusters, permit public IPv6 HTTPS while excluding native
+    # local, private, documentation, and multicast destinations. OpenShift
+    # rejects the IPv4-mapped exclusion; native IPv4 traffic is governed by
+    # the separate IPv4 ipBlock above, while application SSRF policy remains
+    # the boundary for mapped-address interpretation.
     - to:
         - ipBlock:
             cidr: "::/0"
             except:
               - "::/128"
               - "::1/128"
-              - "::ffff:0:0/96"
+              # OpenShift validates IPv6 exclusions as strict `::/0` subsets
+              # and rejects the IPv4-mapped range. Native IPv4 traffic is
+              # already governed by the separate IPv4 ipBlock above.
               - "2001:db8::/32"
               - "fc00::/7"
               - "fe80::/10"

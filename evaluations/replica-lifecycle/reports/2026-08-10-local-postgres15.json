@@ -1,0 +1,736 @@
+{
+  "cleanup": {
+    "prefix": "ic020cap_ff4645b5_",
+    "remaining_functions": 0,
+    "remaining_relations": 0
+  },
+  "container_image": "postgres:15",
+  "database": "postgres://127.0.0.1:55433/ironcrew_capacity",
+  "date": "2026-08-10",
+  "error": null,
+  "evidence_boundary": "local_process_postgresql15_loopback_mock",
+  "finished_at": "2026-08-10T11:50:10.449311+00:00",
+  "host": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6"
+  },
+  "limits": {
+    "active_runs_per_replica": 2,
+    "db_pool_per_replica": 2,
+    "event_max_bytes": 32768,
+    "event_payload_envelope_per_process_bytes": 1048576,
+    "event_replay_bytes_per_run": 262144,
+    "journal_max_total_bytes": 4194304,
+    "journal_max_total_events": 256,
+    "max_events_per_run": 32,
+    "replica_counts": [
+      1,
+      2,
+      3
+    ],
+    "rss_per_process_bytes": 268435456,
+    "sse_per_replica": 2
+  },
+  "phases": [
+    {
+      "event_buffers": {
+        "aggregate_bytes": 1048576,
+        "allocator_or_rss_measurement": false,
+        "measurement": "approximate_retained_serialization_plus_configured_capacity",
+        "observed_retained_bytes": 632,
+        "observed_retained_events": 6,
+        "per_process_bytes": 1048576,
+        "retained_bytes_capacity": 524288,
+        "retained_events_capacity": 64
+      },
+      "post_phase_quiescence": {
+        "elapsed_ms": 948.321,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        },
+        "required_zero_metrics": [
+          "ironcrew_process_active_runs",
+          "ironcrew_process_active_sse_connections",
+          "ironcrew_process_active_provider_calls",
+          "ironcrew_process_eventbus_instances",
+          "ironcrew_process_eventbus_retained_events",
+          "ironcrew_process_eventbus_retained_bytes",
+          "ironcrew_process_eventbus_retained_events_capacity",
+          "ironcrew_process_eventbus_retained_bytes_capacity"
+        ]
+      },
+      "postgres_after_completion": {
+        "connections_excluding_observer": 2,
+        "journal": {
+          "accounted_bytes": 10240,
+          "actual_rows": 10,
+          "maximum_run_accounted_bytes": 5120,
+          "maximum_run_events": 5,
+          "payload_bytes": 1378,
+          "retained_bytes": 10240,
+          "retained_events": 10,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 0,
+          "failed": 0,
+          "success": 2,
+          "total": 2
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "postgres_connections": {
+        "ceiling": 2,
+        "peak": 2,
+        "samples": [
+          2,
+          2,
+          2
+        ]
+      },
+      "postgres_pool_metrics": {
+        "aggregate_in_use_connections": 1,
+        "aggregate_limit": 2,
+        "aggregate_open_connections": 2
+      },
+      "postgres_while_saturated": {
+        "connections_excluding_observer": 2,
+        "journal": {
+          "accounted_bytes": 6144,
+          "actual_rows": 6,
+          "maximum_run_accounted_bytes": 3072,
+          "maximum_run_events": 3,
+          "payload_bytes": 632,
+          "retained_bytes": 6144,
+          "retained_events": 6,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 2,
+          "failed": 0,
+          "success": 0,
+          "total": 2
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "process_metrics_by_replica": {
+        "replica-1": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        }
+      },
+      "provider": {
+        "active_calls": 0,
+        "arrivals": 2,
+        "expected_calls": 2,
+        "failed_calls": 0,
+        "label": "replicas-1",
+        "live_provider": false,
+        "peak_active_calls": 2,
+        "planned_calls": 2
+      },
+      "replicas": 1,
+      "rss_baseline": {
+        "aggregate_peak_bytes": 13451264,
+        "per_process_peak_bytes": {
+          "replica-1": 13451264
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 3,
+        "source": "ps_rss"
+      },
+      "rss_saturated": {
+        "aggregate_ceiling_bytes": 268435456,
+        "aggregate_peak_bytes": 17694720,
+        "per_process_ceiling_bytes": 268435456,
+        "per_process_peak_bytes": {
+          "replica-1": 17694720
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 8,
+        "source": "ps_rss"
+      },
+      "sse": {
+        "aggregate_limit": 2,
+        "established": 2,
+        "extra_rejections": 1,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        }
+      }
+    },
+    {
+      "event_buffers": {
+        "aggregate_bytes": 2097152,
+        "allocator_or_rss_measurement": false,
+        "measurement": "approximate_retained_serialization_plus_configured_capacity",
+        "observed_retained_bytes": 1264,
+        "observed_retained_events": 12,
+        "per_process_bytes": 1048576,
+        "retained_bytes_capacity": 1048576,
+        "retained_events_capacity": 128
+      },
+      "post_phase_quiescence": {
+        "elapsed_ms": 956.093,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-2": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        },
+        "required_zero_metrics": [
+          "ironcrew_process_active_runs",
+          "ironcrew_process_active_sse_connections",
+          "ironcrew_process_active_provider_calls",
+          "ironcrew_process_eventbus_instances",
+          "ironcrew_process_eventbus_retained_events",
+          "ironcrew_process_eventbus_retained_bytes",
+          "ironcrew_process_eventbus_retained_events_capacity",
+          "ironcrew_process_eventbus_retained_bytes_capacity"
+        ]
+      },
+      "postgres_after_completion": {
+        "connections_excluding_observer": 4,
+        "journal": {
+          "accounted_bytes": 30720,
+          "actual_rows": 30,
+          "maximum_run_accounted_bytes": 5120,
+          "maximum_run_events": 5,
+          "payload_bytes": 4134,
+          "retained_bytes": 30720,
+          "retained_events": 30,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 0,
+          "failed": 0,
+          "success": 6,
+          "total": 6
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "postgres_connections": {
+        "ceiling": 4,
+        "peak": 4,
+        "samples": [
+          4,
+          4,
+          4
+        ]
+      },
+      "postgres_pool_metrics": {
+        "aggregate_in_use_connections": 2,
+        "aggregate_limit": 4,
+        "aggregate_open_connections": 4
+      },
+      "postgres_while_saturated": {
+        "connections_excluding_observer": 4,
+        "journal": {
+          "accounted_bytes": 22528,
+          "actual_rows": 22,
+          "maximum_run_accounted_bytes": 5120,
+          "maximum_run_events": 5,
+          "payload_bytes": 2642,
+          "retained_bytes": 22528,
+          "retained_events": 22,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 4,
+          "failed": 0,
+          "success": 2,
+          "total": 6
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "process_metrics_by_replica": {
+        "replica-1": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        },
+        "replica-2": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        }
+      },
+      "provider": {
+        "active_calls": 0,
+        "arrivals": 4,
+        "expected_calls": 4,
+        "failed_calls": 0,
+        "label": "replicas-2",
+        "live_provider": false,
+        "peak_active_calls": 4,
+        "planned_calls": 4
+      },
+      "replicas": 2,
+      "rss_baseline": {
+        "aggregate_peak_bytes": 31506432,
+        "per_process_peak_bytes": {
+          "replica-1": 18022400,
+          "replica-2": 13484032
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 3,
+        "source": "ps_rss"
+      },
+      "rss_saturated": {
+        "aggregate_ceiling_bytes": 536870912,
+        "aggregate_peak_bytes": 35946496,
+        "per_process_ceiling_bytes": 268435456,
+        "per_process_peak_bytes": {
+          "replica-1": 18104320,
+          "replica-2": 17842176
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 8,
+        "source": "ps_rss"
+      },
+      "sse": {
+        "aggregate_limit": 4,
+        "established": 4,
+        "extra_rejections": 2,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-2": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        }
+      }
+    },
+    {
+      "event_buffers": {
+        "aggregate_bytes": 3145728,
+        "allocator_or_rss_measurement": false,
+        "measurement": "approximate_retained_serialization_plus_configured_capacity",
+        "observed_retained_bytes": 1896,
+        "observed_retained_events": 18,
+        "per_process_bytes": 1048576,
+        "retained_bytes_capacity": 1572864,
+        "retained_events_capacity": 192
+      },
+      "post_phase_quiescence": {
+        "elapsed_ms": 925.288,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-2": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-3": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 0,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 0,
+            "ironcrew_process_active_runs": 0,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 0,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 0,
+            "ironcrew_process_eventbus_retained_bytes": 0,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 0,
+            "ironcrew_process_eventbus_retained_events": 0,
+            "ironcrew_process_eventbus_retained_events_capacity": 0,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        },
+        "required_zero_metrics": [
+          "ironcrew_process_active_runs",
+          "ironcrew_process_active_sse_connections",
+          "ironcrew_process_active_provider_calls",
+          "ironcrew_process_eventbus_instances",
+          "ironcrew_process_eventbus_retained_events",
+          "ironcrew_process_eventbus_retained_bytes",
+          "ironcrew_process_eventbus_retained_events_capacity",
+          "ironcrew_process_eventbus_retained_bytes_capacity"
+        ]
+      },
+      "postgres_after_completion": {
+        "connections_excluding_observer": 6,
+        "journal": {
+          "accounted_bytes": 61440,
+          "actual_rows": 60,
+          "maximum_run_accounted_bytes": 5120,
+          "maximum_run_events": 5,
+          "payload_bytes": 8268,
+          "retained_bytes": 61440,
+          "retained_events": 60,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 0,
+          "failed": 0,
+          "success": 12,
+          "total": 12
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "postgres_connections": {
+        "ceiling": 6,
+        "peak": 6,
+        "samples": [
+          6,
+          6,
+          6
+        ]
+      },
+      "postgres_pool_metrics": {
+        "aggregate_in_use_connections": 3,
+        "aggregate_limit": 6,
+        "aggregate_open_connections": 6
+      },
+      "postgres_while_saturated": {
+        "connections_excluding_observer": 6,
+        "journal": {
+          "accounted_bytes": 49152,
+          "actual_rows": 48,
+          "maximum_run_accounted_bytes": 5120,
+          "maximum_run_events": 5,
+          "payload_bytes": 6030,
+          "retained_bytes": 49152,
+          "retained_events": 48,
+          "schema_version": 1
+        },
+        "runs": {
+          "active": 6,
+          "failed": 0,
+          "success": 6,
+          "total": 12
+        },
+        "server_version": "15.18 (Debian 15.18-1.pgdg13+1)"
+      },
+      "process_metrics_by_replica": {
+        "replica-1": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        },
+        "replica-2": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        },
+        "replica-3": {
+          "ironcrew_postgres_pool_connections_limit": 2,
+          "ironcrew_postgres_pool_in_use_connections": 1,
+          "ironcrew_postgres_pool_open_connections": 2,
+          "ironcrew_process_active_provider_calls": 2,
+          "ironcrew_process_active_runs": 2,
+          "ironcrew_process_active_runs_limit": 2,
+          "ironcrew_process_active_sse_connections": 2,
+          "ironcrew_process_active_sse_connections_limit": 2,
+          "ironcrew_process_eventbus_instances": 2,
+          "ironcrew_process_eventbus_retained_bytes": 632,
+          "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+          "ironcrew_process_eventbus_retained_events": 6,
+          "ironcrew_process_eventbus_retained_events_capacity": 64,
+          "ironcrew_process_memory_measurement_available": 0,
+          "ironcrew_process_peak_active_provider_calls": 2
+        }
+      },
+      "provider": {
+        "active_calls": 0,
+        "arrivals": 6,
+        "expected_calls": 6,
+        "failed_calls": 0,
+        "label": "replicas-3",
+        "live_provider": false,
+        "peak_active_calls": 6,
+        "planned_calls": 6
+      },
+      "replicas": 3,
+      "rss_baseline": {
+        "aggregate_peak_bytes": 49790976,
+        "per_process_peak_bytes": {
+          "replica-1": 18153472,
+          "replica-2": 18153472,
+          "replica-3": 13484032
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 3,
+        "source": "ps_rss"
+      },
+      "rss_saturated": {
+        "aggregate_ceiling_bytes": 805306368,
+        "aggregate_peak_bytes": 54280192,
+        "per_process_ceiling_bytes": 268435456,
+        "per_process_peak_bytes": {
+          "replica-1": 18202624,
+          "replica-2": 18251776,
+          "replica-3": 17825792
+        },
+        "platform_or_cgroup_measurement": false,
+        "samples": 8,
+        "source": "ps_rss"
+      },
+      "sse": {
+        "aggregate_limit": 6,
+        "established": 6,
+        "extra_rejections": 3,
+        "metrics_by_replica": {
+          "replica-1": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-2": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          },
+          "replica-3": {
+            "ironcrew_postgres_pool_connections_limit": 2,
+            "ironcrew_postgres_pool_in_use_connections": 1,
+            "ironcrew_postgres_pool_open_connections": 2,
+            "ironcrew_process_active_provider_calls": 2,
+            "ironcrew_process_active_runs": 2,
+            "ironcrew_process_active_runs_limit": 2,
+            "ironcrew_process_active_sse_connections": 2,
+            "ironcrew_process_active_sse_connections_limit": 2,
+            "ironcrew_process_eventbus_instances": 2,
+            "ironcrew_process_eventbus_retained_bytes": 632,
+            "ironcrew_process_eventbus_retained_bytes_capacity": 524288,
+            "ironcrew_process_eventbus_retained_events": 6,
+            "ironcrew_process_eventbus_retained_events_capacity": 64,
+            "ironcrew_process_memory_measurement_available": 0,
+            "ironcrew_process_peak_active_provider_calls": 2
+          }
+        }
+      }
+    }
+  ],
+  "postgres_server_version": "15.18 (Debian 15.18-1.pgdg13+1)",
+  "revision": {
+    "binary_sha256": "3649b92f714a01140d2392ee1313e64a71285393d5f6cf49da47094ca7886277",
+    "dirty": true,
+    "git_commit": "c4799a3c3b8a2441243ad512436d1cb649275cf4"
+  },
+  "schema": "ironcrew.replica-lifecycle-capacity.v1",
+  "shutdown": {
+    "replica-1": {
+      "exit_code": 0,
+      "forced_kill": false
+    },
+    "replica-2": {
+      "exit_code": 0,
+      "forced_kill": false
+    },
+    "replica-3": {
+      "exit_code": 0,
+      "forced_kill": false
+    }
+  },
+  "started_at": "2026-08-10T11:50:01.275595+00:00",
+  "status": "passed",
+  "summary": "One, two, and three real IronCrew processes stayed within the predeclared local envelopes while provider work and SSE were saturated.",
+  "table_prefix": "ic020cap_ff4645b5_"
+}

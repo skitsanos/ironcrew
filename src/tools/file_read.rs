@@ -10,12 +10,28 @@ const DEFAULT_FILE_READ_MAX_BYTES: usize = 10 * 1024 * 1024;
 const HARD_FILE_READ_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct FileReadTool {
-    base_dir: Option<PathBuf>,
+    root: super::execution_policy::CapabilityRoot,
+    max_bytes: usize,
 }
 
 impl FileReadTool {
     pub fn new(base_dir: Option<PathBuf>) -> Self {
-        Self { base_dir }
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(base_dir),
+            max_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_FILE_READ_MAX_BYTES",
+                DEFAULT_FILE_READ_MAX_BYTES,
+                HARD_FILE_READ_MAX_BYTES,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_bytes_for_test(base_dir: PathBuf, max_bytes: usize) -> Self {
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(Some(base_dir)),
+            max_bytes,
+        }
     }
 }
 
@@ -46,6 +62,14 @@ impl Tool for FileReadTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "root_fingerprint": self.root.fingerprint()?,
+            "max_bytes": self.max_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let path = args["path"]
             .as_str()
@@ -62,16 +86,18 @@ impl Tool for FileReadTool {
             }
         })?;
 
-        let max_bytes = super::project_fs::bounded_env_usize(
-            "IRONCREW_FILE_READ_MAX_BYTES",
-            DEFAULT_FILE_READ_MAX_BYTES,
-            HARD_FILE_READ_MAX_BYTES,
-        );
-        let base_dir = self.base_dir.clone();
+        let max_bytes = self.max_bytes;
+        let base_dir = self
+            .root
+            .cloned_path()
+            .map_err(|message| IronCrewError::ToolExecution {
+                tool: "file_read".into(),
+                message: message.into(),
+            })?;
         let relative = relative.to_path_buf();
         let display = path.to_string();
         tokio::task::spawn_blocking(move || {
-            let root = super::project_fs::open_root(base_dir.as_deref())?;
+            let root = super::project_fs::open_root(Some(&base_dir))?;
             super::project_fs::read_utf8_bounded(&root, &relative, max_bytes)
         })
         .await

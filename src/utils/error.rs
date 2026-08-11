@@ -20,6 +20,11 @@ pub enum IronCrewError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A keyed run claim was durably fenced while its owner entered drain.
+    /// Callers must not start new physical execution for this claim.
+    #[error("Run owner instance '{owner_instance_id}' is draining")]
+    OwnerDraining { owner_instance_id: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

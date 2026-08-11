@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ironcrew::api::{AppState, create_router};
@@ -101,11 +101,35 @@ async fn spawn_server_with_idempotency(
     );
     let state = Arc::new(AppState {
         flows_dir: root.clone(),
+        runtime_identity:
+            ironcrew::api::deployment::RuntimeIdentity::try_new(Some(
+                ironcrew::api::deployment::DeploymentEvidence {
+                    revision: "test-revision".into(),
+                    artifact_fingerprint:
+                        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .into(),
+                    flow_fingerprint:
+                        "sha256:123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+                            .into(),
+                    config_fingerprint:
+                        "sha256:23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
+                            .into(),
+                    hitl_keyring_fingerprint:
+                        "sha256:3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
+                            .into(),
+                },
+            ))
+            .unwrap(),
         auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
         admission: Arc::new(admission),
-        accepting_traffic: AtomicBool::new(true),
+        lifecycle: ironcrew::api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            ironcrew::api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                ironcrew::api::conversation_lifecycle::max_active_conversation_lifecycles(),
+            ),
+        ),
         max_active_conversations: max_conversations,
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_conversations)),
         max_active_runs: max_runs,
@@ -515,16 +539,20 @@ async fn stale_durable_conversation_revision_invalidates_and_reloads_the_live_ha
     durable.updated_at = chrono::Utc::now().to_rfc3339();
     server.store.save_conversation(&durable).await.unwrap();
 
-    let conflict = client
-        .post(format!(
-            "{}/flows/chat/conversations/stale-revision/messages",
-            server.base
-        ))
-        .header("Idempotency-Key", "stale-revision-message")
-        .json(&serde_json::json!({ "content": "must not call the provider" }))
-        .send()
-        .await
-        .unwrap();
+    let conflict = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!(
+                "{}/flows/chat/conversations/stale-revision/messages",
+                server.base
+            ))
+            .header("Idempotency-Key", "stale-revision-message")
+            .json(&serde_json::json!({ "content": "must not call the provider" }))
+            .send(),
+    )
+    .await
+    .expect("stale live-handle invalidation must not deadlock")
+    .unwrap();
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
     assert!(
         !server
@@ -706,10 +734,7 @@ async fn liveness_stays_up_while_readiness_checks_shutdown_flows_and_storage() {
         assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
     }
 
-    server
-        .state
-        .accepting_traffic
-        .store(false, Ordering::Release);
+    server.state.lifecycle.begin_fencing();
     let not_ready = client
         .get(format!("{}/health/ready", server.base))
         .send()
@@ -723,16 +748,13 @@ async fn liveness_stays_up_while_readiness_checks_shutdown_flows_and_storage() {
         .unwrap();
     assert_eq!(still_live.status(), reqwest::StatusCode::OK);
 
-    server
-        .state
-        .accepting_traffic
-        .store(true, Ordering::Release);
-    std::fs::remove_dir_all(server.root.join(".ironcrew/runs")).unwrap();
+    let storage_server = spawn_server(1, 4, Duration::from_secs(60)).await;
+    std::fs::remove_dir_all(storage_server.root.join(".ironcrew/runs")).unwrap();
     // Force a fresh backend probe: production readiness snapshots are cached
     // briefly to prevent probe storms from multiplying storage round trips.
-    *server.state.readiness_cache.lock().await = None;
+    *storage_server.state.readiness_cache.lock().await = None;
     let storage_down = client
-        .get(format!("{}/health/ready", server.base))
+        .get(format!("{}/health/ready", storage_server.base))
         .send()
         .await
         .unwrap();
@@ -742,6 +764,87 @@ async fn liveness_stays_up_while_readiness_checks_shutdown_flows_and_storage() {
     );
     let body: serde_json::Value = storage_down.json().await.unwrap();
     assert_eq!(body["component"], "storage");
+}
+
+#[tokio::test]
+async fn overlapping_readiness_probes_coalesce_without_a_false_503() {
+    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
+    let cache_guard = server.state.readiness_cache.lock().await;
+    let client = reqwest::Client::new();
+    let request = tokio::spawn({
+        let url = format!("{}/health/ready", server.base);
+        async move { client.get(url).send().await.unwrap() }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !request.is_finished(),
+        "an overlapping healthy probe must wait for the in-flight check"
+    );
+    drop(cache_guard);
+
+    let response = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .expect("coalesced readiness request must finish")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["component"], "storage");
+}
+
+#[tokio::test]
+async fn queued_readiness_probe_observes_a_drain_transition() {
+    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
+    let cache_guard = server.state.readiness_cache.lock().await;
+    let client = reqwest::Client::new();
+    let request = tokio::spawn({
+        let url = format!("{}/health/ready", server.base);
+        async move { client.get(url).send().await.unwrap() }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !request.is_finished(),
+        "the probe must be queued behind the active readiness check"
+    );
+    server.state.lifecycle.begin_fencing();
+    drop(cache_guard);
+
+    let response = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .expect("the queued readiness request must finish")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["component"], "lifecycle");
+    assert_eq!(body["lifecycle_state"], "fencing");
+}
+
+#[tokio::test]
+async fn overlapping_readiness_probe_fails_closed_when_the_check_stalls() {
+    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
+    let _cache_guard = server.state.readiness_cache.lock().await;
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        reqwest::Client::new()
+            .get(format!("{}/health/ready", server.base))
+            .send(),
+    )
+    .await
+    .expect("a stalled coalesced probe must fail closed within its bound")
+    .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "a contended probe should coalesce before failing closed"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["component"], "readiness_check");
 }
 
 #[tokio::test]
@@ -760,6 +863,19 @@ async fn capabilities_reports_process_scoped_live_control() {
     );
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["instance_id"], server.store.instance_id());
+    assert!(
+        uuid::Uuid::parse_str(body["process_start_id"].as_str().unwrap()).is_ok(),
+        "capabilities must expose a per-process start identity"
+    );
+    assert_eq!(body["deployment"]["revision"], "test-revision");
+    assert_eq!(
+        body["deployment"]["artifact_fingerprint"],
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(
+        body["deployment"]["hitl_keyring_fingerprint"],
+        "sha256:3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
+    );
     assert_eq!(body["topology"], "single_executor");
     assert_eq!(body["control_scope"], "process");
     assert_eq!(body["multi_replica_control"], false);

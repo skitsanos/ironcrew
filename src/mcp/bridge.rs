@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::llm::provider::ToolSchema;
 use crate::mcp::client::McpClient;
 use crate::mcp::config::make_tool_name;
+use crate::mcp::execution_policy::McpCallPolicy;
 use crate::tools::{Tool, ToolCallContext};
 use crate::utils::error::{IronCrewError, Result};
 
@@ -64,6 +65,10 @@ pub struct McpBridgeTool {
     schema: ToolSchema,
     client: Arc<McpClient>,
     server_label: String,
+    execution_identity_fingerprint: Option<String>,
+    call_policy: McpCallPolicy,
+    result_max_bytes: usize,
+    max_content_items: usize,
 }
 
 impl McpBridgeTool {
@@ -72,6 +77,7 @@ impl McpBridgeTool {
         server_label: &str,
         rmcp_tool: &rmcp::model::Tool,
         client: Arc<McpClient>,
+        execution_identity_fingerprint: Option<String>,
     ) -> Result<Self> {
         let server_tool_name = rmcp_tool.name.to_string();
 
@@ -123,6 +129,17 @@ impl McpBridgeTool {
             description: description.clone(),
             parameters,
         };
+        let result_max_bytes = bounded_env(
+            "IRONCREW_MCP_TOOL_RESULT_MAX_BYTES",
+            DEFAULT_MAX_RESULT_BYTES,
+            HARD_MAX_RESULT_BYTES,
+        )?;
+        let max_content_items = bounded_env(
+            "IRONCREW_MCP_MAX_CONTENT_ITEMS",
+            DEFAULT_MAX_CONTENT_ITEMS,
+            HARD_MAX_CONTENT_ITEMS,
+        )?;
+        let call_policy = client.call_policy();
 
         Ok(Self {
             ironcrew_name,
@@ -131,6 +148,10 @@ impl McpBridgeTool {
             schema,
             client,
             server_label: server_label.to_string(),
+            execution_identity_fingerprint,
+            call_policy,
+            result_max_bytes,
+            max_content_items,
         })
     }
 }
@@ -147,6 +168,27 @@ impl Tool for McpBridgeTool {
 
     fn schema(&self) -> ToolSchema {
         self.schema.clone()
+    }
+
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        let identity = self
+            .execution_identity_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                IronCrewError::Validation(format!(
+                    "Persistent conversation tool '{}' requires a non-secret execution_identity for MCP server '{}'",
+                    self.ironcrew_name, self.server_label
+                ))
+            })?;
+        Ok(serde_json::json!({
+            "schema": self.schema,
+            "server_label": self.server_label,
+            "server_tool_name": self.server_tool_name,
+            "execution_identity_fingerprint": identity,
+            "call_policy": self.call_policy.definition(),
+            "result_max_bytes": self.result_max_bytes,
+            "max_content_items": self.max_content_items,
+        }))
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
@@ -166,16 +208,8 @@ impl Tool for McpBridgeTool {
                 }
             })?;
 
-        let cap = bounded_env(
-            "IRONCREW_MCP_TOOL_RESULT_MAX_BYTES",
-            DEFAULT_MAX_RESULT_BYTES,
-            HARD_MAX_RESULT_BYTES,
-        )?;
-        let max_items = bounded_env(
-            "IRONCREW_MCP_MAX_CONTENT_ITEMS",
-            DEFAULT_MAX_CONTENT_ITEMS,
-            HARD_MAX_CONTENT_ITEMS,
-        )?;
+        let cap = self.result_max_bytes;
+        let max_items = self.max_content_items;
         if result.content.len() > max_items {
             return Err(IronCrewError::Mcp {
                 server: self.server_label.clone(),

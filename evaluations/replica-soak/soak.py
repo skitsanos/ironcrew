@@ -35,8 +35,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from replica_topology import (
+    host_rss_pass_criterion,
+    sample_replica_topology,
+    topology_pass_criterion,
+)
 
-SCHEMA_VERSION = "ironcrew.replica-soak.v1"
+
+SCHEMA_VERSION = "ironcrew.replica-soak.v2"
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 FLOW_ROOT = HERE / "flows"
@@ -1388,6 +1394,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port-b", type=int, default=3312)
     parser.add_argument("--base-a")
     parser.add_argument("--base-b")
+    parser.add_argument(
+        "--load-balanced-route",
+        action="store_true",
+        help=(
+            "target mode: use base-a as one platform route for both logical sides "
+            "and require multiple observed instance IDs"
+        ),
+    )
+    parser.add_argument("--expected-instance-count", type=int, default=2)
+    parser.add_argument("--capability-samples", type=int, default=32)
     parser.add_argument("--pid-a", type=int)
     parser.add_argument("--pid-b", type=int)
     parser.add_argument("--docker-container-a")
@@ -1442,6 +1458,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         bounded_int("hitl-pg-reads", args.hitl_pg_reads, 1, 64)
         bounded_int("journal-poll-ms", args.journal_poll_ms, 100, 5000)
         bounded_int("max-events", args.max_events, 1, 10_000)
+        bounded_int("expected-instance-count", args.expected_instance_count, 2, 50)
+        bounded_int("capability-samples", args.capability_samples, 1, 10_000)
         bounded_int("memory-comparator-mib", args.memory_comparator_mib, 64, 1024 * 1024)
         bounded_int("port-a", args.port_a, 1, 65535)
         bounded_int("port-b", args.port_b, 1, 65535)
@@ -1451,10 +1469,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--port-a and --port-b must differ")
     if args.cleanup_database and args.keep_database:
         parser.error("--cleanup-database and --keep-database are mutually exclusive")
-    if args.mode == "target" and (not args.base_a or not args.base_b):
-        parser.error("target mode requires --base-a and --base-b")
+    if args.load_balanced_route and args.mode != "target":
+        parser.error("--load-balanced-route is available only in target mode")
+    if args.mode == "target" and not args.base_a:
+        parser.error("target mode requires --base-a")
+    if args.mode == "target" and not args.load_balanced_route and not args.base_b:
+        parser.error("direct target mode requires --base-a and --base-b")
+    if (
+        args.mode == "target"
+        and not args.load_balanced_route
+        and args.base_a.rstrip("/") == args.base_b.rstrip("/")
+    ):
+        parser.error("identical target URLs require --load-balanced-route")
+    if args.mode == "target" and args.load_balanced_route:
+        if args.expected_instance_count < 2:
+            parser.error("load-balanced target mode requires at least two instances")
+        if args.base_b and args.base_b.rstrip("/") != args.base_a.rstrip("/"):
+            parser.error("load-balanced target mode accepts one route; omit --base-b")
+    if args.capability_samples < args.expected_instance_count:
+        parser.error("--capability-samples must be at least --expected-instance-count")
     if args.mode == "target" and not args.table_prefix:
         parser.error("target mode requires --table-prefix for scoped PostgreSQL metrics")
+    if args.mode == "target" and not os.environ.get(args.api_token_env):
+        parser.error(
+            f"target mode requires a non-empty bearer token via {args.api_token_env}"
+        )
     if args.mode == "launch" and not args.binary.is_file():
         parser.error(f"IronCrew binary not found: {args.binary}")
     if args.table_prefix:
@@ -1571,12 +1610,6 @@ def build_pass_criteria(
         replica_states = {}
         replicas_alive = True
     comparator = args.memory_comparator_mib * 1024 * 1024
-    available_peaks = {
-        name: values.get("sampled_peak_rss_bytes")
-        for name, values in resources.items()
-        if isinstance(values.get("sampled_peak_rss_bytes"), int)
-    }
-    rss_ok = all(peak < comparator for peak in available_peaks.values())
     criteria = {
         "workload": {
             "passed": workload_ok,
@@ -1590,25 +1623,30 @@ def build_pass_criteria(
             "readiness_errors": readiness_errors,
         },
         "replicas_alive_before_shutdown": {
-            "passed": replicas_alive,
+            "status": (
+                "passed"
+                if args.mode == "launch" and replicas_alive
+                else "failed"
+                if args.mode == "launch"
+                else "not_applicable"
+            ),
+            "passed": replicas_alive if args.mode == "launch" else None,
             "applicable": args.mode == "launch",
             "states": replica_states,
         },
+        "replica_instance_count": topology_pass_criterion(
+            report.get("replica_topology")
+        ),
         "postgres_deadlocks": {"passed": deadlocks == 0, "delta": deadlocks},
         "postgres_stats_reset_stable": {"passed": stats_stable},
-        "host_process_rss_comparator": {
-            "passed": rss_ok,
-            "applicable": bool(available_peaks),
-            "sampled_peaks_bytes": available_peaks,
-            "comparator_bytes": comparator,
-            "comparator_enforced_by_runner": False,
-            "scope": "host_process_rss",
-        },
+        "host_process_rss_comparator": host_rss_pass_criterion(
+            resources, comparator
+        ),
     }
     criteria["overall_passed"] = all(
         value.get("passed") is True
         for value in criteria.values()
-        if isinstance(value, dict)
+        if isinstance(value, dict) and value.get("applicable", True)
     )
     return criteria
 
@@ -1734,7 +1772,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             pids = {"a": process_a.pid, "b": process_b.pid}
         else:
             base_a = validate_base_url("base-a", args.base_a)
-            base_b = validate_base_url("base-b", args.base_b)
+            base_b = validate_base_url("base-b", args.base_b or args.base_a)
             pid_a = args.pid_a or (
                 docker_pid(args.docker_container_a) if args.docker_container_a else None
             )
@@ -1750,6 +1788,28 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "a": {"base_url": base_a, "pid": pids["a"]},
             "b": {"base_url": base_b, "pid": pids["b"]},
         }
+        capability_routes = (
+            (("route", base_a),)
+            if args.load_balanced_route
+            else (("a", base_a), ("b", base_b))
+        )
+        report["replica_topology"] = sample_replica_topology(
+            client,
+            capability_routes,
+            args.capability_samples,
+            args.expected_instance_count,
+            args.load_balanced_route,
+        )
+        if not report["replica_topology"]["passed"]:
+            report["pass_criteria"] = {
+                "replica_instance_count": topology_pass_criterion(
+                    report["replica_topology"]
+                ),
+                "overall_passed": False,
+            }
+            raise RuntimeError(
+                "capability sampling observed fewer distinct instances than required"
+            )
         sampler = ResourceSampler(
             pids,
             args.resource_sample_interval,

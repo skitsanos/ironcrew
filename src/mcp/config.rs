@@ -187,6 +187,10 @@ pub struct McpServerConfig {
     /// User-supplied label used in tool-name prefix (`mcp__<label>__<tool>`).
     pub label: String,
     pub transport: McpTransportConfig,
+    /// Digest of an explicit non-secret server version/deployment identity.
+    /// Persistent conversations fail closed when a selected MCP tool's
+    /// server does not provide one.
+    pub execution_identity_fingerprint: Option<String>,
     /// When true, the child process inherits the full parent environment.
     /// Defaults to `false` for security (keeps `OPENAI_API_KEY` etc. out of MCP children).
     pub inherit_env: bool,
@@ -345,6 +349,7 @@ pub fn validate_mcp_http_url(url: &str) -> Result<(), String> {
 /// mcp_servers = {
 ///   git = {
 ///     transport = "stdio",
+///     execution_identity = "mcp-server-git@2026-08",
 ///     command   = "uvx",
 ///     args      = {"mcp-server-git"},
 ///     env       = { MY_VAR = "value" },
@@ -352,6 +357,7 @@ pub fn validate_mcp_http_url(url: &str) -> Result<(), String> {
 ///   },
 ///   myapi = {
 ///     transport = "http",
+///     execution_identity = "catalog-api-v3",
 ///     url       = "https://mcp.example.com/mcp",
 ///     headers   = { authorization = "Bearer TOKEN" },
 ///   },
@@ -379,6 +385,17 @@ pub fn parse_mcp_config(table: &mlua::Table) -> Result<McpConfig, mlua::Error> {
         let inherit_env = server_table
             .get::<Option<bool>>("inherit_env")?
             .unwrap_or(false);
+        let execution_identity_fingerprint = server_table
+            .get::<Option<String>>("execution_identity")?
+            .map(|identity| {
+                crate::engine::conversation_provider::explicit_execution_identity_fingerprint(
+                    "mcp-server",
+                    &label,
+                    &identity,
+                )
+                .map_err(mlua::Error::external)
+            })
+            .transpose()?;
 
         let transport = match transport_str.as_str() {
             "stdio" => {
@@ -453,6 +470,7 @@ pub fn parse_mcp_config(table: &mlua::Table) -> Result<McpConfig, mlua::Error> {
         servers.push(McpServerConfig {
             label,
             transport,
+            execution_identity_fingerprint,
             inherit_env,
         });
     }
@@ -508,6 +526,48 @@ mod tests {
         assert!(validate_server_label("abcdefghijklmnopq").is_err());
         // Empty
         assert!(validate_server_label("").is_err());
+    }
+
+    #[test]
+    fn explicit_execution_identity_is_secret_safe_and_versioned() {
+        let _guard = env_guard();
+        unsafe { std::env::remove_var("IRONCREW_MCP_ALLOWED_COMMANDS") };
+        let parse = |identity: Option<&str>, secret: &str| {
+            let lua = mlua::Lua::new();
+            let identity = identity
+                .map(|value| format!("execution_identity = '{value}',"))
+                .unwrap_or_default();
+            let table = lua
+                .load(format!(
+                    "return {{ svc = {{ transport = 'stdio', command = 'mcp-test', {identity} env = {{ TOKEN = '{secret}' }} }} }}"
+                ))
+                .eval::<mlua::Table>()
+                .unwrap();
+            parse_mcp_config(&table).unwrap().servers.remove(0)
+        };
+
+        let first = parse(Some("catalog-v1"), "secret-one");
+        let rotated = parse(Some("catalog-v1"), "secret-two");
+        let upgraded = parse(Some("catalog-v2"), "secret-one");
+        assert_eq!(
+            first.execution_identity_fingerprint,
+            rotated.execution_identity_fingerprint
+        );
+        assert_ne!(
+            first.execution_identity_fingerprint,
+            upgraded.execution_identity_fingerprint
+        );
+        assert!(
+            parse(None, "secret-one")
+                .execution_identity_fingerprint
+                .is_none()
+        );
+        assert!(
+            first
+                .execution_identity_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| !fingerprint.contains("secret-one"))
+        );
     }
 
     // ── tool name composition ───────────────────────────────────────────────

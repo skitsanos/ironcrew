@@ -7,6 +7,27 @@ use super::*;
 
 mod ic005;
 mod ic006;
+mod ic008;
+mod ic008_assert;
+mod ic008_http;
+mod ic008_process;
+mod ic008_provider;
+mod ic008_sql;
+mod ic016;
+mod ic016_http;
+mod ic016_process;
+mod ic016_sql;
+mod ic017;
+mod ic017_deadline;
+mod ic017_http;
+mod ic017_support;
+mod ic019;
+mod ic019_http;
+mod ic019_limits;
+mod ic019_quota;
+mod ic019_rates;
+mod ic019_support;
+mod ic020;
 mod support;
 
 use support::{
@@ -32,6 +53,7 @@ impl ProcessPair {
         database_url: String,
         prefix: String,
         unique: &str,
+        extra_env: &[(&str, &str)],
     ) -> Self {
         let workspace = tempfile::tempdir().expect("create phase-two process workspace");
         let flow_dir = workspace.path().join(FLOW);
@@ -55,6 +77,7 @@ impl ProcessPair {
             &prefix,
             workspace.path(),
             require_key,
+            extra_env,
         );
         let mut survivor_b = ReplicaProcess::spawn_with_policy(
             &format!("{label}-b"),
@@ -65,6 +88,7 @@ impl ProcessPair {
             &prefix,
             workspace.path(),
             require_key,
+            extra_env,
         );
         tokio::join!(
             owner_a.wait_until_ready(&client),
@@ -100,6 +124,18 @@ pub(super) async fn with_process_pair<F>(label: &str, require_key: bool, fixture
 where
     F: for<'a> FnOnce(&'a mut ProcessPair) -> LocalBoxFuture<'a, ()>,
 {
+    with_configured_process_pair(label, require_key, fixture, &[], scenario).await;
+}
+
+pub(super) async fn with_configured_process_pair<F>(
+    label: &str,
+    require_key: bool,
+    fixture: &str,
+    extra_env: &[(&str, &str)],
+    scenario: F,
+) where
+    F: for<'a> FnOnce(&'a mut ProcessPair) -> LocalBoxFuture<'a, ()>,
+{
     let Some(database_url) = postgres_url() else {
         eprintln!("SKIP {label}: IRONCREW_TEST_PG_URL unset");
         return;
@@ -114,6 +150,7 @@ where
         database_url.clone(),
         prefix.clone(),
         &unique,
+        extra_env,
     ))
     .catch_unwind()
     .await;
@@ -155,7 +192,11 @@ pub(super) async fn start_keyed_run(pair: &ProcessPair, key: &str) -> serde_json
     response.json().await.expect("parse keyed run acceptance")
 }
 
-pub(super) async fn wait_for_shared_question(pair: &ProcessPair, run_id: &str, prompt: &str) {
+pub(super) async fn wait_for_shared_question(
+    pair: &ProcessPair,
+    run_id: &str,
+    prompt: &str,
+) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         let response = authenticated(pair.client.get(format!(
@@ -174,7 +215,11 @@ pub(super) async fn wait_for_shared_question(pair: &ProcessPair, run_id: &str, p
                 assert_eq!(body["status"], "waiting_for_input");
                 assert_eq!(body["owner_instance_id"], pair.owner_a_id);
                 assert_eq!(body["control_scope"], "shared_store");
-                return;
+                return body["questions"]
+                    .as_array()
+                    .and_then(|questions| questions.iter().find(|item| item["prompt"] == prompt))
+                    .expect("located shared question")
+                    .clone();
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

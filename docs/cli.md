@@ -141,7 +141,8 @@ deliberately enabled. Local
 |--------|----------------------------------|-------------|
 | GET    | `/health`                        | Backwards-compatible lightweight liveness check |
 | GET    | `/health/live`                   | Process liveness check |
-| GET    | `/health/ready`                  | Storage- and lease-maintenance-aware readiness (`503` while unavailable or maintenance is unhealthy) |
+| GET    | `/health/ready`                  | Lifecycle-, storage-, and lease-maintenance-aware readiness (`503` unless the process is accepting and dependencies are healthy) |
+| GET    | `/capabilities`                  | Protected runtime/process identity, optional deployment evidence, and `lifecycle_state` contract |
 | GET    | `/metrics`                       | Protected Prometheus process/admission metrics |
 | POST   | `/flows/{flow}/run`              | Run a crew (async, returns run_id) |
 | GET    | `/flows/{flow}/events/{run_id}`  | SSE event stream for a run |
@@ -165,6 +166,54 @@ to start, but readiness returns `503` with
 reconciliation failure has the same effect. Readiness recovers only after one
 complete maintenance cycle succeeds; `/health/live` and the compatibility
 `/health` endpoint remain liveness-only checks.
+
+`serve` starts in `accepting`. On Unix, `SIGUSR1` moves it through `fencing`
+to `draining` without exiting: readiness fails, owned PostgreSQL keyed attempts
+are fenced, protected `POST`/`DELETE` requests whose lifecycle middleware check
+occurs after withdrawal reject with `503 instance_draining`, and authenticated
+reads/SSE remain available. A request admitted just before withdrawal can lose
+an inner race and return a generic non-cacheable `503` with numeric
+`Retry-After`; the middleware phase read is the mutation-admission
+linearization point.
+If the explicit store fence fails, the process remains `fencing` and another
+`SIGUSR1` retries. `SIGTERM` and Ctrl+C start
+`IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS`, retry the fence until it commits, then
+enter `stopping` and bounded teardown. Railway and Kubernetes must continue
+sending `SIGTERM`; configuring `SIGUSR1` as the container stop signal would
+drain but never request exit.
+
+**Deployment Evidence:**
+
+Authenticated `GET /capabilities` always exposes `process_start_id`, a random
+UUID created once for the current process start. It changes after a restart
+even if the platform reuses `IRONCREW_INSTANCE_ID` or `RAILWAY_REPLICA_ID`, and
+must not be used as a durable owner or routing key.
+
+The optional deployment tuple is configured with exactly these variables:
+
+| Variable | Capability field | Description |
+|---|---|---|
+| `IRONCREW_DEPLOYMENT_REVISION` | `deployment.revision` | Operator-selected immutable source/build-input revision, 1–128 bytes using ASCII letters, digits, `.`, `-`, `_`, `:`, or `+` |
+| `IRONCREW_ARTIFACT_FINGERPRINT` | `deployment.artifact_fingerprint` | SHA-256 of the exact running executable/artifact |
+| `IRONCREW_FLOW_FINGERPRINT` | `deployment.flow_fingerprint` | SHA-256 of the operator's documented canonical flow-tree manifest |
+| `IRONCREW_CONFIG_FINGERPRINT` | `deployment.config_fingerprint` | SHA-256 of a documented canonical manifest of effective non-secret parity settings |
+| `IRONCREW_HITL_KEYRING_FINGERPRINT` | `deployment.hitl_keyring_fingerprint` | SHA-256 of a canonical non-secret keyring-revision manifest |
+
+All five absent leaves `deployment: null`; setting only a subset fails startup.
+Every fingerprint is exactly `sha256:` plus 64 lowercase hexadecimal
+characters. These are operator attestations, not hashes calculated by
+IronCrew. Platform gates must independently recalculate them inside every
+active process and correlate each response with `X-IronCrew-Instance-Id` and
+`process_start_id`.
+
+Do not put raw bearer/database/provider credentials, raw HITL keys, or hashes
+of guessable secrets in either canonical manifest. A HITL revision manifest can
+use key ids, the active id, and fingerprints of random 32-byte key material.
+Exclude unique instance/process/platform ids, injected ports/addresses,
+timestamps, and pod-specific paths from equality checks; record them as
+attribution. Record platform CPU/memory limits separately. Planned key-rotation
+revisions may differ temporarily only according to the ordered compatible
+rollout described in [Cloud Deployment](cloud-deployment.md#hitl-key-rotation-on-railway-and-openshift).
 
 ### fmt
 
@@ -353,7 +402,7 @@ be set in the shell or in `.env` files.
 | `OPENROUTER_API_KEY` | Use explicitly as `api_key` beside an OpenRouter custom URL |
 | `IRONCREW_LOG`    | Log level filter (e.g., `info`, `debug`, `trace`, `warn`, `error`) |
 | `IRONCREW_ALLOW_SHELL` | Set to `1` or `true` to enable the shell tool (disabled by default) |
-| `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls (e.g., `200` for 5 req/sec) |
+| `IRONCREW_RATE_LIMIT_MS` | Minimum milliseconds between LLM API calls made by one provider instance in one live Lua VM (e.g., `200` for 5 req/sec). It is not a process- or cluster-wide provider limit |
 | `IRONCREW_TOOL_TIMEOUT` | Max seconds a single tool execution may run (default: `60`; hard ceiling: `3600`). Missing, invalid, or zero values use 60; larger values clamp to 3600 |
 | `IRONCREW_DEFAULT_MAX_CONCURRENT` | Default max parallel tasks per phase when not set in crew config (default: `4`) |
 | `IRONCREW_MAX_CONCURRENT_TASKS` | Process policy ceiling for a crew's `max_concurrent` value (default: `32`). Crew startup fails when its configured/default concurrency is outside `1..=ceiling` |
@@ -386,6 +435,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES` | Maximum logical bytes materialized by one PostgreSQL SSE page (default: the larger of `524288` and `IRONCREW_EVENT_MAX_BYTES`; range: 1024–67108864). Must be at least the single-event limit. Page count is derived as `min(IRONCREW_MAX_EVENTS, 64)`. |
 | `IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS` | PostgreSQL SSE journal polling interval while waiting for another event (default: `500`; range: 100–5000 ms). Applies per open run stream. |
 | `IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS` | Deadline for each PostgreSQL journal-page read (default: `2000`; range: 100–30000 ms). Five consecutive read failures/timeouts close the stream with an SSE error event. |
+| `IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS` | Outer deadline `W` for one PostgreSQL journal-append attempt, including pool acquisition and the complete transaction (default: `1500`; range: 100–5000 ms). PostgreSQL `lock_timeout` and `statement_timeout` are `4W/5`. The writer makes at most three attempts with 50/100 ms backoffs; flush/terminal acknowledgement is bounded by `3W + 650 ms`. |
 | `IRONCREW_EVENT_JOURNAL_PRUNE_BATCH` | Rows selected per bounded PostgreSQL journal-prune step (default: `1000`; range: 1–10000). Must not exceed the global event cap. |
 | `IRONCREW_MESSAGEBUS_QUEUE_DEPTH` | Max messages per agent queue in the MessageBus (default: `1000`). Oldest dropped on overflow with a warning log. `0` disables the cap |
 | `IRONCREW_MESSAGEBUS_PENDING_CAP` | Max pending broadcasts (messages sent before any agent is registered) (default: `500`). `0` disables the cap |
@@ -460,7 +510,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10 MiB; range: 1–67108864) |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | Whole conversation-turn deadline, including provider and tool rounds (default: `300`; hard ceiling: `3600`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min; hard ceiling: `86400`) |
-| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP run and conversation-message mutations (default: `false`; recommended: `true` in production) |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP runs and JSON/SQLite conversation messages (default: `false`; recommended: `true` in production). PostgreSQL conversation messages require the header regardless because it is their shared turn fence |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Completed/indeterminate ledger retention (default: `86400`; range: 60–2592000; must be at least `IRONCREW_MAX_RUN_LIFETIME + 3600`) |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum in-flight plus retained terminal request records (default: `10000`; hard ceiling: `100000`) |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL` | Maximum in-flight plus retained terminal records charged to one authenticated principal (default: global record cap; cannot exceed it) |
@@ -469,26 +519,59 @@ be set in the shell or in `.env` files.
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | Maximum compact JSON response retained per key (default: `8388608` = 8 MiB; hard ceiling: 64 MiB) |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | Aggregate retained response-body budget (default: `268435456` = 256 MiB; hard ceiling: 8 GiB); excess responses become non-replayable tombstones |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL` | Aggregate retained response-body budget charged to one principal (default: global response-byte cap; cannot exceed it); excess responses become non-replayable tombstones |
-| `IRONCREW_MAX_SSE_CONNECTIONS` | Global cap on live run and conversation SSE connections (default: `16`; hard ceiling: `1024`) |
-| `IRONCREW_READINESS_CACHE_MS` | Storage-aware readiness result cache/coalescing interval (default: `1000`; hard ceiling: `10000`) |
+| `IRONCREW_MAX_SSE_CONNECTIONS` | Process-wide per-replica cap on live run and conversation SSE connections (default: `16`; hard ceiling: `1024`) |
+| `IRONCREW_READINESS_CACHE_MS` | Storage-aware readiness result cache interval (default: `1000`; hard ceiling: `10000`). Overlapping uncached probes wait up to one second for the shared check, then fail closed. |
 | `IRONCREW_RUN_SSE_RETENTION_SECS` | Time a completed run's event bus remains available for a late subscriber (default: `5`; hard ceiling: `300`) |
 | `IRONCREW_SSE_OUTPUT_MAX_CHARS` | Truncate task output in process-local JSON/SQLite SSE responses to N chars (disabled by default). PostgreSQL journal payloads are bounded at emission by `IRONCREW_EVENT_MAX_BYTES`; sanitize sensitive flow output before emitting it. |
-| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | Hard deadline in seconds applied after SIGTERM/Ctrl+C. If graceful teardown hasn't completed by then, the process exits anyway (default: `10`; range: 1–300) |
+| `IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS` | Routing deadline measured from SIGTERM/Ctrl+C (default: `5`; range: 0–300 seconds). Fencing consumes part of it and any remainder is spent in `draining`; fence failures retry with bounded store attempts and exponential backoff from 100 ms capped at 5 seconds beyond the deadline, blocking `stopping`. A successful `SIGUSR1` remains draining until a later termination signal. |
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | Hard teardown deadline in seconds started when the lifecycle enters `stopping`. If graceful teardown has not completed by then, the process exits anyway (default: `10`; range: 1–300) |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | Post-serve drain window in milliseconds for background tasks spawned from `Drop` paths (notably reaping stdio MCP children) (default: `1000`; range: 0–30000) |
 
 Admission buckets are intentionally process-local. With multiple HTTP
-replicas, multiply the configured capacity and memory budget by replica count;
-PostgreSQL's keyed cancellation/HITL coordination does not make these limits
-global. Rate-limit breaches return `429` with numeric
+replicas, multiply process-local capacity and the per-pod RAM allocation by
+replica count; shared PostgreSQL idempotency and global journal budgets do not
+multiply. PostgreSQL's keyed cancellation/HITL coordination does not make
+process admission global. Put any required cluster-wide request or provider
+budget in a trusted shared gateway with bounded queues and idempotency-key
+preservation. Rate-limit breaches return `429` with numeric
 `Retry-After` and `Cache-Control: no-store`; the independent control bucket
 keeps abort/answer/delete operations available when work admission is busy,
 and the observation bucket prevents aggressive question-list polling from
 consuming either mutation bucket. Durable SSE's internal PostgreSQL page reads
 are instead bounded by the SSE connection, page, poll, read-timeout, and pool
 settings.
+Use the explicit formulas and caveats in [HTTP Scaling](http-scaling.md#multi-replica-capacity-arithmetic)
+before changing replica count.
 `GET /metrics` is protected by the same API authentication and exposes only
 fixed, low-cardinality labels—never principal names, bearer tokens, audit
-actors, flow names, or idempotency keys.
+actors, flow names, or idempotency keys. Two unlabeled instantaneous gauges
+surface the readiness-critical storage signals already maintained by each
+process:
+
+- `ironcrew_store_maintenance_healthy` is `1` when the latest completed
+  heartbeat-plus-reconciliation maintenance cycle succeeded and `0` after a
+  failed startup/cycle until a complete cycle recovers.
+- `ironcrew_process_terminal_persistence_degraded_finalizers` is the current
+  number of run or conversation finalizers retrying durable persistence. It is
+  not a cumulative failure counter and returns to `0` as those finalizers
+  recover or are fenced.
+- `ironcrew_process_lifecycle_state{state="..."}` is a one-hot gauge over the
+  four fixed lifecycle states.
+- `ironcrew_process_lifecycle_rejections_total{class="work|control"}` counts
+  direct protected mutations rejected after this process withdrew.
+
+Unlabeled resource gauges also expose process-only Linux `VmRSS`/`VmHWM` with
+an availability flag, this process's SQLx PostgreSQL pool, logical provider
+futures (including pacing), registered EventBus replay retention/capacities,
+and active/limit SSE permits. They are fixed-cardinality and per scrape target;
+they are not cgroup/OOM, child-process, PostgreSQL-server, provider-side, or
+cluster-global measurements. See
+[Cloud Deployment: Metrics](cloud-deployment.md#metrics) for the exact series
+and aggregation rules.
+
+These process series reset with the process. In a multi-replica deployment,
+scrape and alert on every pod: do not sum the maintenance-health boolean or
+assume a load-balanced scrape sampled every replica.
 
 **Security:**
 
@@ -536,11 +619,11 @@ actors, flow names, or idempotency keys.
 | `IRONCREW_ASK_HUMAN_MAX_CHOICES` | Maximum choices on one question (default: `100`; hard ceiling: `1000`) |
 | `IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES` | Maximum aggregate bytes across choices (default: `65536`; hard ceiling: `1048576`) |
 | `IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES` | Maximum serialized answer bytes (default: `65536`; hard ceiling: `1048576`) |
-| `IRONCREW_HITL_ENCRYPTION_KEYS` | Secret JSON object mapping at most 8 key ids to canonical base64 encodings of 32-byte keys (maximum JSON size: 16384 bytes). Together with an active key id, enables encrypted PostgreSQL cross-replica questions and answers for idempotency-keyed HTTP runs. During rotation, keep old keys until no mailbox question/answer row references their fingerprints. |
-| `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id from `IRONCREW_HITL_ENCRYPTION_KEYS` used for new question/answer ciphertext. Both variables must be set together; malformed or partial configuration fails PostgreSQL store startup. |
+| `IRONCREW_HITL_ENCRYPTION_KEYS` | Secret JSON object mapping at most 8 key ids to canonical base64 encodings of 32-byte keys (maximum JSON size: 16384 bytes). Together with an active key id, enables encrypted PostgreSQL cross-replica questions and answers for idempotency-keyed HTTP runs. It is loaded once at process startup. During rotation, every process must have the expanded old+new set before active ids differ; remove old only after all old-active writers exit and both mailbox fingerprint columns have zero old references. Startup fails if retained ciphertext needs an absent key. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id from `IRONCREW_HITL_ENCRYPTION_KEYS` used for newly registered question ciphertext. Answers inherit their authenticated question's key. Both variables must be set together; malformed or partial configuration fails PostgreSQL store startup. |
 | `IRONCREW_HITL_POLL_INTERVAL_MS` | Owner mailbox polling interval per pending durable question (default: `500`; effective range: 50–5000 ms). Lower values reduce answer latency but multiply PostgreSQL reads across pending questions, runs, and replicas. |
 | `IRONCREW_HITL_READ_TIMEOUT_MS` | Deadline for one owner-side durable-answer PostgreSQL read (default: `2000`; effective range: 100–30000 ms). Timeouts are retried after the poll interval until the question deadline. |
-| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | Per-process cap on concurrent PostgreSQL question-list/decrypt operations (default: `8`; range: 1–64). Exhaustion fails closed instead of queuing unbounded ciphertext materialization. |
+| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | Per-process cap shared by concurrent PostgreSQL question-list decryption and answer-side question authentication (default: `8`; range: 1–64). Exhaustion fails closed instead of queuing unbounded ciphertext materialization. |
 
 The HTTP, web-scrape, image, and provider-body/output byte settings use a
 shared process hard cap of `268435456` (256 MiB); zero, invalid, or excessive

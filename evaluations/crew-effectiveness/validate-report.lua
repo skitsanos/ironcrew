@@ -13,7 +13,7 @@ if not validation.valid then
     for _, item in ipairs(validation.errors) do
         log("error", (item.path or "$") .. ": " .. item.message)
     end
-    error("crew-effectiveness report does not match report-v1.schema.json")
+    error("crew-effectiveness report does not match the supplied report schema")
 end
 
 print("Crew-effectiveness report schema validation passed.")

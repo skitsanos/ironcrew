@@ -74,4 +74,12 @@ grep -Fq '"require_approval": [' "$probe_root/human-approval.html"
 grep -Fq '"ask_human"' "$probe_root/human-approval.html"
 grep -Fq '"file_write"' "$probe_root/human-approval.html"
 
-printf 'Lua examples: %d files validated; 4 offline probes passed.\n' "$validated"
+PYTHONDONTWRITEBYTECODE=1 python3 \
+  evaluations/platform-canary/runtime_smoke.py \
+  --ironcrew-bin "$ironcrew_bin" \
+  --flow-root evaluations/platform-canary/flows \
+  >"$probe_root/platform-canary-smoke.json"
+grep -Fq '"flows_executed":4' "$probe_root/platform-canary-smoke.json"
+grep -Fq '"effect_calls":2' "$probe_root/platform-canary-smoke.json"
+
+printf 'Lua examples: %d files validated; 5 offline probes passed.\n' "$validated"

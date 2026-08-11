@@ -1,9 +1,18 @@
 pub mod admission;
 pub mod audit;
 pub mod auth;
+pub mod conversation_lifecycle;
 pub mod conversations;
+pub mod deployment;
 pub mod handlers;
 pub mod idempotency;
+pub mod lifecycle;
+mod resource_metrics;
+mod sse;
+mod state;
+
+#[allow(unused_imports)] // public compatibility re-export; binary module tree is private
+pub use state::{ActiveConversationsMap, ActiveRun, AppState, CachedReadiness};
 
 use axum::{
     Router,
@@ -12,98 +21,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use tokio::sync::{RwLock, Semaphore};
-
-use crate::engine::eventbus::EventBus;
-use crate::engine::input_bridge::InputBridge;
-use crate::engine::store::StateStore;
-
-#[derive(Clone, Copy)]
-pub struct CachedReadiness {
-    pub checked_at: std::time::Instant,
-    pub ready: bool,
-    pub component: &'static str,
-}
-
-/// A running crew: its event bus and an abort handle to cancel it.
-pub struct ActiveRun {
-    pub eventbus: EventBus,
-    pub abort_handle: tokio::task::AbortHandle,
-    /// Flow slug this run belongs to, so `abort_run` can reject a request that
-    /// targets another flow's run without a store round-trip.
-    pub flow: String,
-    /// Per-run human-input transport for `crew:ask_human()` — the questions
-    /// and answer endpoints reach the suspended flow through this. Closed as
-    /// soon as the run aborts or otherwise terminates, independently of the
-    /// event bus's short terminal-replay retention window.
-    pub input_bridge: Arc<InputBridge>,
-    /// Becomes `true` after the monitor has persisted and emitted exactly one
-    /// terminal outcome. Shutdown waits on this after aborting active work.
-    pub terminal: tokio::sync::watch::Receiver<bool>,
-}
-
-/// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
-/// Flow slug is the last path segment of the resolved flow dir — the same
-/// value stored in `ConversationRecord.flow_path`, so the map is implicitly
-/// namespaced by flow.
-pub type ActiveConversationsMap =
-    Arc<RwLock<HashMap<(String, String), Arc<conversations::ConversationHandle>>>>;
-
-/// Shared application state
-pub struct AppState {
-    pub flows_dir: PathBuf,
-    /// Immutable authentication policy parsed once at startup. Successful
-    /// protected requests receive a trusted `auth::Principal` extension.
-    pub auth: Arc<auth::AuthConfig>,
-    /// Principal-aware process admission and low-cardinality metrics.
-    pub admission: Arc<admission::AdmissionController>,
-    /// Cleared as soon as graceful shutdown begins so readiness fails before
-    /// active work is cancelled and drained.
-    pub accepting_traffic: AtomicBool,
-    pub active_runs: Arc<RwLock<HashMap<String, ActiveRun>>>,
-    pub active_conversations: ActiveConversationsMap,
-    /// Hard cap on `active_conversations.len()` — reads
-    /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
-    pub max_active_conversations: usize,
-    /// Atomic admission control for active conversations. Each live
-    /// `ConversationHandle` owns one permit for its entire in-memory lifetime.
-    pub conversation_permits: Arc<Semaphore>,
-    /// Hard cap on `active_runs.len()` — reads `IRONCREW_MAX_ACTIVE_RUNS`
-    /// once at boot. Backpressure against unbounded concurrent runs.
-    pub max_active_runs: usize,
-    /// Atomic admission control for active runs. The run monitor owns the
-    /// permit until it has persisted and emitted the terminal outcome.
-    pub run_permits: Arc<Semaphore>,
-    /// Global admission control for long-lived run and conversation SSE
-    /// connections. The stream owns a permit until the client disconnects.
-    pub max_sse_connections: usize,
-    pub sse_permits: Arc<Semaphore>,
-    /// Hard lifetime for an HTTP run, captured once at server startup.
-    pub max_run_lifetime: std::time::Duration,
-    /// Number of HTTP run finalizers currently retrying a durable terminal
-    /// transition. Any non-zero value fails readiness so ingress stops adding
-    /// work while persistence is degraded.
-    pub terminal_persistence_failures: AtomicUsize,
-    /// Set by the lease heartbeat/reconciler loop. A failed maintenance write
-    /// keeps readiness down until a complete heartbeat+reconcile cycle passes.
-    pub store_maintenance_healthy: AtomicBool,
-    /// Coalesces unauthenticated readiness probes and caches the expensive
-    /// storage/schema result for a short interval.
-    pub readiness_cache: tokio::sync::Mutex<Option<CachedReadiness>>,
-    /// Immutable, boot-validated limits for the durable HTTP idempotency
-    /// ledger. Keeping these in state avoids environment reads per request.
-    pub idempotency: idempotency::IdempotencyConfig,
-    /// Server-wide persistence singleton. Bootstrapped once at
-    /// `cmd_serve` startup and reused across every handler so Postgres
-    /// migrations / table checks don't re-run per request, and so every
-    /// caller shares the same connection pool instead of spinning a new
-    /// one per conversation start.
-    pub store: Arc<dyn StateStore>,
-}
 
 /// Response from running a crew
 #[derive(Serialize)]
@@ -237,22 +156,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/flows/{flow}/answer/{run_id}", post(answer_question))
         .layer(axum::middleware::from_fn(sensitive_response_no_store));
 
-    // Protected routes (auth required when either token source is configured).
-    // Authentication is the outer layer: admission sees only server-issued
-    // principal extensions, never X-Audit-Actor or source-IP guesses.
-    let protected = Router::new()
-        .route("/capabilities", get(capabilities))
-        .route("/flows/{flow}/run", post(run_flow))
-        .route("/flows/{flow}/abort/{run_id}", post(abort_run))
-        .route("/flows/{flow}/runs", get(list_runs))
-        .route("/flows/{flow}/runs/{id}", get(get_run))
-        .route("/flows/{flow}/runs/{id}", delete(delete_run))
-        .route("/flows/{flow}/validate", get(validate_flow))
-        .route("/flows/{flow}/agents", get(list_agents))
-        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints. Their route
-        // layer also marks extractor-generated errors as non-cacheable.
-        .merge(sensitive_run_control)
-        // Phase-1 Human-in-the-Loop conversation endpoints
+    let sensitive_conversation_control = Router::new()
         .route(
             "/flows/{flow}/conversations",
             get(conversations::list_conversations),
@@ -270,19 +174,47 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(conversations::get_history),
         )
         .route(
-            "/flows/{flow}/conversations/{id}/events",
-            get(conversations::conversation_events),
-        )
-        .route(
             "/flows/{flow}/conversations/{id}",
             delete(conversations::delete_conversation),
         )
+        .route(
+            "/flows/{flow}/conversations/{id}/events",
+            get(conversations::conversation_events),
+        )
+        .layer(axum::middleware::from_fn(sensitive_response_no_store));
+
+    // Protected routes (auth required when either token source is configured).
+    // Authentication is the outer layer: admission sees only server-issued
+    // principal extensions, never X-Audit-Actor or source-IP guesses.
+    let protected = Router::new()
+        .route("/capabilities", get(capabilities))
+        .route("/flows/{flow}/run", post(run_flow))
+        .route("/flows/{flow}/abort/{run_id}", post(abort_run))
+        .route("/flows/{flow}/runs", get(list_runs))
+        .route("/flows/{flow}/runs/{id}", get(get_run))
+        .route("/flows/{flow}/runs/{id}", delete(delete_run))
+        .route("/flows/{flow}/validate", get(validate_flow))
+        .route("/flows/{flow}/agents", get(list_agents))
+        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints. Their route
+        // layer also marks extractor-generated errors as non-cacheable.
+        .merge(sensitive_run_control)
+        // Conversation payloads and all extractor/error responses are
+        // non-cacheable because transcripts and model output are sensitive.
+        .merge(sensitive_conversation_control)
         .route("/audit", get(handlers::list_audit))
         .route("/metrics", get(admission::metrics))
         .route("/nodes", get(list_nodes))
         .layer(axum::middleware::from_fn_with_state(
             state.admission.clone(),
             admission::enforce_mutation_admission,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            lifecycle::enforce_mutation_lifecycle,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            lifecycle::attach_instance_id,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.auth.clone(),

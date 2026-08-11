@@ -18,14 +18,16 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::agent_turn::ActiveTurnGuard;
 use crate::engine::agent::Agent;
+use crate::engine::conversation_definition::{
+    ConversationDefinition, conversation_definition_fingerprint,
+};
 use crate::engine::eventbus::{CrewEvent, EventBus};
-use crate::engine::sessions::{ConversationRecord, validate_session_id};
-use crate::engine::store::StateStore;
+use crate::engine::sessions::{ConversationExecution, ConversationRecord, validate_session_id};
+use crate::engine::store::{ConversationCoordinationScope, StateStore};
 use crate::llm::provider::{
     ChatMessage, ChatRequest, ChatResponse, DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
     HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider, StreamChunk, append_text_bounded,
-    chat_history_max_bytes, enforce_conversation_history_limits, max_reasoning_bytes,
-    validate_chat_history,
+    enforce_conversation_history_limits, validate_chat_history,
 };
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
@@ -45,6 +47,13 @@ pub(crate) fn default_max_history() -> Option<usize> {
         .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
     Some(env_default)
 }
+
+/// Precomputed canonical flow identity injected by HTTP/CLI runtimes before
+/// Lua executes. Keeping it in app data avoids a second blocking filesystem
+/// walk and binds construction to the source snapshot already checked by the
+/// caller.
+#[derive(Clone)]
+pub struct ConversationSourceFingerprint(pub String);
 
 /// Shared inner state of a conversation. All methods live here so that
 /// non-Lua consumers (HTTP API, CLI REPL) can call them via
@@ -131,6 +140,10 @@ pub struct LuaConversationInner {
     /// Revision expected by the next durable save. Held across persistence so
     /// overlapping save calls cannot reuse the same optimistic revision.
     pub revision: Mutex<u64>,
+
+    /// Durable incarnation, definition identity, and original transcript
+    /// limits represented by this in-memory cache.
+    pub execution: ConversationExecution,
 }
 
 /// Candidate result of one conversation turn. The public conversation history
@@ -163,6 +176,7 @@ impl LuaConversationInner {
         model: String,
         system_prompt: String,
         max_history: Option<usize>,
+        history_max_bytes: usize,
         stream: bool,
         max_tool_rounds: usize,
         eventbus: EventBus,
@@ -173,6 +187,8 @@ impl LuaConversationInner {
         autosave: bool,
         project_dir: std::path::PathBuf,
         http_client: reqwest::Client,
+        source_fingerprint: String,
+        definition_fingerprint: String,
     ) -> Result<Self, IronCrewError> {
         let now = chrono::Utc::now().to_rfc3339();
         let max_history = match max_history {
@@ -184,8 +200,6 @@ impl LuaConversationInner {
             }
             None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
         };
-        let history_max_bytes = chat_history_max_bytes();
-
         // Resolve the id and decide whether the session is persistent.
         let (id, persistent) = match id {
             Some(s) => {
@@ -200,11 +214,30 @@ impl LuaConversationInner {
         let mut messages = vec![ChatMessage::system(&system_prompt)];
         let mut created_at = now.clone();
         let mut revision = 0;
+        let mut execution = ConversationExecution::new(
+            source_fingerprint.clone(),
+            definition_fingerprint.clone(),
+            max_history,
+            history_max_bytes,
+        )?;
 
         if persistent
             && let Some(ref store) = store
             && let Some(record) = store.get_conversation(flow_path.as_deref(), &id).await?
         {
+            record.execution.validate()?;
+            if record.execution.source_fingerprint != source_fingerprint {
+                return Err(IronCrewError::Conflict(
+                    "Conversation flow source changed; restore the original definition or start a new conversation"
+                        .into(),
+                ));
+            }
+            if record.execution.definition_fingerprint != definition_fingerprint {
+                return Err(IronCrewError::Conflict(
+                    "Conversation definition changed; restore the original model, agent, tools, provider, and limits or start a new conversation"
+                        .into(),
+                ));
+            }
             validate_chat_history(&record.messages, max_history, history_max_bytes, true).map_err(
                 |error| {
                     IronCrewError::Validation(format!(
@@ -213,6 +246,7 @@ impl LuaConversationInner {
                 },
             )?;
             revision = record.revision;
+            execution = record.execution;
             messages = record.messages;
             created_at = record.created_at;
             tracing::info!(
@@ -250,6 +284,7 @@ impl LuaConversationInner {
             autosave,
             created_at,
             revision: Mutex::new(revision),
+            execution,
             project_dir,
             http_client,
         })
@@ -283,6 +318,7 @@ impl LuaConversationInner {
             flow_name: self.flow_name.clone(),
             flow_path: self.flow_path.clone(),
             agent_name: self.agent.name.clone(),
+            execution: self.execution.clone(),
             messages,
             created_at: self.created_at.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -362,6 +398,17 @@ impl LuaConversationInner {
         images: Option<Vec<crate::llm::provider::ImageInput>>,
         caller_ctx: &ToolCallContext,
     ) -> Result<(String, Option<String>), IronCrewError> {
+        if self.persistent
+            && self.store.as_ref().is_some_and(|store| {
+                store.conversation_coordination_scope()
+                    == ConversationCoordinationScope::SharedStore
+            })
+        {
+            return Err(IronCrewError::Conflict(
+                "Persistent conversations on a shared store require the keyed HTTP /messages endpoint so provider and tool work is durably fenced"
+                    .into(),
+            ));
+        }
         let prepared = self
             .prepare_turn_with_ctx(user_message, images, caller_ctx)
             .await?;
@@ -455,6 +502,7 @@ impl LuaConversationInner {
             flow_name: self.flow_name.clone(),
             flow_path: self.flow_path.clone(),
             agent_name: self.agent.name.clone(),
+            execution: self.execution.clone(),
             messages: history,
             created_at: self.created_at.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -550,7 +598,7 @@ impl LuaConversationInner {
         active_turn.commit();
 
         let reasoning = response.reasoning.map(|reasoning| {
-            let limit = max_reasoning_bytes();
+            let limit = self.tool_registry.max_reasoning_bytes();
             let mut bounded = String::new();
             if append_text_bounded(&mut bounded, &reasoning, limit) {
                 tracing::warn!(
@@ -787,6 +835,7 @@ pub async fn build_conversation(
     provider: Arc<dyn LlmProvider>,
     tool_registry: ToolRegistry,
     crew_default_model: &str,
+    source_fingerprint: &str,
     crew_max_tool_rounds: usize,
     eventbus: EventBus,
     store: Option<Arc<dyn StateStore>>,
@@ -862,6 +911,31 @@ pub async fn build_conversation(
         .flatten()
         .unwrap_or(true);
 
+    let effective_max_history = max_history.unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
+    let history_max_bytes = tool_registry.chat_history_max_bytes();
+    let provider_execution_fingerprint = match provider.execution_fingerprint() {
+        Ok(fingerprint) => fingerprint,
+        Err(_) if id.is_none() => {
+            crate::engine::conversation_provider::unidentified_ephemeral_provider_fingerprint()
+        }
+        Err(error) => return Err(mlua::Error::external(error)),
+    };
+    let resolved_tools_fingerprint = tool_registry
+        .conversation_execution_fingerprint(&agent.tools)
+        .map_err(mlua::Error::external)?;
+    let definition_fingerprint = conversation_definition_fingerprint(&ConversationDefinition {
+        source_fingerprint,
+        agent: &agent,
+        resolved_model: &model,
+        effective_system_prompt: &system_prompt,
+        max_history: effective_max_history,
+        history_max_bytes,
+        max_tool_rounds: crew_max_tool_rounds,
+        resolved_tools_fingerprint: &resolved_tools_fingerprint,
+        provider_execution_fingerprint: &provider_execution_fingerprint,
+    })
+    .map_err(mlua::Error::external)?;
+
     let inner = LuaConversationInner::new_or_resume(
         agent,
         provider,
@@ -869,6 +943,7 @@ pub async fn build_conversation(
         model,
         system_prompt,
         max_history,
+        history_max_bytes,
         stream,
         crew_max_tool_rounds,
         eventbus,
@@ -879,6 +954,8 @@ pub async fn build_conversation(
         autosave,
         project_dir,
         http_client,
+        source_fingerprint.to_string(),
+        definition_fingerprint,
     )
     .await
     .map_err(mlua::Error::external)?;

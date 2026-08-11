@@ -9,22 +9,47 @@ use crate::utils::error::{IronCrewError, Result};
 const DEFAULT_FILE_WRITE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const HARD_FILE_WRITE_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub struct FileWriteTool {
-    base_dir: Option<PathBuf>,
+    root: super::execution_policy::CapabilityRoot,
     allowed_extensions: Vec<String>,
+    max_bytes: usize,
 }
 
 impl FileWriteTool {
     pub fn new(base_dir: Option<PathBuf>, allowed_extensions: Option<Vec<String>>) -> Self {
+        let mut allowed_extensions = allowed_extensions.unwrap_or_else(|| {
+            vec![
+                "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml", "html", "css",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        });
+        for extension in &mut allowed_extensions {
+            extension.make_ascii_lowercase();
+        }
+        allowed_extensions.sort_unstable();
+        allowed_extensions.dedup();
         Self {
-            base_dir,
-            allowed_extensions: allowed_extensions.unwrap_or_else(|| {
-                vec![
-                    "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml", "html", "css",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            }),
+            root: super::execution_policy::CapabilityRoot::required(base_dir),
+            allowed_extensions,
+            max_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_FILE_WRITE_MAX_BYTES",
+                DEFAULT_FILE_WRITE_MAX_BYTES,
+                HARD_FILE_WRITE_MAX_BYTES,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_policy_for_test(
+        base_dir: PathBuf,
+        allowed_extensions: Vec<String>,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(Some(base_dir)),
+            allowed_extensions,
+            max_bytes,
         }
     }
 
@@ -85,6 +110,15 @@ impl Tool for FileWriteTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "root_fingerprint": self.root.fingerprint()?,
+            "allowed_extensions": self.allowed_extensions,
+            "max_bytes": self.max_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let path = args["path"]
             .as_str()
@@ -101,11 +135,7 @@ impl Tool for FileWriteTool {
 
         self.validate_path(path)?;
 
-        let max_bytes = super::project_fs::bounded_env_usize(
-            "IRONCREW_FILE_WRITE_MAX_BYTES",
-            DEFAULT_FILE_WRITE_MAX_BYTES,
-            HARD_FILE_WRITE_MAX_BYTES,
-        );
+        let max_bytes = self.max_bytes;
         if content.len() > max_bytes {
             return Err(IronCrewError::ToolExecution {
                 tool: "file_write".into(),
@@ -116,12 +146,18 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let base_dir = self.base_dir.clone();
+        let base_dir = self
+            .root
+            .cloned_path()
+            .map_err(|message| IronCrewError::ToolExecution {
+                tool: "file_write".into(),
+                message: message.into(),
+            })?;
         let relative = PathBuf::from(path);
         let bytes = content.as_bytes().to_vec();
         let display = path.to_string();
         tokio::task::spawn_blocking(move || {
-            let root = super::project_fs::open_root(base_dir.as_deref())?;
+            let root = super::project_fs::open_root(Some(&base_dir))?;
             super::project_fs::atomic_write(&root, &relative, &bytes)
         })
         .await

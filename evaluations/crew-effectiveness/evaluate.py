@@ -6,12 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import random
 import re
 import shutil
-import statistics
 import subprocess
 import tempfile
 import threading
@@ -20,12 +18,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from decision_analysis import topology_decision
+from evaluation_setup import plan_receipt, prepare_plan, validate_run_request
 from mock_openai import ContractServer, create_server
+from pairwise_analysis import pairwise_comparisons, summarize_runs
 
 
-SCHEMA_VERSION = "ironcrew.crew-eval.v1"
+SCHEMA_VERSION = "ironcrew.crew-eval.v2"
 VARIANTS = ("single", "dag", "collaborative")
-PLANNED_LLM_CALLS = {"single": 1, "dag": 3, "collaborative": 4}
 EXPECTED_TASKS = {
     "single": {"final"},
     "dag": {"extract", "challenge", "final"},
@@ -431,6 +431,7 @@ def run_one(
     model: str,
     mode: str,
     timeout_seconds: int,
+    planned_llm_calls: int,
     base_environment: dict[str, str],
     mock_server: ContractServer | None,
 ) -> dict[str, Any]:
@@ -475,7 +476,7 @@ def run_one(
             "case_id": case["case_id"],
             "variant": variant,
             "repetition": repetition,
-            "planned_llm_calls": PLANNED_LLM_CALLS[variant],
+            "planned_llm_calls": planned_llm_calls,
             "observed_llm_calls": observed,
             "execution_ok": False,
             "output_parse_ok": False,
@@ -485,8 +486,8 @@ def run_one(
             "run_duration_ms": None,
             "run_id": None,
             "run_status": None,
-            "total_tokens": 0,
-            "cached_tokens": 0,
+            "total_tokens": None,
+            "cached_tokens": None,
             "agent_count": 0,
             "task_count": 0,
             "task_names": [],
@@ -503,7 +504,7 @@ def run_one(
         "case_id": case["case_id"],
         "variant": variant,
         "repetition": repetition,
-        "planned_llm_calls": PLANNED_LLM_CALLS[variant],
+        "planned_llm_calls": planned_llm_calls,
         "observed_llm_calls": observed,
         "execution_ok": False,
         "output_parse_ok": False,
@@ -513,8 +514,8 @@ def run_one(
         "run_duration_ms": None,
         "run_id": None,
         "run_status": None,
-        "total_tokens": 0,
-        "cached_tokens": 0,
+        "total_tokens": None,
+        "cached_tokens": None,
         "agent_count": 0,
         "task_count": 0,
         "task_names": [],
@@ -539,14 +540,18 @@ def run_one(
         return result
 
     status = str(record.get("status", ""))
+    run_succeeded = status.casefold() == "success"
     task_results = record.get("task_results") if isinstance(record.get("task_results"), list) else []
     result.update(
         {
             "run_id": record.get("run_id"),
             "run_status": status,
             "run_duration_ms": record.get("duration_ms"),
-            "total_tokens": record.get("total_tokens", 0),
-            "cached_tokens": record.get("cached_tokens", 0),
+            # A non-successful run can report only a lower bound after one or
+            # more paid calls. Treat aggregate usage as unknown rather than
+            # presenting a partial number as a complete cost measurement.
+            "total_tokens": record.get("total_tokens", 0) if run_succeeded else None,
+            "cached_tokens": record.get("cached_tokens", 0) if run_succeeded else None,
             "agent_count": record.get("agent_count", 0),
             "task_count": record.get("task_count", 0),
             "task_names": sorted(
@@ -559,7 +564,7 @@ def run_one(
             ),
         }
     )
-    if status.casefold() != "success":
+    if not run_succeeded:
         result["failure_reason"] = f"run status was {status or 'missing'}"
         return result
 
@@ -588,98 +593,6 @@ def run_one(
         result["failure_reason"] = "; ".join(schema_errors)
     result.update(score_model_output(model_output, case, oracle))
     return result
-
-
-def percentile_95(values: list[int]) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    return float(ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)])
-
-
-def summarize_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summaries: list[dict[str, Any]] = []
-    for variant in VARIANTS:
-        selected = [run for run in runs if run["variant"] == variant]
-        answers_total = sum(run["answers_total"] for run in selected)
-        correct = sum(run["answers_correct"] for run in selected)
-        grounded = sum(run["grounded_correct"] for run in selected)
-        citation_tp = sum(run["citation_tp"] for run in selected)
-        citation_fp = sum(run["citation_fp"] for run in selected)
-        citation_fn = sum(run["citation_fn"] for run in selected)
-        precision = citation_tp / (citation_tp + citation_fp) if citation_tp + citation_fp else 0.0
-        recall = citation_tp / (citation_tp + citation_fn) if citation_tp + citation_fn else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        durations = [
-            int(run["run_duration_ms"])
-            for run in selected
-            if isinstance(run.get("run_duration_ms"), int)
-        ]
-        tokens = [int(run["total_tokens"]) for run in selected if isinstance(run.get("total_tokens"), int)]
-        summaries.append(
-            {
-                "variant": variant,
-                "run_count": len(selected),
-                "execution_success_rate": sum(run["execution_ok"] for run in selected)
-                / len(selected),
-                "parse_success_rate": sum(run["output_parse_ok"] for run in selected)
-                / len(selected),
-                "schema_success_rate": sum(run["output_schema_ok"] for run in selected)
-                / len(selected),
-                "correctness": correct / answers_total if answers_total else 0.0,
-                "grounded_correctness": grounded / answers_total if answers_total else 0.0,
-                "citation_precision": precision,
-                "citation_recall": recall,
-                "citation_f1": f1,
-                "latency_ms": {
-                    "median": float(statistics.median(durations)) if durations else None,
-                    "p95": percentile_95(durations),
-                },
-                "tokens": {
-                    "median": float(statistics.median(tokens)) if tokens else None,
-                    "total": sum(tokens),
-                },
-            }
-        )
-    return summaries
-
-
-def pairwise_comparisons(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    indexed = {
-        (run["case_id"], run["repetition"], run["variant"]): run for run in runs
-    }
-    comparisons: list[dict[str, Any]] = []
-    for variant in ("dag", "collaborative"):
-        deltas: list[float] = []
-        wins = ties = losses = 0
-        for case_id, repetition, candidate in [
-            (case_id, repetition, run)
-            for (case_id, repetition, run_variant), run in indexed.items()
-            if run_variant == variant
-        ]:
-            baseline = indexed.get((case_id, repetition, "single"))
-            if baseline is None:
-                continue
-            delta = candidate["grounded_correctness"] - baseline["grounded_correctness"]
-            deltas.append(delta)
-            if delta > 0:
-                wins += 1
-            elif delta < 0:
-                losses += 1
-            else:
-                ties += 1
-        comparisons.append(
-            {
-                "candidate": variant,
-                "baseline": "single",
-                "paired_count": len(deltas),
-                "mean_grounded_correctness_delta": statistics.fmean(deltas) if deltas else None,
-                "wins": wins,
-                "ties": ties,
-                "losses": losses,
-            }
-        )
-    return comparisons
 
 
 def contract_failures(runs: list[dict[str, Any]]) -> list[str]:
@@ -760,13 +673,23 @@ def build_parser(base_dir: Path, repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("contract", "live"), default="contract")
     parser.add_argument("--binary", type=Path, default=repo_root / "target/debug/ironcrew")
     parser.add_argument("--model", default="gpt-4.1-mini")
+    parser.add_argument(
+        "--provider-id",
+        help="non-secret operator-declared provider identity required for live runs",
+    )
     parser.add_argument("--cases", type=Path, default=base_dir / "cases.v1.jsonl")
     parser.add_argument("--oracle", type=Path, default=base_dir / "oracle.v1.jsonl")
+    parser.add_argument("--plan", type=Path, default=base_dir / "decision-plan.v1.json")
     parser.add_argument("--report", type=Path, default=base_dir / "reports/latest.json")
-    parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--repetitions", type=int)
     parser.add_argument("--order-seed", type=int, default=20260719)
     parser.add_argument("--case-limit", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--dry-run-plan",
+        action="store_true",
+        help="validate and print the planned provider workload without executing IronCrew",
+    )
     return parser
 
 
@@ -778,11 +701,17 @@ def main() -> int:
     binary = args.binary.resolve()
     cases_path = args.cases.resolve()
     oracle_path = args.oracle.resolve()
+    plan_path = args.plan.resolve()
     report_path = args.report.resolve()
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise SystemExit(f"IronCrew binary is not executable: {binary}")
-    if args.repetitions < 1:
-        raise SystemExit("--repetitions must be at least 1")
+    try:
+        repetitions, provider_id = validate_run_request(
+            mode=args.mode,
+            repetitions=args.repetitions,
+            provider_id=args.provider_id,
+            model=args.model,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.case_limit is not None and args.case_limit < 1:
         raise SystemExit("--case-limit must be at least 1")
     if args.timeout_seconds < 1:
@@ -794,9 +723,42 @@ def main() -> int:
     if args.case_limit is not None:
         cases = cases[: args.case_limit]
 
+    try:
+        plan, planned_work, planned_calls, planned_output_tokens = prepare_plan(
+            base_dir=base_dir,
+            plan_path=plan_path,
+            cases=cases,
+            repetitions=repetitions,
+            mode=args.mode,
+            variants=VARIANTS,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+    if args.dry_run_plan:
+        print(
+            json.dumps(
+                {
+                    "mode": args.mode,
+                    "model": args.model,
+                    "provider_id": provider_id,
+                    "plan": plan_receipt(
+                        plan=plan, plan_path=plan_path, planned_work=planned_work
+                    ),
+                    "planned_work": planned_work,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SystemExit(f"IronCrew binary is not executable: {binary}")
+
     work: list[tuple[int, dict[str, Any], str]] = [
         (repetition, case, variant)
-        for repetition in range(args.repetitions)
+        for repetition in range(repetitions)
         for case in cases
         for variant in VARIANTS
     ]
@@ -835,6 +797,7 @@ def main() -> int:
                     model=args.model,
                     mode=args.mode,
                     timeout_seconds=args.timeout_seconds,
+                    planned_llm_calls=planned_calls[variant],
                     base_environment=environment,
                     mock_server=mock_server,
                 )
@@ -846,7 +809,9 @@ def main() -> int:
         if mock_thread is not None:
             mock_thread.join(timeout=5)
 
-    summaries = summarize_runs(runs)
+    summaries = summarize_runs(runs, VARIANTS)
+    comparisons = pairwise_comparisons(runs, plan["uncertainty"])
+    decision = topology_decision(mode=args.mode, comparisons=comparisons, plan=plan)
     report = {
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
@@ -871,20 +836,28 @@ def main() -> int:
         "provider": {
             "name": "synthetic-oracle-backed-mock"
             if args.mode == "contract"
-            else "process-configured-openai-compatible",
+            else provider_id,
+            "identity_source": "evaluator-contract"
+            if args.mode == "contract"
+            else "operator-declared",
             "model": args.model,
         },
+        "evaluation_plan": plan_receipt(
+            plan=plan, plan_path=plan_path, planned_work=planned_work
+        ),
         "configuration": {
-            "repetitions": args.repetitions,
+            "repetitions": repetitions,
             "temperature": 0.0,
             "order_seed": args.order_seed,
             "variants": list(VARIANTS),
-            "planned_llm_calls_per_run": PLANNED_LLM_CALLS,
+            "planned_llm_calls_per_run": planned_calls,
+            "planned_max_output_tokens_per_run": planned_output_tokens,
         },
         "mock_provider_stats": mock_server.snapshot() if mock_server else None,
         "runs": sorted(runs, key=lambda run: (run["case_id"], run["repetition"], run["variant"])),
         "summary": summaries,
-        "pairwise": pairwise_comparisons(runs),
+        "pairwise": comparisons,
+        "decision": decision,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -893,12 +866,12 @@ def main() -> int:
         binary=binary,
         repo_root=repo_root,
         validator_path=base_dir / "validate-report.lua",
-        schema_path=base_dir / "report-v1.schema.json",
+        schema_path=base_dir / "report-v2.schema.json",
         report_path=report_path,
         environment=environment,
     )
     if schema_error:
-        print(f"FAIL: generated report did not match report-v1.schema.json: {schema_error}")
+        print(f"FAIL: generated report did not match report-v2.schema.json: {schema_error}")
         print(f"Report: {report_path}")
         return 1
 
@@ -916,7 +889,10 @@ def main() -> int:
             f"{total_answers}/{total_answers} grounded answers."
         )
     else:
-        print(f"Live exploratory evaluation completed: {len(runs)} CLI runs.")
+        print(
+            f"Live exploratory evaluation completed: {len(runs)} CLI runs; "
+            f"decision={decision['status']}."
+        )
     print(f"Report: {report_path}")
     return 0
 

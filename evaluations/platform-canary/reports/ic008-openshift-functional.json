@@ -1,0 +1,369 @@
+{
+  "record_count": 17,
+  "records": [
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "route_capabilities",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "lifecycle_state": "accepting",
+        "process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "route_capabilities",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "lifecycle_state": "accepting",
+        "process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "route_capabilities",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "lifecycle_state": "accepting",
+        "process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "route_capabilities",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "lifecycle_state": "accepting",
+        "process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "route_capabilities",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "lifecycle_state": "accepting",
+        "process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "route_capabilities",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "lifecycle_state": "accepting",
+        "process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "route_capabilities",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "lifecycle_state": "accepting",
+        "process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "route_capabilities",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "deployment": {
+          "artifact_fingerprint": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+          "config_fingerprint": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+          "flow_fingerprint": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+          "hitl_keyring_fingerprint": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+          "revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e"
+        },
+        "instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "lifecycle_state": "accepting",
+        "process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51"
+      },
+      "response_bytes": 1007,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_start",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "events_url": "/flows/ic008/conversations/ic008-receipt-20260811/events",
+        "flow": "ic008",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "revision": 1,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "turn_count": 0
+      },
+      "response_bytes": 482,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_start",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "events_url": "/flows/ic008/conversations/ic008-receipt-20260811/events",
+        "flow": "ic008",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "revision": 1,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "turn_count": 0
+      },
+      "response_bytes": 482,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_message",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "revision": 2,
+        "turn_count": 1,
+        "turn_index": 0
+      },
+      "response_bytes": 308,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "idempotency-replayed": "true",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_message",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "revision": 2,
+        "turn_count": 1,
+        "turn_index": 0
+      },
+      "response_bytes": 308,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_history",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "flow": "ic008",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "messages": [
+          {"role": "system"},
+          {"role": "user"},
+          {"role": "assistant"},
+          {"role": "tool"},
+          {"role": "assistant"}
+        ],
+        "revision": 2,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "truncated": false,
+        "turn_count": 1
+      },
+      "response_bytes": 1177,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_history",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-receipt-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "flow": "ic008",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "messages": [
+          {"role": "system"},
+          {"role": "user"},
+          {"role": "assistant"},
+          {"role": "tool"},
+          {"role": "assistant"}
+        ],
+        "revision": 2,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "truncated": false,
+        "turn_count": 1
+      },
+      "response_bytes": 1177,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_sse_conflict",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {},
+      "response_bytes": 115,
+      "status": 409
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_sse_conflict",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {},
+      "response_bytes": 115,
+      "status": 409
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_delete",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deleted": "ic008-receipt-20260811"
+      },
+      "response_bytes": 36,
+      "status": 200
+    }
+  ],
+  "schema": "ironcrew-ic008-platform-canary-v1"
+}

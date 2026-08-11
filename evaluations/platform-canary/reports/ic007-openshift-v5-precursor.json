@@ -1,0 +1,200 @@
+{
+  "schema": "ironcrew-platform-canary-receipt-v1",
+  "status": "precursor_superseded_before_closure",
+  "platform": "openshift",
+  "namespace": "gedankrayze-dev",
+  "test_run": "ic007-final-20260810",
+  "evidence_window": {
+    "date": "2026-08-10",
+    "kind": "bounded temporary canary",
+    "not_claimed": ["release artifact", "production monitoring", "soak"]
+  },
+  "supersession": {
+    "reason": "A Railway canary exposed a journal-write timeout defect after this OpenShift v5 matrix completed.",
+    "v5_result_use": "negative and precursor evidence only",
+    "closure_requires": "homogeneous v6 rollout and repeated source-binding matrix"
+  },
+  "source": {
+    "base_commit": "c4799a3c3b8a2441243ad512436d1cb649275cf4",
+    "dirty_build_inputs": true,
+    "source_build_dockerfile_sha256": "5f6c0a1dc6eb71feaeb4a07132d906ea4257a73bdcda0fb92799861bf1178cda",
+    "deployment_manifest_sha256": "f4d00d17009069c9faf403c8b0389ebccd8e03b4e11a83c038d253f734e6c22d",
+    "deployment_manifest_scope": "separate from the runtime artifact tuple; deploy/ is excluded from the binary build-input manifest",
+    "deployment_fix": "UDP and TCP 5353 egress limited to openshift-dns, in addition to UDP and TCP 53"
+  },
+  "artifact": {
+    "tag": "ironcrew:ic007-platform-final-v5-20260810",
+    "oci_index_sha256": "32c6d4ecd0e93f2e76f3f8080dc1fa91b66b1b46ed7a81df23e6a0b79d5c3864",
+    "linux_amd64_manifest_sha256": "a2cb1eff1b4029d1dfbe3d097bf771509135563c98f07871cad3b6777630f2a7",
+    "oci_config_sha256": "d908632dbc812f45542d8b66cb46b11bddad89262e7e9bda79cf98c0f4224556",
+    "image_attestation_manifest_sha256": "a4f570a45a53a0d4443546ac52a9648f72e1d984baec09012539419666d0f98a",
+    "binary_sha256": "1fc1b963d743426b62c1c80705ea0e7b33dc28e299c777795107133b062a3078",
+    "flow_tree_sha256": "7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+    "canonical_build_manifest_sha256": "7d637f0b2d33c58ebc0200ea09e74dd6d6cf709d513d1f496f7b90a735abbf48",
+    "build_attestation_file_sha256": "5b98f29676a32cdac242c96584c573543df53c5230f61e176f73f271c4a159c8",
+    "assembly_dockerfile_sha256": "6de0d031b6d5bc6078996bc13b8ca89ab22486c6b73065a047937b7c8e6f9723",
+    "full_revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-7d637f0b2d33c58ebc0200ea09e74dd6d6cf709d513d1f496f7b90a735abbf48"
+  },
+  "retained_artifacts": {
+    "assembly_dockerfile": "ic007-openshift-v5-assembly.Dockerfile",
+    "build_attestation": "ic007-openshift-v5-build-attestation.json",
+    "build_manifest": "ic007-openshift-v5-build-manifest.json",
+    "build_manifest_file_sha256_with_terminal_lf": "cbc83ccfd25822b6b55597b77c41a358f2ee8888bc3ba701a32d22bf0617a3d2",
+    "build_manifest_canonical_payload": "file bytes excluding the single terminal LF",
+    "effective_config": "ic007-openshift-v5-effective-config.json",
+    "effective_config_file_sha256": "00151ceac6ac4bac8c08f5b5a099642a2ff8d9c80613d966573e2d71fe289f87"
+  },
+  "parity": {
+    "route_samples": 64,
+    "statuses_200": 64,
+    "identity_distribution": {
+      "d3140ba3-00ee-4d1f-8d90-27beee1a02a4": 32,
+      "308a7509-acc8-4164-9f0c-041992510ced": 32
+    },
+    "header_body_attribution_exact": true,
+    "artifact_flow_config_tuple_count": 1,
+    "independent_in_pod_binary_flow_attestation_hashes_verified": true,
+    "final_pods": {
+      "a": {"uid": "351322b7-0a4d-4fdc-bb85-187af202bd67", "restart_count": 0},
+      "b": {"uid": "d10ead29-d0ac-4d7f-923f-3dc29a190258", "restart_count": 0}
+    }
+  },
+  "cases": [
+    {
+      "case": 1,
+      "outcome": "passed",
+      "evidence": "64/64 authenticated shared-Route capability probes, exact 32/32 attribution"
+    },
+    {
+      "case": 2,
+      "outcome": "passed",
+      "run_id": "fad14567-083e-429a-a735-201055c9d9b2",
+      "evidence": "cross-peer same-key replay returned 200, replay=true, and the original run"
+    },
+    {
+      "case": 3,
+      "outcome": "passed",
+      "run_id": "fad14567-083e-429a-a735-201055c9d9b2",
+      "evidence": "changed-body key reuse returned 409; terminal Success; mock counts chat=2 effect=1 final=1 tool=1"
+    },
+    {
+      "case": 4,
+      "outcome": "intentional_nonportable_boundary",
+      "run_id": "2102d9c4-8129-4fff-b41f-ee0458263a45",
+      "evidence": "unkeyed durable WaitingForInput was visible, but peer question and abort returned 409 run_owned_by_another_instance; owner abort completed Aborted"
+    },
+    {
+      "case": 5,
+      "outcome": "passed",
+      "run_id": "91d8cf35-46f6-4442-92db-37a7ccf76c75",
+      "evidence": "concurrent peer aborts returned 200/200 with false/true already-terminal flags"
+    },
+    {
+      "case": 6,
+      "outcome": "passed",
+      "run_id": "91d8cf35-46f6-4442-92db-37a7ccf76c75",
+      "evidence": "one Aborted terminal event, post-terminal mailbox 404, and zero mailbox rows"
+    },
+    {
+      "case": 7,
+      "outcome": "passed",
+      "run_id": "4b7ac95b-37ce-41ed-8359-849a8218de62",
+      "evidence": "two questions answered cross-peer with 202, duplicate answer 404, terminal Success"
+    },
+    {
+      "case": 8,
+      "outcome": "passed",
+      "run_ids": ["4b7ac95b-37ce-41ed-8359-849a8218de62", "91c3b9aa-33f2-4bab-b648-7e03cb775d23"],
+      "evidence": "retained event ids 1-7, reconnect after 2 returned 3-7; malformed/cross-run/ahead cursors returned 400/400/409; expired cursor 1 returned 409 cursor_expired and no-cursor stream emitted journal_gap at id 3 before ids 4-7"
+    },
+    {
+      "case": 9,
+      "outcome": "intentional_nonportable_boundary",
+      "conversation_id": "ic007-578f0914f80046358d5d",
+      "evidence": "peer live message and SSE returned 404 while peer durable history returned 200; owner message replayed; history had one turn with system,user,assistant,tool,assistant roles"
+    },
+    {
+      "case": 10,
+      "outcome": "passed",
+      "evidence": "each pod independently enforced run/conversation/SSE local limits; shared prefix ic007q_ admitted one holder and returned 429 Retry-After=60 from both peers; one 64-character idempotency hash and ten tables were observed, then the exact quota prefix was dropped"
+    },
+    {
+      "case": 11,
+      "outcome": "passed",
+      "run_id": "d00ac44e-caa4-4a0d-8576-d6118774d37f",
+      "evidence": "standalone owner child received SIGKILL, pod exited 137 with restartPolicy Never; peer remained ready, replayed the same run, and reconciled exactly once to Abandoned; replacement UID changed and completed a counted-effect Success"
+    },
+    {
+      "case": 12,
+      "outcome": "passed",
+      "evidence": "attributed shared-Route sampling, authenticated capabilities and metrics, and direct-pod checks agreed on identity and tuple"
+    },
+    {
+      "case": 13,
+      "outcome": "passed",
+      "run_id": "c1cabd62-bf82-46c3-84d6-77fcdd5c1a98",
+      "evidence": "SIGUSR1 fenced readiness and mutations, EndpointSlice withdrew the draining pod, TERM exited 0, replay stayed stable, exact pod replacement preserved 60/60 shared-Route readiness, and a new cross-peer HITL run succeeded"
+    }
+  ],
+  "rotation": {
+    "premature_new_only": "failed closed with exit 1 because retained ciphertext required an unavailable key; ciphertext row hash and bytes were unchanged",
+    "successful_sequence": ["expanded_old", "mixed_expanded_old_and_new", "expanded_new", "zero_old_question_or_answer_references", "new_only"],
+    "old_row_run_id": "9ece5919-5bbf-42c8-8d6b-3d74769009b5",
+    "new_row_run_id": "78e3b26c",
+    "final_new_only_run_id": "48aaf504",
+    "final_keyring_fingerprint": "sha256:41989ab25945921fe33de6f7d21d7f8000e4fb5b9eefe730757d981e0975d01f"
+  },
+  "security_and_resources": {
+    "scc": "restricted-v2",
+    "runtime_uid": 1004800000,
+    "runtime_gid": 0,
+    "run_as_non_root": true,
+    "allow_privilege_escalation": false,
+    "capabilities_drop": ["ALL"],
+    "read_only_root_filesystem": true,
+    "seccomp": "RuntimeDefault",
+    "service_account_token_automount": false,
+    "requests_per_app_pod": {"cpu": "100m", "memory": "128Mi", "ephemeral_storage": "64Mi"},
+    "limits_per_app_pod": {"cpu": "1", "memory": "512Mi", "ephemeral_storage": "512Mi"},
+    "rootfs_write": "blocked",
+    "tmp_write": "succeeded",
+    "point_samples": {"a": {"cpu": "1m", "memory": "2Mi"}, "b": {"cpu": "8m", "memory": "2Mi"}},
+    "point_sample_boundary": "not a sustained ceiling or OOM proof"
+  },
+  "network": {
+    "mock_public_route_or_domain": false,
+    "public_routes": ["ic007-final-a", "ic007-final-b", "ic007-final-app"],
+    "mock_service_exposure": "ClusterIP only; no external IP or load balancer",
+    "mock_authentication": "none",
+    "mock_and_postgres_ingress": "only pods labeled role=app and test-run=ic007-final-20260810",
+    "dns_egress": "UDP/TCP 53 and 5353 only to openshift-dns",
+    "namespace_policy_boundary": "namespace policies are additive; the canary policy is not claimed as the sole ingress boundary"
+  },
+  "secret_scan": {
+    "running_pods": 4,
+    "log_bytes": 18400,
+    "scoped_pg_dump_bytes": 43057,
+    "credential_needles": 7,
+    "credential_matches_logs": 0,
+    "credential_matches_database": 0,
+    "hitl_plaintext_matches_logs": 0,
+    "hitl_plaintext_matches_database": 0,
+    "raw_idempotency_key_matches_database": 0
+  },
+  "configuration_boundary": {
+    "openshift_run_lease_ttl_seconds": 9,
+    "railway_later_run_lease_ttl_seconds": 60,
+    "intentional_platform_canary_difference": true,
+    "cross_platform_config_equality_claimed": false
+  },
+  "cleanup": {
+    "status": "deferred_for_v6",
+    "remote_mutation_after_supersession": false,
+    "resources_held_healthy": true,
+    "observed_at": "2026-08-10T15:13:24Z",
+    "deployments_ready": 4,
+    "running_pods": 4,
+    "pod_restarts": 0,
+    "selector": "ironcrew.io/test-run=ic007-final-20260810"
+  }
+}

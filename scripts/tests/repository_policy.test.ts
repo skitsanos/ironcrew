@@ -177,6 +177,13 @@ describe("repository integration policy", () => {
 
   test("PostgreSQL 15 process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const agents = await Bun.file(join(repository, "AGENTS.md")).text();
+    const soakGuide = await Bun.file(
+      join(repository, "evaluations/replica-soak/README.md"),
+    ).text();
+    const storeTest = await Bun.file(
+      join(repository, "tests/postgres_store_test.rs"),
+    ).text();
     const workflow = Bun.YAML.parse(source) as {
       jobs: Record<string, {
         services?: Record<string, { image?: string }>;
@@ -188,6 +195,71 @@ describe("repository integration policy", () => {
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test two_process_replica_acceptance_test");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
+    expect(agents).toContain("Pull the moving `postgres:15` tag");
+    expect(agents).toContain("Do not substitute `postgres:latest`");
+    expect(agents).toContain("Never run a global Docker system, image, builder");
+    expect(soakGuide).toContain("docker pull postgres:15");
+    expect(soakGuide).toContain("postgres:15");
+    expect(soakGuide).toContain("docker run --rm -d");
+    expect(soakGuide).toContain("ironcrew_pg_container_id=$(docker run");
+    expect(soakGuide).toContain('docker stop "$ironcrew_pg_container_id"');
+    expect(soakGuide).toContain('docker inspect "$ironcrew_pg_container_id"');
+    expect(storeTest).toContain("docker pull postgres:15");
+    expect(storeTest).toContain("postgres:15");
+    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:17");
+    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:latest");
+  });
+
+  test("Lua validation includes the platform-canary runtime smoke", async () => {
+    const luaGate = await Bun.file(
+      join(repository, "scripts/check-lua-examples.sh"),
+    ).text();
+    const canaryGuide = await Bun.file(
+      join(repository, "evaluations/platform-canary/README.md"),
+    ).text();
+
+    expect(luaGate).toContain("evaluations/platform-canary/runtime_smoke.py");
+    expect(luaGate).toContain('"flows_executed":4');
+    expect(canaryGuide).toContain("Static Lua validation does not execute");
+  });
+
+  test("OpenShift dual-stack policy avoids rejected IPv4-mapped exclusions", async () => {
+    const manifest = await Bun.file(join(repository, "deploy/openshift.yaml")).text();
+    const cloudGuide = await Bun.file(
+      join(repository, "docs/cloud-deployment.md"),
+    ).text();
+
+    expect(manifest).toContain('cidr: "::/0"');
+    expect(manifest).not.toContain('::ffff:0:0/96');
+    expect(manifest).toContain("kubernetes.io/metadata.name: openshift-dns");
+    expect(manifest.match(/port: 5353/g)).toHaveLength(2);
+    expect(cloudGuide).toContain("UDP/TCP 53 and 5353 in `openshift-dns`");
+    expect(cloudGuide).not.toContain(
+      "\nIRONCREW_INSTANCE_ID=${{RAILWAY_REPLICA_ID}}\nIRONCREW_STORE=postgres",
+    );
+    expect(cloudGuide).toContain(
+      "Railway injects `RAILWAY_REPLICA_ID` only into each running replica",
+    );
+  });
+
+  test("journal write timing stays explicit across deployment and canary contracts", async () => {
+    const [manifest, canaryConfig, configContract, canaryGuide, cliGuide] = await Promise.all([
+      Bun.file(join(repository, "deploy/openshift.yaml")).text(),
+      Bun.file(join(repository, "evaluations/platform-canary/canary_config.py")).text(),
+      Bun.file(join(repository, "evaluations/platform-canary/config_contract.py")).text(),
+      Bun.file(join(repository, "evaluations/platform-canary/README.md")).text(),
+      Bun.file(join(repository, "docs/cli.md")).text(),
+    ]);
+
+    expect(manifest).toMatch(
+      /- name: IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS\n\s+value: "5000"/,
+    );
+    expect(canaryConfig).toContain(
+      '("IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS", "5000")',
+    );
+    expect(configContract).toContain('"IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS"');
+    expect(canaryGuide).toContain("not the application's 1500 ms default");
+    expect(cliGuide).toContain("flush/terminal acknowledgement is bounded by `3W + 650 ms`");
   });
 
   test("release workflow gates builds and scopes publication authority", async () => {

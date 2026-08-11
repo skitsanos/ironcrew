@@ -3,26 +3,34 @@
 //! Skipped unless `IRONCREW_TEST_PG_URL` points at a reachable PostgreSQL
 //! instance, e.g.:
 //!
-//!   docker run -d --name pg -e POSTGRES_PASSWORD=ironcrew -e POSTGRES_USER=ironcrew \
-//!     -e POSTGRES_DB=ironcrew_test -p 55432:5432 postgres:17
+//!   docker pull postgres:15
+//!   docker run --rm -d --name ironcrew-postgres-test \
+//!     -e POSTGRES_PASSWORD=ironcrew -e POSTGRES_USER=ironcrew \
+//!     -e POSTGRES_DB=ironcrew_test -p 55432:5432 postgres:15
 //!   IRONCREW_TEST_PG_URL=postgres://ironcrew:ironcrew@localhost:55432/ironcrew_test \
 //!     cargo test --all-features --test postgres_store_test
 //!
 //! Each test uses its own table prefix and drops those tables first, so they
-//! are isolated and can run in parallel against one database.
+//! are isolated and can run in parallel against one database. Stop the named
+//! container after the gate; `--rm` removes it.
 #![cfg(feature = "postgres")]
 
 use ironcrew::api::idempotency::RunLeaseHeartbeat;
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
+use ironcrew::engine::conversation_json::HARD_STORED_CONVERSATION_JSON_CONTAINER_ENTRIES;
+use ironcrew::engine::conversation_record::{
+    HARD_STORED_CONVERSATION_EXECUTION_BYTES, HARD_STORED_CONVERSATION_MESSAGES,
+    HARD_STORED_CONVERSATION_METADATA_BYTES,
+};
 use ironcrew::engine::human_input::{
     DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputKeyring,
     HumanInputListOutcome, HumanInputReadOutcome, HumanInputRegistrationOutcome,
 };
 use ironcrew::engine::idempotency::{
-    CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
-    IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
-    IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION, RunCancellationRequest,
-    RunFenceHeartbeat,
+    CONVERSATION_MESSAGE_OPERATION, HARD_IDEMPOTENCY_RESPONSE_BYTES, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup,
+    IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyState, PrincipalId, RUN_OPERATION,
+    RunCancellationRequest, RunFenceHeartbeat,
 };
 use ironcrew::engine::input_bridge::QuestionInfo;
 use ironcrew::engine::postgres_store::PostgresStore;
@@ -30,13 +38,16 @@ use ironcrew::engine::reconciler::{
     heartbeat_owned_runs_bounded, maintain_run_leases, reconcile_stuck_runs_at,
 };
 use ironcrew::engine::run_events::{
-    EventJournalScope, RunEventAppendBatch, RunEventAppendEntry, RunEventGapReason,
-    RunEventJournalConfig,
+    DEFAULT_JOURNAL_WRITE_TIMEOUT_MS, EventJournalScope, RunEventAppendBatch, RunEventAppendEntry,
+    RunEventGapReason, RunEventJournalConfig,
 };
 use ironcrew::engine::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunStatus, RunTransition,
 };
-use ironcrew::engine::sessions::{ConversationRecord, DialogStateRecord};
+use ironcrew::engine::sessions::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+    DialogStateRecord, conversation_mutation_scope,
+};
 use ironcrew::engine::store::{RunLeaseConfig, StateStore, run_maintenance_database_timeout};
 use ironcrew::engine::task::TaskResult;
 use ironcrew::llm::provider::ChatMessage;
@@ -225,6 +236,29 @@ fn human_input_keyring() -> HumanInputKeyring {
     .unwrap()
 }
 
+fn rotating_human_input_keyrings() -> (HumanInputKeyring, HumanInputKeyring, HumanInputKeyring) {
+    const OLD_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const NEW_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    let old_only = HumanInputKeyring::from_json(
+        &format!(r#"{{"rotation-old":"{OLD_KEY}"}}"#),
+        "rotation-old",
+    )
+    .unwrap();
+    let overlap_new_active = HumanInputKeyring::from_json(
+        &format!(r#"{{"rotation-old":"{OLD_KEY}","rotation-new":"{NEW_KEY}"}}"#),
+        "rotation-new",
+    )
+    .unwrap();
+    let new_only = HumanInputKeyring::from_json(
+        &format!(r#"{{"rotation-new":"{NEW_KEY}"}}"#),
+        "rotation-new",
+    )
+    .unwrap();
+    (old_only, overlap_new_active, new_only)
+}
+
+type HumanInputAnswerColumns = (String, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>);
+
 fn human_input_registration(
     run_id: &str,
     question_id: &str,
@@ -259,6 +293,7 @@ fn run_event_config() -> RunEventJournalConfig {
         page_max_bytes: 16 * 1024,
         poll_interval: Duration::from_millis(100),
         read_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS),
         prune_batch: 64,
     }
 }
@@ -405,6 +440,33 @@ async fn wait_for_blocked_health_probes(pool: &sqlx::PgPool, table_name: &str, e
     .expect("all store connections must reach the held table lock");
 }
 
+async fn wait_for_blocked_run_event_appends(
+    pool: &sqlx::PgPool,
+    usage_table: &str,
+    expected: usize,
+) {
+    let query_pattern = format!("%FROM {usage_table}%FOR UPDATE%");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query LIKE $1",
+            )
+            .bind(&query_pattern)
+            .fetch_one(pool)
+            .await
+            .expect("inspect blocked PostgreSQL run-event appends");
+            if blocked >= i64::try_from(expected).expect("probe count fits i64") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("run-event appends must reach the held usage-row lock");
+}
+
 fn idempotency_claim(
     key: char,
     fingerprint: char,
@@ -449,6 +511,48 @@ fn idempotency_completion(claim: &IdempotencyClaim, body: Option<&str>) -> Idemp
     }
 }
 
+fn conversation_execution() -> ConversationExecution {
+    ConversationExecution {
+        schema_version: CONVERSATION_EXECUTION_SCHEMA_VERSION,
+        incarnation_id: "00000000-0000-4000-8000-000000000001".into(),
+        source_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        definition_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        max_history: 50,
+        history_max_bytes: 1024 * 1024,
+    }
+}
+
+fn messages_with_oversized_raw_blocks_container() -> String {
+    let raw_blocks = format!(
+        "{}null",
+        "null,".repeat(HARD_STORED_CONVERSATION_JSON_CONTAINER_ENTRIES)
+    );
+    format!(
+        r#"[{{"role":"system","content":"sys"}},{{"role":"user","content":"hi"}},{{"role":"assistant","content":null,"raw_blocks":[{raw_blocks}]}}]"#
+    )
+}
+
+fn conversation_fixture(id: &str) -> ConversationRecord {
+    ConversationRecord {
+        id: id.into(),
+        flow_name: "chat".into(),
+        flow_path: Some("flow-a".into()),
+        agent_name: "assistant".into(),
+        execution: conversation_execution(),
+        messages: vec![ChatMessage::system("system")],
+        created_at: "2026-07-19T12:00:00Z".into(),
+        updated_at: "2026-07-19T12:00:00Z".into(),
+        revision: 0,
+    }
+}
+
+async fn persist_conversation_fixture(store: &PostgresStore, id: &str) -> ConversationRecord {
+    let mut conversation = conversation_fixture(id);
+    conversation.revision = store.save_conversation(&conversation).await.unwrap();
+    assert_eq!(conversation.revision, 1);
+    conversation
+}
+
 #[tokio::test]
 async fn pg_rejects_stale_session_snapshots() {
     let Some(url) = pg_url() else {
@@ -464,6 +568,7 @@ async fn pg_rejects_stale_session_snapshots() {
         flow_name: "chat".into(),
         flow_path: Some("flow-a".into()),
         agent_name: "assistant".into(),
+        execution: conversation_execution(),
         messages: vec![ChatMessage::system("system")],
         created_at: "2026-07-18T10:00:00Z".into(),
         updated_at: "2026-07-18T10:00:00Z".into(),
@@ -527,10 +632,10 @@ async fn pg_rejects_stale_session_snapshots() {
 }
 
 #[tokio::test]
-async fn pg_migrates_legacy_sessions_to_revision_guarded_updates() {
+async fn pg_migrates_legacy_sessions_without_inventing_conversation_identity() {
     let Some(url) = pg_url() else {
         eprintln!(
-            "SKIP pg_migrates_legacy_sessions_to_revision_guarded_updates: IRONCREW_TEST_PG_URL unset"
+            "SKIP pg_migrates_legacy_sessions_without_inventing_conversation_identity: IRONCREW_TEST_PG_URL unset"
         );
         return;
     };
@@ -563,14 +668,27 @@ async fn pg_migrates_legacy_sessions_to_revision_guarded_updates() {
     pool.close().await;
 
     let store = PostgresStore::new(&url, prefix).await.unwrap();
-    let mut conversation = store
+    let conversation = store
         .get_conversation(None, "legacy-chat")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(conversation.revision, 0);
-    conversation.revision = store.save_conversation(&conversation).await.unwrap();
-    assert_eq!(conversation.revision, 1);
+    assert!(matches!(
+        store.save_conversation(&conversation).await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+    store
+        .delete_conversation(None, "legacy-chat")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_conversation(None, "legacy-chat")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let mut dialog = store
         .get_dialog_state(None, "legacy-dialog")
@@ -580,6 +698,221 @@ async fn pg_migrates_legacy_sessions_to_revision_guarded_updates() {
     assert_eq!(dialog.revision, 0);
     dialog.revision = store.save_dialog_state(&dialog).await.unwrap();
     assert_eq!(dialog.revision, 1);
+}
+
+#[tokio::test]
+async fn pg_bounds_untrusted_conversation_rows_before_decode() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_bounds_untrusted_conversation_rows_before_decode: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "conversation_bounds_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let insert_sql = format!(
+        "INSERT INTO {prefix}conversations \
+         (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision) \
+         VALUES ($1, 'chat', 'flow-a', 'assistant', $2::jsonb, $3::jsonb, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1)"
+    );
+
+    let oversized_execution = serde_json::json!({
+        "sentinel": "x".repeat(HARD_STORED_CONVERSATION_EXECUTION_BYTES + 1),
+    })
+    .to_string();
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+        .bind("oversized-execution")
+        .bind(&oversized_execution)
+        .bind("[]")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = store
+        .get_conversation(Some("flow-a"), "oversized-execution")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("execution identity exceeds the hard byte limit"));
+    assert!(!error.contains("sentinel"));
+    store
+        .delete_conversation(Some("flow-a"), "oversized-execution")
+        .await
+        .unwrap();
+
+    let execution = serde_json::to_string(&conversation_execution()).unwrap();
+    let too_many_messages = serde_json::to_string(&vec![
+        serde_json::json!({});
+        HARD_STORED_CONVERSATION_MESSAGES + 1
+    ])
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+        .bind("oversized-count")
+        .bind(&execution)
+        .bind(&too_many_messages)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = store
+        .get_conversation(Some("flow-a"), "oversized-count")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("message count exceeds the hard limit"));
+    let list_error = store
+        .list_conversations(Some("flow-a"), 10, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        list_error
+            .contains("PostgreSQL stored conversation summary is corrupt or exceeds hard limits")
+    );
+    store
+        .delete_conversation(Some("flow-a"), "oversized-count")
+        .await
+        .unwrap();
+
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+        .bind("corrupt-shape")
+        .bind(&execution)
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = store
+        .get_conversation(Some("flow-a"), "corrupt-shape")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("messages must be a JSON array"));
+    let list_error = store
+        .list_conversations(Some("flow-a"), 10, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        list_error
+            .contains("PostgreSQL stored conversation summary is corrupt or exceeds hard limits")
+    );
+    store
+        .delete_conversation(Some("flow-a"), "corrupt-shape")
+        .await
+        .unwrap();
+
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
+        .bind("oversized-raw-blocks")
+        .bind(&execution)
+        .bind(messages_with_oversized_raw_blocks_container())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = store
+        .get_conversation(Some("flow-a"), "oversized-raw-blocks")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("hard JSON container-entry limit"));
+    let summaries = store
+        .list_conversations(Some("flow-a"), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].turn_count, 1);
+    store
+        .delete_conversation(Some("flow-a"), "oversized-raw-blocks")
+        .await
+        .unwrap();
+
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+        .bind("oversized-summary")
+        .bind(&execution)
+        .bind("[]")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let oversized_agent = format!(
+        "summary-sentinel{}",
+        "x".repeat(HARD_STORED_CONVERSATION_METADATA_BYTES)
+    );
+    let update_sql =
+        format!("UPDATE {prefix}conversations SET agent_name = $1 WHERE id = 'oversized-summary'");
+    sqlx::query(sqlx::AssertSqlSafe(update_sql))
+        .bind(oversized_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let list_error = store
+        .list_conversations(Some("flow-a"), 10, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        list_error
+            .contains("PostgreSQL stored conversation summary is corrupt or exceeds hard limits")
+    );
+    assert!(!list_error.contains("summary-sentinel"));
+    store
+        .delete_conversation(Some("flow-a"), "oversized-summary")
+        .await
+        .unwrap();
+
+    pool.close().await;
+    reset(&url, prefix).await;
+}
+
+#[tokio::test]
+async fn pg_bounds_untrusted_idempotency_response_before_decode() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_bounds_untrusted_idempotency_response_before_decode: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "idempotency_body_bounds_";
+    reset(&url, prefix).await;
+    let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let key_hash = "a".repeat(64);
+    let request_fingerprint = "b".repeat(64);
+    let principal = PrincipalId::legacy();
+    let sql = format!(
+        "INSERT INTO {prefix}idempotency \
+         (key_hash, principal_id, request_fingerprint, operation, scope, resource_id, \
+          exclusive_scope, attempt_id, owner_instance_id, base_revision, state, \
+          response_status, response_body, lease_expires_at, created_at, updated_at, \
+          completed_at, expires_at, ttl_seconds) \
+         VALUES ($1, $2, $3, 'flow.run', 'flow-a', 'oversized-replay', NULL, \
+                 'attempt-1', 'pod-a', NULL, 'completed', 200, repeat('x', $4), '', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', \
+                 '2026-01-01T00:00:01Z', '2026-01-01T01:00:01Z', 600)"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(&key_hash)
+        .bind(principal.as_str())
+        .bind(&request_fingerprint)
+        .bind(i32::try_from(HARD_IDEMPOTENCY_RESPONSE_BYTES + 1).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = store
+        .lookup_idempotency_for_principal(
+            &principal,
+            &key_hash,
+            &request_fingerprint,
+            "2026-01-01T00:00:02Z",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("response body exceeds the hard byte limit"));
+    assert!(!error.contains(&"x".repeat(128)));
+
+    pool.close().await;
+    reset(&url, prefix).await;
 }
 
 #[tokio::test]
@@ -980,7 +1313,7 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(idempotency_columns, 20);
+    assert_eq!(idempotency_columns, 21);
     let idempotency_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes \
          WHERE schemaname = current_schema() AND tablename = $1",
@@ -989,7 +1322,7 @@ async fn pg_migration_adds_flow_column_to_old_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(idempotency_indexes, 5, "primary key plus four indexes");
+    assert_eq!(idempotency_indexes, 6, "primary key plus five indexes");
     let accounting_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns \
          WHERE table_schema = current_schema() AND table_name = $1",
@@ -2101,13 +2434,16 @@ async fn pg_two_stores_claim_once_and_fence_stale_attempts() {
     reset(&url, prefix).await;
     let store_a = PostgresStore::new(&url, prefix).await.unwrap();
     let store_b = PostgresStore::new(&url, prefix).await.unwrap();
+    let conversation = persist_conversation_fixture(&store_a, "chat-1").await;
+    let scope =
+        conversation_mutation_scope("flow-a", "chat-1", &conversation.execution.incarnation_id);
     let claim = idempotency_claim(
         'a',
         'b',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-1",
-        Some("conversation:flow-a:chat-1"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "2026-07-19T12:10:00Z",
     );
 
@@ -2186,13 +2522,19 @@ async fn pg_key_advisory_locks_do_not_serialize_unrelated_heartbeats() {
     let prefix = "idem_key_lock_";
     reset(&url, prefix).await;
     let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let lock_a = persist_conversation_fixture(&store, "lock-a").await;
+    let lock_b = persist_conversation_fixture(&store, "lock-b").await;
+    let lock_a_scope =
+        conversation_mutation_scope("flow-a", "lock-a", &lock_a.execution.incarnation_id);
+    let lock_b_scope =
+        conversation_mutation_scope("flow-a", "lock-b", &lock_b.execution.incarnation_id);
     let first = idempotency_claim(
         '1',
         '2',
         CONVERSATION_MESSAGE_OPERATION,
         "lock-a",
-        Some("conversation:flow-a:lock-a"),
-        Some(0),
+        Some(&lock_a_scope),
+        Some(lock_a.revision),
         "9999-01-01T00:00:00Z",
     );
     let second = idempotency_claim(
@@ -2200,8 +2542,8 @@ async fn pg_key_advisory_locks_do_not_serialize_unrelated_heartbeats() {
         '3',
         CONVERSATION_MESSAGE_OPERATION,
         "lock-b",
-        Some("conversation:flow-a:lock-b"),
-        Some(0),
+        Some(&lock_b_scope),
+        Some(lock_b.revision),
         "9999-01-01T00:00:00Z",
     );
     assert!(matches!(
@@ -2394,14 +2736,21 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
     .await
     .unwrap();
 
+    let conversation = persist_conversation_fixture(&store, "chat-skew").await;
+    let scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-skew",
+        &conversation.execution.incarnation_id,
+    );
+
     let before_claim = postgres_now(&url).await;
     let mut claim = idempotency_claim(
         '4',
         '5',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-skew",
-        Some("conversation:flow-a:chat-skew"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "1900-01-01T00:01:00Z",
     );
     claim.created_at = "1900-01-01T00:00:00Z".into();
@@ -2433,8 +2782,8 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
         '6',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-skew",
-        Some("conversation:flow-a:chat-skew"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "9999-01-01T00:01:00Z",
     );
     future_competitor.created_at = "9999-01-01T00:00:00Z".into();
@@ -2557,14 +2906,19 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
     )
     .await
     .unwrap();
-    let scope = "conversation:flow-a:chat-hazard";
+    let conversation = persist_conversation_fixture(&store, "chat-hazard").await;
+    let scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-hazard",
+        &conversation.execution.incarnation_id,
+    );
     let first = idempotency_claim(
         '8',
         '9',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-hazard",
-        Some(scope),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "9999-01-01T00:00:00Z",
     );
     assert!(matches!(
@@ -2581,8 +2935,8 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
         'a',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-hazard",
-        Some(scope),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "1900-01-01T00:00:00Z",
     );
     assert!(matches!(
@@ -2639,7 +2993,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
         .unwrap()
     {
         IdempotencyLookup::Indeterminate(record) => {
-            assert_eq!(record.exclusive_scope.as_deref(), Some(scope));
+            assert_eq!(record.exclusive_scope.as_deref(), Some(scope.as_str()));
         }
         other => panic!("expected unacknowledged hazard tombstone, got {other:?}"),
     }
@@ -2671,7 +3025,7 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
         IdempotencyLookup::Indeterminate(record) => {
             assert_eq!(
                 record.exclusive_scope.as_deref(),
-                Some(scope),
+                Some(scope.as_str()),
                 "a quota-denied recovery must not consume the hazard binding"
             );
         }
@@ -2718,8 +3072,8 @@ async fn pg_indeterminate_exclusive_scope_requires_recovery_after_grace() {
         'b',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-hazard",
-        Some(scope),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "1900-01-01T00:00:00Z",
     );
     assert!(matches!(
@@ -2742,13 +3096,19 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
     let prefix = "idem_chat_";
     reset(&url, prefix).await;
     let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let conversation = persist_conversation_fixture(&store, "chat-atomic").await;
+    let scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-atomic",
+        &conversation.execution.incarnation_id,
+    );
     let claim = idempotency_claim(
         'b',
         'c',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-atomic",
-        Some("conversation:flow-a:chat-atomic"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
@@ -2758,18 +3118,11 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
     ));
-    let conversation = ConversationRecord {
-        id: "chat-atomic".into(),
-        flow_name: "chat".into(),
-        flow_path: Some("flow-a".into()),
-        agent_name: "assistant".into(),
-        messages: vec![ChatMessage::user("hello")],
-        created_at: "2026-07-19T12:00:00Z".into(),
-        updated_at: "2026-07-19T12:01:00Z".into(),
-        revision: 0,
-    };
+    let mut candidate = conversation.clone();
+    candidate.messages.push(ChatMessage::user("hello"));
+    candidate.updated_at = "2026-07-19T12:01:00Z".into();
     assert!(matches!(
-        store.save_conversation(&conversation).await,
+        store.save_conversation(&candidate).await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
     assert!(matches!(
@@ -2783,12 +3136,12 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
     let committed = store
         .commit_conversation_idempotency_with_limits(
             completion.clone(),
-            &conversation,
+            &candidate,
             idempotency_limits(100, 1024, 10),
         )
         .await
         .unwrap();
-    assert_eq!(committed.revision, 1);
+    assert_eq!(committed.revision, 2);
     assert!(committed.replayable);
     assert!(!committed.already_completed);
     let persisted = store
@@ -2796,52 +3149,108 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(persisted.revision, 1);
-    assert_eq!(persisted.messages.len(), 1);
-    assert_eq!(persisted.messages[0].role, "user");
-    assert_eq!(persisted.messages[0].content.as_deref(), Some("hello"));
+    assert_eq!(persisted.revision, 2);
+    assert_eq!(persisted.messages.len(), 2);
+    assert_eq!(persisted.messages[1].role, "user");
+    assert_eq!(persisted.messages[1].content.as_deref(), Some("hello"));
 
     let repeated = store
         .commit_conversation_idempotency_with_limits(
             completion,
-            &conversation,
+            &candidate,
             idempotency_limits(100, 1024, 10),
         )
         .await
         .unwrap();
-    assert_eq!(repeated.revision, 1);
+    assert_eq!(repeated.revision, 2);
     assert!(repeated.already_completed);
+
+    let next_claim = idempotency_claim(
+        'd',
+        'e',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-atomic",
+        Some(&scope),
+        Some(persisted.revision),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(next_claim.clone(), default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    assert!(matches!(
+        store
+            .delete_conversation(Some("flow-a"), "chat-atomic")
+            .await,
+        Err(ironcrew::utils::error::IronCrewError::Conflict(_))
+    ));
+
+    let mut next_candidate = persisted.clone();
+    next_candidate
+        .messages
+        .push(ChatMessage::assistant(Some("hi".into()), None));
+    let next_completion = idempotency_completion(&next_claim, Some("{\"reply\":\"next\"}"));
+    let next_commit = store
+        .commit_conversation_idempotency_with_limits(
+            next_completion,
+            &next_candidate,
+            idempotency_limits(100, 1024, 10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next_commit.revision, 3);
+    assert!(!next_commit.already_completed);
+
+    for replay_claim in [&claim, &next_claim] {
+        match store
+            .lookup_idempotency(
+                &replay_claim.key_hash,
+                &replay_claim.request_fingerprint,
+                "2026-07-19T12:02:00Z",
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyLookup::Replay(record) => {
+                assert_eq!(record.exclusive_scope.as_deref(), Some(scope.as_str()));
+            }
+            other => panic!("expected completed conversation replay, got {other:?}"),
+        }
+    }
+    store
+        .delete_conversation(Some("flow-a"), "chat-atomic")
+        .await
+        .unwrap();
+    reset(&url, prefix).await;
 }
 
 #[tokio::test]
-async fn pg_conversation_claim_checks_durable_revision_before_insert() {
+async fn pg_conversation_claim_checks_durable_revision_and_incarnation() {
     let Some(url) = pg_url() else {
         eprintln!(
-            "SKIP pg_conversation_claim_checks_durable_revision_before_insert: IRONCREW_TEST_PG_URL unset"
+            "SKIP pg_conversation_claim_checks_durable_revision_and_incarnation: IRONCREW_TEST_PG_URL unset"
         );
         return;
     };
     let prefix = "idem_rev_";
     reset(&url, prefix).await;
     let store = PostgresStore::new(&url, prefix).await.unwrap();
-    let conversation = ConversationRecord {
-        id: "chat-revision".into(),
-        flow_name: "chat".into(),
-        flow_path: Some("flow-a".into()),
-        agent_name: "assistant".into(),
-        messages: vec![ChatMessage::user("existing")],
-        created_at: "2026-07-19T12:00:00Z".into(),
-        updated_at: "2026-07-19T12:01:00Z".into(),
-        revision: 0,
-    };
-    assert_eq!(store.save_conversation(&conversation).await.unwrap(), 1);
+    let conversation = persist_conversation_fixture(&store, "chat-revision").await;
+    let scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-revision",
+        &conversation.execution.incarnation_id,
+    );
 
     let stale = idempotency_claim(
         'e',
         'f',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-revision",
-        Some("conversation:flow-a:chat-revision"),
+        Some(&scope),
         Some(0),
         "2026-07-19T12:10:00Z",
     );
@@ -2869,13 +3278,13 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
         'e',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-revision",
-        Some("conversation:flow-a:chat-revision"),
-        Some(1),
+        Some(&scope),
+        Some(conversation.revision),
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
         store
-            .claim_idempotency_with_limits(current, default_idempotency_limits())
+            .claim_idempotency_with_limits(current.clone(), default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -2886,7 +3295,11 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
         '1',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-missing",
-        Some("conversation:flow-a:chat-missing"),
+        Some(&conversation_mutation_scope(
+            "flow-a",
+            "chat-missing",
+            &conversation.execution.incarnation_id,
+        )),
         Some(1),
         "2026-07-19T12:10:00Z",
     );
@@ -2902,13 +3315,70 @@ async fn pg_conversation_claim_checks_durable_revision_before_insert() {
         '0',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-missing",
-        Some("conversation:flow-a:chat-missing"),
+        Some(&conversation_mutation_scope(
+            "flow-a",
+            "chat-missing",
+            &conversation.execution.incarnation_id,
+        )),
         Some(0),
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
         store
             .claim_idempotency_with_limits(missing_zero, default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Conflict
+    ));
+
+    assert!(
+        store
+            .release_idempotency(&current.key_hash, &current.attempt_id)
+            .await
+            .unwrap()
+    );
+    store
+        .delete_conversation(Some("flow-a"), "chat-revision")
+        .await
+        .unwrap();
+    let mut recreated = conversation_fixture("chat-revision");
+    recreated.execution.incarnation_id = "00000000-0000-4000-8000-000000000002".into();
+    recreated.revision = store.save_conversation(&recreated).await.unwrap();
+    assert_eq!(recreated.revision, 1);
+
+    let stale_incarnation = idempotency_claim(
+        '2',
+        '4',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-revision",
+        Some(&scope),
+        Some(recreated.revision),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(stale_incarnation, default_idempotency_limits())
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Conflict
+    ));
+    let recreated_scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-revision",
+        &recreated.execution.incarnation_id,
+    );
+    let recreated_claim = idempotency_claim(
+        '3',
+        '5',
+        CONVERSATION_MESSAGE_OPERATION,
+        "chat-revision",
+        Some(&recreated_scope),
+        Some(recreated.revision),
+        "2026-07-19T12:10:00Z",
+    );
+    assert!(matches!(
+        store
+            .claim_idempotency_with_limits(recreated_claim, default_idempotency_limits())
             .await
             .unwrap(),
         IdempotencyClaimOutcome::Claimed(_)
@@ -2926,13 +3396,19 @@ async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
     let prefix = "idem_ind_";
     reset(&url, prefix).await;
     let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let conversation = persist_conversation_fixture(&store, "chat-indeterminate").await;
+    let scope = conversation_mutation_scope(
+        "flow-a",
+        "chat-indeterminate",
+        &conversation.execution.incarnation_id,
+    );
     let claim = idempotency_claim(
         '2',
         '3',
         CONVERSATION_MESSAGE_OPERATION,
         "chat-indeterminate",
-        Some("conversation:flow-a:chat-indeterminate"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "2026-07-19T12:10:00Z",
     );
     assert!(matches!(
@@ -2961,32 +3437,29 @@ async fn pg_indeterminate_records_cannot_be_completed_or_committed() {
             .await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
-    let conversation = ConversationRecord {
-        id: "chat-indeterminate".into(),
-        flow_name: "chat".into(),
-        flow_path: Some("flow-a".into()),
-        agent_name: "assistant".into(),
-        messages: vec![ChatMessage::user("must not persist")],
-        created_at: "2026-07-19T12:00:00Z".into(),
-        updated_at: "2026-07-19T12:01:00Z".into(),
-        revision: 0,
-    };
+    let mut candidate = conversation.clone();
+    candidate
+        .messages
+        .push(ChatMessage::user("must not persist"));
     assert!(matches!(
         store
             .commit_conversation_idempotency_with_limits(
                 completion,
-                &conversation,
+                &candidate,
                 idempotency_limits(100, 1024, 10)
             )
             .await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
     ));
-    assert!(
-        store
-            .get_conversation(Some("flow-a"), "chat-indeterminate")
-            .await
-            .unwrap()
-            .is_none()
+    let persisted = store
+        .get_conversation(Some("flow-a"), "chat-indeterminate")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.revision, conversation.revision);
+    assert_eq!(
+        serde_json::to_value(&persisted.messages).unwrap(),
+        serde_json::to_value(&conversation.messages).unwrap()
     );
     assert!(matches!(
         store
@@ -3012,13 +3485,16 @@ async fn pg_idempotency_retention_prunes_only_terminal_records() {
     let prefix = "idem_ret_";
     reset(&url, prefix).await;
     let store = PostgresStore::new(&url, prefix).await.unwrap();
+    let conversation = persist_conversation_fixture(&store, "expired").await;
+    let scope =
+        conversation_mutation_scope("flow-a", "expired", &conversation.execution.incarnation_id);
     let expired = idempotency_claim(
         'c',
         'd',
         CONVERSATION_MESSAGE_OPERATION,
         "expired",
-        Some("conversation:flow-a:expired"),
-        Some(0),
+        Some(&scope),
+        Some(conversation.revision),
         "2026-07-19T12:10:00Z",
     );
     let live = idempotency_claim(
@@ -4145,6 +4621,213 @@ async fn pg_human_input_mailbox_is_encrypted_and_cross_replica() {
 }
 
 #[tokio::test]
+async fn pg_human_input_rotation_fails_closed_and_pins_answers_to_question_key() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_human_input_rotation_fails_closed_and_pins_answers_to_question_key: IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "hitl_rotation_";
+    reset(&url, prefix).await;
+    let (old_only, overlap_new_active, new_only) = rotating_human_input_keyrings();
+    let old_fingerprint = old_only.active_fingerprint().to_owned();
+    let new_fingerprint = new_only.active_fingerprint().to_owned();
+    let owner = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+        Some(old_only.clone()),
+    )
+    .await
+    .unwrap();
+    // This process took its startup snapshot before the old writer retained a
+    // question. Per-operation authentication must still prevent corruption.
+    let early_new_only = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("peer-new-early", Duration::from_secs(60)).unwrap(),
+        Some(new_only.clone()),
+    )
+    .await
+    .unwrap();
+
+    let claim = create_keyed_run(&owner, "rotation-run", '7').await;
+    let registration = human_input_registration(
+        "rotation-run",
+        "rotation-question",
+        &claim.key_hash,
+        &claim.attempt_id,
+    );
+    assert_eq!(
+        owner.register_human_input(&registration).await.unwrap(),
+        HumanInputRegistrationOutcome::Registered
+    );
+    let answer = serde_json::json!({"decision": "approve rotation"});
+    let early_error = early_new_only
+        .answer_human_input("flow-a", "rotation-run", "rotation-question", &answer)
+        .await
+        .expect_err("new-only peer must reject an old-key question");
+    assert!(matches!(early_error, IronCrewError::Conflict(_)));
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let table = format!("{prefix}human_inputs");
+    let (state, answer_fingerprint, answer_nonce, answer_ciphertext): HumanInputAnswerColumns =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT state, answer_key_fingerprint, answer_nonce, answer_ciphertext \
+         FROM {table} WHERE run_id = 'rotation-run'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert!(answer_fingerprint.is_none());
+    assert!(answer_nonce.is_none());
+    assert!(answer_ciphertext.is_none());
+
+    // Corrupted storage must be rejected from fixed-size metadata alone,
+    // before SQLx transfers an unbounded fingerprint or ciphertext into the
+    // process. Keep the row pending and restore the authenticated question so
+    // the rotation scenario can continue.
+    let (valid_fingerprint, valid_nonce, valid_ciphertext): (String, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT question_key_fingerprint, question_nonce, question_ciphertext \
+             FROM {table} WHERE run_id = 'rotation-run'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET question_key_fingerprint = repeat('f', 65), \
+             question_nonce = decode(repeat('00', 13), 'hex'), \
+             question_ciphertext = decode(repeat('00', 17825792), 'hex') \
+         WHERE run_id = 'rotation-run'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let corrupt_error = owner
+        .answer_human_input("flow-a", "rotation-run", "rotation-question", &answer)
+        .await
+        .expect_err("oversized and malformed stored question metadata must fail closed");
+    assert!(
+        corrupt_error
+            .to_string()
+            .contains("exceeds its authenticated bounds")
+    );
+    let corrupt_state: HumanInputAnswerColumns = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT state, answer_key_fingerprint, answer_nonce, answer_ciphertext \
+             FROM {table} WHERE run_id = 'rotation-run'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(corrupt_state, ("pending".into(), None, None, None));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET question_key_fingerprint = $1, question_nonce = $2, \
+             question_ciphertext = $3 WHERE run_id = 'rotation-run'"
+    )))
+    .bind(valid_fingerprint)
+    .bind(valid_nonce)
+    .bind(valid_ciphertext)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let fresh_new_only = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("peer-new-blocked", Duration::from_secs(60)).unwrap(),
+        Some(new_only.clone()),
+    )
+    .await;
+    let startup_error = fresh_new_only
+        .err()
+        .expect("new-only startup must fail while old-key question ciphertext remains");
+    assert!(
+        startup_error
+            .to_string()
+            .contains("unavailable encryption key")
+    );
+
+    let overlap_peer = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("peer-overlap-new", Duration::from_secs(60)).unwrap(),
+        Some(overlap_new_active.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        overlap_peer
+            .answer_human_input("flow-a", "rotation-run", "rotation-question", &answer,)
+            .await
+            .unwrap(),
+        HumanInputAnswerOutcome::Queued { .. }
+    ));
+    let (question_fingerprint, answer_fingerprint): (String, Option<String>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT question_key_fingerprint, answer_key_fingerprint FROM {table} \
+             WHERE run_id = 'rotation-run'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(question_fingerprint, old_fingerprint);
+    assert_eq!(
+        answer_fingerprint.as_deref(),
+        Some(old_fingerprint.as_str())
+    );
+    assert_eq!(
+        owner.read_human_input(&registration).await.unwrap(),
+        HumanInputReadOutcome::Answered(answer.clone())
+    );
+
+    // Make the question readable by the new-only keyring while retaining the
+    // old-key answer. Startup must inspect both fingerprint columns.
+    let new_question = overlap_new_active
+        .seal_question(
+            &registration.aad("owner-a").unwrap(),
+            &registration.question,
+        )
+        .unwrap();
+    assert_eq!(new_question.key_fingerprint, new_fingerprint);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET question_key_fingerprint = $1, question_nonce = $2, \
+         question_ciphertext = $3 WHERE run_id = 'rotation-run'"
+    )))
+    .bind(&new_question.key_fingerprint)
+    .bind(&new_question.nonce)
+    .bind(&new_question.ciphertext)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let answer_only_block = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("peer-new-answer-blocked", Duration::from_secs(60)).unwrap(),
+        Some(new_only.clone()),
+    )
+    .await;
+    assert!(
+        answer_only_block.is_err(),
+        "new-only startup must inspect retained answer fingerprints"
+    );
+
+    assert!(owner.close_human_input(&registration).await.unwrap());
+    let retired = PostgresStore::new_with_lease_config_and_human_input_keyring(
+        &url,
+        prefix,
+        RunLeaseConfig::new("peer-new-safe", Duration::from_secs(60)).unwrap(),
+        Some(new_only),
+    )
+    .await
+    .unwrap();
+    retired.health_check().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn pg_human_input_rejects_wrong_flow_fence_lease_and_expiry() {
     let Some(url) = pg_url() else {
         eprintln!(
@@ -4399,6 +5082,102 @@ async fn pg_human_input_rows_follow_run_lifecycle_cleanup() {
 }
 
 #[tokio::test]
+async fn pg_run_event_append_lock_timeout_rolls_back_and_recovers_pool() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_run_event_append_lock_timeout_rolls_back_and_recovers_pool: \
+             IRONCREW_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let prefix = "event_lock_timeout_";
+    reset(&url, prefix).await;
+    let config = run_event_config();
+    let write_timeout = config.write_timeout;
+    let store = Arc::new(journal_store(&url, prefix, "owner-a", config).await);
+    let probe_count = configured_postgres_pool_size().clamp(1, 2);
+    let run_ids = (0..probe_count)
+        .map(|index| format!("locked-journal-{index}"))
+        .collect::<Vec<_>>();
+    for run_id in &run_ids {
+        store
+            .save_run_intent(intent(run_id, "flow-a", "2026-08-10T12:00:00Z", vec![]))
+            .await
+            .unwrap();
+    }
+
+    let observer = sqlx::PgPool::connect(&url).await.unwrap();
+    let usage_table = format!("{prefix}run_event_usage");
+    let mut blocker = observer.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT retained_events FROM {usage_table} WHERE singleton = TRUE FOR UPDATE"
+    )))
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    let probes = run_ids
+        .iter()
+        .map(|run_id| {
+            let store = store.clone();
+            let batch = run_event_batch(run_id, "owner-a", vec![run_event(1, "crew_started", 0)]);
+            tokio::spawn(async move { store.append_run_events(&batch).await })
+        })
+        .collect::<Vec<_>>();
+    wait_for_blocked_run_event_appends(&observer, &usage_table, probe_count).await;
+
+    for probe in probes {
+        let error = tokio::time::timeout(write_timeout + Duration::from_secs(2), probe)
+            .await
+            .expect("database timeout must bound the blocked append")
+            .expect("append probe must not panic")
+            .expect_err("the held usage row must reject the append");
+        let message = error.to_string();
+        assert!(
+            message.contains("run-event global accounting lock failed")
+                && message.contains("timeout"),
+            "the database must report the bounded usage-row lock wait: {message}"
+        );
+    }
+    assert!(
+        started.elapsed() < write_timeout + Duration::from_secs(2),
+        "blocked appends outlived the configured outer attempt window plus test headroom"
+    );
+
+    let persisted_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_events"
+    )))
+    .fetch_one(&observer)
+    .await
+    .unwrap();
+    let state_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {prefix}run_event_state"
+    )))
+    .fetch_one(&observer)
+    .await
+    .unwrap();
+    assert_eq!((persisted_rows, state_rows), (0, 0));
+
+    blocker.rollback().await.unwrap();
+    for run_id in &run_ids {
+        store
+            .append_run_events(&run_event_batch(
+                run_id,
+                "owner-a",
+                vec![run_event(1, "crew_started", 0)],
+            ))
+            .await
+            .expect("released store pool must append successfully");
+        let page = store.read_run_events("flow-a", run_id, 0).await.unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].sequence, 1);
+        assert!(page.gap.is_none());
+    }
+    observer.close().await;
+}
+
+#[tokio::test]
 async fn pg_run_event_journal_is_shared_fenced_idempotent_and_gap_aware() {
     let Some(url) = pg_url() else {
         eprintln!(
@@ -4618,6 +5397,7 @@ async fn pg_run_event_journal_enforces_per_run_and_global_caps() {
         page_max_bytes: 3 * 1024,
         poll_interval: Duration::from_millis(100),
         read_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS),
         prune_batch: 4,
     };
     let store = journal_store(&url, prefix, "owner-a", config.clone()).await;
@@ -5064,6 +5844,7 @@ async fn pg_run_event_journal_reclaims_across_batches_and_survives_restart() {
         page_max_bytes: 5 * 1024,
         poll_interval: Duration::from_millis(100),
         read_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS),
         prune_batch: 2,
     };
     let store = journal_store(&url, prefix, "owner-a", config.clone()).await;
@@ -5220,6 +6001,7 @@ async fn pg_run_event_page_delivers_first_wire_bounded_event_when_db_accounting_
         page_max_bytes: 1024,
         poll_interval: Duration::from_millis(100),
         read_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS),
         prune_batch: 4,
     };
     let store = journal_store(&url, prefix, "owner-a", config).await;
