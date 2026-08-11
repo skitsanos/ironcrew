@@ -17,6 +17,10 @@ pub const CONVERSATION_MESSAGE_OPERATION: &str = "conversation.message";
 pub const MAX_IDEMPOTENCY_SCOPE_BYTES: usize = 512;
 pub const MAX_IDEMPOTENCY_RESOURCE_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// Absolute size ceiling for one durable replay body. SQL backends use this
+/// before returning untrusted text to Rust, and every decoded record enforces
+/// it again before replay.
+pub const HARD_IDEMPOTENCY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Opaque server-issued identity used for admission and durable quota
 /// accounting. It is derived from an operator-controlled principal label,
@@ -177,6 +181,9 @@ pub enum RunCancellationRequest {
         already_requested: bool,
     },
     Terminal(RunStatus),
+    OwnerDraining {
+        owner_instance_id: String,
+    },
     NotFound,
     NotDurable,
 }
@@ -369,6 +376,15 @@ impl IdempotencyRecord {
         if self.response_body.is_some() && self.response_status.is_none() {
             return Err(IronCrewError::Validation(
                 "Stored idempotency response body has no HTTP status".into(),
+            ));
+        }
+        if self
+            .response_body
+            .as_deref()
+            .is_some_and(|body| body.len() > HARD_IDEMPOTENCY_RESPONSE_BYTES)
+        {
+            return Err(IronCrewError::Validation(
+                "Stored idempotency response body exceeds the hard byte limit".into(),
             ));
         }
         if self.state.is_in_flight() && self.expires_at.is_some() {

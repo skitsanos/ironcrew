@@ -1,0 +1,94 @@
+{
+  "schema": "ironcrew-platform-canary-receipt-v1",
+  "status": "preflight_cancelled",
+  "platform": "railway",
+  "project_id": "d0eda4bf-f0ed-4258-bdb6-5b76cfdb8761",
+  "environment_id": "4ef85b76-84c6-470f-8a18-825c4d32222a",
+  "test_run": "ic007-final-20260810",
+  "evidence_window": {
+    "date": "2026-08-10",
+    "kind": "cancelled artifact preflight",
+    "functional_evidence_counted": false
+  },
+  "supersession": {
+    "reason": "Source review found that the new run-event transaction timeout-configuration error was not classified retryable; the corrected final artifact is named v7.",
+    "closure_use": "negative operator and preflight evidence only"
+  },
+  "source_artifact": {
+    "tag": "ironcrew:ic007-platform-final-v6-20260810",
+    "oci_index_sha256": "f3f1872e7942e566c0ef75b09b47110ee98b81382f3421e9090f805e52c7e1de",
+    "linux_amd64_manifest_sha256": "53ee551bcc2078e1b24dfaf8ddcc245d0d881287dc90bd28e6e01212d5c91126",
+    "oci_config_sha256": "a5e389ed2587890f6cc36ae72df358fffc6d88dda9f625bef62ac59b2a08b4e4",
+    "binary_sha256": "9c602ad5c2f10cd361a3b9b5a4ffaabfe69a7887753c31c2d063adfd43a40083",
+    "flow_tree_sha256": "7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+    "canonical_build_manifest_sha256": "457637f8c88b83d1c9631889dc40a926c7ef3bd5368442789d745793db4e8ea9",
+    "build_attestation_file_sha256": "e6a8437c43a57d2755228d9a081b3e87bfb2490843e959598018201d48c96951",
+    "assembly_dockerfile_sha256": "6de0d031b6d5bc6078996bc13b8ca89ab22486c6b73065a047937b7c8e6f9723",
+    "assembly_context_manifest_sha256": "sha256:29eff19e0e4145012d09ab2381c4110d47576bcbaf1916a704d14abe560cd2ae",
+    "assembly_context_files": 10
+  },
+  "retained_artifacts": {
+    "assembly_dockerfile": "ic007-v6-assembly.Dockerfile",
+    "build_attestation": "ic007-v6-build-attestation.json",
+    "build_manifest": "ic007-v6-build-manifest.json",
+    "assembly_context": "ic007-v6-assembly-context.json"
+  },
+  "railway_upload": {
+    "deployment_id": "071d5709-9e1e-4911-8ea0-4f7ce84b7bd2",
+    "created_at": "2026-08-10T15:38:06.504Z",
+    "removed_at": "2026-08-10T15:44:06.754Z",
+    "railway_image_digest": "sha256:31adc25d2925a0f43012527e5934efbb24ac9958d0422b7e86e3905d385b8e2d",
+    "runtime": "V2",
+    "build_duration_seconds": 170,
+    "instances": [
+      "a477c86c-8f59-4a8f-a003-63009ce4f3e0",
+      "a87dd29e-0431-4d14-99e6-d00dcc42f30b"
+    ],
+    "instance_status_after_cancel": "REMOVED",
+    "functional_requests_sent": 0
+  },
+  "assembly_context_mismatch": {
+    "cause": "A local pre-upload Python fingerprint probe created a pycache after the authoritative v6 image had been built.",
+    "extra_uploaded_path": "opt/ironcrew-canary/__pycache__/config_contract.cpython-314.pyc",
+    "extra_uploaded_size": 3572,
+    "extra_uploaded_sha256": "sha256:8e9c9ad923de3d0eb4cd88c8b668fd4f9ff43447907175da37924eae7999d199",
+    "shared_oci_identity_claimed": false,
+    "runtime_parity_claimed": false,
+    "correction": "The exact attributed pycache was removed and the canonical 10-file source context was independently matched to both OpenShift v6 pods; it was not reused for final Railway evidence."
+  },
+  "staged_configuration": {
+    "table_prefix": "ic007_final_rw_v6_20260810_",
+    "config_fingerprint": "sha256:5644258f22abe58b308328a01916245bf622bb6cac80305fed3026bac95e2f01",
+    "run_lease_ttl_seconds": 60,
+    "event_journal_write_timeout_ms": 5000,
+    "database_pool_size_per_process": 2,
+    "secrets_retained": false
+  },
+  "database_preflight_state": {
+    "tables": 10,
+    "indexes": 18,
+    "functions": 2,
+    "run_rows": 0,
+    "idempotency_rows": 0,
+    "human_input_rows": 0,
+    "run_event_rows": 0,
+    "run_event_state_rows": 0
+  },
+  "operator_note": {
+    "railway_down_expected": "cancel the newest pending deployment",
+    "railway_down_observed": "removed the previous healthy v5 deployment while the v6 deployment continued",
+    "correction": "The exact v6 deployment was then cancelled through deploymentCancel(id) and verified REMOVED.",
+    "product_scope_broadened": false
+  },
+  "current_state": {
+    "application_service": "quiescent with no active deployment",
+    "downtime_boundary": "acceptable in the isolated sandbox",
+    "v5_prefix_preserved": true,
+    "v6_prefix_preserved": true,
+    "provider_and_postgres_services_preserved": true,
+    "public_domain_preserved": true,
+    "active_canary_volumes": 0,
+    "preexisting_volume_tombstones_preserved": 2,
+    "cleanup": "deferred for v7"
+  }
+}

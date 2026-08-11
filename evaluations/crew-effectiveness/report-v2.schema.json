@@ -1,0 +1,1186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ironcrew.dev/schemas/crew-effectiveness-report-v2.schema.json",
+  "title": "IronCrew Crew Effectiveness Report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "effectiveness_evidence",
+    "notice",
+    "generated_at",
+    "revision",
+    "binary",
+    "dataset",
+    "provider",
+    "configuration",
+    "mock_provider_stats",
+    "runs",
+    "summary",
+    "pairwise",
+    "evaluation_plan",
+    "decision"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "ironcrew.crew-eval.v2"
+    },
+    "mode": {
+      "enum": [
+        "contract",
+        "live"
+      ]
+    },
+    "effectiveness_evidence": {
+      "type": "boolean"
+    },
+    "notice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha",
+        "dirty"
+      ],
+      "properties": {
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "version",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "answer_contract",
+        "correctness_rule",
+        "case_count",
+        "cases_sha256",
+        "oracle_sha256",
+        "oracle_injected_into_prompt"
+      ],
+      "properties": {
+        "name": {
+          "const": "grounded-decisions-options-v1"
+        },
+        "answer_contract": {
+          "const": "source-visible-single-select-v1"
+        },
+        "correctness_rule": {
+          "const": "exact-option-id-v1"
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cases_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "oracle_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "oracle_injected_into_prompt": {
+          "const": false
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "identity_source",
+        "model"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "identity_source": {
+          "enum": [
+            "evaluator-contract",
+            "operator-declared"
+          ]
+        },
+        "model": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repetitions",
+        "temperature",
+        "order_seed",
+        "variants",
+        "planned_llm_calls_per_run",
+        "planned_max_output_tokens_per_run"
+      ],
+      "properties": {
+        "repetitions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "temperature": {
+          "const": 0
+        },
+        "order_seed": {
+          "type": "integer"
+        },
+        "variants": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "single"
+            },
+            {
+              "const": "dag"
+            },
+            {
+              "const": "collaborative"
+            }
+          ],
+          "items": false
+        },
+        "planned_llm_calls_per_run": {
+          "const": {
+            "single": 1,
+            "dag": 3,
+            "collaborative": 4
+          }
+        },
+        "planned_max_output_tokens_per_run": {
+          "const": {
+            "single": 800,
+            "dag": 1800,
+            "collaborative": 2300
+          }
+        }
+      }
+    },
+    "mock_provider_stats": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "request_count",
+            "requests_by_stage"
+          ],
+          "properties": {
+            "request_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "requests_by_stage": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    },
+    "summary": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/summary"
+      }
+    },
+    "pairwise": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate",
+          "baseline",
+          "paired_count",
+          "unique_case_count",
+          "mean_grounded_correctness_delta",
+          "mean_grounded_correctness_delta_interval",
+          "candidate_success_rate",
+          "baseline_success_rate",
+          "token_pair_count",
+          "latency_pair_count",
+          "mean_token_multiplier",
+          "mean_latency_multiplier",
+          "wins",
+          "ties",
+          "losses"
+        ],
+        "properties": {
+          "candidate": {
+            "enum": [
+              "dag",
+              "collaborative"
+            ]
+          },
+          "baseline": {
+            "const": "single"
+          },
+          "paired_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unique_case_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_grounded_correctness_delta": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "wins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "losses": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_grounded_correctness_delta_interval": {
+            "$ref": "#/$defs/interval"
+          },
+          "candidate_success_rate": {
+            "$ref": "#/$defs/rate"
+          },
+          "baseline_success_rate": {
+            "$ref": "#/$defs/rate"
+          },
+          "token_pair_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latency_pair_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_token_multiplier": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "mean_latency_multiplier": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
+    "evaluation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "flow",
+        "limits",
+        "uncertainty",
+        "selection",
+        "path",
+        "sha256",
+        "planned_work"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "ironcrew.crew-eval-plan.v1"
+        },
+        "flow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256",
+            "variants"
+          ],
+          "properties": {
+            "path": {
+              "const": "crew.lua"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "variants": {
+              "const": {
+                "single": {
+                  "planned_llm_calls": 1,
+                  "maximum_output_tokens": 800
+                },
+                "dag": {
+                  "planned_llm_calls": 3,
+                  "maximum_output_tokens": 1800
+                },
+                "collaborative": {
+                  "planned_llm_calls": 4,
+                  "maximum_output_tokens": 2300
+                }
+              }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_cli_runs",
+            "max_planned_llm_calls",
+            "max_planned_output_tokens",
+            "max_case_input_bytes"
+          ],
+          "properties": {
+            "max_cli_runs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_planned_llm_calls": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_planned_output_tokens": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_case_input_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "uncertainty": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "familywise_confidence_level",
+            "multiplicity_correction",
+            "comparison_count",
+            "bootstrap_samples",
+            "bootstrap_seed"
+          ],
+          "properties": {
+            "familywise_confidence_level": {
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 0.999
+            },
+            "multiplicity_correction": {
+              "const": "bonferroni"
+            },
+            "comparison_count": {
+              "const": 2
+            },
+            "bootstrap_samples": {
+              "type": "integer",
+              "minimum": 100
+            },
+            "bootstrap_seed": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "minimum_paired_count",
+            "minimum_unique_case_count",
+            "minimum_success_rate",
+            "minimum_mean_grounded_correctness_delta",
+            "minimum_confidence_lower_bound",
+            "maximum_mean_token_multiplier",
+            "maximum_mean_latency_multiplier"
+          ],
+          "properties": {
+            "minimum_paired_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "minimum_unique_case_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "minimum_success_rate": {
+              "$ref": "#/$defs/rate"
+            },
+            "minimum_mean_grounded_correctness_delta": {
+              "type": "number",
+              "minimum": -1,
+              "maximum": 1
+            },
+            "minimum_confidence_lower_bound": {
+              "type": "number",
+              "minimum": -1,
+              "maximum": 1
+            },
+            "maximum_mean_token_multiplier": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "maximum_mean_latency_multiplier": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "planned_work": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "case_input_bytes",
+            "cli_runs",
+            "llm_calls",
+            "maximum_output_tokens",
+            "paired_comparisons_per_candidate",
+            "unique_cases"
+          ],
+          "properties": {
+            "case_input_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cli_runs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "llm_calls": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maximum_output_tokens": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "paired_comparisons_per_candidate": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "unique_cases": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "recommended_variant",
+        "reason",
+        "candidates"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not_applicable",
+            "insufficient_evidence",
+            "single_preferred",
+            "crew_qualified"
+          ]
+        },
+        "recommended_variant": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "single",
+                "dag",
+                "collaborative"
+              ]
+            }
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "candidate",
+              "qualified",
+              "checks"
+            ],
+            "properties": {
+              "candidate": {
+                "enum": [
+                  "dag",
+                  "collaborative"
+                ]
+              },
+              "qualified": {
+                "type": "boolean"
+              },
+              "checks": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "paired_count",
+                  "unique_case_count",
+              "candidate_success",
+              "baseline_success",
+              "token_coverage",
+              "latency_coverage",
+              "mean_quality_delta",
+                  "confidence_lower_bound",
+                  "token_multiplier",
+                  "latency_multiplier"
+                ],
+                "properties": {
+                  "paired_count": {
+                    "type": "boolean"
+                  },
+                  "unique_case_count": {
+                    "type": "boolean"
+                  },
+                  "candidate_success": {
+                    "type": "boolean"
+                  },
+                  "baseline_success": {
+                    "type": "boolean"
+                  },
+                  "token_coverage": {
+                    "type": "boolean"
+                  },
+                  "latency_coverage": {
+                    "type": "boolean"
+                  },
+                  "mean_quality_delta": {
+                    "type": "boolean"
+                  },
+                  "confidence_lower_bound": {
+                    "type": "boolean"
+                  },
+                  "token_multiplier": {
+                    "type": "boolean"
+                  },
+                  "latency_multiplier": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "contract"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effectiveness_evidence": {
+            "const": false
+          },
+          "provider": {
+            "properties": {
+              "name": {
+                "const": "synthetic-oracle-backed-mock"
+              },
+              "identity_source": {
+                "const": "evaluator-contract"
+              }
+            }
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "not_applicable"
+              },
+              "recommended_variant": {
+                "type": "null"
+              },
+              "candidates": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effectiveness_evidence": {
+            "const": true
+          },
+          "provider": {
+            "properties": {
+              "identity_source": {
+                "const": "operator-declared"
+              }
+            }
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "insufficient_evidence",
+                  "single_preferred",
+                  "crew_qualified"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "insufficient_evidence"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "single_preferred"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "const": "single"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "crew_qualified"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "enum": [
+                  "dag",
+                  "collaborative"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "variant",
+        "repetition",
+        "planned_llm_calls",
+        "observed_llm_calls",
+        "execution_ok",
+        "output_parse_ok",
+        "output_schema_ok",
+        "failure_reason",
+        "client_duration_ms",
+        "run_duration_ms",
+        "run_id",
+        "run_status",
+        "total_tokens",
+        "cached_tokens",
+        "agent_count",
+        "task_count",
+        "task_names",
+        "task_failures",
+        "model_output",
+        "answers_total",
+        "answers_correct",
+        "grounded_correct",
+        "correctness",
+        "grounded_correctness",
+        "citation_tp",
+        "citation_fp",
+        "citation_fn",
+        "citation_precision",
+        "citation_recall",
+        "citation_f1",
+        "answer_details"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "variant": {
+          "enum": [
+            "single",
+            "dag",
+            "collaborative"
+          ]
+        },
+        "repetition": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "planned_llm_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_llm_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "execution_ok": {
+          "type": "boolean"
+        },
+        "output_parse_ok": {
+          "type": "boolean"
+        },
+        "output_schema_ok": {
+          "type": "boolean"
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "run_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "agent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "task_failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_output": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "answers_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "answers_correct": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "grounded_correct": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "grounded_correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_tp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_fp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_fn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_precision": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_recall": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_f1": {
+          "$ref": "#/$defs/rate"
+        },
+        "answer_details": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variant",
+        "run_count",
+        "execution_success_rate",
+        "parse_success_rate",
+        "schema_success_rate",
+        "correctness",
+        "grounded_correctness",
+        "citation_precision",
+        "citation_recall",
+        "citation_f1",
+        "latency_ms",
+        "tokens"
+      ],
+      "properties": {
+        "variant": {
+          "enum": [
+            "single",
+            "dag",
+            "collaborative"
+          ]
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "execution_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "parse_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "schema_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "grounded_correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_precision": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_recall": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_f1": {
+          "$ref": "#/$defs/rate"
+        },
+        "latency_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "median",
+            "p95",
+            "observed_count",
+            "coverage_complete"
+          ],
+          "properties": {
+            "median": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "p95": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "coverage_complete": {
+              "type": "boolean"
+            }
+          }
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "median",
+            "total",
+            "observed_count",
+            "coverage_complete"
+          ],
+          "properties": {
+            "median": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "total": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "coverage_complete": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "confidence_level",
+        "familywise_confidence_level",
+        "multiplicity_correction",
+        "comparison_count",
+        "samples",
+        "seed",
+        "lower",
+        "upper"
+      ],
+      "properties": {
+        "method": {
+          "const": "paired-case-bootstrap-percentile-v1"
+        },
+        "confidence_level": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 0.999
+        },
+        "familywise_confidence_level": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 0.999
+        },
+        "multiplicity_correction": {
+          "const": "bonferroni"
+        },
+        "comparison_count": {
+          "const": 2
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 100
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lower": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "upper": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        }
+      }
+    }
+  }
+}

@@ -114,7 +114,17 @@ impl McpConnectionManager {
             );
 
             for rmcp_tool in &tools {
-                match McpBridgeTool::from_rmcp_tool(label, rmcp_tool, client.clone()) {
+                let execution_identity_fingerprint = config
+                    .servers
+                    .iter()
+                    .find(|server| server.label == *label)
+                    .and_then(|server| server.execution_identity_fingerprint.clone());
+                match McpBridgeTool::from_rmcp_tool(
+                    label,
+                    rmcp_tool,
+                    client.clone(),
+                    execution_identity_fingerprint,
+                ) {
                     Ok(bridge) => {
                         tracing::debug!(
                             server = %label,

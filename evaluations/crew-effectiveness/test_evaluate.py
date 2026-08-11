@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import copy
+import json
+import shutil
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest import mock
 
 import evaluate
+import evaluation_setup
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -94,6 +98,14 @@ class DatasetTests(unittest.TestCase):
         options[1]["label"] = options[0]["label"].upper()
         with self.assertRaisesRegex(ValueError, "duplicate option label"):
             evaluate.validate_dataset(altered, oracle)
+
+    def test_case_byte_accounting_matches_the_actual_ascii_safe_packet(self) -> None:
+        cases = [{"case_id": "unicode", "evidence": "café"}]
+        packet = json.dumps(cases[0], sort_keys=True, separators=(",", ":"))
+        self.assertEqual(
+            evaluation_setup.serialized_case_input_bytes(cases), len(packet.encode("utf-8"))
+        )
+        self.assertIn(r"\u00e9", packet)
 
 
 class ScorerTests(unittest.TestCase):
@@ -188,6 +200,142 @@ class ScorerTests(unittest.TestCase):
         output = {"case_id": "scorer-case", "answers": []}
         errors = evaluate.validate_model_output(output, self.case)
         self.assertIn("answers must contain every question exactly once", errors)
+
+
+class PairwiseTests(unittest.TestCase):
+    @staticmethod
+    def make_run(variant: str, score: float, tokens: int, duration: int) -> dict:
+        return {
+            "case_id": "case-a",
+            "repetition": 0,
+            "variant": variant,
+            "grounded_correctness": score,
+            "execution_ok": True,
+            "output_parse_ok": True,
+            "output_schema_ok": True,
+            "total_tokens": tokens,
+            "run_duration_ms": duration,
+        }
+
+    def test_pairwise_metrics_use_matched_runs(self) -> None:
+        comparisons = evaluate.pairwise_comparisons(
+            [
+                self.make_run("single", 0.5, 100, 50),
+                self.make_run("dag", 0.75, 250, 100),
+                self.make_run("collaborative", 0.25, 300, 150),
+            ],
+            {
+                "familywise_confidence_level": 0.95,
+                "multiplicity_correction": "bonferroni",
+                "comparison_count": 2,
+                "bootstrap_samples": 100,
+                "bootstrap_seed": 7,
+            },
+        )
+        dag = comparisons[0]
+        self.assertEqual(dag["mean_grounded_correctness_delta"], 0.25)
+        self.assertEqual(dag["unique_case_count"], 1)
+        self.assertEqual(dag["mean_token_multiplier"], 2.5)
+        self.assertEqual(dag["mean_latency_multiplier"], 2.0)
+        self.assertEqual(dag["token_pair_count"], 1)
+        self.assertEqual(dag["latency_pair_count"], 1)
+        self.assertEqual(dag["candidate_success_rate"], 1.0)
+        self.assertEqual(
+            dag["mean_grounded_correctness_delta_interval"]["lower"], 0.25
+        )
+
+    def test_failed_cli_usage_is_unknown_instead_of_zero(self) -> None:
+        false_binary = shutil.which("false")
+        if false_binary is None:
+            self.skipTest("false executable is unavailable")
+        result = evaluate.run_one(
+            binary=Path(false_binary),
+            repo_root=BASE_DIR,
+            flow_dir=BASE_DIR,
+            case={"case_id": "failed-run"},
+            oracle={"answers": []},
+            variant="single",
+            repetition=0,
+            model="offline",
+            mode="live",
+            timeout_seconds=1,
+            planned_llm_calls=1,
+            base_environment={},
+            mock_server=None,
+        )
+        self.assertIsNone(result["total_tokens"])
+        self.assertIsNone(result["cached_tokens"])
+
+    def test_non_success_run_record_usage_is_unknown(self) -> None:
+        for status in ("Failed", "PartialFailure"):
+            with self.subTest(status=status), mock.patch.object(
+                evaluate.subprocess,
+                "run",
+                return_value=mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "run_id": f"{status.casefold()}-run",
+                            "status": status,
+                            "total_tokens": 123,
+                            "cached_tokens": 45,
+                            "task_results": [],
+                        }
+                    ),
+                    stderr="",
+                ),
+            ):
+                result = evaluate.run_one(
+                    binary=Path("unused-mocked-binary"),
+                    repo_root=BASE_DIR,
+                    flow_dir=BASE_DIR,
+                    case={"case_id": f"{status.casefold()}-case"},
+                    oracle={"answers": []},
+                    variant="single",
+                    repetition=0,
+                    model="offline",
+                    mode="live",
+                    timeout_seconds=1,
+                    planned_llm_calls=1,
+                    base_environment={},
+                    mock_server=None,
+                )
+                self.assertEqual(result["run_status"], status)
+                self.assertIsNone(result["total_tokens"])
+                self.assertIsNone(result["cached_tokens"])
+                self.assertEqual(result["failure_reason"], f"run status was {status}")
+
+    def test_summary_does_not_label_partial_usage_as_total(self) -> None:
+        runs = []
+        for variant, tokens, duration in (
+            ("single", None, None),
+            ("dag", 20, 10),
+            ("collaborative", 30, 15),
+        ):
+            runs.append(
+                {
+                    "variant": variant,
+                    "answers_total": 1,
+                    "answers_correct": 0,
+                    "grounded_correct": 0,
+                    "citation_tp": 0,
+                    "citation_fp": 0,
+                    "citation_fn": 0,
+                    "execution_ok": False,
+                    "output_parse_ok": False,
+                    "output_schema_ok": False,
+                    "run_duration_ms": duration,
+                    "total_tokens": tokens,
+                }
+            )
+        summaries = {
+            item["variant"]: item
+            for item in evaluate.summarize_runs(runs, evaluate.VARIANTS)
+        }
+        self.assertIsNone(summaries["single"]["tokens"]["total"])
+        self.assertFalse(summaries["single"]["tokens"]["coverage_complete"])
+        self.assertFalse(summaries["single"]["latency_ms"]["coverage_complete"])
+        self.assertEqual(summaries["dag"]["tokens"]["total"], 20)
 
 
 if __name__ == "__main__":

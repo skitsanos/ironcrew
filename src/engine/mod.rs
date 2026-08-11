@@ -2,8 +2,14 @@ pub mod agent;
 pub mod audit;
 pub mod collaborative;
 pub mod condition;
+pub mod conversation_definition;
+mod conversation_identity;
+pub mod conversation_json;
+pub mod conversation_provider;
+pub mod conversation_record;
 pub mod crew;
 pub mod eventbus;
+pub(crate) mod eventbus_metrics;
 pub mod executor;
 pub mod foreach;
 // This module is a public library contract; the binary declares the same
@@ -20,6 +26,7 @@ pub mod orchestrator;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 pub mod reconciler;
+pub(crate) mod run_event_timing;
 // This module is a public library contract; the binary declares the same
 // module tree privately and does not consume every public surface directly.
 #[cfg_attr(not(test), allow(dead_code))]

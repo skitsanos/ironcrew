@@ -46,15 +46,13 @@ pub struct RunLeaseConfig {
 
 impl RunLeaseConfig {
     pub fn from_env() -> Result<Self> {
-        let configured_instance_id = match std::env::var("IRONCREW_INSTANCE_ID") {
-            Ok(value) => Some(validate_instance_id(value)?),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(crate::utils::error::IronCrewError::Validation(
-                    "IRONCREW_INSTANCE_ID must be valid UTF-8".into(),
-                ));
-            }
+        let explicit_instance_id = read_optional_instance_env("IRONCREW_INSTANCE_ID")?;
+        let railway_replica_id = if explicit_instance_id.is_none() {
+            read_optional_instance_env("RAILWAY_REPLICA_ID")?
+        } else {
+            None
         };
+        let configured_instance_id = select_instance_id(explicit_instance_id, railway_replica_id)?;
         // Cache configured ids too: all independently constructed stores in
         // this process must agree even if environment loading/mutation happens
         // later in startup.
@@ -149,6 +147,29 @@ pub fn run_maintenance_database_timeout(ttl: Duration) -> Duration {
 }
 
 fn validate_instance_id(value: String) -> Result<String> {
+    validate_instance_id_from("IRONCREW_INSTANCE_ID", value)
+}
+
+fn read_optional_instance_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            crate::utils::error::IronCrewError::Validation(format!("{name} must be valid UTF-8")),
+        ),
+    }
+}
+
+fn select_instance_id(explicit: Option<String>, railway: Option<String>) -> Result<Option<String>> {
+    match explicit {
+        Some(value) => validate_instance_id_from("IRONCREW_INSTANCE_ID", value).map(Some),
+        None => railway
+            .map(|value| validate_instance_id_from("RAILWAY_REPLICA_ID", value))
+            .transpose(),
+    }
+}
+
+fn validate_instance_id_from(source: &str, value: String) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty()
         || trimmed.len() > 255
@@ -156,15 +177,33 @@ fn validate_instance_id(value: String) -> Result<String> {
             .bytes()
             .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
     {
-        return Err(crate::utils::error::IronCrewError::Validation(
-            "IRONCREW_INSTANCE_ID must be 1-255 printable ASCII bytes".into(),
-        ));
+        return Err(crate::utils::error::IronCrewError::Validation(format!(
+            "{source} must be 1-255 printable ASCII bytes"
+        )));
     }
     Ok(trimmed.to_string())
 }
 
 /// Pluggable storage backend for run records and persistent sessions
 /// (conversations and dialogs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresPoolUsage {
+    pub open_connections: u32,
+    pub in_use_connections: u32,
+    pub connection_limit: u32,
+}
+
+/// Whether persistent conversation turns can be coordinated across processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationCoordinationScope {
+    /// The store is durable, but active turns and live handles are local to
+    /// one process. Idempotency keys remain optional for this mode.
+    ProcessLocal,
+    /// The store provides transactional revision and idempotency fences that
+    /// allow any replica to rebuild a handle and own one keyed turn.
+    SharedStore,
+}
+
 #[async_trait]
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
@@ -197,6 +236,11 @@ pub trait StateStore: Send + Sync {
     /// Stable identity used to own run records created through this handle.
     fn instance_id(&self) -> &str;
 
+    /// Process-local SQLx pool usage. Non-PostgreSQL stores omit these metrics.
+    fn postgres_pool_usage(&self) -> Option<PostgresPoolUsage> {
+        None
+    }
+
     /// Configured duration of an ownership lease. Heartbeat loops should run
     /// at least three times within this interval.
     fn run_lease_ttl(&self) -> Duration;
@@ -220,6 +264,13 @@ pub trait StateStore: Send + Sync {
     /// Whether this backend can replay run events across processes.
     fn event_journal_scope(&self) -> EventJournalScope {
         EventJournalScope::ProcessLocal
+    }
+
+    /// Whether conversation mutations can be safely rehydrated and fenced on
+    /// a different process. PostgreSQL overrides this; local stores retain the
+    /// established process-only execution model.
+    fn conversation_coordination_scope(&self) -> ConversationCoordinationScope {
+        ConversationCoordinationScope::ProcessLocal
     }
 
     /// Immutable journal limits used by the event producer and page reader.
@@ -364,6 +415,14 @@ pub trait StateStore: Send + Sync {
         attempt_id: &str,
         new_lease_expires_at: &str,
     ) -> Result<RunFenceHeartbeat>;
+
+    /// Fence every in-flight keyed run ledger owned by this process before it
+    /// advertises the draining lifecycle. Shared stores override this with an
+    /// atomic owner-scoped update; local stores have no cross-process control
+    /// plane and therefore use the no-op default.
+    async fn begin_owner_drain(&self) -> Result<usize> {
+        Ok(0)
+    }
 
     /// Durably request cancellation of a keyed HTTP run. PostgreSQL uses the
     /// linked idempotency ledger as a cross-replica control mailbox; backends
@@ -664,6 +723,24 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(config.deadline_from(now), "2026-07-18T10:01:00+00:00");
+    }
+
+    #[test]
+    fn explicit_instance_id_precedes_validated_railway_runtime_identity() {
+        assert_eq!(
+            select_instance_id(Some("explicit-owner".into()), Some("railway-owner".into()))
+                .unwrap()
+                .as_deref(),
+            Some("explicit-owner")
+        );
+        assert_eq!(
+            select_instance_id(None, Some("railway-owner".into()))
+                .unwrap()
+                .as_deref(),
+            Some("railway-owner")
+        );
+        assert!(select_instance_id(None, Some(String::new())).is_err());
+        assert_eq!(select_instance_id(None, None).unwrap(), None);
     }
 
     #[test]

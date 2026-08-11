@@ -78,6 +78,7 @@ pub struct OpenAiResponsesProvider {
     api_key: String,
     rate_limit: Option<RateLimiter>,
     config: ResponsesConfig,
+    execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
 impl OpenAiResponsesProvider {
@@ -89,11 +90,8 @@ impl OpenAiResponsesProvider {
         .build()
         .expect("Failed to build HTTP client");
 
-        let rate_limit = std::env::var("IRONCREW_RATE_LIMIT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(RateLimiter::new);
+        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
             client,
@@ -101,6 +99,7 @@ impl OpenAiResponsesProvider {
             api_key,
             rate_limit,
             config,
+            execution_policy,
         }
     }
 
@@ -328,15 +327,9 @@ impl OpenAiResponsesProvider {
 
         let status = resp.status();
         let response_limit = if status.is_success() {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_RESPONSE_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_RESPONSE_BYTES,
-            )
+            self.execution_policy.response_bytes()
         } else {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            )
+            self.execution_policy.error_bytes()
         };
         let bytes = crate::utils::http::read_response_bytes(
             resp,
@@ -402,10 +395,7 @@ impl OpenAiResponsesProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let limit = crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            );
+            let limit = self.execution_policy.error_bytes();
             let bytes = crate::utils::http::read_response_bytes(
                 resp,
                 limit,
@@ -429,20 +419,14 @@ impl OpenAiResponsesProvider {
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
-        let output_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_OUTPUT_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_OUTPUT_BYTES,
-        );
+        let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
         let mut item_states: HashMap<String, ItemState> = HashMap::new();
         let mut usage_data: Option<Value> = None;
 
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        let stream_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_STREAM_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_STREAM_BYTES,
-        );
+        let stream_limit = self.execution_policy.stream_bytes();
         let mut buffer =
             crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI Responses stream");
         let mut current_event_type = String::new();
@@ -770,6 +754,48 @@ fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn execution_fingerprint(&self) -> Result<String> {
+        let server_tools = self
+            .config
+            .server_tools
+            .iter()
+            .map(|tool| match tool {
+                ServerTool::WebSearch { context_size } => {
+                    json!({"type": "web_search", "context_size": context_size})
+                }
+                ServerTool::FileSearch {
+                    vector_store_ids,
+                    max_num_results,
+                } => json!({
+                    "type": "file_search",
+                    "vector_store_ids": vector_store_ids,
+                    "max_num_results": max_num_results,
+                }),
+                ServerTool::CodeInterpreter => json!({"type": "code_interpreter"}),
+                ServerTool::Mcp {
+                    server_label,
+                    server_url,
+                    allowed_tools,
+                } => json!({
+                    "type": "mcp",
+                    "server_label": server_label,
+                    "server_url": server_url,
+                    "allowed_tools": allowed_tools,
+                }),
+            })
+            .collect::<Vec<_>>();
+        crate::engine::conversation_provider::provider_execution_fingerprint(
+            "openai-responses",
+            &self.base_url,
+            &json!({
+                "reasoning_effort": self.config.reasoning_effort,
+                "reasoning_summary": self.config.reasoning_summary,
+                "server_tools": server_tools,
+                "execution_policy": self.execution_policy.definition(),
+            }),
+        )
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         tracing::debug!(
             provider = "openai-responses",

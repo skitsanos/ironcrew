@@ -42,7 +42,7 @@ pub enum MutationClass {
 }
 
 impl MutationClass {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Work => "work",
             Self::Control => "control",
@@ -326,7 +326,7 @@ pub async fn enforce_mutation_admission(
     next: Next,
 ) -> Response {
     let Some(class) = classify_mutation(request.method(), request.uri().path()) else {
-        return next.run(request).await;
+        return harden_downstream_rate_response(next.run(request).await);
     };
     match controller.admit(&principal, class) {
         Ok(()) => harden_downstream_rate_response(next.run(request).await),
@@ -362,7 +362,7 @@ fn harden_downstream_rate_response(mut response: Response) -> Response {
     response
 }
 
-fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
+pub(crate) fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
     // Polling a shared question mailbox performs indexed database reads plus
     // bounded ciphertext decryption. Give it an independently bounded bucket
     // so an aggressive UI poll loop cannot starve answer/abort capacity.
@@ -375,11 +375,26 @@ fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
     if method != Method::POST {
         return None;
     }
-    if path.contains("/abort/") || path.contains("/answer/") {
+    if is_run_control_path(path) {
         Some(MutationClass::Control)
     } else {
         Some(MutationClass::Work)
     }
+}
+
+fn is_run_control_path(path: &str) -> bool {
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some("flows"), Some(flow), Some("abort" | "answer"), Some(run_id), None)
+            if !flow.is_empty() && !run_id.is_empty()
+    )
 }
 
 fn is_question_poll_path(path: &str) -> bool {
@@ -516,6 +531,54 @@ pub async fn metrics(
         "ironcrew_process_active_sse_connections_limit",
         state.max_sse_connections,
     );
+    super::resource_metrics::append(&mut body, &state).await;
+    write_helped_gauge(
+        &mut body,
+        "ironcrew_store_maintenance_healthy",
+        "Whether the latest completed store maintenance cycle succeeded (1 healthy, 0 unhealthy).",
+        u8::from(state.store_maintenance_healthy.load(Ordering::Acquire)),
+    );
+    write_helped_gauge(
+        &mut body,
+        "ironcrew_process_terminal_persistence_degraded_finalizers",
+        "Current run or conversation finalizers retrying durable persistence in this process.",
+        state.terminal_persistence_failures.load(Ordering::Acquire),
+    );
+    writeln!(
+        body,
+        "# HELP ironcrew_process_lifecycle_state Current process lifecycle as a fixed one-hot gauge."
+    )
+    .unwrap();
+    writeln!(body, "# TYPE ironcrew_process_lifecycle_state gauge").unwrap();
+    let lifecycle_phase = state.lifecycle.phase();
+    for phase in super::lifecycle::LifecyclePhase::ALL {
+        writeln!(
+            body,
+            "ironcrew_process_lifecycle_state{{state=\"{}\"}} {}",
+            phase.as_str(),
+            u8::from(phase == lifecycle_phase),
+        )
+        .unwrap();
+    }
+    writeln!(
+        body,
+        "# HELP ironcrew_process_lifecycle_rejections_total Mutation requests rejected by the process lifecycle boundary."
+    )
+    .unwrap();
+    writeln!(
+        body,
+        "# TYPE ironcrew_process_lifecycle_rejections_total counter"
+    )
+    .unwrap();
+    for class in [MutationClass::Work, MutationClass::Control] {
+        writeln!(
+            body,
+            "ironcrew_process_lifecycle_rejections_total{{class=\"{}\"}} {}",
+            class.label(),
+            state.lifecycle.rejection_count(class),
+        )
+        .unwrap();
+    }
     write_gauge(
         &mut body,
         "ironcrew_auth_configured_principals",
@@ -719,6 +782,11 @@ fn write_gauge<T: std::fmt::Display>(body: &mut String, name: &str, value: T) {
     writeln!(body, "{name} {value}").unwrap();
 }
 
+fn write_helped_gauge<T: std::fmt::Display>(body: &mut String, name: &str, help: &str, value: T) {
+    writeln!(body, "# HELP {name} {help}").unwrap();
+    write_gauge(body, name, value);
+}
+
 fn write_counter<T: std::fmt::Display>(body: &mut String, name: &str, value: T) {
     writeln!(body, "{name} {value}").unwrap();
 }
@@ -810,6 +878,29 @@ mod tests {
             None
         );
         assert_eq!(classify_mutation(&Method::GET, "/metrics"), None);
+
+        for path in [
+            "/flows/abort/run",
+            "/flows/answer/run",
+            "/flows/a/conversations/abort/start",
+            "/flows/a/conversations/answer/messages",
+            "/flows/a/abort/run-id/extra",
+            "/flows/a/answer/run-id/extra",
+        ] {
+            assert_eq!(
+                classify_mutation(&Method::POST, path),
+                Some(MutationClass::Work),
+                "attacker-controlled path segment must not select control admission: {path}"
+            );
+        }
+
+        for path in ["/flows/a/abort/run-id", "/flows/a/answer/run-id"] {
+            assert_eq!(
+                classify_mutation(&Method::POST, path),
+                Some(MutationClass::Control),
+                "exact run-control route must retain control admission: {path}"
+            );
+        }
     }
 
     fn test_controller(observation: RatePolicy, control: RatePolicy) -> AdmissionController {

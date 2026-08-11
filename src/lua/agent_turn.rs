@@ -141,7 +141,10 @@ pub async fn run_single_agent_turn(
         }
         None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
     };
-    let max_history_bytes = chat_history_max_bytes();
+    let max_history_bytes = ctx.tool_registry.as_ref().map_or_else(
+        chat_history_max_bytes,
+        crate::tools::registry::ToolRegistry::chat_history_max_bytes,
+    );
     enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
     validate_chat_history(&history, max_history, max_history_bytes, true)?;
 
@@ -157,7 +160,10 @@ pub async fn run_single_agent_turn(
         .unwrap_or_else(|| format!("agent__{}", agent.name));
 
     let mut accumulated_reasoning = String::new();
-    let reasoning_limit = max_reasoning_bytes();
+    let reasoning_limit = ctx.tool_registry.as_ref().map_or_else(
+        max_reasoning_bytes,
+        crate::tools::registry::ToolRegistry::max_reasoning_bytes,
+    );
     let mut reasoning_truncated = false;
     let mut rounds = 0usize;
 
@@ -257,11 +263,14 @@ pub async fn run_single_agent_turn(
             // A call may extend its own dispatch deadline (ask_human waits
             // on a person; approval-gated tools wait for a sign-off);
             // everything else gets the global timeout.
-            let timeout = ctx
-                .tool_registry
-                .as_ref()
-                .and_then(|reg| reg.dispatch_timeout(&tool_call.function.name, &args))
-                .unwrap_or_else(|| Duration::from_secs(tool_timeout_secs()));
+            let timeout = ctx.tool_registry.as_ref().map_or_else(
+                || Duration::from_secs(tool_timeout_secs()),
+                |registry| {
+                    registry
+                        .dispatch_timeout(&tool_call.function.name, &args)
+                        .unwrap_or_else(|| registry.default_dispatch_timeout())
+                },
+            );
             let (result_text, ok) = match &ctx.tool_registry {
                 Some(reg) => {
                     let dispatch = reg.execute(&tool_call.function.name, args, ctx);

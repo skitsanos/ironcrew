@@ -95,11 +95,17 @@ struct Replica {
 async fn spawn_replica(flows_dir: std::path::PathBuf, store: Arc<dyn StateStore>) -> Replica {
     let state = Arc::new(AppState {
         flows_dir,
+        runtime_identity: ironcrew::api::deployment::RuntimeIdentity::disabled(),
         auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
         admission: Arc::new(ironcrew::api::admission::AdmissionController::default()),
-        accepting_traffic: AtomicBool::new(true),
+        lifecycle: ironcrew::api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            ironcrew::api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                ironcrew::api::conversation_lifecycle::max_active_conversation_lifecycles(),
+            ),
+        ),
         max_active_conversations: 4,
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_active_runs: 4,

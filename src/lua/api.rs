@@ -24,7 +24,6 @@ use crate::mcp::parse_mcp_config;
 const MAX_GOAL_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_NAME_BYTES: usize = 128;
 const MAX_MODEL_NAME_BYTES: usize = 1024;
-const MAX_BASE_URL_BYTES: usize = 4096;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
 const MAX_CONFIG_ITEM_BYTES: usize = 4096;
 const DEFAULT_MAX_MEMORY_ITEMS: usize = 10_000;
@@ -296,22 +295,8 @@ pub fn register_crew_constructor(
         validate_config_string("provider", &provider, MAX_PROVIDER_NAME_BYTES)?;
         validate_config_string("model", &model, MAX_MODEL_NAME_BYTES)?;
         if let Some(url) = base_url.as_deref() {
-            validate_config_string("base_url", url, MAX_BASE_URL_BYTES)?;
-            let parsed = reqwest::Url::parse(url).map_err(|error| {
-                mlua::Error::external(IronCrewError::Validation(format!(
-                    "Crew.new base_url must be a valid HTTP(S) URL: {error}"
-                )))
-            })?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(mlua::Error::external(IronCrewError::Validation(
-                    "Crew.new base_url must use http or https".into(),
-                )));
-            }
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                return Err(mlua::Error::external(IronCrewError::Validation(
-                    "Crew.new base_url must not contain embedded credentials".into(),
-                )));
-            }
+            crate::engine::conversation_provider::validate_provider_endpoint(url)
+                .map_err(mlua::Error::external)?;
         }
         if let Some(key) = api_key.as_deref() {
             validate_api_key_value(key)?;
@@ -539,6 +524,7 @@ pub fn register_crew_constructor(
             } else {
                 None
             };
+        let custom_provider = custom_provider.map(crate::llm::metrics::observe_provider);
 
         let config = ProviderConfig {
             provider,

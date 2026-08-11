@@ -16,18 +16,17 @@ use rmcp::{
     transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
 };
 use std::collections::HashMap;
-use std::io::Write;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::mcp::config::{McpServerConfig, McpTransportConfig};
+use crate::mcp::execution_policy::{McpCallPolicy, ensure_serialized_size};
 use crate::utils::error::{IronCrewError, Result};
 use crate::utils::network::{OutboundNetworkPolicy, secure_no_redirect_client};
 
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LIST_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_CALL_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3_600;
 
@@ -37,40 +36,7 @@ const DEFAULT_MAX_LIST_PAGES: usize = 32;
 const HARD_MAX_LIST_PAGES: usize = 256;
 const DEFAULT_MAX_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
 const HARD_MAX_TOOL_DEFINITION_BYTES: usize = 1024 * 1024;
-const DEFAULT_MAX_ARGUMENT_BYTES: usize = 256 * 1024;
-const HARD_MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const HARD_MAX_TOOL_NAME_BYTES: usize = 256;
-
-struct SerializedSizeLimiter {
-    bytes: usize,
-    limit: usize,
-}
-
-impl Write for SerializedSizeLimiter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(buffer.len())
-            .ok_or_else(|| std::io::Error::other("serialized size overflow"))?;
-        if self.bytes > self.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "serialized value exceeds limit",
-            ));
-        }
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn ensure_serialized_size<T: serde::Serialize>(value: &T, limit: usize, label: &str) -> Result<()> {
-    let mut writer = SerializedSizeLimiter { bytes: 0, limit };
-    serde_json::to_writer(&mut writer, value)
-        .map_err(|error| mcp_error(format!("{label} exceeds {limit} bytes: {error}")))
-}
 
 fn mcp_error(message: impl Into<String>) -> IronCrewError {
     IronCrewError::Mcp {
@@ -193,12 +159,14 @@ type ShutdownFn = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + Sync>;
 pub struct McpClient {
     peer: Peer<RoleClient>,
     shutdown: Mutex<Option<ShutdownFn>>,
+    call_policy: McpCallPolicy,
 }
 
 impl McpClient {
     fn from_service<S>(
         service: RunningService<RoleClient, S>,
         process_group: Option<McpProcessGroupGuard>,
+        call_policy: McpCallPolicy,
     ) -> Self
     where
         S: rmcp::Service<RoleClient> + 'static,
@@ -218,11 +186,13 @@ impl McpClient {
         McpClient {
             peer,
             shutdown: Mutex::new(Some(shutdown)),
+            call_policy,
         }
     }
 
     /// Connect using a `McpServerConfig`, respecting all security constraints.
     pub async fn connect(cfg: &McpServerConfig) -> Result<Self> {
+        let call_policy = McpCallPolicy::capture()?;
         let handshake_timeout = configured_timeout(
             "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS",
             DEFAULT_HANDSHAKE_TIMEOUT_SECS,
@@ -265,7 +235,11 @@ impl McpClient {
                             message: format!("Handshake failed: {}", e),
                         })?;
 
-                Ok(Self::from_service(service, Some(process_group)))
+                Ok(Self::from_service(
+                    service,
+                    Some(process_group),
+                    call_policy,
+                ))
             }
             McpTransportConfig::Http { url, headers } => {
                 let config = if headers.is_empty() {
@@ -320,7 +294,7 @@ impl McpClient {
                         message: format!("HTTP handshake failed: {}", e),
                     })?;
 
-                Ok(Self::from_service(service, None))
+                Ok(Self::from_service(service, None, call_policy))
             }
         }
     }
@@ -399,12 +373,7 @@ impl McpClient {
                 "MCP tool name must contain 1..={HARD_MAX_TOOL_NAME_BYTES} bytes"
             )));
         }
-        let max_argument_bytes = bounded_env_usize(
-            "IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES",
-            DEFAULT_MAX_ARGUMENT_BYTES,
-            HARD_MAX_ARGUMENT_BYTES,
-        )?;
-        ensure_serialized_size(&args, max_argument_bytes, "MCP tool arguments")?;
+        self.call_policy.validate_arguments(&args)?;
 
         let params = match args {
             serde_json::Value::Object(arguments) => {
@@ -414,8 +383,7 @@ impl McpClient {
             _ => return Err(mcp_error("MCP tool arguments must be a JSON object")),
         };
 
-        let timeout =
-            configured_timeout("IRONCREW_MCP_CALL_TIMEOUT_SECS", DEFAULT_CALL_TIMEOUT_SECS)?;
+        let timeout = self.call_policy.timeout();
         tokio::time::timeout(timeout, self.peer.call_tool(params))
             .await
             .map_err(|_| {
@@ -426,6 +394,10 @@ impl McpClient {
                 ))
             })?
             .map_err(|e| mcp_error(format!("call_tool '{name}' failed: {e}")))
+    }
+
+    pub(super) fn call_policy(&self) -> McpCallPolicy {
+        self.call_policy
     }
 
     /// Graceful async shutdown — awaits the service loop's exit and drops

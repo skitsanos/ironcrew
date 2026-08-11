@@ -1,18 +1,18 @@
 //! Phase-1 Human-in-the-Loop: HTTP conversation endpoints.
 //!
 //! Wraps `crew:conversation({...})` behind six endpoints under
-//! `/flows/{flow}/conversations`. Sessions are serialized per-id via a
-//! `tokio::sync::Mutex<()>` on the `ConversationHandle`.
+//! `/flows/{flow}/conversations`. A bounded lifecycle gate serializes local
+//! same-id mutations, each live handle serializes turns, and PostgreSQL adds
+//! the durable incarnation/revision claim across processes.
 //!
 //! Session creation is explicit: `POST /start` builds the session and
 //! stashes it in `AppState.active_conversations`. `POST /messages` against
 //! an unknown id returns 404 (never auto-creates). Overlapping mutations for
 //! the same session fail fast instead of retaining an unbounded request queue.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -20,6 +20,7 @@ use axum::{
     extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
+    response::{IntoResponse, Response},
 };
 use mlua::AnyUserData;
 use serde::{Deserialize, Serialize};
@@ -27,18 +28,26 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, broadcas
 
 use super::admission::QuotaMetric;
 use super::auth::Principal;
+use super::conversation_lifecycle::{
+    ConversationKey, ConversationLifecycleRegistryFull, OwnedConversationLifecycleGuard,
+};
 use super::{AppState, ErrorResponse, error_response, resolve_flow_path};
+use crate::engine::conversation_definition::{FlowSourceSnapshot, capture_flow_source};
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::idempotency::{
     CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
     IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLookup, IdempotencyQuotaResource,
     IdempotencyQuotaScope, IdempotencyRecord, PrincipalId,
 };
-use crate::engine::sessions::validate_session_id;
+use crate::engine::sessions::{ConversationExecution, ConversationRecord, validate_session_id};
+use crate::engine::store::ConversationCoordinationScope;
 use crate::lua::api::{CHAT_CREW_REGISTRY_KEY, ChatMode, set_ironcrew_mode};
 use crate::lua::conversation::{LuaConversation, LuaConversationInner};
 use crate::tools::ToolCallContext;
 use crate::utils::error::IronCrewError;
+
+mod image_input;
+use image_input::load_message_images;
 
 type MessageResult = Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
 
@@ -51,7 +60,16 @@ struct MessageIdempotencyAttempt {
     lease_deadline: tokio::time::Instant,
 }
 
-fn replay_message(record: &IdempotencyRecord) -> MessageResult {
+struct ClaimedMessage {
+    attempt: MessageIdempotencyAttempt,
+    heartbeat: super::idempotency::LeaseHeartbeat,
+}
+
+fn replay_message(
+    record: &IdempotencyRecord,
+    id: &str,
+    execution: &ConversationExecution,
+) -> MessageResult {
     let (Some(status), Some(body)) = (record.response_status, record.response_body.as_deref())
     else {
         return Err(error_response(
@@ -73,7 +91,76 @@ fn replay_message(record: &IdempotencyRecord) -> MessageResult {
             "Stored idempotency response is corrupt".into(),
         )
     })?;
+    validate_replayed_message(&response, id, execution, record.base_revision)?;
     Ok((super::idempotency::replay_headers(), Json(response)))
+}
+
+fn validate_replayed_message(
+    response: &MessageResp,
+    id: &str,
+    execution: &ConversationExecution,
+    base_revision: Option<u64>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let expected_revision = base_revision.and_then(|revision| revision.checked_add(1));
+    if response.conversation_id != id
+        || response.incarnation_id != execution.incarnation_id
+        || response.definition_fingerprint != execution.definition_fingerprint
+        || Some(response.revision) != expected_revision
+        || response.turn_count == 0
+        || response.turn_index != response.turn_count.saturating_sub(1)
+    {
+        tracing::error!(
+            "Stored conversation idempotency response has invalid identity or revision"
+        );
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response has invalid conversation identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validated_message_replay(
+    state: &Arc<AppState>,
+    flow: &str,
+    id: &str,
+    execution: &ConversationExecution,
+    record: &IdempotencyRecord,
+) -> MessageResult {
+    let expected_scope =
+        super::idempotency::conversation_scope(flow, id, &execution.incarnation_id);
+    if record.operation != CONVERSATION_MESSAGE_OPERATION
+        || record.scope != flow
+        || record.resource_id != id
+        || record.exclusive_scope.as_deref() != Some(expected_scope.as_str())
+    {
+        tracing::error!("Stored conversation idempotency response has an invalid resource fence");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored idempotency response has an invalid conversation fence".into(),
+        ));
+    }
+    let current = state
+        .store
+        .get_conversation(Some(flow), id)
+        .await
+        .map_err(message_idempotency_store_error)?;
+    if current
+        .as_ref()
+        .is_none_or(|record| record.execution != *execution)
+    {
+        state
+            .active_conversations
+            .write()
+            .await
+            .remove(&(flow.to_string(), id.to_string()));
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation was deleted or recreated; the prior incarnation cannot be replayed"
+                .into(),
+        ));
+    }
+    replay_message(record, id, execution)
 }
 
 fn message_idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
@@ -173,10 +260,6 @@ pub fn max_active_conversations() -> usize {
     positive_bounded_env("IRONCREW_MAX_ACTIVE_CONVERSATIONS", 8, 1024)
 }
 
-fn max_conversation_turn_secs() -> u64 {
-    positive_bounded_env("IRONCREW_MAX_CONVERSATION_TURN_SECS", 300, 3600) as u64
-}
-
 fn positive_bounded_env(name: &str, default: usize, upper: usize) -> usize {
     let fallback = default.min(upper);
     match std::env::var(name) {
@@ -200,203 +283,9 @@ fn api_max_history() -> usize {
     positive_bounded_env("IRONCREW_API_CONVERSATION_MAX_HISTORY", 50, 1000)
 }
 
-fn api_message_max_bytes() -> usize {
-    positive_bounded_env(
-        "IRONCREW_API_MESSAGE_MAX_BYTES",
-        256 * 1024,
-        4 * 1024 * 1024,
-    )
-}
-
-fn api_max_images_per_message() -> usize {
-    positive_bounded_env("IRONCREW_API_MAX_IMAGES_PER_MESSAGE", 4, 32)
-}
-
-fn api_max_images_per_conversation() -> usize {
-    positive_bounded_env("IRONCREW_API_MAX_IMAGES_PER_CONVERSATION", 16, 256)
-}
-
-fn api_max_image_bytes_per_message() -> usize {
-    positive_bounded_env(
-        "IRONCREW_API_MAX_IMAGE_BYTES_PER_MESSAGE",
-        20 * 1024 * 1024,
-        100 * 1024 * 1024,
-    )
-}
-
-fn api_max_image_bytes_per_conversation() -> usize {
-    positive_bounded_env(
-        "IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION",
-        32 * 1024 * 1024,
-        512 * 1024 * 1024,
-    )
-}
-
-fn api_max_image_locator_bytes() -> usize {
-    positive_bounded_env("IRONCREW_API_MAX_IMAGE_LOCATOR_BYTES", 2048, 16 * 1024)
-}
-
-type ConversationKey = (String, String);
-type LifecycleLock = Mutex<()>;
-
-const DEFAULT_MAX_CONVERSATION_LIFECYCLES: usize = 256;
-const HARD_MAX_CONVERSATION_LIFECYCLES: usize = 4_096;
-
-struct LifecycleRegistryEntry {
-    key: Arc<ConversationKey>,
-    gate: Arc<LifecycleLock>,
-    leases: usize,
-}
-
-/// Bounded registry of per-conversation operation gates.
-///
-/// Entries exist only while a caller owns a [`LifecycleLease`]. Dropping the
-/// last lease removes its exact key in O(1), so sequential attacker-chosen IDs
-/// neither accumulate in memory nor trigger a full-map scan on later lookups.
-struct LifecycleRegistry {
-    capacity: usize,
-    entries: StdMutex<HashMap<ConversationKey, LifecycleRegistryEntry>>,
-}
-
-#[derive(Debug)]
-struct LifecycleRegistryFull {
-    capacity: usize,
-}
-
-/// Pins one registry entry for the full operation lifetime.
-struct LifecycleLease {
-    registry: Arc<LifecycleRegistry>,
-    key: Arc<ConversationKey>,
-    gate: Arc<LifecycleLock>,
-}
-
-/// An owned lifecycle lock used by detached message tasks. Keeping the lease
-/// beside the Tokio guard prevents the registry entry from disappearing while
-/// the task still holds the gate.
-struct OwnedLifecycleGuard {
-    // Field order is intentional: Rust drops the mutex guard before the lease,
-    // so a replacement entry cannot be published while this gate is locked.
-    _guard: OwnedMutexGuard<()>,
-    _lease: LifecycleLease,
-}
-
-impl LifecycleRegistry {
-    fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "lifecycle registry capacity must be positive");
-        Self {
-            capacity,
-            entries: StdMutex::new(HashMap::with_capacity(capacity)),
-        }
-    }
-
-    fn acquire(
-        self: &Arc<Self>,
-        key: &ConversationKey,
-    ) -> Result<LifecycleLease, LifecycleRegistryFull> {
-        let (owned_key, gate) = {
-            let mut entries = self
-                .entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = entries.get_mut(key) {
-                entry.leases = entry.leases.checked_add(1).ok_or(LifecycleRegistryFull {
-                    capacity: self.capacity,
-                })?;
-                (Arc::clone(&entry.key), Arc::clone(&entry.gate))
-            } else {
-                if entries.len() >= self.capacity {
-                    return Err(LifecycleRegistryFull {
-                        capacity: self.capacity,
-                    });
-                }
-                let owned_key = Arc::new(key.clone());
-                let gate = Arc::new(Mutex::new(()));
-                entries.insert(
-                    key.clone(),
-                    LifecycleRegistryEntry {
-                        key: Arc::clone(&owned_key),
-                        gate: Arc::clone(&gate),
-                        leases: 1,
-                    },
-                );
-                (owned_key, gate)
-            }
-        };
-
-        Ok(LifecycleLease {
-            registry: Arc::clone(self),
-            key: owned_key,
-            gate,
-        })
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-    }
-}
-
-impl LifecycleLease {
-    fn try_lock(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, tokio::sync::TryLockError> {
-        self.gate.try_lock()
-    }
-
-    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.gate.lock().await
-    }
-
-    fn try_lock_owned(self) -> Result<OwnedLifecycleGuard, Self> {
-        match Arc::clone(&self.gate).try_lock_owned() {
-            Ok(guard) => Ok(OwnedLifecycleGuard {
-                _guard: guard,
-                _lease: self,
-            }),
-            Err(_) => Err(self),
-        }
-    }
-}
-
-impl Drop for LifecycleLease {
-    fn drop(&mut self) {
-        let mut entries = self
-            .registry
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remove = entries.get_mut(self.key.as_ref()).is_some_and(|entry| {
-            if !Arc::ptr_eq(&entry.gate, &self.gate) {
-                return false;
-            }
-            debug_assert!(entry.leases > 0);
-            entry.leases = entry.leases.saturating_sub(1);
-            entry.leases == 0
-        });
-        if remove {
-            entries.remove(self.key.as_ref());
-        }
-    }
-}
-
-static CONVERSATION_LIFECYCLES: OnceLock<Arc<LifecycleRegistry>> = OnceLock::new();
-
-fn max_conversation_lifecycles() -> usize {
-    positive_bounded_env(
-        "IRONCREW_MAX_CONVERSATION_LIFECYCLES",
-        DEFAULT_MAX_CONVERSATION_LIFECYCLES,
-        HARD_MAX_CONVERSATION_LIFECYCLES,
-    )
-}
-
-fn lifecycle_lock(key: &ConversationKey) -> Result<LifecycleLease, LifecycleRegistryFull> {
-    CONVERSATION_LIFECYCLES
-        .get_or_init(|| Arc::new(LifecycleRegistry::new(max_conversation_lifecycles())))
-        .acquire(key)
-}
-
-fn lifecycle_capacity_error(error: LifecycleRegistryFull) -> (StatusCode, Json<ErrorResponse>) {
+fn lifecycle_capacity_error(
+    error: ConversationLifecycleRegistryFull,
+) -> (StatusCode, Json<ErrorResponse>) {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         format!(
@@ -404,19 +293,6 @@ fn lifecycle_capacity_error(error: LifecycleRegistryFull) -> (StatusCode, Json<E
             error.capacity
         ),
     )
-}
-
-fn decoded_base64_len(data: &str) -> usize {
-    let padding = data
-        .as_bytes()
-        .iter()
-        .rev()
-        .take_while(|byte| **byte == b'=')
-        .count();
-    data.len()
-        .saturating_div(4)
-        .saturating_mul(3)
-        .saturating_sub(padding)
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +315,10 @@ pub struct StartResp {
     pub agent: String,
     pub created_at: String,
     pub turn_count: usize,
+    pub revision: u64,
+    pub incarnation_id: String,
+    pub source_fingerprint: String,
+    pub definition_fingerprint: String,
     pub events_url: String,
 }
 
@@ -457,6 +337,9 @@ pub struct MessageResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     pub turn_count: usize,
+    pub revision: u64,
+    pub incarnation_id: String,
+    pub definition_fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -469,6 +352,10 @@ pub struct HistoryResp {
     pub messages: Vec<HistoryMessage>,
     pub turn_count: usize,
     pub truncated: bool,
+    pub revision: u64,
+    pub incarnation_id: String,
+    pub source_fingerprint: String,
+    pub definition_fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -511,6 +398,11 @@ pub struct ConversationEntry {
 // ---------------------------------------------------------------------------
 
 fn map_err_to_response(e: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    if let IronCrewError::Lua(error) = e
+        && let Some(embedded) = embedded_lua_client_error(error)
+    {
+        return map_err_to_response(embedded);
+    }
     let status = match e {
         IronCrewError::Conflict(_) => StatusCode::CONFLICT,
         IronCrewError::Validation(_) => StatusCode::BAD_REQUEST,
@@ -520,11 +412,105 @@ fn map_err_to_response(e: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
     error_response(status, e.to_string())
 }
 
+fn embedded_lua_client_error(error: &mlua::Error) -> Option<&IronCrewError> {
+    let mut current = error;
+    loop {
+        if let Some(embedded) = current.downcast_ref::<IronCrewError>()
+            && matches!(
+                embedded,
+                IronCrewError::Validation(_) | IronCrewError::Conflict(_)
+            )
+        {
+            return Some(embedded);
+        }
+        let parent = current.parent()?;
+        current = parent;
+    }
+}
+
+fn map_lua_err_to_response(error: mlua::Error) -> (StatusCode, Json<ErrorResponse>) {
+    map_err_to_response(&IronCrewError::Lua(error))
+}
+
 fn flow_segment(path: &std::path::Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+async fn current_flow_source_snapshot(
+    flow_path: &std::path::Path,
+) -> Result<Arc<FlowSourceSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    let flow_path = flow_path.to_path_buf();
+    tokio::task::spawn_blocking(move || capture_flow_source(&flow_path).map(Arc::new))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Conversation source fingerprint worker failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to inspect the conversation definition".into(),
+            )
+        })?
+        .map_err(|error| map_err_to_response(&error))
+}
+
+fn validate_stored_start(
+    record: &ConversationRecord,
+    requested_agent: Option<&str>,
+    requested_max_history: Option<usize>,
+    history_cap: usize,
+    source_fingerprint: &str,
+) -> Result<(String, usize), (StatusCode, Json<ErrorResponse>)> {
+    record
+        .execution
+        .validate()
+        .map_err(|error| map_err_to_response(&error))?;
+    if requested_agent.is_some_and(|requested| requested != record.agent_name.as_str()) {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "start: requested `agent` does not match the stored conversation agent".into(),
+        ));
+    }
+    if requested_max_history.is_some_and(|requested| requested != record.execution.max_history) {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "start: requested `max_history` does not match the stored conversation limit".into(),
+        ));
+    }
+    if record.execution.max_history > history_cap {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "The stored conversation history limit exceeds the current HTTP policy".into(),
+        ));
+    }
+    if record.execution.source_fingerprint != source_fingerprint {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation flow source changed; restore the original definition or start a new conversation"
+                .into(),
+        ));
+    }
+    Ok((record.agent_name.clone(), record.execution.max_history))
+}
+
+async fn start_response(
+    handle: &ConversationHandle,
+    flow: String,
+    events_url: String,
+) -> Json<StartResp> {
+    Json(StartResp {
+        conversation_id: handle.id.clone(),
+        flow,
+        agent: handle.agent.clone(),
+        created_at: handle.created_at.clone(),
+        turn_count: handle.conv.turn_count().await,
+        revision: handle.conv.revision().await,
+        incarnation_id: handle.conv.execution.incarnation_id.clone(),
+        source_fingerprint: handle.conv.execution.source_fingerprint.clone(),
+        definition_fingerprint: handle.conv.execution.definition_fingerprint.clone(),
+        events_url,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -575,10 +561,7 @@ async fn start_conversation_inner(
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
-    if !state
-        .accepting_traffic
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server is shutting down".into(),
@@ -587,7 +570,10 @@ async fn start_conversation_inner(
 
     let flow_slug = flow_segment(&flow_path_resolved);
     let key = (flow_slug.clone(), id.clone());
-    let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
+    let lifecycle = state
+        .conversation_lifecycles
+        .acquire(&key)
+        .map_err(lifecycle_capacity_error)?;
     let _lifecycle_guard = lifecycle.try_lock().map_err(|_| {
         error_response(
             StatusCode::CONFLICT,
@@ -606,49 +592,99 @@ async fn start_conversation_inner(
         ));
     }
 
-    // Idempotent: if a handle exists, return its current metadata. This
-    // path does NOT require `agent` in the body — clients can restart a
-    // session with `{}` and trust the server's stored agent.
-    {
-        let map = state.active_conversations.read().await;
-        if let Some(existing) = map.get(&key) {
-            let turn_count = existing.conv.turn_count().await;
-            return Ok(Json(StartResp {
-                conversation_id: existing.id.clone(),
-                flow: flow.clone(),
-                agent: existing.agent.clone(),
-                created_at: existing.created_at.clone(),
-                turn_count,
-                events_url: format!("/flows/{}/conversations/{}/events", flow, id),
-            }));
-        }
-    }
-
-    // No active handle — decide whether this is a resume (store has a
-    // prior record for this flow+id) or a fresh start. Resuming lets the
-    // client re-activate an evicted or restarted session by posting
-    // `{}` without re-sending the agent.
-    let resume_agent: Option<String> = state
+    let requested_agent = req
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .map(str::to_owned);
+    let mut stored = state
         .store
         .get_conversation(Some(&flow_slug), &id)
         .await
-        .map_err(|e| map_err_to_response(&e))?
-        .map(|r| r.agent_name);
+        .map_err(|e| map_err_to_response(&e))?;
 
-    let agent_name = match (req.agent.as_deref().map(str::trim), resume_agent) {
-        (Some(s), _) if !s.is_empty() => s.to_string(),
-        (_, Some(stored)) => stored,
-        _ => {
+    // Agent and limit conflicts are checked before reading or executing the
+    // current flow, so a mismatched resume cannot trigger Lua side effects.
+    if let Some(record) = stored.as_ref() {
+        record
+            .execution
+            .validate()
+            .map_err(|error| map_err_to_response(&error))?;
+        if requested_agent
+            .as_deref()
+            .is_some_and(|requested| requested != record.agent_name.as_str())
+        {
             return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "start: `agent` is required for a new conversation".into(),
+                StatusCode::CONFLICT,
+                "start: requested `agent` does not match the stored conversation agent".into(),
             ));
         }
+        if req
+            .max_history
+            .is_some_and(|requested| requested != record.execution.max_history)
+        {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "start: requested `max_history` does not match the stored conversation limit"
+                    .into(),
+            ));
+        }
+    }
+
+    let source_snapshot = current_flow_source_snapshot(&flow_path_resolved).await?;
+    let source_fingerprint = source_snapshot.fingerprint();
+    if stored.is_none() {
+        // A peer may have deleted the durable incarnation while this process
+        // still held a cache entry. Never let that stale handle authorize a
+        // restart or retain an admission permit.
+        state.active_conversations.write().await.remove(&key);
+    }
+    let (agent_name, max_history) = match stored.as_ref() {
+        Some(record) => validate_stored_start(
+            record,
+            requested_agent.as_deref(),
+            req.max_history,
+            history_cap,
+            source_fingerprint,
+        )?,
+        None => (
+            requested_agent.clone().ok_or_else(|| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "start: `agent` is required for a new conversation".into(),
+                )
+            })?,
+            req.max_history.unwrap_or(history_cap),
+        ),
     };
-    let req = StartReq {
+    let build_req = StartReq {
         agent: Some(agent_name),
-        max_history: Some(req.max_history.unwrap_or(history_cap)),
+        max_history: Some(max_history),
     };
+    let events_url = format!("/flows/{}/conversations/{}/events", flow, id);
+
+    // A live handle is only a cache. Verify it still represents the exact
+    // durable incarnation, definition, and revision before returning it.
+    let existing = state.active_conversations.read().await.get(&key).cloned();
+    if let Some(existing) = existing {
+        let existing_revision = existing.conv.revision().await;
+        let current = stored.as_ref().is_some_and(|record| {
+            existing.conv.execution == record.execution && existing_revision == record.revision
+        });
+        if current {
+            return Ok(start_response(&existing, flow, events_url).await);
+        }
+        let mut map = state.active_conversations.write().await;
+        if map
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &existing))
+        {
+            map.remove(&key);
+        }
+        drop(map);
+        drop(existing);
+    }
 
     // Reserve a slot atomically before building the Lua VM. A plain
     // `map.len()` check races concurrent starts; an owned semaphore permit
@@ -668,39 +704,120 @@ async fn start_conversation_inner(
         })?;
 
     // Build a fresh session.
-    let (handle, created_at, turn_count) = build_session(
+    let (mut handle, _, _) = build_session(
         &state,
         &flow_path_resolved,
         &flow_slug,
         &id,
-        &req,
+        &build_req,
+        source_snapshot.clone(),
         admission_permit,
     )
     .await?;
-    let events_url = format!("/flows/{}/conversations/{}/events", flow, id);
 
-    // Establish durability before publishing the handle. If this request is
-    // cancelled during persistence, the candidate handle (and permit) drops;
-    // a successfully-written record is safely resumable on the next start.
-    handle.conv.persist().await.map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to persist conversation bootstrap: {error}"),
+    let built_revision = handle.conv.revision().await;
+    if let Some(expected) = stored.as_ref() {
+        if handle.conv.execution != expected.execution || built_revision != expected.revision {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Conversation changed while its live handle was being rebuilt; retry /start".into(),
+            ));
+        }
+    } else if built_revision != 0 {
+        // `build_session` performs its own durable lookup. If another process
+        // created this id after our first read, adopt that exact winner as a
+        // read-only resume instead of incrementing its revision as though it
+        // were our fresh bootstrap.
+        let winner = state
+            .store
+            .get_conversation(Some(&flow_slug), &id)
+            .await
+            .map_err(|error| map_err_to_response(&error))?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::CONFLICT,
+                    "Conversation changed while its live handle was being rebuilt; retry /start"
+                        .into(),
+                )
+            })?;
+        if handle.conv.execution != winner.execution || built_revision != winner.revision {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Conversation changed while its live handle was being rebuilt; retry /start".into(),
+            ));
+        }
+        stored = Some(winner);
+    }
+
+    // A resume is read-only. For a fresh start, establish durability before
+    // publishing. If another process created the same id first, discard this
+    // candidate and rebuild once from the winning durable incarnation.
+    if stored.is_none()
+        && let Err(error) = handle.conv.persist().await
+    {
+        if !matches!(error, IronCrewError::Conflict(_)) {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist conversation bootstrap: {error}"),
+            ));
+        }
+        drop(handle);
+        stored = state
+            .store
+            .get_conversation(Some(&flow_slug), &id)
+            .await
+            .map_err(|error| map_err_to_response(&error))?;
+        let winner = stored.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::CONFLICT,
+                "Conversation creation raced another request; retry /start".into(),
+            )
+        })?;
+        let (winner_agent, winner_max_history) = validate_stored_start(
+            winner,
+            requested_agent.as_deref(),
+            req.max_history,
+            history_cap,
+            source_fingerprint,
+        )?;
+        let permit = state
+            .conversation_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Active conversation limit reached ({} sessions). Raise IRONCREW_MAX_ACTIVE_CONVERSATIONS or wait for idle eviction.",
+                        state.max_active_conversations
+                    ),
+                )
+            })?;
+        handle = build_session(
+            &state,
+            &flow_path_resolved,
+            &flow_slug,
+            &id,
+            &StartReq {
+                agent: Some(winner_agent),
+                max_history: Some(winner_max_history),
+            },
+            source_snapshot.clone(),
+            permit,
         )
-    })?;
+        .await?
+        .0;
+    }
 
     // Resolve a same-id creation race under the map lock. Only the winning
     // handle is published and returned; the losing candidate is dropped,
     // which also returns its unused admission permit. The lifecycle lock
     // normally makes the occupied branch unreachable, but the map check keeps
     // this invariant robust to future callers.
-    let (selected, inserted) = {
+    let selected = {
         use std::collections::hash_map::Entry;
         let mut map = state.active_conversations.write().await;
-        if !state
-            .accepting_traffic
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !state.lifecycle.is_accepting_mutations() {
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Server is shutting down".into(),
@@ -709,32 +826,12 @@ async fn start_conversation_inner(
         match map.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(handle.clone());
-                (handle.clone(), true)
+                handle.clone()
             }
-            Entry::Occupied(entry) => (entry.get().clone(), false),
+            Entry::Occupied(entry) => entry.get().clone(),
         }
     };
-
-    if !inserted {
-        let selected_turn_count = selected.conv.turn_count().await;
-        return Ok(Json(StartResp {
-            conversation_id: selected.id.clone(),
-            flow,
-            agent: selected.agent.clone(),
-            created_at: selected.created_at.clone(),
-            turn_count: selected_turn_count,
-            events_url,
-        }));
-    }
-
-    Ok(Json(StartResp {
-        conversation_id: id,
-        flow,
-        agent: selected.agent.clone(),
-        created_at,
-        turn_count,
-        events_url,
-    }))
+    Ok(start_response(&selected, flow, events_url).await)
 }
 
 /// Helper — build the Lua VM + conversation inner, wrap in a
@@ -745,12 +842,17 @@ async fn build_session(
     flow_slug: &str,
     id: &str,
     req: &StartReq,
+    source_snapshot: Arc<FlowSourceSnapshot>,
     admission_permit: OwnedSemaphorePermit,
 ) -> Result<(Arc<ConversationHandle>, String, usize), (StatusCode, Json<ErrorResponse>)> {
-    use crate::cli::project::{load_project, setup_crew_runtime};
+    use crate::cli::project::setup_http_conversation_runtime;
 
-    let loader = load_project(flow_path).map_err(|e| map_err_to_response(&e))?;
-    let (lua, _runtime) = setup_crew_runtime(&loader).map_err(|e| map_err_to_response(&e))?;
+    let loader = crate::lua::loader::ProjectLoader::from_conversation_snapshot(&source_snapshot)
+        .map_err(|e| map_err_to_response(&e))?;
+    let (lua, _runtime, entrypoint) =
+        setup_http_conversation_runtime(&loader, source_snapshot.clone())
+            .map_err(|e| map_err_to_response(&e))?;
+    let source_fingerprint = source_snapshot.fingerprint();
 
     // Mark chat mode so the Crew constructor parks its userdata in the
     // registry AND so user code can guard `crew:run()` appropriately.
@@ -759,30 +861,29 @@ async fn build_session(
     // constructor reuses it instead of calling `create_store()` again
     // (which would re-run Postgres bootstrap on every session start).
     lua.set_app_data(state.store.clone());
+    lua.set_app_data(crate::lua::conversation::ConversationSourceFingerprint(
+        source_fingerprint.to_string(),
+    ));
     set_ironcrew_mode(&lua, "chat").map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
 
     // Per-session event bus. Conversation turn events flow through this bus.
     let eventbus = EventBus::new(256);
     lua.set_app_data(eventbus.clone());
 
-    // Execute the entrypoint so the user's `Crew.new(...)` runs.
-    let entrypoint = loader.entrypoint().ok_or_else(|| {
-        error_response(
-            StatusCode::BAD_REQUEST,
-            "No entrypoint found in flow".into(),
-        )
-    })?;
-    let script = crate::lua::source::read_lua_source(entrypoint)
-        .map_err(|error| map_err_to_response(&error))?;
-
-    {
+    // Execute the exact entrypoint bytes that were fingerprinted.
+    let entrypoint_result = {
         let _execution = crate::lua::limits::LuaExecutionGuard::begin(&lua)
             .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
-        lua.load(&script)
+        lua.load(entrypoint.source())
+            .set_name(format!(
+                "@snapshot/{}",
+                entrypoint.relative_path().display()
+            ))
             .exec_async()
             .await
-            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
-    }
+    };
+    lua.remove_app_data::<crate::lua::bootstrap::HttpConversationBootstrap>();
+    entrypoint_result.map_err(map_lua_err_to_response)?;
 
     // Pull the Crew userdata from the registry and call `conversation`.
     let crew_ud: AnyUserData = lua
@@ -818,15 +919,29 @@ async fn build_session(
         lua.load(&snippet)
             .call_async::<AnyUserData>(crew_ud)
             .await
-            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?
+            .map_err(map_lua_err_to_response)?
     };
 
     let conv: Arc<LuaConversationInner> = {
         let wrapper = conv_ud
             .borrow::<LuaConversation>()
-            .map_err(|e| map_err_to_response(&IronCrewError::Lua(e)))?;
+            .map_err(map_lua_err_to_response)?;
         wrapper.inner()
     };
+
+    // Bind the durable definition to one stable source-tree observation.
+    // The first fingerprint is threaded into Lua's definition fingerprint;
+    // this second bounded walk detects a rollout or local edit that crossed
+    // session construction instead of publishing a mixed-definition handle.
+    let verified_source = current_flow_source_snapshot(flow_path).await?;
+    let verified_source_fingerprint = verified_source.fingerprint();
+    if verified_source_fingerprint != source_fingerprint {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation flow source changed while the session was being built; retry after the deployment stabilizes"
+                .into(),
+        ));
+    }
 
     let created_at = conv.created_at.clone();
     let turn_count = conv.turn_count().await;
@@ -852,6 +967,91 @@ async fn build_session(
 
     let _ = state; // silence unused when no-op
     Ok((handle, created_at, turn_count))
+}
+
+async fn message_handle(
+    state: &Arc<AppState>,
+    flow_path: &std::path::Path,
+    flow_slug: &str,
+    id: &str,
+    record: &ConversationRecord,
+    source_snapshot: Arc<FlowSourceSnapshot>,
+) -> Result<Arc<ConversationHandle>, (StatusCode, Json<ErrorResponse>)> {
+    let key = (flow_slug.to_string(), id.to_string());
+    let existing = state.active_conversations.read().await.get(&key).cloned();
+    let mut invalidated_stale_handle = false;
+    if let Some(existing) = existing {
+        let revision = existing.conv.revision().await;
+        if existing.conv.execution == record.execution && revision == record.revision {
+            return Ok(existing);
+        }
+        let mut map = state.active_conversations.write().await;
+        if map
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &existing))
+        {
+            map.remove(&key);
+            invalidated_stale_handle = true;
+        }
+        drop(map);
+        drop(existing);
+    }
+
+    if state.store.conversation_coordination_scope() != ConversationCoordinationScope::SharedStore {
+        if invalidated_stale_handle {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Conversation changed in durable storage; call /start to reload it before retrying"
+                    .into(),
+            ));
+        }
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Conversation '{id}' is not active — call /start first"),
+        ));
+    }
+
+    let permit = state
+        .conversation_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Active conversation limit reached ({} sessions). Raise IRONCREW_MAX_ACTIVE_CONVERSATIONS or wait for idle eviction.",
+                    state.max_active_conversations
+                ),
+            )
+        })?;
+    let handle = build_session(
+        state,
+        flow_path,
+        flow_slug,
+        id,
+        &StartReq {
+            agent: Some(record.agent_name.clone()),
+            max_history: Some(record.execution.max_history),
+        },
+        source_snapshot,
+        permit,
+    )
+    .await?
+    .0;
+    let revision = handle.conv.revision().await;
+    if handle.conv.execution != record.execution || revision != record.revision {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation changed while its live handle was being rebuilt; retry the message"
+                .into(),
+        ));
+    }
+    state
+        .active_conversations
+        .write()
+        .await
+        .insert(key, handle.clone());
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +1116,31 @@ async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdem
     }
 }
 
+async fn release_message_claim(state: &Arc<AppState>, attempt: &MessageIdempotencyAttempt) {
+    if let Err(error) = state
+        .store
+        .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
+        .await
+    {
+        tracing::error!(%error, "Failed to release a conversation idempotency claim before provider execution");
+    }
+}
+
+async fn finish_claim_after_preparation_failure(
+    state: &Arc<AppState>,
+    key: &ConversationKey,
+    claimed: ClaimedMessage,
+    may_have_executed_flow_code: bool,
+) {
+    drop(claimed.heartbeat);
+    if may_have_executed_flow_code {
+        state.active_conversations.write().await.remove(key);
+        mark_message_indeterminate(state, &claimed.attempt).await;
+    } else {
+        release_message_claim(state, &claimed.attempt).await;
+    }
+}
+
 async fn commit_message_with_retry(
     state: &Arc<AppState>,
     completion: IdempotencyCompletion,
@@ -975,21 +1200,49 @@ async fn execute_idempotent_message(
     handle: Arc<ConversationHandle>,
     id: String,
     content: String,
-    images: Option<Vec<crate::llm::provider::ImageInput>>,
+    image_paths: Option<Vec<String>>,
+    flow_path: std::path::PathBuf,
     attempt: MessageIdempotencyAttempt,
-    _lifecycle_guard: OwnedLifecycleGuard,
+    heartbeat: super::idempotency::LeaseHeartbeat,
+    _lifecycle_guard: OwnedConversationLifecycleGuard,
     _turn_guard: OwnedMutexGuard<()>,
 ) -> Result<MessageResp, (StatusCode, Json<ErrorResponse>)> {
-    let heartbeat = super::idempotency::LeaseHeartbeat::spawn(
-        state.store.clone(),
-        attempt.key_hash.clone(),
-        attempt.attempt_id.clone(),
-        CONVERSATION_MESSAGE_OPERATION,
-        attempt.lease_deadline,
-    );
     let mut claim_loss = heartbeat.loss_receiver();
-    let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
     let mut shutdown = handle.shutdown.subscribe();
+    let shared_store =
+        state.store.conversation_coordination_scope() == ConversationCoordinationScope::SharedStore;
+    let image_load = load_message_images(&handle, &flow_path, image_paths, shared_store);
+    tokio::pin!(image_load);
+    let images = tokio::select! {
+        biased;
+        _ = shutdown.changed() => {
+            drop(heartbeat);
+            release_message_claim(&state, &attempt).await;
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation turn cancelled during server shutdown".into(),
+            ));
+        }
+        _ = super::idempotency::wait_for_lease_loss(&mut claim_loss) => {
+            drop(heartbeat);
+            state.active_conversations.write().await.remove(&key);
+            mark_message_indeterminate(&state, &attempt).await;
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation image preparation stopped after its idempotency claim was lost; inspect history before retrying"
+                    .into(),
+            ));
+        }
+        result = &mut image_load => match result {
+            Ok(images) => images,
+            Err(error) => {
+                drop(heartbeat);
+                release_message_claim(&state, &attempt).await;
+                return Err(error);
+            }
+        },
+    };
+    let turn_timeout = handle.conv.tool_registry.conversation_turn_timeout();
     let caller_context = ToolCallContext::default();
     let turn = tokio::time::timeout(
         turn_timeout,
@@ -1060,12 +1313,21 @@ async fn execute_idempotent_message(
         },
     };
 
+    let response_revision = prepared.record.revision.checked_add(1).ok_or_else(|| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Conversation revision overflow".into(),
+        )
+    })?;
     let response = MessageResp {
         conversation_id: id,
         turn_index: prepared.turn_index,
         assistant: prepared.assistant.clone(),
         reasoning: prepared.reasoning.clone(),
         turn_count: prepared.turn_count,
+        revision: response_revision,
+        incarnation_id: prepared.record.execution.incarnation_id.clone(),
+        definition_fingerprint: prepared.record.execution.definition_fingerprint.clone(),
     };
     let response_body = match super::idempotency::bounded_response_json(
         &response,
@@ -1160,39 +1422,24 @@ pub async fn post_message(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<MessageReq>,
 ) -> MessageResult {
-    if !state
-        .accepting_traffic
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server is shutting down".into(),
         ));
     }
-    if req.content.trim().is_empty() {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "`content` is required".into(),
-        ));
-    }
-    let message_max_bytes = api_message_max_bytes();
-    if req.content.len() > message_max_bytes {
-        return Err(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "`content` is {} bytes, exceeds IRONCREW_API_MESSAGE_MAX_BYTES ({message_max_bytes})",
-                req.content.len()
-            ),
-        ));
-    }
-
     let flow_path_resolved =
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
-    let request_key =
-        super::idempotency::request_key(&headers, state.idempotency.require_key, principal.id())
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let shared =
+        state.store.conversation_coordination_scope() == ConversationCoordinationScope::SharedStore;
+    let request_key = super::idempotency::request_key(
+        &headers,
+        state.idempotency.require_key || shared,
+        principal.id(),
+    )
+    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
     let recovery_key = super::idempotency::recovery_key(&headers, principal.id())
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
     if recovery_key.is_some() && request_key.is_none() {
@@ -1211,12 +1458,34 @@ pub async fn post_message(
         ));
     }
     let flow_slug = flow_segment(&flow_path_resolved);
+    let durable = state
+        .store
+        .get_conversation(Some(&flow_slug), &id)
+        .await
+        .map_err(|error| map_err_to_response(&error))?;
+    let Some(durable) = durable else {
+        state
+            .active_conversations
+            .write()
+            .await
+            .remove(&(flow_slug.clone(), id.clone()));
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Conversation '{id}' not found"),
+        ));
+    };
+    durable
+        .execution
+        .validate()
+        .map_err(|error| map_err_to_response(&error))?;
     let request_fingerprint = super::idempotency::conversation_message_fingerprint(
         &flow_slug,
         &id,
+        &durable.execution.incarnation_id,
         &req.content,
         req.images.as_deref(),
     );
+
     if let Some(request_key) = request_key.as_ref() {
         let now = chrono::Utc::now().to_rfc3339();
         match state
@@ -1231,7 +1500,16 @@ pub async fn post_message(
             .map_err(message_idempotency_store_error)?
         {
             IdempotencyLookup::Miss => {}
-            IdempotencyLookup::Replay(record) => return replay_message(&record),
+            IdempotencyLookup::Replay(record) => {
+                return validated_message_replay(
+                    &state,
+                    &flow_slug,
+                    &id,
+                    &durable.execution,
+                    &record,
+                )
+                .await;
+            }
             IdempotencyLookup::InProgress(_) => {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -1254,125 +1532,40 @@ pub async fn post_message(
         }
     }
 
+    let source_snapshot = current_flow_source_snapshot(&flow_path_resolved).await?;
+    if durable.execution.source_fingerprint != source_snapshot.fingerprint() {
+        state
+            .active_conversations
+            .write()
+            .await
+            .remove(&(flow_slug.clone(), id.clone()));
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation flow source changed; restore the original definition or start a new conversation"
+                .into(),
+        ));
+    }
+
     let key = (flow_slug, id.clone());
-    let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
+    let lifecycle = state
+        .conversation_lifecycles
+        .acquire(&key)
+        .map_err(lifecycle_capacity_error)?;
     let lifecycle_guard = lifecycle.try_lock_owned().map_err(|_| {
         error_response(
             StatusCode::CONFLICT,
             "Conversation is busy; retry after the active operation completes".into(),
         )
     })?;
-    let handle = {
-        let map = state.active_conversations.read().await;
-        map.get(&key).cloned().ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                format!("Conversation '{}' is not active — call /start first", id),
-            )
-        })?
-    };
-
-    // The lifecycle gate prevents delete/eviction/recreation from crossing
-    // this turn. Fail fast if another path already owns the handle instead of
-    // retaining parsed requests in an unbounded same-session queue.
-    let turn_guard = handle.turn_lock.clone().try_lock_owned().map_err(|_| {
-        error_response(
-            StatusCode::CONFLICT,
-            "Conversation is busy; retry after the active operation completes".into(),
-        )
-    })?;
-    if !state
-        .accepting_traffic
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server is shutting down".into(),
         ));
     }
-    let (history_image_count, history_image_bytes) = {
-        let history = handle.conv.messages.lock().await;
-        history
-            .iter()
-            .filter_map(|message| message.images.as_ref())
-            .flatten()
-            .fold((0usize, 0usize), |(count, bytes), image| {
-                (
-                    count.saturating_add(1),
-                    bytes.saturating_add(decoded_base64_len(&image.data)),
-                )
-            })
-    };
-
-    let images: Option<Vec<crate::llm::provider::ImageInput>> = match req.images {
-        Some(paths) if !paths.is_empty() => {
-            let max_per_message = api_max_images_per_message();
-            let max_per_conversation = api_max_images_per_conversation();
-            if paths.len() > max_per_message
-                || history_image_count.saturating_add(paths.len()) > max_per_conversation
-            {
-                return Err(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "Image count exceeds limits ({max_per_message} per message, {max_per_conversation} per conversation)"
-                    ),
-                ));
-            }
-            let max_locator_bytes = api_max_image_locator_bytes();
-            if let Some(path) = paths
-                .iter()
-                .find(|path| path.is_empty() || path.len() > max_locator_bytes)
-            {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Image locator must be 1..={max_locator_bytes} bytes (received {})",
-                        path.len()
-                    ),
-                ));
-            }
-
-            let max_conversation_bytes = api_max_image_bytes_per_conversation();
-            let conversation_remaining = max_conversation_bytes.saturating_sub(history_image_bytes);
-            let mut remaining = api_max_image_bytes_per_message().min(conversation_remaining);
-            if remaining == 0 {
-                return Err(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Conversation image-byte limit reached".into(),
-                ));
-            }
-
-            // Use the shared client so image-URL fetches inherit the SSRF
-            // redirect policy (a fresh Client would follow redirects to
-            // private addresses unchecked).
-            let client = crate::tools::http_request::SHARED_HTTP_CLIENT.clone();
-            let mut loaded = Vec::with_capacity(paths.len());
-            for p in paths {
-                let img = crate::llm::image::load_image_with_limit(
-                    &p,
-                    &flow_path_resolved,
-                    &client,
-                    remaining,
-                )
-                .await
-                .map_err(|e| map_err_to_response(&e))?;
-                let decoded_bytes = decoded_base64_len(&img.data);
-                if decoded_bytes > remaining {
-                    return Err(error_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "Aggregate image-byte limit exceeded".into(),
-                    ));
-                }
-                remaining -= decoded_bytes;
-                loaded.push(img);
-            }
-            Some(loaded)
-        }
-        _ => None,
-    };
-
-    if let Some(request_key) = request_key {
-        let scope = super::idempotency::conversation_scope(&key.0, &id);
+    let mut claimed = if let Some(request_key) = request_key {
+        let scope =
+            super::idempotency::conversation_scope(&key.0, &id, &durable.execution.incarnation_id);
         let lease_started = tokio::time::Instant::now();
         let now = chrono::Utc::now();
         let lease_ttl = state.store.run_lease_ttl();
@@ -1397,7 +1590,7 @@ pub async fn post_message(
             exclusive_scope: Some(scope),
             attempt_id: attempt_id.clone(),
             owner_instance_id: state.store.instance_id().to_string(),
-            base_revision: Some(handle.conv.revision().await),
+            base_revision: Some(durable.revision),
             response_status: None,
             response_body: None,
             max_total_response_bytes: state.idempotency.max_total_response_bytes,
@@ -1422,7 +1615,10 @@ pub async fn post_message(
             .map_err(message_idempotency_store_error)?
         {
             IdempotencyClaimOutcome::Claimed(_) => {}
-            IdempotencyClaimOutcome::Replay(record) => return replay_message(&record),
+            IdempotencyClaimOutcome::Replay(record) => {
+                return validated_message_replay(&state, &key.0, &id, &durable.execution, &record)
+                    .await;
+            }
             IdempotencyClaimOutcome::InProgress(_) => {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -1484,6 +1680,121 @@ pub async fn post_message(
             ));
         }
 
+        let heartbeat = super::idempotency::LeaseHeartbeat::spawn(
+            state.store.clone(),
+            attempt.key_hash.clone(),
+            attempt.attempt_id.clone(),
+            CONVERSATION_MESSAGE_OPERATION,
+            attempt.lease_deadline,
+        );
+        Some(ClaimedMessage { attempt, heartbeat })
+    } else {
+        None
+    };
+
+    // In shared-store mode, construction of a cold Lua handle runs only
+    // after the durable mutation claim is active. This keeps top-level chat
+    // setup, provider selection, and tool finalization behind the same fence
+    // as the turn itself instead of allowing two replicas to build first and
+    // race at the later transcript commit.
+    enum HandleBuildOutcome {
+        Finished(Result<Arc<ConversationHandle>, (StatusCode, Json<ErrorResponse>)>),
+        ClaimLost,
+    }
+    let handle_outcome = {
+        let handle_build = message_handle(
+            &state,
+            &flow_path_resolved,
+            &key.0,
+            &id,
+            &durable,
+            source_snapshot,
+        );
+        tokio::pin!(handle_build);
+        if let Some(active_claim) = claimed.as_ref() {
+            let mut claim_loss = active_claim.heartbeat.loss_receiver();
+            tokio::select! {
+                biased;
+                _ = super::idempotency::wait_for_lease_loss(&mut claim_loss) => {
+                    HandleBuildOutcome::ClaimLost
+                }
+                result = &mut handle_build => HandleBuildOutcome::Finished(result),
+            }
+        } else {
+            HandleBuildOutcome::Finished(handle_build.await)
+        }
+    };
+    let handle = match handle_outcome {
+        HandleBuildOutcome::Finished(Ok(handle)) => handle,
+        HandleBuildOutcome::Finished(Err(error)) => {
+            if let Some(active_claim) = claimed.take() {
+                finish_claim_after_preparation_failure(&state, &key, active_claim, shared).await;
+            }
+            return Err(error);
+        }
+        HandleBuildOutcome::ClaimLost => {
+            let active_claim = claimed
+                .take()
+                .expect("claim-loss branch requires an active message claim");
+            finish_claim_after_preparation_failure(&state, &key, active_claim, true).await;
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Conversation rehydration stopped after its idempotency claim was lost; inspect history before retrying"
+                    .into(),
+            ));
+        }
+    };
+
+    let message_policy = handle.conv.tool_registry.conversation_policy();
+    let message_error = if req.content.trim().is_empty() {
+        Some(error_response(
+            StatusCode::BAD_REQUEST,
+            "`content` is required".into(),
+        ))
+    } else if req.content.len() > message_policy.message_bytes() {
+        Some(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "`content` is {} bytes, exceeds IRONCREW_API_MESSAGE_MAX_BYTES ({})",
+                req.content.len(),
+                message_policy.message_bytes()
+            ),
+        ))
+    } else {
+        None
+    };
+    if let Some(error) = message_error {
+        if let Some(active_claim) = claimed.take() {
+            finish_claim_after_preparation_failure(&state, &key, active_claim, shared).await;
+        }
+        return Err(error);
+    }
+
+    // The lifecycle gate prevents delete/eviction/recreation from crossing
+    // this turn. Fail fast if another path already owns the handle instead of
+    // retaining parsed requests in an unbounded same-session queue.
+    let turn_guard = match handle.turn_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some(active_claim) = claimed.take() {
+                finish_claim_after_preparation_failure(&state, &key, active_claim, shared).await;
+            }
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Conversation is busy; retry after the active operation completes".into(),
+            ));
+        }
+    };
+    if !state.lifecycle.is_accepting_mutations() {
+        if let Some(active_claim) = claimed.take() {
+            finish_claim_after_preparation_failure(&state, &key, active_claim, shared).await;
+        }
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is shutting down".into(),
+        ));
+    }
+    if let Some(ClaimedMessage { attempt, heartbeat }) = claimed {
         let task_state = state.clone();
         let audit_state = state.clone();
         let audit_flow = flow.clone();
@@ -1496,8 +1807,10 @@ pub async fn post_message(
                 handle,
                 id,
                 req.content,
-                images,
+                req.images,
+                flow_path_resolved,
                 attempt,
+                heartbeat,
                 lifecycle_guard,
                 turn_guard,
             )
@@ -1542,9 +1855,10 @@ pub async fn post_message(
         return Ok((HeaderMap::new(), Json(response)));
     }
 
+    let images = load_message_images(&handle, &flow_path_resolved, req.images, shared).await?;
     *handle.last_touched.write().await = Instant::now();
 
-    let turn_timeout = Duration::from_secs(max_conversation_turn_secs());
+    let turn_timeout = handle.conv.tool_registry.conversation_turn_timeout();
     let mut shutdown = handle.shutdown.subscribe();
     let turn = tokio::time::timeout(turn_timeout, handle.conv.run_turn(&req.content, images));
     let turn_result = tokio::select! {
@@ -1571,6 +1885,7 @@ pub async fn post_message(
 
     let turn_count = handle.conv.turn_count().await;
     let turn_index = turn_count.saturating_sub(1);
+    let revision = handle.conv.revision().await;
 
     crate::api::audit::record(
         &state.store,
@@ -1597,6 +1912,9 @@ pub async fn post_message(
             assistant,
             reasoning,
             turn_count,
+            revision,
+            incarnation_id: handle.conv.execution.incarnation_id.clone(),
+            definition_fingerprint: handle.conv.execution.definition_fingerprint.clone(),
         }),
     ))
 }
@@ -1628,7 +1946,7 @@ pub async fn get_history(
 
     let turn_count = record.messages.iter().filter(|m| m.role == "user").count();
 
-    let max_messages = api_max_history();
+    let max_messages = record.execution.max_history;
     let start = record.messages.len().saturating_sub(max_messages);
     let truncated = start > 0;
     let messages: Vec<HistoryMessage> = record
@@ -1651,6 +1969,10 @@ pub async fn get_history(
         messages,
         turn_count,
         truncated,
+        revision: record.revision,
+        incarnation_id: record.execution.incarnation_id,
+        source_fingerprint: record.execution.source_fingerprint,
+        definition_fingerprint: record.execution.definition_fingerprint,
     }))
 }
 
@@ -1684,15 +2006,42 @@ fn event_type_str(event: &CrewEvent) -> &'static str {
 pub async fn conversation_events(
     State(state): State<Arc<AppState>>,
     Path((flow, id)): Path<(String, String)>,
-) -> Result<
-    Sse<impl futures::stream::Stream<Item = std::result::Result<Event, Infallible>>>,
-    (StatusCode, Json<ErrorResponse>),
-> {
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let flow_path_resolved =
         resolve_flow_path(&state, &flow).map_err(|e| map_err_to_response(&e))?;
     validate_session_id(&id).map_err(|e| map_err_to_response(&e))?;
 
     let key = (flow_segment(&flow_path_resolved), id.clone());
+    if state.store.conversation_coordination_scope() == ConversationCoordinationScope::SharedStore {
+        let exists = state
+            .store
+            .get_conversation(Some(&key.0), &id)
+            .await
+            .map_err(|error| map_err_to_response(&error))?
+            .is_some();
+        if !exists {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Conversation '{id}' not found"),
+            ));
+        }
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation SSE replay is unavailable with shared-store coordination; use durable history for recovery"
+                .into(),
+        ));
+    }
+    if headers
+        .get(axum::http::HeaderName::from_static("last-event-id"))
+        .is_some()
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Conversation SSE is process-local and does not support Last-Event-ID replay; reconnect without a cursor and recover durable messages from history"
+                .into(),
+        ));
+    }
     let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
         error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -1722,7 +2071,7 @@ pub async fn conversation_events(
             }
             let event_type = event_type_str(&event);
             let data = serde_json::to_string(&*event).unwrap_or_default();
-            yield Ok(Event::default().event(event_type).data(data));
+            yield Ok::<Event, Infallible>(Event::default().event(event_type).data(data));
         }
         loop {
             match rx.recv().await {
@@ -1732,10 +2081,20 @@ pub async fn conversation_events(
                     }
                     let event_type = event_type_str(&event);
                     let data = serde_json::to_string(&*event).unwrap_or_default();
-                    yield Ok(Event::default().event(event_type).data(data));
+                    yield Ok::<Event, Infallible>(Event::default().event(event_type).data(data));
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // keep going
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let data = serde_json::json!({
+                        "error": "conversation_event_gap",
+                        "skipped_events": skipped,
+                        "recovery": "read durable conversation history",
+                    });
+                    yield Ok::<Event, Infallible>(
+                        Event::default()
+                            .event("conversation_gap")
+                            .data(data.to_string())
+                    );
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1745,11 +2104,14 @@ pub async fn conversation_events(
     // `keep_alive` emits a comment-only event every 15 s so intermediate
     // proxies (Bun, reverse proxies, browser buffering) don't treat an
     // idle conversation as a stalled connection and tear it down.
-    Ok(Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    let response = Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    Ok(super::sse::hardened_response(response))
 }
 
 fn is_conversation_event(event: &CrewEvent) -> bool {
@@ -1792,12 +2154,20 @@ pub async fn delete_conversation(
 
         let flow_slug = flow_segment(&flow_path_resolved);
         let key = (flow_slug.clone(), id.clone());
-        let lifecycle = lifecycle_lock(&key).map_err(lifecycle_capacity_error)?;
-        let _lifecycle_guard = lifecycle.lock().await;
+        let lifecycle = state
+            .conversation_lifecycles
+            .acquire(&key)
+            .map_err(lifecycle_capacity_error)?;
+        let _lifecycle_guard = lifecycle.try_lock().map_err(|_| {
+            error_response(
+                StatusCode::CONFLICT,
+                "Conversation is busy; retry after the active operation completes".into(),
+            )
+        })?;
 
-        // Wait for an in-flight turn before deleting its durable record. All
-        // same-id operations honor the lifecycle gate, so no cloned stale
-        // handle can autosave after this deletion or race a recreated handle.
+        // The lifecycle try-lock above has already rejected an active same-id
+        // operation. Taking the turn lock closes the cache lookup/removal race
+        // so no cloned stale handle can autosave after deletion or recreation.
         let handle = state.active_conversations.read().await.get(&key).cloned();
         let _turn_guard = match handle.as_ref() {
             Some(handle) => Some(handle.turn_lock.lock().await),
@@ -1942,7 +2312,7 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
         // evicting a freshly touched handle or deleting a newly recreated one.
         let mut evicted = 0usize;
         for (key, observed) in expired {
-            let lifecycle = match lifecycle_lock(&key) {
+            let lifecycle = match state.conversation_lifecycles.acquire(&key) {
                 Ok(lifecycle) => lifecycle,
                 Err(error) => {
                     tracing::warn!(
@@ -1967,14 +2337,12 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
                 continue;
             }
 
-            if let Err(error) = observed.conv.persist().await {
-                tracing::warn!(
-                    conversation_id = %observed.id,
-                    %error,
-                    "Failed to persist conversation during idle eviction; retaining handle for retry"
-                );
-                continue;
-            }
+            // HTTP start/message completion already persists the exact
+            // conversation revision before exposing success. Saving again
+            // here would manufacture a revision during cache eviction and a
+            // stale replica could then conflict forever after a peer turn.
+            // This cache is therefore clean-by-contract: eviction only drops
+            // the process-local handle and its admission permit.
             let mut map = state.active_conversations.write().await;
             if map
                 .get(&key)
@@ -1991,143 +2359,65 @@ pub async fn idle_eviction_loop(state: Arc<AppState>) {
 }
 
 #[cfg(test)]
-mod lifecycle_registry_tests {
+mod lua_error_mapping_tests {
+    use std::sync::Arc;
+
     use super::*;
-    use tokio::sync::Barrier;
 
-    fn key(index: usize) -> ConversationKey {
-        ("flow".to_string(), format!("conversation-{index}"))
-    }
-
-    #[test]
-    fn sequential_high_cardinality_keys_are_removed_immediately() {
-        let registry = Arc::new(LifecycleRegistry::new(4));
-
-        for index in 0..20_000 {
-            let lease = registry
-                .acquire(&key(index))
-                .expect("a released slot must be reusable");
-            assert_eq!(registry.len(), 1);
-            drop(lease);
-            assert_eq!(registry.len(), 0);
+    fn callback_error(error: IronCrewError) -> mlua::Error {
+        mlua::Error::CallbackError {
+            traceback: "test traceback".into(),
+            cause: Arc::new(mlua::Error::external(error)),
         }
     }
 
     #[test]
-    fn capacity_bounds_distinct_keys_but_preserves_existing_key_serialization() {
-        let registry = Arc::new(LifecycleRegistry::new(4));
-        let leases: Vec<_> = (0..4)
-            .map(|index| registry.acquire(&key(index)).expect("slot available"))
-            .collect();
+    fn embedded_validation_and_conflict_keep_client_statuses() {
+        let (status, Json(body)) = map_lua_err_to_response(callback_error(
+            IronCrewError::Validation("invalid bootstrap".into()),
+        ));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "Validation error: invalid bootstrap");
 
-        assert_eq!(registry.len(), 4);
-        assert!(registry.acquire(&key(4)).is_err());
-
-        let same_key = registry
-            .acquire(&key(0))
-            .expect("an existing key must not consume another slot");
-        assert!(Arc::ptr_eq(&same_key.gate, &leases[0].gate));
-        assert_eq!(registry.len(), 4);
-        drop(same_key);
-
-        drop(leases);
-        assert_eq!(registry.len(), 0);
+        let (status, Json(body)) = map_lua_err_to_response(callback_error(
+            IronCrewError::Conflict("definition drift".into()),
+        ));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.error, "Conflict: definition drift");
     }
 
     #[test]
-    fn owned_guard_pins_the_entry_and_fails_fast_for_the_same_key() {
-        let registry = Arc::new(LifecycleRegistry::new(2));
-        let conversation = key(0);
-        let owner = registry
-            .acquire(&conversation)
-            .expect("owner lease available")
-            .try_lock_owned()
-            .unwrap_or_else(|_| panic!("owner must acquire the gate"));
+    fn replay_response_must_match_conversation_identity_and_revision() {
+        let execution = ConversationExecution::new(
+            format!("sha256:{}", "a".repeat(64)),
+            format!("sha256:{}", "b".repeat(64)),
+            20,
+            1024,
+        )
+        .unwrap();
+        let valid = MessageResp {
+            conversation_id: "chat".into(),
+            turn_index: 0,
+            assistant: "answer".into(),
+            reasoning: None,
+            turn_count: 1,
+            revision: 8,
+            incarnation_id: execution.incarnation_id.clone(),
+            definition_fingerprint: execution.definition_fingerprint.clone(),
+        };
+        assert!(validate_replayed_message(&valid, "chat", &execution, Some(7)).is_ok());
 
-        assert_eq!(registry.len(), 1);
-        let contender = registry
-            .acquire(&conversation)
-            .expect("same key shares its slot");
-        assert!(contender.try_lock_owned().is_err());
-        assert_eq!(registry.len(), 1);
-
-        drop(owner);
-        assert_eq!(registry.len(), 0);
-    }
-
-    #[test]
-    fn unrelated_keys_do_not_share_a_gate() {
-        let registry = Arc::new(LifecycleRegistry::new(2));
-        let first = registry.acquire(&key(0)).expect("first slot available");
-        let second = registry.acquire(&key(1)).expect("second slot available");
-        let _first_guard = first.try_lock().expect("first gate available");
-        let _second_guard = second.try_lock().expect("second gate available");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_high_cardinality_registry_never_exceeds_capacity() {
-        const CAPACITY: usize = 64;
-
-        let registry = Arc::new(LifecycleRegistry::new(CAPACITY));
-        let acquired = Arc::new(Barrier::new(CAPACITY + 1));
-        let release = Arc::new(Barrier::new(CAPACITY + 1));
-        let mut tasks = Vec::with_capacity(CAPACITY);
-
-        for index in 0..CAPACITY {
-            let registry = Arc::clone(&registry);
-            let acquired = Arc::clone(&acquired);
-            let release = Arc::clone(&release);
-            tasks.push(tokio::spawn(async move {
-                let _lease = registry
-                    .acquire(&key(index))
-                    .expect("one slot per concurrent key");
-                acquired.wait().await;
-                release.wait().await;
-            }));
-        }
-
-        acquired.wait().await;
-        assert_eq!(registry.len(), CAPACITY);
-        assert!(registry.acquire(&key(CAPACITY)).is_err());
-        release.wait().await;
-
-        for task in tasks {
-            task.await.expect("registry worker must finish");
-        }
-        assert_eq!(registry.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn cancelling_an_owned_guard_releases_its_capacity() {
-        let registry = Arc::new(LifecycleRegistry::new(1));
-        let task_registry = Arc::clone(&registry);
-        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _owner = task_registry
-                .acquire(&key(0))
-                .expect("slot available")
-                .try_lock_owned()
-                .unwrap_or_else(|_| panic!("gate available"));
-            acquired_tx.send(()).expect("test receiver remains open");
-            std::future::pending::<()>().await;
-        });
-
-        acquired_rx.await.expect("owner acquires its gate");
-        assert_eq!(registry.len(), 1);
-        assert!(registry.acquire(&key(1)).is_err());
-
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task must be cancelled")
-                .is_cancelled()
-        );
-        assert_eq!(registry.len(), 0);
-
-        let replacement = registry
-            .acquire(&key(1))
-            .expect("cancelled owner returns its slot");
-        drop(replacement);
-        assert_eq!(registry.len(), 0);
+        let mut invalid = valid.clone();
+        invalid.conversation_id = "other".into();
+        assert!(validate_replayed_message(&invalid, "chat", &execution, Some(7)).is_err());
+        invalid = valid.clone();
+        invalid.incarnation_id = uuid::Uuid::new_v4().to_string();
+        assert!(validate_replayed_message(&invalid, "chat", &execution, Some(7)).is_err());
+        invalid = valid.clone();
+        invalid.definition_fingerprint = format!("sha256:{}", "c".repeat(64));
+        assert!(validate_replayed_message(&invalid, "chat", &execution, Some(7)).is_err());
+        invalid = valid;
+        invalid.revision = 9;
+        assert!(validate_replayed_message(&invalid, "chat", &execution, Some(7)).is_err());
     }
 }

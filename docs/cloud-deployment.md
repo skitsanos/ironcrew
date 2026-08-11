@@ -34,30 +34,79 @@ image contains those capabilities.
 
 ## Graceful shutdown
 
-IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cleanly:
+IronCrew uses a monotonic process lifecycle:
 
-1. Signal received → server stops accepting new HTTP requests and starts the hard-deadline clock (`IRONCREW_SHUTDOWN_TIMEOUT_SECS`).
-2. Readiness is disabled immediately, so `/health/ready` returns `503` while teardown proceeds.
-3. Active run work is aborted. Each run monitor persists an `aborted` terminal state and emits its terminal event; shutdown waits for that acknowledgement before dropping the run handle/EventBus.
-4. All entries in `active_conversations` are dropped. Dropping a chat session closes its per-session `EventBus`, so SSE subscribers on `/conversations/{id}/events` unblock and their streams terminate.
-5. Axum's `with_graceful_shutdown` lets remaining in-flight non-SSE requests finish.
-6. Per-request `LuaCrew` instances drop → MCP managers call `shutdown_blocking()` which spawns async cleanup tasks for each stdio child / HTTP connection.
-7. If Axum graceful shutdown takes longer than `IRONCREW_SHUTDOWN_TIMEOUT_SECS`, the server exits anyway (logs a warning).
-8. A post-serve drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) gives the Drop-spawned MCP cleanup tasks a moment before the Tokio runtime tears down.
+```text
+accepting -> fencing -> draining -> stopping
+```
+
+On Unix, `SIGUSR1` is an explicit drain signal and does not exit the process:
+
+1. The replica enters `fencing`. Readiness fails. A direct protected
+   `POST`/`DELETE` whose lifecycle middleware check occurs after that transition
+   returns a non-cacheable `503 instance_draining` with `Retry-After: 1`.
+2. PostgreSQL atomically marks each exact in-flight idempotency attempt owned
+   by this process as draining. A peer then returns `503 run_owner_draining`
+   with `Retry-After: 1` for cancellation or HITL answer delivery instead of
+   reporting false acceptance.
+3. The replica enters `draining`. Already accepted execution, protected
+   `GET`/`HEAD`, metrics, question reads, and new or existing SSE remain
+   observable. The process stays in this state until terminated.
+
+If the explicit PostgreSQL fence errors or times out, the lifecycle remains
+`fencing`: readiness and mutations stay closed, but the process does not claim
+that the durable fence exists. A later `SIGUSR1` retries it; `SIGTERM`/Ctrl+C
+switches to the termination retry policy below.
+
+`SIGTERM` (Kubernetes/Railway) and Ctrl+C start a routing deadline of
+`IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS` and perform the same fence. If a fence
+attempt fails, IronCrew stays unready in `fencing` and retries with bounded
+store attempts and exponential backoff from 100 ms, capped at 5 seconds, until
+the transaction commits; it never advances to `stopping` with an unpublished
+owner fence. After a successful fence, it waits any remainder of the routing
+interval and then enters `stopping`:
+
+1. Active run work is aborted. Each run monitor persists an `aborted` terminal
+   state and emits its terminal event; shutdown waits for that acknowledgement
+   before dropping the run handle/EventBus.
+2. Active chat turns are cancelled, revision-guarded state is persisted, and
+   conversation SSE closes.
+3. Axum's graceful-shutdown path finishes other in-flight HTTP work. The
+   `IRONCREW_SHUTDOWN_TIMEOUT_SECS` hard deadline starts at `stopping`, not when
+   the routing grace begins.
+4. Per-request `LuaCrew` instances drop and MCP managers start bounded cleanup.
+5. `IRONCREW_SHUTDOWN_DRAIN_MS` gives Drop-spawned background cleanup a final
+   window before the Tokio runtime exits.
+
+This sequence is an owner fence and bounded stop, not execution migration.
+`SIGKILL`, node loss, or a grace-period overrun still relies on lease expiry
+and `abandoned` reconciliation; external tool/provider effects remain the
+tool's idempotency responsibility.
+
+The lifecycle middleware snapshot is the mutation-admission linearization
+point. A request admitted while the replica was still `accepting` remains a
+pre-fence request even if an inner race check later rejects it; that rejection
+is a generic non-cacheable `503` with numeric `Retry-After`, not necessarily
+the structured `instance_draining` body.
 
 ### Shutdown tunables
 
 | Variable | Default | Description |
 |---|---|---|
-| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard deadline, in seconds, counted from the moment SIGTERM/SIGINT arrives. If Axum graceful shutdown exceeds it, the process exits anyway. Keep it below the platform's configured termination grace. |
+| `IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS` | `5` | Routing deadline measured from SIGTERM/Ctrl+C (range `0..300`). Fencing consumes part of this interval; after a successful fence, any remainder is spent in `draining`. Fence failure retries beyond the deadline and prevents `stopping`. Use `0` only when an external drain has already been verified and the store fence is expected to commit immediately. |
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard teardown deadline in seconds, started when the process enters `stopping` (range `1..300`). The process exits if graceful teardown has not completed. |
 | `IRONCREW_SHUTDOWN_DRAIN_MS` | `1000` | Milliseconds to wait after Axum returns, so Drop-spawned shutdown tasks can complete. Set to `0` to skip (children will be killed when the runtime drops). |
 
 **Tune these values** to fit your platform's grace period:
 
-- **Kubernetes `terminationGracePeriodSeconds: 30`** (default) → leave `IRONCREW_SHUTDOWN_DRAIN_MS=1000`. Plenty of headroom.
-- **Tight grace periods (≤ 10 s)** → `IRONCREW_SHUTDOWN_DRAIN_MS=500`.
+- **Kubernetes `terminationGracePeriodSeconds: 30`** (default) → the defaults
+  require at least `5 + 10 + 1` seconds before an operator safety margin.
+- **Tight grace periods (≤ 10 s)** → lower the routing and cleanup windows only
+  after testing actual EndpointSlice/ingress withdrawal and child cleanup.
 - **Heavy MCP stdio usage** (many long-lived child processes per request) → bump to `2000–3000` to ensure every `uvx` / `npx` child exits cleanly.
-- **Railway** → the platform default draining time is zero. The checked-in `railway.json` explicitly grants 30 seconds, so use a shutdown timeout below that value.
+- **Railway** → the platform default draining time is zero. The checked-in
+  `railway.json` explicitly grants 30 seconds, so fit routing grace, stopping
+  timeout, cleanup, and margin inside that value.
 
 ### Pod termination sequence (Kubernetes)
 
@@ -65,10 +114,12 @@ IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cl
     kubelet              ironcrew pod
        │                      │
        │─── SIGTERM ─────────►│
-       │                      │── stop accepting new requests
-       │                      │── start hard-deadline clock
+       │                      │── fencing: fail readiness + reject mutations
+       │                      │── fence exact owned keyed attempts in Postgres
+       │                      │── draining: keep reads/SSE observable
+       │                      │── remainder of SHUTDOWN_ROUTING_GRACE_SECS
+       │                      │── stopping: start hard-deadline clock
        │                      │       (IRONCREW_SHUTDOWN_TIMEOUT_SECS)
-       │                      │── fail readiness (/health/ready → 503)
        │                      │── abort active_runs
        │                      │       → persist aborted terminal states
        │                      │       → emit terminal events and await monitors
@@ -87,7 +138,18 @@ IronCrew handles `SIGTERM` (Kubernetes pod termination) and `SIGINT` (Ctrl+C) cl
        │─── SIGKILL ─────────►│
 ```
 
-Ensure `terminationGracePeriodSeconds ≥ IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s margin`. Because long-running runs are aborted on SIGTERM, you do **not** need to add `IRONCREW_MAX_RUN_LIFETIME` into this budget.
+Ensure
+`terminationGracePeriodSeconds >= IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS + IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + operator margin`.
+The checked-in OpenShift values use `5 + 30 + 1 + 5 = 41` seconds inside a
+45-second pod grace when the durable owner fence commits inside the five-second
+routing grace. A `preStop` hook consumes the same pod grace period and must be
+added to the left side of that arithmetic; it does not create another
+independent budget. If PostgreSQL fencing cannot commit, IronCrew deliberately
+stays in `fencing` until the platform may send `SIGKILL`; it cannot promise
+clean teardown or the formula in that failure mode. Lease expiry then
+reconciles unfinished work as `abandoned`. Because long-running runs are
+aborted after the routing grace, do **not** add `IRONCREW_MAX_RUN_LIFETIME` to
+the healthy termination budget.
 
 ---
 
@@ -109,8 +171,8 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | **unset** | Only enable if MCP servers run as sidecars. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
-| `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical on every replica | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. Store only in Railway/OpenShift secrets; never bake it into the image. |
-| `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for new ciphertext. Both HITL variables must be set together. |
+| `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical in steady state | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. During the controlled rotation overlap, every process must contain both keys even while active ids temporarily differ. Store only in Railway/OpenShift secrets; never bake it into the image. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for newly registered question metadata. Answers inherit their authenticated question's key. Both HITL variables must be set together. |
 | `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist shared by Lua `env()` and `${env.NAME}` interpolation. Opt in only the exact vars a crew needs. See [docs/sandbox.md](sandbox.md). |
 | `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
@@ -213,7 +275,7 @@ per-flow read grants.
 | `IRONCREW_MESSAGEBUS_QUEUE_MAX_BYTES` | `4194304` (4 MiB) | Byte cap on each agent queue. |
 | `IRONCREW_MAX_RUN_LIFETIME` | `1800` (30 min) | Hard per-run timeout. Lower for short flows. |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | `300` | Whole provider/tool deadline for one conversation message. |
-| `IRONCREW_READINESS_CACHE_MS` | `1000` | Coalesces public storage-aware readiness checks to protect the DB pool. |
+| `IRONCREW_READINESS_CACHE_MS` | `1000` | Caches public storage-aware readiness results to protect the DB pool. Overlapping uncached probes share the in-flight check for up to one second, then fail closed instead of returning a false contention-only `503`. |
 | `IRONCREW_CONVERSATION_MAX_HISTORY` | `50` | Trim conversation history at this many non-system messages (hard ceiling 4096; zero is rejected). |
 | `IRONCREW_DIALOG_MAX_HISTORY` | `100` | Trim dialog transcript at this many turns (hard ceiling 4095). |
 | `IRONCREW_DIALOG_MAX_TURNS` | `1000` | Maximum accepted total turns in one dialog (hard ceiling 10000). |
@@ -221,7 +283,7 @@ per-flow read grants.
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
 | `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | `256` | Bounds distinct conversation IDs with an in-flight lifecycle operation, preventing unbounded coordination-map growth (hard ceiling 4096). |
 | `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
-| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run/message retries cannot silently duplicate work. |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run and JSON/SQLite message retries cannot silently duplicate work. PostgreSQL conversation messages require a key regardless. |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | `86400` | Replay/tombstone retention; must exceed max run lifetime by at least one hour. |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | `8388608` | Per-key transient serialization and stored-response cap. Lower to 4 MiB for the 1 GiB baseline. |
 | `IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES` | `268435456` | Aggregate stored response budget. Lower to 64 MiB for the 1 GiB baseline. |
@@ -304,6 +366,16 @@ history/images/network/provider output, and a PostgreSQL pool of 2. Keep these
 settings until a workload-specific Linux/container soak test demonstrates
 headroom.
 
+At two identical replicas this declares 4 active runs, 8 resident
+conversations, 32 SSE connections, 4 maximum PostgreSQL pool connections, 2
+GiB of container memory allocation, and a 288 MiB admitted run/conversation Lua
+top-level allocator budget. Nested `run_flow`/`crew:subworkflow` VMs are
+additional, so this is neither an RSS bound nor proof that the workload fits
+the container allocation. It also does not create a cluster-wide provider
+limit. See
+[multi-replica capacity arithmetic](http-scaling.md#multi-replica-capacity-arithmetic)
+for the formulas, shared-quota exceptions, and provider caveat.
+
 **Large pod (4 GB / 4 CPU, after load testing):**
 ```bash
 IRONCREW_MAX_ACTIVE_RUNS=4
@@ -341,6 +413,13 @@ enforced by the store and remain the restart-safe protection. A `429` includes
 `Retry-After`; clients should back off without changing the idempotency key for
 the same logical operation.
 
+If an application requires one cluster-wide request, concurrency, or provider
+budget, enforce it in a trusted shared gateway that authenticates before
+policy, bounds queues/waits, fails closed, and preserves idempotency keys.
+PostgreSQL is used for durable ledger/journal coordination; do not hold a
+database lock across provider or tool execution to simulate a global
+semaphore.
+
 ---
 
 ## Persistence
@@ -356,9 +435,15 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 **Kubernetes/OpenShift:** use PostgreSQL for production durability. With a
 shared HITL keyring, idempotency-keyed runs support cross-replica cancellation
 and question listing/answer delivery. PostgreSQL's bounded run-event journal
-also supports cross-replica run SSE replay. Live Lua execution, conversation
-handles/SSE, and JSON/SQLite run SSE remain owner-local, so keep `replicas: 1`
-when clients require those surfaces through arbitrary Service routing.
+also supports cross-replica run SSE replay. The reviewed IC-008 worktree
+implements cold rehydration of a keyed PostgreSQL conversation message on
+either replica from the last committed incarnation/revision, but does not move
+an in-flight turn. Its local two-process PostgreSQL gate and affinity-free
+OpenShift IC-008 canary pass; Railway remains unrun, and the tested dirty
+artifact was unpublished and removed. Shared-store conversation SSE returns
+`409` unsupported. JSON/SQLite run and conversation SSE remain owner-local.
+Keep `replicas: 1` until the behavior is released, or whenever clients require
+the remaining owner-local surfaces through arbitrary Service routing.
 JSON/SQLite require a writable persistent volume if their records must survive
 replacement.
 
@@ -367,15 +452,19 @@ replacement.
 ### Live-control boundary
 
 The safest general-purpose topology remains one `serve` replica because a
-second process cannot use another process's live conversation handle or take
-over a dead owner's Lua VM. PostgreSQL does support a bounded multi-replica
-slice: any replica can accept new keyed runs and durable reads, stream retained
-run journal events, replay keyed acceptance, request keyed cancellation,
+second process cannot take over a dead owner's in-flight Lua VM. PostgreSQL
+does support a bounded multi-replica slice: any replica can accept new keyed
+runs and durable reads, stream retained run journal events, replay keyed
+acceptance, request keyed cancellation,
 and—when the shared HITL keyring is configured—list or answer that keyed run's
-pending questions. Routing affinity is not a correctness mechanism for the
-remaining owner-local surfaces. Use one-shot `ironcrew run` workers only when
-their workload and store ownership are intentionally separated from the HTTP
-service.
+pending questions. The reviewed IC-008 worktree also reconstructs a required-key
+`/messages` request on either replica from a committed conversation boundary.
+The local process gate and OpenShift canary pass; Railway routing remains
+unrun, the artifact is unpublished, in-flight takeover is unsupported, and
+conversation SSE remains unsupported. Routing affinity is not a correctness
+mechanism for the remaining owner-local surfaces. Use one-shot `ironcrew run`
+workers only when their workload and store ownership are intentionally
+separated from the HTTP service.
 
 **Store lifecycle in `serve` mode.** The store is a **server-wide singleton**: it is bootstrapped once per process startup and reused across all request handlers. With the PostgreSQL backend this means migrations (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, index creation) run once during each process boot, and the SQLx connection pool is shared across every concurrent request. Size `IRONCREW_DB_POOL_SIZE` for the number of concurrent in-flight requests, not the number of flows mounted in `--flows-dir`.
 
@@ -412,20 +501,21 @@ the run ID and dropped-result count.
 | `IRONCREW_DB_CONNECT_RETRIES` | `10` | Connection retries after the initial attempt (range 0–100). |
 | `IRONCREW_DB_CONNECT_BACKOFF_MS` | `1000` | Base delay for exponential connection-retry backoff, in milliseconds (range 1–30000). |
 | `IRONCREW_DB_CONNECT_TIMEOUT_SECS` | `30` | Connect/acquire timeout (range 1–120 seconds). |
-| `IRONCREW_INSTANCE_ID` | generated per process | Optional 1–255 byte printable ASCII runtime identity written to run ownership records. Use the pod UID on OpenShift and Railway's replica ID on Railway. |
+| `IRONCREW_INSTANCE_ID` | Railway runtime replica ID, otherwise generated per process | Optional 1–255 byte printable ASCII runtime identity written to run ownership records. An explicit value wins; otherwise IronCrew uses a valid non-empty runtime `RAILWAY_REPLICA_ID`, then falls back to a generated process identity. Use the pod UID explicitly on OpenShift. Do not configure Railway's runtime-only value through service-reference interpolation. |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | `60` | Ownership lease expiry before unfinished-run reconciliation, and the grace before explicit indeterminate-turn recovery. Production range: 6–86400; owner heartbeat and replica maintenance cadence is TTL/3. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | unset | Secret JSON object of at most 8 key ids and canonical base64 32-byte keys; maximum 16 KiB. Enables the encrypted mailbox only when the active id is also set. |
-| `IRONCREW_HITL_ACTIVE_KEY_ID` | unset | Key id used for new HITL ciphertext. Configure identically on every replica. |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | unset | Key id used for newly registered question ciphertext. Configure identically in steady state; the ordered rotation below deliberately permits a mixed-active overlap only after every process has both keys. |
 | `IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` | `1048576` (1 MiB) | Aggregate serialized pending-question metadata per run; range 1 byte–16 MiB. PostgreSQL ciphertext admission also accounts for 28 AEAD bytes per allowed pending row. |
 | `IRONCREW_HITL_POLL_INTERVAL_MS` | `500` | PostgreSQL poll interval per pending durable question. Effective range 50–5000 ms; tune against latency and aggregate database reads. |
 | `IRONCREW_HITL_READ_TIMEOUT_MS` | `2000` | Timeout for one owner-side PostgreSQL answer read. Effective range 100–30000 ms. |
-| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | `8` | Process-wide concurrency cap for PostgreSQL question-list/decrypt reads; range 1–64. |
+| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | `8` | Process-wide concurrency cap shared by PostgreSQL question-list decryption and answer-side question authentication; range 1–64. |
 | `IRONCREW_EVENT_JOURNAL_RETENTION_SECS` | `3600` | Logical PostgreSQL event retention; range 60–2592000 seconds. |
 | `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS` | `100000` | Global logical event-count cap; range 1–10000000 and at least `IRONCREW_MAX_EVENTS`. |
 | `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES` | `268435456` (256 MiB) | Global logical event-byte cap; range 1 KiB–8 GiB and at least the per-run replay-byte budget. |
 | `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES` | `524288` (512 KiB), or the event maximum when larger | Maximum bytes read in one journal page; range 1 KiB–64 MiB and at least `IRONCREW_EVENT_MAX_BYTES`. A page contains at most 64 events. |
 | `IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS` | `500` | Active-stream database poll interval; range 100–5000 ms. |
 | `IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS` | `2000` | Timeout for one journal page read; range 100–30000 ms. |
+| `IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS` | `1500` | Outer timeout `W` for one journal-append attempt, including pool acquisition and the complete transaction; range 100–5000 ms. PostgreSQL statements use `4W/5`. |
 | `IRONCREW_EVENT_JOURNAL_PRUNE_BATCH` | `1000` | Maximum rows pruned per bounded pass; range 1–10000 and no greater than the global event cap. |
 | `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | `600` | Per-principal/process rate for question-list observation; range 1–60000. |
 | `IRONCREW_ADMISSION_OBSERVATION_BURST` | `20` | Per-principal/process observation burst; range 1–1000. |
@@ -433,6 +523,70 @@ the run ID and dropped-result count.
 IronCrew supports PostgreSQL 15+ only. This matches the session-storage
 features used by the runtime and the intended deployment target of
 extension-capable Postgres installs such as `pgvector`.
+
+### Deployment evidence and replica parity
+
+Authenticated `GET /capabilities` always reports both the `instance_id`
+recorded in durable run ownership and a random UUID `process_start_id` created
+for the current operating-system process. A platform may reuse its replica id
+after restart; `process_start_id` distinguishes the replacement process without
+becoming a durable owner or routable address.
+
+For release-candidate and platform acceptance, configure the optional
+deployment-evidence tuple:
+
+| Variable | Capability field | Contract |
+|---|---|---|
+| `IRONCREW_DEPLOYMENT_REVISION` | `deployment.revision` | Immutable source/build-input identifier, 1–128 ASCII letters, digits, `.`, `-`, `_`, `:`, or `+` |
+| `IRONCREW_ARTIFACT_FINGERPRINT` | `deployment.artifact_fingerprint` | Fingerprint of the exact executable/artifact in this process |
+| `IRONCREW_FLOW_FINGERPRINT` | `deployment.flow_fingerprint` | Fingerprint of the complete canonical flow-tree manifest |
+| `IRONCREW_CONFIG_FINGERPRINT` | `deployment.config_fingerprint` | Fingerprint of canonical effective non-secret application settings |
+| `IRONCREW_HITL_KEYRING_FINGERPRINT` | `deployment.hitl_keyring_fingerprint` | Fingerprint of the canonical non-secret readable-keyset/active-key revision |
+
+All five variables are optional only as one unit. With all absent,
+`deployment` is `null`; any partial tuple fails startup before the HTTP listener
+binds. Each fingerprint must be exactly `sha256:` followed by 64 lowercase
+hexadecimal characters. The tuple is protected and non-cacheable because it is
+returned only by `/capabilities`.
+
+IronCrew validates and repeats these operator-supplied values; it does not
+calculate or verify them. Equal reported strings are therefore not platform
+parity proof by themselves. A valid acceptance receipt must:
+
+1. freeze and retain the build-input/revision manifest;
+2. document the exact deterministic serialization used for the flow, effective
+   config, and keyring-revision manifests;
+3. inventory every active Railway replica or OpenShift pod rather than relying
+   on a finite load-balancer sample;
+4. independently hash the executable and the three canonical manifests inside
+   every process without printing their source secrets; and
+5. compare the independently observed values with that process's authenticated
+   capability tuple, `X-IronCrew-Instance-Id`, and `process_start_id`.
+
+The config manifest must use resolved effective values—not merely whichever
+environment variables happened to be present—and include the non-secret
+settings whose equality is required: storage type and table/schema identity,
+authentication/principal policy shape, idempotency policy, database pool and
+lease policy, admission/lifecycle/journal policy, and relevant runtime limits.
+Explicitly configure every required field or derive its resolved default before
+hashing. Do not include raw `DATABASE_URL`, bearer/provider credentials, raw
+HITL key material, or unsalted hashes of guessable secrets. Verify the canary
+bearer against every process separately.
+
+For the keyring revision, canonicalize the key ids, active id, and fingerprints
+derived from the random 32-byte keys; never include or log the base64 key
+material. This detects the otherwise invisible error where matching key ids map
+to different keys. During the ordered rotation below, config/keyring hashes can
+intentionally differ between compatible revisions. Record the allowed value for
+every process and phase rather than declaring any difference acceptable.
+
+Unique `IRONCREW_INSTANCE_ID`/`RAILWAY_REPLICA_ID` values,
+`process_start_id`, pod/deployment ids, injected bind addresses and ports,
+timestamps, and pod-specific paths are attribution data and are excluded from
+steady-state fingerprint equality. Platform CPU/memory requests, limits, and
+physical replica/surge counts are also outside the application fingerprint;
+record and compare them separately because they remain required capacity
+evidence.
 
 ### Lease maintenance, readiness, and owner loss
 
@@ -495,23 +649,51 @@ configuration. Put it in a Railway secret variable or an
 OpenShift/Kubernetes `Secret` supplied by an external secret manager. The JSON
 values must be canonical base64 encodings of exactly 32 random bytes.
 
-Rotate without making in-flight questions unreadable:
+IronCrew reads the keyring once during process startup; editing a Railway
+variable or OpenShift Secret does not reload a running process. Rotate through
+three ordered rollout revisions without making in-flight questions unreadable:
 
-1. Add the new key id/material to the secret on every replica, but leave the
-   old active id selected.
-2. Wait until every replica is running the expanded keyring.
-3. Change `IRONCREW_HITL_ACTIVE_KEY_ID` to the new id everywhere; retain the
-   old key so old ciphertext can still be decrypted.
-4. After the old deployment is drained, verify that no `{prefix}human_inputs`
-   row references the old question or answer key fingerprint. Answer
-   consumption, timeout, terminalization, and abandoned-run reconciliation
-   normally remove those rows; only then remove the old key.
+1. Deploy the expanded `{old,new}` keyring to every process with `old` still
+   active. Do not proceed until every known replica has restarted with both
+   readable keys.
+2. Deploy the same expanded keyring with `new` active. Mixed old-active and
+   new-active processes are safe only in this phase because every reader has
+   both keys. The active id selects new question ciphertext; an accepted answer
+   is encrypted with its authenticated question's fingerprint, so an old-active
+   owner can still consume an answer queued by a new-active peer.
+3. After every old-active writer has exited, drain or terminalize old-key
+   questions and verify that both `question_key_fingerprint` and
+   `answer_key_fingerprint` have zero references to the old fingerprint. Only
+   then deploy a new-only keyring.
+
+Use a bound parameter for the retiring fingerprint when applying this database
+gate to the configured table prefix:
+
+```sql
+SELECT
+    COUNT(*) FILTER (WHERE question_key_fingerprint = $1) AS old_question_refs,
+    COUNT(*) FILTER (WHERE answer_key_fingerprint = $1) AS old_answer_refs,
+    COUNT(*) FILTER (
+        WHERE question_key_fingerprint = $1 OR answer_key_fingerprint = $1
+    ) AS old_rows
+FROM {prefix}human_inputs;
+```
+
+Every count must be zero. Store startup also scans both fingerprint columns and
+fails before the HTTP listener binds when retained ciphertext needs an absent
+key. The scan is bounded by `IRONCREW_DB_CONNECT_TIMEOUT_SECS` plus one second
+and is a startup snapshot, not a recurring fleet audit: a stale old-active
+writer that appears afterward is rejected when a replica authenticates the
+mailbox row, but operators must still inventory and stop every old revision.
+`/health/ready` and `/capabilities` do not replace that fleet check.
 
 Railway rolling deployments and OpenShift rolling updates can temporarily run
 both revisions. A one-step key replacement is therefore unsafe: an old pod
 cannot read new-key ciphertext, while a new pod cannot read old-key ciphertext.
 The keyring supports at most eight keys, which leaves room for staged rotation
-without unbounded secret or process memory.
+without unbounded secret or process memory. Keep the compatible expanded secret
+available during code rollback; restoring an old-only process after new-key
+questions exist is intentionally rejected.
 
 At the default 500 ms poll interval, each pending question performs about two
 PostgreSQL reads per second. Multiply that by pending questions and suspended
@@ -537,6 +719,21 @@ retention, global capacity, or owner loss are explicit. Active-run completeness
 is best-effort, and a terminal run record can synthesize an unnumbered
 `run_complete` with `journal_complete: false` when the numbered terminal event
 is absent.
+
+Let `W` be `IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS`. One journal batch gets
+three outer attempts with 50 ms and 100 ms backoffs (`3W + 150 ms` total). Each
+append transaction sets PostgreSQL `lock_timeout` and `statement_timeout` to
+`4W/5`, so one database lock/query wait ends before the outer deadline; that
+outer deadline also covers pool acquisition and cumulative statements. The
+pre-terminal flush and numbered terminal append each use a derived
+acknowledgement deadline of `3W + 650 ms`. This is a bounded best-effort wait,
+not a guarantee to drain every queued batch. The authoritative terminal run row
+is committed before the numbered terminal append, so terminal run status is not
+a journal-flush barrier. Idempotency finalization runs before the bounded
+terminal append begins, so clients that need a resumable terminal cursor must
+use their own bounded reconnect policy. The run row
+still progresses when the journal fails, enabling the explicit incomplete SSE
+fallback above.
 
 The per-run/global byte caps are logical accounting, with at least 1 KiB
 charged per event. They do not include PostgreSQL tuple/page or index overhead,
@@ -568,24 +765,82 @@ All health endpoints are public and require no API token:
 | Endpoint | Meaning | Use |
 |---|---|---|
 | `GET /health/live` | Process is alive and the HTTP runtime can answer. It does not probe providers or storage. | Kubernetes/OpenShift liveness. |
-| `GET /health/ready` | Process accepts traffic, the configured persistence store responds, and run-lease maintenance is healthy. Returns `503` with a component label when any gate fails. | Startup/readiness probes and Railway deployment healthcheck. |
+| `GET /health/ready` | Process is `accepting`, the configured persistence store responds, and run-lease maintenance is healthy. Lifecycle withdrawal returns `503` with `component: "lifecycle"` and the current `lifecycle_state`; other failures retain their component label. | Startup/readiness probes and Railway deployment healthcheck. |
 | `GET /health` | Backwards-compatible lightweight liveness response. | Existing monitors only; do not use as a storage-aware readiness gate. |
 
 Provider APIs are intentionally excluded from readiness: a provider outage
 should fail requests cleanly, not continuously restart or withdraw the whole
 service.
 
+Authenticated protected responses include `X-IronCrew-Instance-Id`. Preserve
+that header in canary tooling so a load-balanced request can be attributed to
+the receiving process, but never turn the opaque value into a public route.
+The configured CORS policy exposes it and `Retry-After` to authorized browser
+clients.
+
 ### Metrics
 
 `GET /metrics` exposes Prometheus text and is protected by the same bearer
 authentication as the API. It reports process-wide active/limit gauges,
 principal admission outcomes, tracked bucket count, idempotency quota
-rejections, and a store-backed durable-ledger snapshot. Store reads are
-coalesced for one second. The durable series expose global record/response-byte
-usage and limits, global in-flight count, maximum usage by any one principal,
-per-principal limits, principal count, and counts at 80/90/100 percent
-saturation. Labels are fixed; principal names, tokens, keys, flow names, and
-other caller-controlled values are deliberately omitted.
+rejections, readiness-critical storage state, and a store-backed durable-ledger
+snapshot. `ironcrew_store_maintenance_healthy` is an unlabeled per-process
+gauge (`1` healthy, `0` unhealthy) for the latest completed
+heartbeat-plus-reconciliation cycle. The unlabeled
+`ironcrew_process_terminal_persistence_degraded_finalizers` gauge counts the
+run or conversation finalizers currently retrying durable persistence in that
+process. It is not a cumulative error counter: it returns to zero after
+recovery or fencing, and both gauges reset when the process restarts.
+`ironcrew_process_lifecycle_state` is a one-hot per-process gauge with the four
+fixed `state` label values `accepting`, `fencing`, `draining`, and `stopping`.
+Alert when a target remains outside `accepting` unexpectedly; a planned
+explicit drain should be correlated with deployment events rather than treated
+as storage failure.
+`ironcrew_process_lifecycle_rejections_total{class="work|control"}` counts
+direct lifecycle-boundary mutation rejections with two fixed class labels.
+
+The resource-acceptance families below are unlabeled, fixed-cardinality, and
+describe only the process behind one scrape target:
+
+| Series | Exact meaning |
+|---|---|
+| `ironcrew_process_memory_measurement_available` | `1` when Linux `/proc/self/status` supplied both `VmRSS` and `VmHWM`; otherwise `0`. |
+| `ironcrew_process_resident_memory_bytes` | Current Linux `VmRSS` for the IronCrew process. Omitted when the measurement is unavailable. |
+| `ironcrew_process_peak_resident_memory_bytes` | Linux `VmHWM` for the IronCrew process since startup. Omitted when the measurement is unavailable. |
+| `ironcrew_postgres_pool_open_connections` | Connections currently open in this process's SQLx PostgreSQL pool. Omitted for JSON and SQLite stores. |
+| `ironcrew_postgres_pool_in_use_connections` | Open SQLx pool connections currently checked out by this process. |
+| `ironcrew_postgres_pool_connections_limit` | Configured maximum for this process's SQLx pool. |
+| `ironcrew_process_active_provider_calls` | Logical provider futures currently active across run and conversation paths, including time spent in provider-instance pacing. |
+| `ironcrew_process_peak_active_provider_calls` | Peak concurrent logical provider futures in this process since startup. This is measurement, not a provider semaphore or quota. |
+| `ironcrew_process_eventbus_instances` | Underlying process-local EventBus replay buffers currently registered, including a terminal run buffer during its bounded late-replay window. EventBus clones share one registration. |
+| `ironcrew_process_eventbus_retained_events` | Events currently retained across those replay buffers. |
+| `ironcrew_process_eventbus_retained_bytes` | Approximate serialized bytes currently retained across those replay buffers; not allocator or RSS usage. |
+| `ironcrew_process_eventbus_retained_events_capacity` | Sum of configured event-count capacities across the registered replay buffers. |
+| `ironcrew_process_eventbus_retained_bytes_capacity` | Sum of configured byte capacities across the registered replay buffers. |
+| `ironcrew_process_active_sse_connections` | Run and conversation SSE connections currently admitted by this process. |
+| `ironcrew_process_active_sse_connections_limit` | Process-local SSE permit limit. |
+
+The `/proc/self/status` read is Linux-only, capped at 64 KiB, fail-soft, and
+coalesced for one second, including unavailable results. It deliberately does
+not represent cgroup/container current usage or limits, OOM events, child/MCP
+processes, or sidecars. Collect those from Railway/OpenShift/Kubernetes and the
+container runtime. Likewise, SQLx pool gauges do not describe PostgreSQL
+server memory, server-wide connection capacity, or other clients, and provider
+gauges do not describe provider-side acceptance, retries, billing, or a
+cluster-wide quota. Those remain external platform, database, and trusted
+gateway/provider telemetry.
+
+Preserve the scrape target identity outside metric labels. Aggregate only
+after deduplicating targets: sum current resource use and per-process limits
+when planning fleet capacity, while treating each process peak as a
+target-local high-water mark. A load-balanced public endpoint cannot prove
+that every replica was sampled.
+
+Store reads are coalesced for one second. The durable series expose global
+record/response-byte usage and limits, global in-flight count, maximum usage by
+any one principal, per-principal limits, principal count, and counts at
+80/90/100 percent saturation. Labels are fixed; principal names, tokens, keys,
+flow names, and other caller-controlled values are deliberately omitted.
 
 If the store snapshot fails, `/metrics` returns `503` rather than serving
 fabricated or stale durable utilization.
@@ -593,9 +848,30 @@ fabricated or stale durable utilization.
 Scrape with a dedicated bearer principal used only by the monitoring client,
 and alert before a pod reaches its active run/conversation/SSE limits, on
 sustained admission `limited` outcomes, and on idempotency utilization
-thresholds. Structured tracing output remains available for Loki/Promtail or
-similar log pipelines. Do not expose `/metrics` through an unauthenticated
-ServiceMonitor or public exception.
+thresholds. Also alert when a pod's maintenance-health gauge remains `0` across
+multiple scrapes or when its degraded-finalizer gauge remains above `0`; either
+condition already removes that pod from readiness, so sustained values indicate
+storage work that has not recovered rather than a separate health policy.
+For a two-minute example window, use
+`max_over_time(ironcrew_store_maintenance_healthy[2m]) == 0` for continuously
+failed maintenance and
+`min_over_time(ironcrew_process_terminal_persistence_degraded_finalizers[2m]) > 0`
+for continuously degraded finalization; monitor scrape-target absence
+separately. Tune the window to the configured scrape and lease-maintenance
+cadence.
+Structured tracing output remains available for Loki/Promtail or similar log
+pipelines. Do not expose `/metrics` through an unauthenticated ServiceMonitor or
+public exception.
+
+These process gauges are per replica. Preserve the pod/instance scrape target
+for diagnosis, use the minimum maintenance-health value to detect any
+unhealthy pod, and sum degraded finalizers only when estimating cluster-wide
+impact. Do not sum the one-hot lifecycle gauge without grouping by `state`.
+Railway
+or another load balancer may route repeated public scrapes to the same healthy
+replica, so use a platform/private per-instance metrics integration when
+claiming fleet coverage. On OpenShift, prefer authenticated per-pod scraping;
+a Service-level aggregate cannot prove every pod was observed.
 
 The OpenShift baseline admits only ingress-controller traffic. Scrape through
 the authenticated Route, or add a separate ingress rule limited to the actual
@@ -660,6 +936,10 @@ spec:
           value: "/tmp/ironcrew-outputs"
         - name: IRONCREW_DEFAULT_MAX_CONCURRENT
           value: "2"
+        - name: IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS
+          value: "5"
+        - name: IRONCREW_SHUTDOWN_TIMEOUT_SECS
+          value: "30"
         - name: IRONCREW_SHUTDOWN_DRAIN_MS
           value: "1000"
         - name: IRONCREW_MCP_ALLOWED_COMMANDS
@@ -713,11 +993,15 @@ killing it.
 
 For small flow sets, mount `crew.lua` / `config.lua` via ConfigMap. For larger sets, bake them into a separate image layer or pull from object storage at startup.
 
-Do not configure session affinity as a substitute for this restriction. Affinity
-can improve routing but cannot transfer run execution or conversation handles
-between processes. Configured PostgreSQL run SSE and a keyed HITL mailbox work
-without affinity, but neither can transfer the Lua VM or suspended coroutine;
-conversation SSE and JSON/SQLite run SSE remain process-local.
+Do not configure session affinity as a substitute for this restriction.
+Affinity can improve routing but cannot transfer run execution or an in-flight
+conversation handle between processes. Configured PostgreSQL run SSE, a keyed
+HITL mailbox, and the current worktree's keyed PostgreSQL conversation messages
+work without affinity at committed turn boundaries, but none can transfer a Lua
+VM or suspended coroutine. IC-008's affinity-free OpenShift canary passed this
+committed-boundary slice, but its dirty artifact was unpublished and Railway
+remains unrun. PostgreSQL conversation SSE is unsupported; JSON/SQLite
+conversation and run SSE remain process-local.
 
 ---
 
@@ -726,8 +1010,10 @@ conversation SSE and JSON/SQLite run SSE remain process-local.
 The checked-in [`deploy/openshift.yaml`](../deploy/openshift.yaml) is the
 production baseline. It deliberately uses:
 
-- one replica with Deployment strategy `Recreate` as the conservative baseline
-  for applications that also use owner-local conversations or unkeyed controls
+- one replica with Deployment strategy `Recreate` as the conservative
+  unpublished-release baseline and for applications that require conversation
+  SSE, in-flight conversation takeover, or unkeyed controls; the dated
+  OpenShift IC-008 canary passed only the keyed committed-boundary slice
 - `/health/ready` for startup and readiness, and `/health/live` for liveness
 - readiness removes a pod from Service endpoints after a lease heartbeat or
   reconciliation failure; liveness deliberately does not restart it for that
@@ -750,6 +1036,13 @@ production baseline. It deliberately uses:
 - principal-scoped work/control/observation admission, idempotency budgets,
   bounded HITL metadata, a bounded PostgreSQL event journal, and a bounded
   conversation lifecycle registry, sized for the 1 GiB pod baseline
+- an explicit 5000 ms journal-write attempt bound for managed PostgreSQL; its
+  4-second database statement bound and each 15.65-second acknowledgement
+  envelope remain bounded, while the 30-second teardown deadline stays
+  authoritative if both pre-terminal and terminal waits hit their maxima
+- a 5-second routing grace, 30-second stopping deadline, 1-second cleanup
+  window, and 45-second pod grace (`5 + 30 + 1 + 5 = 41` seconds including
+  the operator margin)
 
 Apply it only after replacing the image tag, example CORS origin, ConfigMap,
 and Secret names:
@@ -757,6 +1050,58 @@ and Secret names:
 ```bash
 oc apply -f deploy/openshift.yaml
 ```
+
+### Two-replica rolling overlay
+
+Use a horizontal overlay only for an application whose routed surface fits the
+documented PostgreSQL keyed-run/run-SSE slice. After the first drain-aware
+version is homogeneous, a bounded two-replica rollout can use:
+
+```yaml
+spec:
+  replicas: 2
+  # Do not retire an old pod after a replacement's first transiently healthy
+  # probe. Require a stable readiness window before it counts as available.
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+```
+
+At steady state the checked-in limits declare 4 active runs, 8 resident
+conversations, 32 SSE connections, 4 pool connections, and 2 GiB of container
+memory allocation. `maxSurge: 1` permits three non-terminating pods, but
+terminating pods are not counted in that controller limit. For one controlled
+two-replica rollout, conservatively budget old `R` + new `R` = 4 physical pods
+until both old pods exit: 8 run slots, 16 resident conversations, 64 SSE
+connections, 8 pool connections, and 4 GiB of platform memory allocation.
+Overlapping rollouts or manual deletion can exceed even that envelope, so
+monitor the actual pod count and do not begin another rollout while old pods
+remain terminating. PostgreSQL-global ledger/journal caps remain one shared
+budget; provider concurrency is still not cluster-global.
+
+Kubernetes starts local termination while the control plane updates the
+EndpointSlice. Terminating endpoints normally become `ready: false`, but
+propagation through kube-proxy, Routes, external load balancers, and existing
+connections is not instantaneous. Keep IronCrew's routing grace and verify the
+actual cluster path. Do not set the container stop signal to `SIGUSR1`: that
+signal drains without exiting, so kubelet would eventually need `SIGKILL`.
+Leave termination as `SIGTERM`. A `preStop` hook runs inside the same 45-second
+grace and therefore reduces the time available to IronCrew rather than adding
+a second drain budget. Keep a non-zero `minReadySeconds` stabilization window:
+without it, the Deployment controller may retire the old pod after one healthy
+probe even if the replacement immediately becomes unready. IronCrew coalesces
+overlapping readiness checks for up to one second so routine kubelet/operator
+probe overlap does not itself create that flap.
+
+The first deployment containing this fence is a mixed-version boundary. An old
+owner cannot publish the fence and an old peer cannot honor it. Use the
+one-replica `Recreate` baseline, a maintenance/scale-to-zero cutover, or an
+externally verified zero-active-work transition for that first rollout. Enable
+the rolling overlay only after every routable replica reports the new
+`lifecycle_state` capability.
 
 ### Restricted SCC and non-root
 
@@ -803,8 +1148,9 @@ probe handling is CNI-specific.
 
 Egress is allowlisted to:
 
-- UDP/TCP 53 in `openshift-dns` (plus `kube-system` for CoreDNS-compatible
-  clusters);
+- UDP/TCP 53 and 5353 in `openshift-dns` (the latter covers OVN-Kubernetes
+  post-DNAT policy evaluation), plus UDP/TCP 53 in `kube-system` for
+  CoreDNS-compatible clusters;
 - TCP 5432 to pods in the IronCrew namespace; and
 - TCP 443 to public IPv4/IPv6 addresses, excluding private, loopback,
   link-local, reserved/documentation, benchmarking, and multicast ranges.
@@ -850,7 +1196,8 @@ root Dockerfile and configures:
 - `/health/ready` as the deployment healthcheck, with a 300-second timeout
 - a per-replica limit of 1 vCPU and 1 GiB through
   `deploy.limitOverride.containers`
-- no additional old/new deployment overlap
+- no extra *accepting* overlap (`overlapSeconds: 0`); old and new allocations
+  can still coexist while the old deployment handles SIGTERM drain
 - a 30-second SIGTERM draining window
 - restart policy `ALWAYS`
 
@@ -933,6 +1280,7 @@ IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES=67108864
 IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES=262144
 IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS=1000
 IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS=2000
+IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS=5000
 IRONCREW_EVENT_JOURNAL_PRUNE_BATCH=500
 IRONCREW_MAX_SSE_CONNECTIONS=16
 IRONCREW_ASK_HUMAN_MAX_PENDING=8
@@ -941,9 +1289,9 @@ IRONCREW_HITL_POLL_INTERVAL_MS=1000
 IRONCREW_HITL_READ_TIMEOUT_MS=2000
 IRONCREW_HITL_PG_MAX_CONCURRENT_READS=2
 IRONCREW_DB_POOL_SIZE=2
-IRONCREW_SHUTDOWN_TIMEOUT_SECS=25
+IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS=5
+IRONCREW_SHUTDOWN_TIMEOUT_SECS=15
 IRONCREW_SHUTDOWN_DRAIN_MS=1000
-IRONCREW_INSTANCE_ID=${{RAILWAY_REPLICA_ID}}
 IRONCREW_STORE=postgres
 IRONCREW_FILE_WRITE_ROOT=/data/outputs
 IRONCREW_MCP_ALLOWED_COMMANDS=__disabled__
@@ -951,7 +1299,27 @@ IRONCREW_MCP_ALLOWED_HTTP_HOSTS=__disabled__
 OPENAI_API_KEY=sk-...
 ```
 
+When enabling shared HITL, add `IRONCREW_HITL_ENCRYPTION_KEYS` and
+`IRONCREW_HITL_ACTIVE_KEY_ID` as sealed Railway variables rather than placing
+their values in this plaintext recipe. Each rotation phase requires a new
+deployment because IronCrew reads them once at process startup. Follow the
+[three-revision rotation gate](#hitl-key-rotation-on-railway-and-openshift)
+before removing a key.
+
 Railway's Postgres add-on auto-injects `DATABASE_URL`.
+
+Railway injects `RAILWAY_REPLICA_ID` only into each running replica. The
+service-variable expression
+`IRONCREW_INSTANCE_ID=${{RAILWAY_REPLICA_ID}}` was observed to resolve to an
+empty configured value during the 2026-08-10 canary, which IronCrew correctly
+rejects. Leave `IRONCREW_INSTANCE_ID` absent: IronCrew now validates and uses
+the non-empty runtime `RAILWAY_REPLICA_ID` automatically. It generates a
+process-lifetime fallback only when neither identity is present. This keeps
+authenticated IronCrew response attribution aligned with Railway's runtime
+replica identifier without relying on service-variable interpolation. Railway
+may reuse that replica identifier after an in-place restart; use the separate
+capability `process_start_id` and platform lifecycle evidence to distinguish
+the old process from its replacement.
 
 For multiple callers, migrate the shared `IRONCREW_API_TOKEN` to a secret
 `IRONCREW_API_TOKENS` JSON object, for example
@@ -973,10 +1341,20 @@ around 1 vCPU/1 GiB and the conservative caps above (the checked-in OpenShift
 manifest contains the fuller set). Raise CPU/RAM and application caps only
 after a representative container soak test. The checked-in general-purpose
 baseline keeps `numReplicas: 1`; Pro plan headroom does not make owner-local
-conversations or execution horizontally safe. Scale only applications whose
-routed surfaces fit the documented PostgreSQL run-SSE/keyed-control contract,
-and include per-replica pools, admission, Lua memory, journal queues/pages, and
+execution horizontally safe. The keyed PostgreSQL conversation-message path
+passes its local two-process gate and OpenShift canary but has no Railway
+IC-008 canary or published artifact. Scale only applications whose routed
+surfaces fit the documented PostgreSQL run-SSE/keyed-control contract, and
+include per-replica pools, admission, Lua memory, journal queues/pages, and
 HITL polling in the aggregate budget.
+
+During replacement Railway can run both the old `R`-replica deployment and the
+new `R`-replica deployment while SIGTERM drain completes, so the physical
+planning count is `P = 2R`. At `R = 2`, the checked-in per-replica limits imply
+8 active-run slots, 16 resident conversation slots, 64 SSE slots, 8 maximum
+pool connections, and 4 GiB of container allocation. `overlapSeconds: 0`
+removes a deliberate accepting delay; it does not eliminate this bounded
+teardown overlap. PostgreSQL-global caps still remain one shared budget.
 
 The live Railway JSON schema supports
 `deploy.limitOverride.containers.{cpu,memoryBytes}`. The checked-in config uses
@@ -1016,15 +1394,31 @@ Railway's default draining time is zero seconds. `railway.json` explicitly sets
 that window:
 
 ```
-IRONCREW_SHUTDOWN_TIMEOUT_SECS=25
+IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS=5
+IRONCREW_SHUTDOWN_TIMEOUT_SECS=15
 IRONCREW_SHUTDOWN_DRAIN_MS=1000
 ```
 
+This budgets `5 + 15 + 1 + 5 = 26` seconds, including a five-second operator
+margin, inside Railway's 30-second teardown window when the durable fence
+commits during the routing grace. Railway sends `SIGTERM` and, on expiry,
+`SIGKILL`; it does not send `SIGUSR1`. The `SIGTERM` path therefore includes
+IronCrew's fence and routing grace automatically. If fencing cannot commit,
+Railway may use `SIGKILL` and the run later reconciles as `abandoned`.
+
 `overlapSeconds: 0` prevents extra overlap after the candidate becomes active;
 it does not make owner-local live controls distributed. Multiple replicas can
-use PostgreSQL run SSE and the keyed cancellation/HITL slice, but keep the
-service at one when clients require arbitrary-replica conversations or unkeyed
-live controls.
+use PostgreSQL run SSE and the keyed cancellation/HITL slice. The current
+worktree also supports arbitrary routing of keyed PostgreSQL messages between
+committed conversation turns. Its local and OpenShift gates pass, but Railway
+has not run the IC-008 canary and no published artifact contains the worktree.
+Keep the service at one when clients require conversation SSE, in-flight turn
+takeover, unkeyed live controls, or any other owner-local surface.
+
+For the first drain-aware release, do not infer mixed-version safety from this
+timing. Use a maintenance/zero-active-work cutover or one-replica replacement,
+then verify every routed response reports the new `lifecycle_state` capability
+before enabling a two-replica rolling deployment.
 
 ### 5. Volumes
 
@@ -1075,6 +1469,8 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [Railway plan resource ceilings](https://docs.railway.com/pricing/plans)
 - [Railway-provided variables](https://docs.railway.com/variables/reference)
 - [Kubernetes Deployment strategies](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Kubernetes pod termination lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Kubernetes EndpointSlice conditions](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/)
 - [Kubernetes startup, readiness, and liveness probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
 - [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
 - [OpenShift NetworkPolicy](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/network_security/network-policy)
@@ -1091,12 +1487,18 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - Reduce `IRONCREW_MAX_PROMPT_CHARS` and per-tool byte caps.
 
 ### MCP stdio children orphaned after SIGKILL
-- `terminationGracePeriodSeconds` was too short. Raise it so IronCrew's drain window (`IRONCREW_SHUTDOWN_DRAIN_MS`) fits comfortably.
+- `terminationGracePeriodSeconds` was too short. Raise it so routing grace,
+  stopping timeout, background cleanup, any `preStop`, and an operator margin
+  all fit the one pod-termination budget.
 
 ### `/health/live` passes but readiness is 503
-- The process is alive but a readiness gate failed. `component: "storage"`
-  points to the ordinary store probe. `component: "storage_maintenance"` means
-  startup or periodic lease heartbeat/reconciliation failed or timed out;
+- The process is alive but a readiness gate failed. `component: "lifecycle"`
+  with `lifecycle_state` means this replica was deliberately withdrawn and
+  cannot be made accepting without restart. `component: "storage"` points to
+  the ordinary store probe. `component: "storage_finalization"` means a run or
+  conversation finalizer is retrying durable persistence.
+  `component: "storage_maintenance"` means startup or periodic lease
+  heartbeat/reconciliation failed or timed out;
   inspect PostgreSQL connectivity, pool saturation, held advisory locks, and
   long transactions. Readiness recovers only after both maintenance operations
   succeed in one cycle. Provider APIs are not part of readiness.
@@ -1127,30 +1529,52 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [ ] `IRONCREW_ALLOW_SHELL` unset (unless sandboxed)
 - [ ] `IRONCREW_MCP_ALLOWED_COMMANDS` whitelist set (if using MCP stdio)
 - [ ] `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` is `__disabled__` or lists only exact operator-trusted hosts
-- [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (active runs are aborted on SIGTERM, so this limit is independent of termination grace)
+- [ ] `IRONCREW_MAX_RUN_LIFETIME` tuned to workload (accepted runs may continue
+      through routing grace but are aborted at `stopping`, so the full run
+      lifetime is not a termination-grace promise)
 - [ ] `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`; clients preserve keys across retries, and ledger byte/record caps fit the pod/database budget
 - [ ] Per-principal idempotency and admission limits are set, and `429`
       saturation alerts are configured from protected `/metrics`
-- [ ] `IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + 5s` fits within platform termination grace
+- [ ] `IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS + IRONCREW_SHUTDOWN_TIMEOUT_SECS + IRONCREW_SHUTDOWN_DRAIN_MS/1000 + preStop + operator margin` fits within platform termination grace
+- [ ] Alert on a replica stuck in `fencing`; the clean-shutdown arithmetic
+      assumes PostgreSQL commits the owner fence inside routing grace, while a
+      prolonged fence failure intentionally falls back to platform `SIGKILL`
+      and later `abandoned` reconciliation
 - [ ] Replica count matches the
-      [multi-replica live-control contract](multi-replica.md); use exactly one
-      when clients require arbitrary-routed conversations or unkeyed controls;
-      PostgreSQL run SSE has its own bounded shared contract
-- [ ] Replacement strategy does not intentionally overlap active executors (`Recreate` on OpenShift; Railway overlap set to zero)
+  [multi-replica live-control contract](multi-replica.md); use exactly one
+      until the IC-008 behavior is released, on Railway until its attributed
+      canary passes, or whenever clients require conversation SSE, in-flight
+      conversation takeover, or unkeyed controls; PostgreSQL run SSE and keyed
+      conversation messages have separate bounded contracts
+- [ ] First drain-aware rollout avoids mixed old/new drain semantics; later
+      rolling deployments verify every routable replica exposes
+      `lifecycle_state`
+- [ ] Rolling deployments use a measured non-zero `minReadySeconds` window and
+      preserve at least one continuously ready endpoint during replacement
+- [ ] Replacement/surge arithmetic uses maximum physical pods, including
+      Railway old/new teardown (`2R`) and OpenShift terminating pods beyond
+      the controller's `replicas + maxSurge` envelope
 - [ ] Railway config-as-code and dashboard replica limits agree at the intended
       baseline (the checked-in start point is 1 vCPU / 1 GiB)
 - [ ] PostgreSQL configured for production durability
 - [ ] PostgreSQL event-journal logical limits, read/page/poll/prune bounds, and
       actual database/WAL/autovacuum footprint are monitored independently
-- [ ] If cross-replica HITL is enabled, every replica receives the same staged
-      `IRONCREW_HITL_ENCRYPTION_KEYS` secret and active key id; rotation keeps
-      old keys until no mailbox row references their fingerprints
+- [ ] If cross-replica HITL is enabled, every replica receives the same readable
+      `IRONCREW_HITL_ENCRYPTION_KEYS` set; steady state uses one active id, while
+      rotation follows the ordered mixed-active phase and keeps old keys until
+      both mailbox fingerprint columns contain zero old references
 - [ ] Secrets mounted from `Secret` / vault, not baked into image
 - [ ] Startup/readiness probes hit `/health/ready`; liveness hits `/health/live`
 - [ ] Resource `requests` and `limits` set on the container
 - [ ] OpenShift Route, DNS, PostgreSQL, and provider HTTPS verified with the
       NetworkPolicy applied; private/link-local negative probes fail
 - [ ] Production image reference replaced with the signed release digest (`image@sha256:...`), not a mutable tag
+- [ ] The complete deployment-evidence tuple is set for platform acceptance;
+      every active process independently matches its revision, artifact, flow,
+      effective-config, and HITL-keyring fingerprints
+- [ ] `process_start_id` and platform inventory prove process replacement even
+      when a stable platform replica id is reused; unique attribution fields and
+      platform resource limits are recorded outside config-fingerprint equality
 - [ ] Container runs non-root with no privilege escalation and dropped capabilities
 - [ ] TLS terminated at ingress / router / load balancer
 - [ ] Log level set to `info` or lower (never `debug` in prod)

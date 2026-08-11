@@ -594,6 +594,15 @@ pub enum StreamChunk {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Canonical identity of the effective, non-secret provider behavior used
+    /// to resume durable conversations. Providers that do not implement this
+    /// must fail closed for persistent conversation construction.
+    fn execution_fingerprint(&self) -> Result<String> {
+        Err(IronCrewError::Validation(
+            "Provider does not expose a durable conversation execution fingerprint".into(),
+        ))
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
     async fn chat_with_tools(
         &self,

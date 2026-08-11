@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 use crate::utils::error::{IronCrewError, Result};
 
-use crate::engine::idempotency::{IdempotencyLimits, PrincipalId, RunFenceHeartbeat};
+use crate::engine::idempotency::{
+    HARD_IDEMPOTENCY_RESPONSE_BYTES, IdempotencyLimits, PrincipalId, RunFenceHeartbeat,
+};
 use crate::engine::store::StateStore;
 
 pub const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
@@ -28,7 +30,6 @@ const HARD_MAX_RECORDS: usize = 100_000;
 const DEFAULT_PRUNE_BATCH: usize = 1_000;
 const HARD_PRUNE_BATCH: usize = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const HARD_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const HARD_MAX_TOTAL_RESPONSE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
@@ -605,7 +606,7 @@ impl IdempotencyConfig {
                 "IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES",
                 DEFAULT_MAX_RESPONSE_BYTES,
                 1,
-                HARD_MAX_RESPONSE_BYTES,
+                HARD_IDEMPOTENCY_RESPONSE_BYTES,
             )?,
             max_total_response_bytes,
             max_total_response_bytes_per_principal: bounded_env_usize(
@@ -758,12 +759,14 @@ pub fn run_fingerprint(flow: &str, body: Option<&Value>) -> String {
 pub fn conversation_message_fingerprint(
     flow: &str,
     conversation_id: &str,
+    incarnation_id: &str,
     content: &str,
     images: Option<&[String]>,
 ) -> String {
-    let mut encoder = FingerprintEncoder::new(b"ironcrew:conversation.message:v1");
+    let mut encoder = FingerprintEncoder::new(b"ironcrew:conversation.message:v2");
     encoder.field(flow.as_bytes());
     encoder.field(conversation_id.as_bytes());
+    encoder.field(incarnation_id.as_bytes());
     encoder.field(content.as_bytes());
     let images = images.unwrap_or_default();
     encoder.field(&(images.len() as u64).to_be_bytes());
@@ -777,8 +780,8 @@ pub fn run_scope(flow: &str) -> String {
     flow.to_string()
 }
 
-pub fn conversation_scope(flow: &str, conversation_id: &str) -> String {
-    format!("conversation.message:{flow}:{conversation_id}")
+pub fn conversation_scope(flow: &str, conversation_id: &str, incarnation_id: &str) -> String {
+    crate::engine::sessions::conversation_mutation_scope(flow, conversation_id, incarnation_id)
 }
 
 /// Compactly serialize a response without ever allocating more than the
@@ -1009,8 +1012,16 @@ mod tests {
     #[test]
     fn absent_and_empty_message_images_have_one_fingerprint() {
         assert_eq!(
-            conversation_message_fingerprint("flow", "c1", "hello", None),
-            conversation_message_fingerprint("flow", "c1", "hello", Some(&[]))
+            conversation_message_fingerprint("flow", "c1", "incarnation", "hello", None),
+            conversation_message_fingerprint("flow", "c1", "incarnation", "hello", Some(&[]),)
+        );
+    }
+
+    #[test]
+    fn recreated_conversation_has_a_distinct_message_fingerprint() {
+        assert_ne!(
+            conversation_message_fingerprint("flow", "c1", "first", "hello", None),
+            conversation_message_fingerprint("flow", "c1", "second", "hello", None),
         );
     }
 

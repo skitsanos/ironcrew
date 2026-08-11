@@ -19,7 +19,7 @@ use crate::mcp::{McpConfig, McpConnectionManager};
 
 use super::conversation::build_conversation;
 use super::dialog::build_dialog;
-use super::json::{json_value_to_lua, lua_table_to_json, lua_value_to_json};
+use super::json::{json_value_to_lua, lua_value_to_json};
 use super::parsers::{agent_from_lua_table, task_from_lua_table};
 use super::subflow::{SubflowContext, SubflowDepth, invoke_subflow};
 
@@ -342,13 +342,21 @@ impl UserData for LuaCrew {
         methods.add_async_method(
             "subworkflow",
             |lua, this, (path, options): (String, Option<Table>)| async move {
+                super::bootstrap::reject_effect(&lua, "crew:subworkflow")?;
                 // Parse options — `output_key` wraps the result in a single-field
                 // table, `input` gets JSON-bridged to the sub-flow's global `input`.
                 let output_key: Option<String> =
                     options.as_ref().and_then(|o| o.get("output_key").ok());
                 let input_table: Option<Table> = options.as_ref().and_then(|o| o.get("input").ok());
+                let json_limits = this
+                    .runtime
+                    .lua_vm_policy()
+                    .map_err(mlua::Error::external)?
+                    .json_limits();
                 let input_json: Option<serde_json::Value> = match input_table {
-                    Some(ref t) => Some(lua_table_to_json(t)?),
+                    Some(ref t) => {
+                        Some(super::json::lua_table_to_json_with_limits(t, json_limits)?)
+                    }
                     None => None,
                 };
 
@@ -358,12 +366,18 @@ impl UserData for LuaCrew {
                 // Prefer the API-injected EventBus (keeps SSE events flowing
                 // through the same channel as the parent crew).
                 let eventbus = lua.app_data_ref::<EventBus>().map(|e| e.clone());
+                let source_context = lua
+                    .app_data_ref::<
+                        crate::engine::conversation_definition::ConversationSourceContext,
+                    >()
+                    .map(|context| context.clone());
 
                 let ctx = SubflowContext {
                     runtime: this.runtime.clone(),
                     project_dir: Arc::new(this.project_dir.clone()),
                     depth,
                     eventbus,
+                    source_context,
                     output_key,
                 };
 
@@ -413,7 +427,8 @@ impl UserData for LuaCrew {
         // MessageBus methods
         methods.add_async_method(
             "message_send",
-            |_, this, (from, to, content, msg_type): (String, String, String, Option<String>)| async move {
+            |lua, this, (from, to, content, msg_type): (String, String, String, Option<String>)| async move {
+                super::bootstrap::reject_effect(&lua, "crew:message_send")?;
                 let message_type = match msg_type.as_deref() {
                     Some("request") => MessageType::Request,
                     Some("broadcast") => MessageType::Broadcast,
@@ -458,6 +473,7 @@ impl UserData for LuaCrew {
         // Human-in-the-loop: suspend the flow until a human answers (or the
         // question times out). See docs/superpowers/specs/2026-07-07-ask-human-design.md.
         methods.add_async_method("ask_human", |lua, this, opts: Table| async move {
+            super::bootstrap::reject_effect(&lua, "crew:ask_human")?;
             let prompt: String = opts
                 .get("prompt")
                 .map_err(|_| mlua::Error::external("ask_human requires a 'prompt' string field"))?;
@@ -548,7 +564,8 @@ impl UserData for LuaCrew {
         // Memory methods
         methods.add_async_method(
             "memory_set",
-            |_, this, (key, value): (String, Value)| async move {
+            |lua, this, (key, value): (String, Value)| async move {
+                super::bootstrap::reject_effect(&lua, "crew:memory_set")?;
                 let json_value = lua_value_to_json(value)?;
                 this.crew
                     .lock()
@@ -563,7 +580,8 @@ impl UserData for LuaCrew {
 
         methods.add_async_method(
             "memory_set_ex",
-            |_, this, (key, value, options): (String, Value, Table)| async move {
+            |lua, this, (key, value, options): (String, Value, Table)| async move {
+                super::bootstrap::reject_effect(&lua, "crew:memory_set_ex")?;
                 let json_value = lua_value_to_json(value)?;
                 let tags: Vec<String> = options
                     .get::<Table>("tags")
@@ -593,7 +611,8 @@ impl UserData for LuaCrew {
             }
         });
 
-        methods.add_async_method("memory_delete", |_, this, key: String| async move {
+        methods.add_async_method("memory_delete", |lua, this, key: String| async move {
+            super::bootstrap::reject_effect(&lua, "crew:memory_delete")?;
             Ok(this.crew.lock().await.memory.delete(&key).await)
         });
 
@@ -606,7 +625,8 @@ impl UserData for LuaCrew {
             Ok(table)
         });
 
-        methods.add_async_method("memory_clear", |_, this, ()| async move {
+        methods.add_async_method("memory_clear", |lua, this, ()| async move {
+            super::bootstrap::reject_effect(&lua, "crew:memory_clear")?;
             this.crew.lock().await.memory.clear().await;
             Ok(())
         });
@@ -622,6 +642,7 @@ impl UserData for LuaCrew {
         // crew:conversation({agent = ..., model = ..., stream = ..., ...})
         // Creates a stateful multi-turn conversation bound to this crew.
         methods.add_async_method("conversation", |lua, this, table: Table| async move {
+            super::bootstrap::reject_effect(&lua, "crew:conversation")?;
             // Lazy agent-as-tool finalization — fails fast with a validation
             // error if any agent__<name> refs an unknown agent. Also covers
             // MCP augmentation so conversations see the same augmented
@@ -649,12 +670,22 @@ impl UserData for LuaCrew {
                 .unwrap_or_else(|| crew.eventbus.clone());
             drop(crew);
 
-            // Resolve the shared store for cross-run persistence. If the
-            // store can't be created (e.g. misconfigured PG URL), fall back
-            // to an ephemeral in-memory session rather than failing the
-            // whole call — this mirrors how ephemeral conversations worked
-            // before the persistence layer was added.
-            let store = this.get_or_init_store().await.ok();
+            // An explicit id opts into durable persistence. Never silently
+            // downgrade that contract if the configured store is unavailable:
+            // provider/tool work must not run against an in-memory session
+            // that the caller believes is recoverable from another replica.
+            // Id-less conversations retain the historical ephemeral fallback.
+            let persistent_requested = table.get::<Option<String>>("id")?.is_some();
+            let store = match this.get_or_init_store().await {
+                Ok(store) => Some(store),
+                Err(_) if !persistent_requested => None,
+                Err(_) => {
+                    return Err(mlua::Error::external(IronCrewError::Validation(
+                        "Persistent conversation storage is unavailable; fix the configured store before retrying"
+                            .into(),
+                    )));
+                }
+            };
 
             // Derive flow_path from the project directory's last segment
             // so records created via the Lua-only path can still be looked
@@ -664,6 +695,31 @@ impl UserData for LuaCrew {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_string());
+            let source_fingerprint = if let Some(fingerprint) = lua
+                .app_data_ref::<super::conversation::ConversationSourceFingerprint>()
+                .map(|fingerprint| fingerprint.0.clone())
+            {
+                fingerprint
+            } else if let Some(context) = lua
+                .app_data_ref::<
+                    crate::engine::conversation_definition::ConversationSourceContext,
+                >()
+                .map(|context| context.clone())
+            {
+                context.snapshot.fingerprint().to_owned()
+            } else {
+                let project_dir = this.project_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::engine::conversation_definition::flow_source_fingerprint(&project_dir)
+                })
+                .await
+                .map_err(|error| {
+                    mlua::Error::external(crate::utils::error::IronCrewError::Validation(format!(
+                        "Conversation source fingerprint worker failed: {error}"
+                    )))
+                })?
+                .map_err(mlua::Error::external)?
+            };
 
             let conv = build_conversation(
                 table,
@@ -671,6 +727,7 @@ impl UserData for LuaCrew {
                 provider,
                 tool_registry,
                 &default_model,
+                &source_fingerprint,
                 max_tool_rounds,
                 eventbus,
                 store,
@@ -687,6 +744,7 @@ impl UserData for LuaCrew {
         // crew:dialog({agents = {"name", ...}, starter = ..., ...})
         // Creates an agent-to-agent dialog with perspective-flipped histories.
         methods.add_async_method("dialog", |lua, this, table: Table| async move {
+            super::bootstrap::reject_effect(&lua, "crew:dialog")?;
             // Lazy agent-as-tool finalization — fails fast with a validation
             // error if any agent__<name> refs an unknown agent. Dialogs get
             // the same augmented registry (built-ins + MCP + AgentAsTool)
@@ -745,6 +803,7 @@ impl UserData for LuaCrew {
         });
 
         methods.add_async_method("run", |lua, this, ()| async move {
+            super::bootstrap::reject_effect(&lua, "crew:run")?;
             let run_start = chrono::Utc::now();
             let api_lifecycle = lua
                 .app_data_ref::<ApiRunLifecycle>()

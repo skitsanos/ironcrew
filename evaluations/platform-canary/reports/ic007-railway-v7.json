@@ -1,0 +1,1728 @@
+{
+  "artifact": {
+    "artifact_cleanup_status": "complete",
+    "artifact_copy_retained_after_cleanup": false,
+    "assembly_context_manifest": "sha256:4d04389f7c8d013c419e2cf5bbe65189f1d1e453bd97bea828670154aee74ee6",
+    "assembly_dockerfile": "sha256:6de0d031b6d5bc6078996bc13b8ca89ab22486c6b73065a047937b7c8e6f9723",
+    "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+    "build_attestation_file": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+    "canonical_build_manifest": "sha256:031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5",
+    "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+    "helpers": {
+      "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+      "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+      "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+    },
+    "identity_boundary": "Railway rebuilt the exact verified ten-file context; the Railway digest is recorded separately from the source OCI digests. Digests prove observed identity only, not a bit-reproducible or downloadable artifact.",
+    "railway_rebuilt_image_digest": "sha256:78dd8d7adf24832cd2cf4b3a2020b0326899538a274d932da5a4f522b21124a1",
+    "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5",
+    "source_linux_amd64_manifest": "sha256:725bf9b4cb3e91bbb3c4f6a58bc14987be18b143816611318037c257bc6d6479",
+    "source_oci_config": "sha256:ece9dc52830e84976605986d45cfab90eec7bee9cd67d7ee46040a99b168fa57",
+    "source_oci_index": "sha256:bd1c8a1df0f98e2c8d92ee59408c44a98a882848dd33e5a081d973da01ae8f7f",
+    "source_provenance": "sha256:808ff4cca4106345a4ce547ced969b0275c88c48a71706695b444947c84920c6",
+    "tag": "ironcrew:ic007-platform-final-v7-20260810"
+  },
+  "cleanup": {
+    "active_volume_ids": [],
+    "broad_delete_planned": false,
+    "broad_delete_used": false,
+    "completed_at": "2026-08-10T20:44:38Z",
+    "database_after": {
+      "functions": 0,
+      "indexes": 0,
+      "relations": 0,
+      "sequences": 0,
+      "tables": 0
+    },
+    "database_prefixes": [
+      "ic007_final_rw_20260810_",
+      "ic007_final_rw_v6_20260810_",
+      "ic007_final_rw_v7_20260810_",
+      "ic007_final_rw_v7_quota_20260810_",
+      "ic007_final_rw_v7_quota_retry_20260810_",
+      "ic007_rw_v7_quota2_20260810_"
+    ],
+    "docker_prune_planned": false,
+    "docker_prune_used": false,
+    "domain_id": "92d1008b-7445-4dd7-805d-6b301bed6fb1",
+    "local_after": {
+      "attributable_docker_containers": 0,
+      "attributable_docker_images": 0,
+      "postgres_15_image_retained": true,
+      "python_cache_directories": 0,
+      "railway_scratch_scripts": 0,
+      "staging_context_copies": 0,
+      "temporary_evidence_files": 0
+    },
+    "preserve_environment": true,
+    "preserve_project": true,
+    "preserve_volume_tombstones": [
+      {
+        "deleted_at": "2026-08-12T12:20:51.248Z",
+        "id": "59b97c18-92f4-400f-92fe-c84c5bc85637",
+        "pending_deletion": true
+      },
+      {
+        "deleted_at": "2026-08-12T10:26:53.673Z",
+        "id": "96da93ee-dac1-41fb-ada4-406c075070c1",
+        "pending_deletion": true
+      }
+    ],
+    "service_ids": [
+      "4bc87da5-72cc-451f-8f54-7c382c4fd1bf",
+      "f7469a6d-3b3f-4523-8c9f-8968b26d0fd4",
+      "f32fdfa8-0ce2-4cd8-a49f-76fbd7b9b686"
+    ],
+    "remote_baseline_after": {
+      "active_volumes": 0,
+      "buckets": 0,
+      "domains": 0,
+      "environment_preserved": true,
+      "project_preserved": true,
+      "service_instances": 0,
+      "services": 0,
+      "tcp_proxies": 0,
+      "volume_tombstones_preserved": [
+        {
+          "deleted_at": "2026-08-12T12:20:51.248Z",
+          "id": "59b97c18-92f4-400f-92fe-c84c5bc85637",
+          "pending_deletion": true,
+          "service_id": null
+        },
+        {
+          "deleted_at": "2026-08-12T10:26:53.673Z",
+          "id": "96da93ee-dac1-41fb-ada4-406c075070c1",
+          "pending_deletion": true,
+          "service_id": null
+        }
+      ]
+    },
+    "status": "complete"
+  },
+  "configuration": {
+    "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+    "effective_config_receipt": "ic007-railway-v7-effective-config.json",
+    "event_journal_write_timeout_ms": 5000,
+    "fields": 113,
+    "hitl_poll_interval_ms": 5000,
+    "injected_port": "8080",
+    "lua_max_execution_seconds": 300,
+    "private_provider_base_url": "http://ic007-final-provider.railway.internal:8080/v1",
+    "run_lease_ttl_seconds": 60,
+    "sse_output_max_chars": "absent",
+    "table_prefix": "ic007_final_rw_v7_20260810_"
+  },
+  "environment_id": "4ef85b76-84c6-470f-8a18-825c4d32222a",
+  "outcome": {
+    "cleanup": "complete",
+    "exactly_once_external_effects_claimed": false,
+    "execution_failover_claimed": false,
+    "live_conversation_portability_claimed": false,
+    "long_duration_monitoring_claimed": false,
+    "required_rotation_acceptance": "passed",
+    "security_clean_claimed": false
+  },
+  "platform": {
+    "active_canary_volumes": 0,
+    "application_service_id": "4bc87da5-72cc-451f-8f54-7c382c4fd1bf",
+    "buckets": 0,
+    "deployment_manifests": {
+      "expanded_new": {
+        "cpu_per_process": 1,
+        "created_at": "2026-08-10T20:08:13.998Z",
+        "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+        "draining_seconds": 10,
+        "evidence_snapshot_status": "SUCCESS",
+        "healthcheck_path": "/health/ready",
+        "healthcheck_timeout_seconds": 300,
+        "image_digest": "sha256:78dd8d7adf24832cd2cf4b3a2020b0326899538a274d932da5a4f522b21124a1",
+        "memory_bytes_per_process": 1000000000,
+        "overlap_seconds": 600,
+        "post_evidence_status": "REMOVED",
+        "regional_replicas": {
+          "europe-west4-drams3a": 2
+        },
+        "start_command": "python3 -c \"import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())\"",
+        "supervisor_start_command_sha256": "sha256:7778c2514d6ac9bee46f9c01f0d58bcc6fbd8d8a46655a9cfa8821033b29f8af",
+        "top_level_replicas": 2,
+        "updated_at": "2026-08-10T20:16:53.495Z"
+      },
+      "expanded_old": {
+        "cpu_per_process": 1,
+        "created_at": "2026-08-10T20:00:33.668Z",
+        "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+        "draining_seconds": 10,
+        "evidence_snapshot_status": "SUCCESS",
+        "healthcheck_path": "/health/ready",
+        "healthcheck_timeout_seconds": 300,
+        "image_digest": "sha256:78dd8d7adf24832cd2cf4b3a2020b0326899538a274d932da5a4f522b21124a1",
+        "memory_bytes_per_process": 1000000000,
+        "overlap_seconds_in_predecessor_manifest": 90,
+        "post_evidence_status": "REMOVED",
+        "regional_replicas": {
+          "europe-west4-drams3a": 2
+        },
+        "start_command": "python3 -c \"import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())\"",
+        "supervisor_start_command_sha256": "sha256:7778c2514d6ac9bee46f9c01f0d58bcc6fbd8d8a46655a9cfa8821033b29f8af",
+        "top_level_replicas": 2,
+        "updated_at": "2026-08-10T20:16:28.642Z"
+      },
+      "new_only": {
+        "cpu_per_process": 1,
+        "created_at": "2026-08-10T20:14:24.161Z",
+        "deployment_id": "914e6fec-a39b-4398-b2e6-1cb05c5e4f21",
+        "draining_seconds": 10,
+        "healthcheck_path": "/health/ready",
+        "healthcheck_timeout_seconds": 300,
+        "image_digest": "sha256:78dd8d7adf24832cd2cf4b3a2020b0326899538a274d932da5a4f522b21124a1",
+        "instances": [
+          {
+            "id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "status": "RUNNING"
+          },
+          {
+            "id": "2079b924-17e6-44af-9e99-aaebec10e59a",
+            "status": "RUNNING"
+          }
+        ],
+        "memory_bytes_per_process": 1000000000,
+        "overlap_seconds": 600,
+        "regional_replicas": {
+          "europe-west4-drams3a": 2
+        },
+        "start_command": "python3 -c \"import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())\"",
+        "status": "SUCCESS",
+        "supervisor_start_command_sha256": "sha256:7778c2514d6ac9bee46f9c01f0d58bcc6fbd8d8a46655a9cfa8821033b29f8af",
+        "top_level_replicas": 2,
+        "updated_at": "2026-08-10T20:15:17.695Z"
+      }
+    },
+    "domain": {
+      "hostname": "ic007-final-app-production.up.railway.app",
+      "id": "92d1008b-7445-4dd7-805d-6b301bed6fb1",
+      "target_port": 8080
+    },
+    "postgres_service_id": "f32fdfa8-0ce2-4cd8-a49f-76fbd7b9b686",
+    "provider_service_id": "f7469a6d-3b3f-4523-8c9f-8968b26d0fd4",
+    "resource_arithmetic": {
+      "authoritative_mixed_cpu_limit": 4,
+      "authoritative_mixed_max_pg_pool_connections": 8,
+      "authoritative_mixed_memory_bytes_limit": 4000000000,
+      "authoritative_mixed_processes": 4,
+      "final_cpu_limit": 2,
+      "final_max_pg_pool_connections": 4,
+      "final_memory_bytes_limit": 2000000000,
+      "final_processes": 2,
+      "final_transition_peak_cpu_limit": 6,
+      "final_transition_peak_max_pg_pool_connections": 12,
+      "final_transition_peak_memory_bytes_limit": 6000000000,
+      "final_transition_peak_processes": 6,
+      "qualification": "limits are replica-count arithmetic, not sustained usage or OOM evidence"
+    }
+  },
+  "project_id": "d0eda4bf-f0ed-4258-bdb6-5b76cfdb8761",
+  "recorded_at": "2026-08-10T20:27:24Z",
+  "retained_assets": [
+    "ic007-v7-assembly-context.json",
+    "ic007-v7-assembly.Dockerfile",
+    "ic007-v7-build-attestation.json",
+    "ic007-v7-build-manifest.json",
+    "ic007-railway-v7-effective-config.json"
+  ],
+  "rotation": {
+    "excluded_attempts": [
+      {
+        "artifact_generation": "v5",
+        "classification": "source defect",
+        "reason": "terminal journal appends failed under the shorter write-timeout implementation; not acceptance evidence",
+        "receipt": "ic007-railway-v5-precursor.json"
+      },
+      {
+        "artifact_generation": "v6",
+        "classification": "cancelled preflight",
+        "reason": "staging contamination and retry-classification gap were found before functional requests",
+        "receipt": "ic007-railway-v6-preflight.json"
+      },
+      {
+        "classification": "excluded incomplete bidirectional rotation",
+        "old_references_after_cleanup": {
+          "old_references": "0|0|0"
+        },
+        "phase": "overlap90",
+        "reason": "the old cohort expired during build plus attestation; only old-to-new was captured",
+        "run_ids": [
+          "c2382661-09a5-47aa-9ab4-5cf3ef18e8e4",
+          "8693d388-52ed-4429-8cdb-a83018a34a17"
+        ],
+        "safe_old_capture": {
+          "answer_ciphertext_bytes": 41,
+          "answer_ciphertext_sha256": "c71aceedf81c5248ac58fe87fd7146f7e41969fad5ad6e6e03b9632d5982d241",
+          "answer_key_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+          "answer_nonce_bytes": 12,
+          "answer_nonce_sha256": "582dcac123f8234960bc073a476c788417d4e834bc6d18fbc4cc346e43054640",
+          "answer_plaintext_absent_at_capture": true,
+          "answer_plaintext_absent_recomputed": true,
+          "answered_at": "2026-08-10T19:54:08.736552+00:00",
+          "captured_after_answer": true,
+          "captured_at": "2026-08-10T19:54:08.740403+00:00",
+          "new_state": "answered",
+          "old_answer_was_null": true,
+          "old_state": "pending",
+          "owner_instance_id": "0b374fdb-27fc-4526-b1d9-7ff2b80a3b09",
+          "question_ciphertext_bytes": 235,
+          "question_ciphertext_sha256": "81d96a536e640bf4f6db0a0b13ac4e26beef60ef35487fa24282a534d7a0e72c",
+          "question_id": "ee2b5f02-ad6a-43d2-b41d-a5cebed2d841",
+          "question_immutable": true,
+          "question_key_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+          "question_nonce_bytes": 12,
+          "question_nonce_sha256": "86118e964094a11ac307841c1874355cd8886f3464425a7e010aa544e81dc5db",
+          "question_plaintext_absent": true,
+          "routing_immutable": true,
+          "run_id": "c2382661-09a5-47aa-9ab4-5cf3ef18e8e4",
+          "target_label": "old",
+          "target_snapshot_matches": true,
+          "timestamps_immutable": true,
+          "transaction_id": 4841
+        },
+        "terminal_cleanup": {
+          "mailbox_target_capture_counts": "0|0|2|1",
+          "terminals": {
+            "new": {
+              "body": {
+                "owner_instance_id": "5864139f-bb76-4c96-8718-bfeb8e41194f",
+                "run_id": "8693d388-52ed-4429-8cdb-a83018a34a17",
+                "status": "Aborted"
+              },
+              "cache_control": null,
+              "receiver": "a5c490ed-f0c2-411c-956c-2999eede0a38",
+              "replayed": null,
+              "status": 200
+            },
+            "old": {
+              "body": {
+                "owner_instance_id": "0b374fdb-27fc-4526-b1d9-7ff2b80a3b09",
+                "run_id": "c2382661-09a5-47aa-9ab4-5cf3ef18e8e4",
+                "status": "Abandoned"
+              },
+              "cache_control": null,
+              "receiver": "a5c490ed-f0c2-411c-956c-2999eede0a38",
+              "replayed": null,
+              "status": 200
+            }
+          }
+        }
+      },
+      {
+        "classification": "operator monitoring error only",
+        "phase": "overlap600-authoritative",
+        "reason": "a redirected result file was inspected while the single controller invocation was still running; the same invocation later completed the retained 9224-byte receipt and was not retried"
+      }
+    ],
+    "final_new_only_peer_hitl": {
+      "barrier": "0|2|2|1|true|7",
+      "first_answer": {
+        "body": {
+          "control_scope": "shared_store",
+          "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+          "question_id": "9817102a-38af-4783-8d71-621559a9c680",
+          "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+          "status": "queued"
+        },
+        "cache_control": "no-store",
+        "receiver": "2079b924-17e6-44af-9e99-aaebec10e59a",
+        "replayed": null,
+        "status": 202
+      },
+      "run": {
+        "listed": {
+          "body": {
+            "control_scope": "shared_store",
+            "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+            "status": "waiting_for_input"
+          },
+          "cache_control": "no-store",
+          "receiver": "2079b924-17e6-44af-9e99-aaebec10e59a",
+          "replayed": null,
+          "status": 200
+        },
+        "pending": {
+          "answer_ciphertext_bytes": "",
+          "answer_ciphertext_sha256": "",
+          "answer_fingerprint": "",
+          "answer_nonce_bytes": "",
+          "answer_plaintext_absent": "",
+          "expires_in_seconds": "295",
+          "question_ciphertext_bytes": "235",
+          "question_ciphertext_sha256": "18eae4f775fa01476a136aa8a9a5e042dc877c8921c61320ac000cfbcd61599f",
+          "question_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+          "question_nonce_bytes": "12",
+          "question_nonce_sha256": "8da52939f3984f899cdd230393bb2a4acb827f80b8bd2a991bc75f0b1756a6bc",
+          "question_plaintext_absent": "true",
+          "run_age_seconds": "4",
+          "state": "pending"
+        },
+        "question_id": "9817102a-38af-4783-8d71-621559a9c680",
+        "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+        "started": {
+          "body": {
+            "control_scope": "process",
+            "events_url": "/flows/shared-control/events/8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+            "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+            "status": "started"
+          },
+          "cache_control": null,
+          "receiver": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+          "replayed": null,
+          "status": 200
+        }
+      },
+      "second": {
+        "answer": {
+          "body": {
+            "control_scope": "shared_store",
+            "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "question_id": "b9c575fc-06db-4484-998b-70f280c83cd2",
+            "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+            "status": "queued"
+          },
+          "cache_control": "no-store",
+          "receiver": "2079b924-17e6-44af-9e99-aaebec10e59a",
+          "replayed": null,
+          "status": 202
+        },
+        "listed": {
+          "body": {
+            "control_scope": "shared_store",
+            "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+            "status": "waiting_for_input"
+          },
+          "cache_control": "no-store",
+          "receiver": "2079b924-17e6-44af-9e99-aaebec10e59a",
+          "replayed": null,
+          "status": 200
+        }
+      },
+      "terminal": {
+        "body": {
+          "owner_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+          "run_id": "8c2c5c19-7479-484a-912b-66cf9a2f4a3a",
+          "status": "Success"
+        },
+        "cache_control": null,
+        "receiver": "2079b924-17e6-44af-9e99-aaebec10e59a",
+        "replayed": null,
+        "status": 200
+      }
+    },
+    "keyring_fingerprints": {
+      "expanded_new_active": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf",
+      "expanded_old_active": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+      "new_only": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1"
+    },
+    "mixed_hitl": {
+      "attested_cohorts": {
+        "new": [
+          "585f3a1d-9a56-4fdc-858c-58899afc3138",
+          "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a"
+        ],
+        "old": [
+          "461fc1b5-df3b-4586-bb55-822112e2fecb",
+          "c56893e2-5554-43a9-93c6-87041ebc94a8"
+        ]
+      },
+      "barriers": {
+        "new": "0|2|2|1|true|7",
+        "old": "0|2|2|1|true|7"
+      },
+      "first_answers": {
+        "new": {
+          "answer": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+              "question_id": "5d4ebb67-804c-4410-81a4-312fd95320f2",
+              "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+              "status": "queued"
+            },
+            "cache_control": "no-store",
+            "receiver": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+            "replayed": null,
+            "status": 202
+          },
+          "capture": {
+            "answer_ciphertext_bytes": 41,
+            "answer_ciphertext_sha256": "e1f22f770e0bcde224299ddc2e7830140da393afb06520cacf3843ccd45d092a",
+            "answer_key_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+            "answer_nonce_bytes": 12,
+            "answer_nonce_sha256": "fffdb10c6e7d0c5de2918b2fa6ddb1990f0c6737fd9e49f3d2720d6b6b6fa7d2",
+            "answer_plaintext_absent_at_capture": true,
+            "answer_plaintext_absent_recomputed": true,
+            "answered_at": "2026-08-10T20:11:09.093064+00:00",
+            "captured_after_answer": true,
+            "captured_at": "2026-08-10T20:11:09.096699+00:00",
+            "new_state": "answered",
+            "old_answer_was_null": true,
+            "old_state": "pending",
+            "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+            "question_ciphertext_bytes": 235,
+            "question_ciphertext_sha256": "673669d4b73b74221bd6612bc75caef97539506c5ee959918577c3ce751e6e20",
+            "question_id": "5d4ebb67-804c-4410-81a4-312fd95320f2",
+            "question_immutable": true,
+            "question_key_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+            "question_nonce_bytes": 12,
+            "question_nonce_sha256": "c0b8db1cfbe57629d127e4cbc81d4da4547e38ee2bf29f963269dd10bf19f9c3",
+            "question_plaintext_absent": true,
+            "routing_immutable": true,
+            "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+            "target_label": "new",
+            "target_snapshot_matches": true,
+            "timestamps_immutable": true,
+            "transaction_id": 5053
+          }
+        },
+        "old": {
+          "answer": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+              "question_id": "2b7098e6-0db5-485f-ab24-14ab19e1d1d7",
+              "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+              "status": "queued"
+            },
+            "cache_control": "no-store",
+            "receiver": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "replayed": null,
+            "status": 202
+          },
+          "capture": {
+            "answer_ciphertext_bytes": 41,
+            "answer_ciphertext_sha256": "f145b5d675be091f70cc7506c6360629498466015eeaf8e8605424be94fa7e50",
+            "answer_key_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+            "answer_nonce_bytes": 12,
+            "answer_nonce_sha256": "c230e1cc8071d1236b3d66cf382c1e0dab83c80877ac9dfe952dae0d14262634",
+            "answer_plaintext_absent_at_capture": true,
+            "answer_plaintext_absent_recomputed": true,
+            "answered_at": "2026-08-10T20:10:43.607016+00:00",
+            "captured_after_answer": true,
+            "captured_at": "2026-08-10T20:10:43.610814+00:00",
+            "new_state": "answered",
+            "old_answer_was_null": true,
+            "old_state": "pending",
+            "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+            "question_ciphertext_bytes": 235,
+            "question_ciphertext_sha256": "990ee6e25f994abe8f7db8c470a665db896d7eb4d30a174fc16fb21e2fb3cbeb",
+            "question_id": "2b7098e6-0db5-485f-ab24-14ab19e1d1d7",
+            "question_immutable": true,
+            "question_key_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+            "question_nonce_bytes": 12,
+            "question_nonce_sha256": "5db179aad166b118f74ca60bd5f73c914441e0680ff17cf34481033a13f924ab",
+            "question_plaintext_absent": true,
+            "routing_immutable": true,
+            "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+            "target_label": "old",
+            "target_snapshot_matches": true,
+            "timestamps_immutable": true,
+            "transaction_id": 5027
+          }
+        }
+      },
+      "new_run": {
+        "listed": {
+          "body": {
+            "control_scope": "shared_store",
+            "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+            "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+            "status": "waiting_for_input"
+          },
+          "cache_control": "no-store",
+          "receiver": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+          "replayed": null,
+          "status": 200
+        },
+        "pending": {
+          "answer_ciphertext_bytes": "",
+          "answer_ciphertext_sha256": "",
+          "answer_fingerprint": "",
+          "answer_nonce_bytes": "",
+          "answer_plaintext_absent": "",
+          "expires_in_seconds": "295",
+          "question_ciphertext_bytes": "235",
+          "question_ciphertext_sha256": "673669d4b73b74221bd6612bc75caef97539506c5ee959918577c3ce751e6e20",
+          "question_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+          "question_nonce_bytes": "12",
+          "question_nonce_sha256": "c0b8db1cfbe57629d127e4cbc81d4da4547e38ee2bf29f963269dd10bf19f9c3",
+          "question_plaintext_absent": "true",
+          "run_age_seconds": "5",
+          "state": "pending"
+        },
+        "question_id": "5d4ebb67-804c-4410-81a4-312fd95320f2",
+        "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+        "started": {
+          "body": {
+            "control_scope": "process",
+            "events_url": "/flows/shared-control/events/3e31864d-a858-40ed-8e9c-31e34f0d2636",
+            "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+            "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+            "status": "started"
+          },
+          "cache_control": null,
+          "receiver": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+          "replayed": null,
+          "status": 200
+        }
+      },
+      "observer_summary": {
+        "captures": 2,
+        "distinct_fingerprints": 2,
+        "new_captures": 1,
+        "new_targets": 1,
+        "old_captures": 1,
+        "old_targets": 1,
+        "targets": 2,
+        "unexpected_labels": 0
+      },
+      "observer_targets": {
+        "new": {
+          "active_fence_bound": true,
+          "answer_fields_null": true,
+          "created_at": "2026-08-10T20:10:54.230216+00:00",
+          "expires_at": "2026-08-10T20:15:54.230216+00:00",
+          "expires_in_seconds": 287,
+          "flow": "shared-control",
+          "idempotency_lease_seconds": 46,
+          "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+          "question_ciphertext_bytes": 235,
+          "question_ciphertext_sha256": "673669d4b73b74221bd6612bc75caef97539506c5ee959918577c3ce751e6e20",
+          "question_digest": "37ab5e58ce977a47e5187a6259a8a642a6aa6f8aa83f1d8e4960a9833bca94ee",
+          "question_id": "5d4ebb67-804c-4410-81a4-312fd95320f2",
+          "question_key_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+          "question_nonce_bytes": 12,
+          "question_nonce_sha256": "c0b8db1cfbe57629d127e4cbc81d4da4547e38ee2bf29f963269dd10bf19f9c3",
+          "registered_at": "2026-08-10T20:11:07.140896+00:00",
+          "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+          "run_lease_seconds": 46,
+          "target_label": "new"
+        },
+        "old": {
+          "active_fence_bound": true,
+          "answer_fields_null": true,
+          "created_at": "2026-08-10T20:10:25.770372+00:00",
+          "expires_at": "2026-08-10T20:15:25.770372+00:00",
+          "expires_in_seconds": 284,
+          "flow": "shared-control",
+          "idempotency_lease_seconds": 44,
+          "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+          "question_ciphertext_bytes": 235,
+          "question_ciphertext_sha256": "990ee6e25f994abe8f7db8c470a665db896d7eb4d30a174fc16fb21e2fb3cbeb",
+          "question_digest": "2108e89240aeb1f5087698e8c045dad41e6bdd1d7f1b80bbaa58956953ead201",
+          "question_id": "2b7098e6-0db5-485f-ab24-14ab19e1d1d7",
+          "question_key_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+          "question_nonce_bytes": 12,
+          "question_nonce_sha256": "5db179aad166b118f74ca60bd5f73c914441e0680ff17cf34481033a13f924ab",
+          "registered_at": "2026-08-10T20:10:41.489722+00:00",
+          "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+          "run_lease_seconds": 44,
+          "target_label": "old"
+        }
+      },
+      "old_run": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+      "second_answers": {
+        "new": {
+          "answer": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+              "question_id": "48b40484-ff7b-4425-8d60-4cc68370208e",
+              "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+              "status": "queued"
+            },
+            "cache_control": "no-store",
+            "receiver": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "replayed": null,
+            "status": 202
+          },
+          "listed": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+              "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+              "status": "waiting_for_input"
+            },
+            "cache_control": "no-store",
+            "receiver": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "replayed": null,
+            "status": 200
+          }
+        },
+        "old": {
+          "answer": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+              "question_id": "f2536238-6ac2-488b-9718-28dbbca10a57",
+              "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+              "status": "queued"
+            },
+            "cache_control": "no-store",
+            "receiver": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "replayed": null,
+            "status": 202
+          },
+          "listed": {
+            "body": {
+              "control_scope": "shared_store",
+              "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+              "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+              "status": "waiting_for_input"
+            },
+            "cache_control": "no-store",
+            "receiver": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "replayed": null,
+            "status": 200
+          }
+        }
+      },
+      "terminals": {
+        "new": {
+          "body": {
+            "owner_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+            "run_id": "3e31864d-a858-40ed-8e9c-31e34f0d2636",
+            "status": "Success"
+          },
+          "cache_control": null,
+          "receiver": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+          "replayed": null,
+          "status": 200
+        },
+        "old": {
+          "body": {
+            "owner_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+            "run_id": "4ce89ee2-1e8b-476e-ac7b-0b39629549b8",
+            "status": "Success"
+          },
+          "cache_control": null,
+          "receiver": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+          "replayed": null,
+          "status": 200
+        }
+      }
+    },
+    "observer": {
+      "cleanup": {
+        "after": {
+          "capture_kind": null,
+          "capture_oid": "0",
+          "capture_owner": null,
+          "database_user": "ic007canary",
+          "function_config": [],
+          "function_oid": "0",
+          "function_owner": null,
+          "function_security_definer": null,
+          "source_oid": 16859,
+          "target_kind": null,
+          "target_oid": "0",
+          "target_owner": null,
+          "trigger_enabled": null,
+          "trigger_function_oid": "0",
+          "trigger_oid": "0",
+          "trigger_table_oid": "0"
+        },
+        "before": {
+          "capture_kind": "r",
+          "capture_oid": "17461",
+          "capture_owner": "ic007canary",
+          "database_user": "ic007canary",
+          "function_config": [
+            "search_path=pg_catalog"
+          ],
+          "function_oid": "17470",
+          "function_owner": "ic007canary",
+          "function_security_definer": false,
+          "source_oid": 16859,
+          "target_kind": "r",
+          "target_oid": "17450",
+          "target_owner": "ic007canary",
+          "trigger_enabled": "O",
+          "trigger_function_oid": "17470",
+          "trigger_oid": "17471",
+          "trigger_table_oid": "16859"
+        },
+        "cascade_used": false
+      },
+      "install": {
+        "after": {
+          "capture_kind": "r",
+          "capture_oid": "17461",
+          "capture_owner": "ic007canary",
+          "database_user": "ic007canary",
+          "function_config": [
+            "search_path=pg_catalog"
+          ],
+          "function_oid": "17470",
+          "function_owner": "ic007canary",
+          "function_security_definer": false,
+          "source_oid": 16859,
+          "target_kind": "r",
+          "target_oid": "17450",
+          "target_owner": "ic007canary",
+          "trigger_enabled": "O",
+          "trigger_function_oid": "17470",
+          "trigger_oid": "17471",
+          "trigger_table_oid": "16859"
+        },
+        "before": {
+          "capture_kind": null,
+          "capture_oid": "0",
+          "capture_owner": null,
+          "database_user": "ic007canary",
+          "function_config": [],
+          "function_oid": "0",
+          "function_owner": null,
+          "function_security_definer": null,
+          "source_oid": 16859,
+          "target_kind": null,
+          "target_oid": "0",
+          "target_owner": null,
+          "trigger_enabled": null,
+          "trigger_function_oid": "0",
+          "trigger_oid": "0",
+          "trigger_table_oid": "0"
+        },
+        "instrumented_secondary_evidence": true,
+        "names": {
+          "captures": "ic007_final_rw_v7_20260810_hitl_obs_cap",
+          "function": "ic007_final_rw_v7_20260810_hitl_obs_fn",
+          "idempotency": "ic007_final_rw_v7_20260810_idempotency",
+          "runs": "ic007_final_rw_v7_20260810_runs",
+          "schema": "public",
+          "source": "ic007_final_rw_v7_20260810_human_inputs",
+          "targets": "ic007_final_rw_v7_20260810_hitl_obs_tgt",
+          "trigger": "ic007_final_rw_v7_20260810_hitl_obs_trg"
+        },
+        "security": "invoker",
+        "source": {
+          "columns": [
+            [
+              "run_id",
+              "text",
+              false
+            ],
+            [
+              "question_id",
+              "text",
+              false
+            ],
+            [
+              "flow",
+              "text",
+              false
+            ],
+            [
+              "owner_instance_id",
+              "text",
+              false
+            ],
+            [
+              "key_hash",
+              "text",
+              false
+            ],
+            [
+              "attempt_id",
+              "text",
+              false
+            ],
+            [
+              "question_digest",
+              "text",
+              false
+            ],
+            [
+              "question_key_fingerprint",
+              "text",
+              false
+            ],
+            [
+              "question_nonce",
+              "bytea",
+              false
+            ],
+            [
+              "question_ciphertext",
+              "bytea",
+              false
+            ],
+            [
+              "answer_key_fingerprint",
+              "text",
+              true
+            ],
+            [
+              "answer_nonce",
+              "bytea",
+              true
+            ],
+            [
+              "answer_ciphertext",
+              "bytea",
+              true
+            ],
+            [
+              "state",
+              "text",
+              false
+            ],
+            [
+              "created_at",
+              "timestamp with time zone",
+              false
+            ],
+            [
+              "expires_at",
+              "timestamp with time zone",
+              false
+            ],
+            [
+              "answered_at",
+              "timestamp with time zone",
+              true
+            ]
+          ],
+          "database_user": "ic007canary",
+          "schema": "public",
+          "schema_create": true,
+          "source_count": 1,
+          "source_kind": "r",
+          "source_oid": "16859",
+          "source_owner": "ic007canary",
+          "source_select": true,
+          "source_trigger": true
+        }
+      },
+      "old_references_after_terminal": {
+        "old_references": "0|0|0"
+      },
+      "purpose": "transactional secondary evidence for encrypted pending-to-answered rows; no plaintext or raw ciphertext is retained",
+      "strict_order": [
+        "both Success terminal journal barriers",
+        "safe 2/2 observer summary",
+        "OID-bound cleanup without CASCADE",
+        "all observer OIDs zero",
+        "old question/answer/union references 0|0|0"
+      ]
+    },
+    "process_inventory": {
+      "expanded_old_stable": {
+        "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+        "instances": [
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613"
+            },
+            "port": "8080",
+            "process_start_id": "e07139d8-7f45-48f0-b780-7b276e9ae93c",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          },
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613"
+            },
+            "port": "8080",
+            "process_start_id": "f4c94941-324a-45b0-95c1-433bf4c013a4",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          }
+        ]
+      },
+      "mixed_active": {
+        "after": {
+          "new": {
+            "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+            "instances": [
+              {
+                "id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+                "status": "RUNNING"
+              },
+              {
+                "id": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+                "status": "RUNNING"
+              }
+            ],
+            "running_instances": [
+              "585f3a1d-9a56-4fdc-858c-58899afc3138",
+              "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a"
+            ],
+            "status": "SUCCESS"
+          },
+          "old": {
+            "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+            "instances": [
+              {
+                "id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+                "status": "RUNNING"
+              },
+              {
+                "id": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+                "status": "RUNNING"
+              }
+            ],
+            "running_instances": [
+              "461fc1b5-df3b-4586-bb55-822112e2fecb",
+              "c56893e2-5554-43a9-93c6-87041ebc94a8"
+            ],
+            "status": "SUCCESS"
+          }
+        },
+        "before": {
+          "new": {
+            "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+            "instances": [
+              {
+                "id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+                "status": "RUNNING"
+              },
+              {
+                "id": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+                "status": "RUNNING"
+              }
+            ],
+            "running_instances": [
+              "585f3a1d-9a56-4fdc-858c-58899afc3138",
+              "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a"
+            ],
+            "status": "SUCCESS"
+          },
+          "old": {
+            "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+            "instances": [
+              {
+                "id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+                "status": "RUNNING"
+              },
+              {
+                "id": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+                "status": "RUNNING"
+              }
+            ],
+            "running_instances": [
+              "461fc1b5-df3b-4586-bb55-822112e2fecb",
+              "c56893e2-5554-43a9-93c6-87041ebc94a8"
+            ],
+            "status": "SUCCESS"
+          }
+        },
+        "processes": [
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "461fc1b5-df3b-4586-bb55-822112e2fecb",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613"
+            },
+            "port": "8080",
+            "process_start_id": "e07139d8-7f45-48f0-b780-7b276e9ae93c",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          },
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "c56893e2-5554-43a9-93c6-87041ebc94a8",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613"
+            },
+            "port": "8080",
+            "process_start_id": "f4c94941-324a-45b0-95c1-433bf4c013a4",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          },
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "585f3a1d-9a56-4fdc-858c-58899afc3138",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf"
+            },
+            "port": "8080",
+            "process_start_id": "37905c1b-b621-4968-98d4-c5346bf187e9",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          },
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf"
+            },
+            "port": "8080",
+            "process_start_id": "960c7be7-2fc1-45b5-aace-203390861749",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          }
+        ],
+        "supervisor_start_command_sha256": "sha256:7778c2514d6ac9bee46f9c01f0d58bcc6fbd8d8a46655a9cfa8821033b29f8af"
+      },
+      "new_only": {
+        "deployment_id": "914e6fec-a39b-4398-b2e6-1cb05c5e4f21",
+        "instances": [
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1"
+            },
+            "port": "8080",
+            "process_start_id": "a4d32b14-de11-427b-872c-afb0e20862e0",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          },
+          {
+            "advertised": {
+              "artifact_fingerprint": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "config_fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow_fingerprint": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "hitl_keyring_fingerprint": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1",
+              "revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-031a037a2fec088ddb3a07ff8f9467734513a3ef2c52a6efe91ab119b5ad6cd5"
+            },
+            "cap_cache_control": "no-store",
+            "cap_instance_id": "2079b924-17e6-44af-9e99-aaebec10e59a",
+            "cap_status": 200,
+            "computed": {
+              "binary": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0",
+              "build_attestation": "sha256:197f85d6e692c63baf6634d7b8ea115a178e97de346c31bfb48b51f31619c9e1",
+              "config": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+              "flow": "sha256:7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+              "helpers": {
+                "config_contract.py": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+                "fingerprints.py": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+                "mock_provider.py": "sha256:319b0d9156ff159b42a3c64a66442d9c2f7eb53d6fc49c3808242d67272d154c"
+              },
+              "keyring": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1"
+            },
+            "port": "8080",
+            "process_start_id": "ae477290-fcd0-4ea1-9135-4a169d23be51",
+            "process_tree": {
+              "ironcrew_cmdlines": {
+                "2": [
+                  "/usr/local/bin/ironcrew",
+                  "serve",
+                  "--flows-dir",
+                  "/flows"
+                ]
+              },
+              "ironcrew_exe_sha256": {
+                "2": "sha256:b80ec1f50ad5f9842b9b826979bc7f1e984da1fe692730cdf7e9e1bd8a9467e0"
+              },
+              "ironcrew_pids": [
+                "2"
+              ],
+              "ironcrew_ppids": {
+                "2": 1
+              },
+              "ironcrew_uids": {
+                "2": 10001
+              },
+              "pid1": "python3",
+              "pid1_cmdline": [
+                "python3",
+                "-c",
+                "import subprocess,sys; p=subprocess.Popen(['/usr/local/bin/ironcrew','serve','--flows-dir','/flows']); sys.exit(p.wait())"
+              ],
+              "pid1_uid": 10001,
+              "proc_1_exe_sha256": "sha256:17b78e0a93175e86f9ac03141924fd7a7f0c0c52e66b34bfa0de20ffef989df1"
+            },
+            "ready": {
+              "component": "storage",
+              "status": "ready",
+              "version": "2.24.0"
+            },
+            "ready_status": 200
+          }
+        ]
+      }
+    },
+    "scope": "IC-016 expanded/old-active -> expanded/new-active -> zero old references -> new-only on a real Railway overlap"
+  },
+  "scans": {
+    "database_before_cleanup": {
+      "answered_mailbox_rows": 0,
+      "blocked_sessions": 0,
+      "observer_functions": 0,
+      "observer_relations": 0,
+      "pending_mailbox_rows": 0,
+      "postgres_connections": {
+        "idle": 4
+      },
+      "prefixed_sequences": 0,
+      "prefixes": [
+        {
+          "audit_events": 8,
+          "idempotency_rows": 2,
+          "mailbox_rows": 0,
+          "prefix": "ic007_final_rw_20260810_",
+          "run_events": 0,
+          "run_statuses": {
+            "success": 2
+          },
+          "runs": 2
+        },
+        {
+          "audit_events": 0,
+          "idempotency_rows": 0,
+          "mailbox_rows": 0,
+          "prefix": "ic007_final_rw_v6_20260810_",
+          "run_events": 0,
+          "run_statuses": {},
+          "runs": 0
+        },
+        {
+          "audit_events": 101,
+          "idempotency_rows": 7,
+          "mailbox_rows": 0,
+          "prefix": "ic007_final_rw_v7_20260810_",
+          "run_events": 7,
+          "run_statuses": {
+            "abandoned": 2,
+            "aborted": 6,
+            "failed": 2,
+            "success": 10,
+            "timed_out": 1
+          },
+          "runs": 21
+        },
+        {
+          "audit_events": 3,
+          "idempotency_rows": 1,
+          "mailbox_rows": 0,
+          "prefix": "ic007_final_rw_v7_quota_20260810_",
+          "run_events": 0,
+          "run_statuses": {
+            "failed": 1
+          },
+          "runs": 1
+        },
+        {
+          "audit_events": 3,
+          "idempotency_rows": 1,
+          "mailbox_rows": 0,
+          "prefix": "ic007_rw_v7_quota2_20260810_",
+          "run_events": 2,
+          "run_statuses": {
+            "aborted": 1
+          },
+          "runs": 1
+        }
+      ]
+    },
+    "logs": {
+      "bounded_lines": 5000,
+      "exact_secret_matches_total": 0,
+      "records": [
+        {
+          "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+          "error_keyword_lines": 0,
+          "error_level_lines": 116,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:01:26.555821966Z",
+          "invalid_lines": 0,
+          "label": "authoritative-old",
+          "last_timestamp": "2026-08-10T20:16:28.827159712Z",
+          "line_count": 174,
+          "stream": "runtime",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+          "error_keyword_lines": 0,
+          "error_level_lines": 0,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:01:08.937898743Z",
+          "invalid_lines": 0,
+          "label": "authoritative-old",
+          "last_timestamp": "2026-08-10T20:01:27.649294776Z",
+          "line_count": 45,
+          "stream": "build",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+          "error_keyword_lines": 0,
+          "error_level_lines": 116,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:09:19.906531493Z",
+          "invalid_lines": 0,
+          "label": "authoritative-expanded-new",
+          "last_timestamp": "2026-08-10T20:16:52.657927289Z",
+          "line_count": 174,
+          "stream": "runtime",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+          "error_keyword_lines": 0,
+          "error_level_lines": 0,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:08:34.227413363Z",
+          "invalid_lines": 0,
+          "label": "authoritative-expanded-new",
+          "last_timestamp": "2026-08-10T20:09:22.934510877Z",
+          "line_count": 48,
+          "stream": "build",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "914e6fec-a39b-4398-b2e6-1cb05c5e4f21",
+          "error_keyword_lines": 0,
+          "error_level_lines": 116,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:15:14.206030743Z",
+          "invalid_lines": 0,
+          "label": "authoritative-new-only",
+          "last_timestamp": "2026-08-10T20:17:24.867968213Z",
+          "line_count": 170,
+          "stream": "runtime",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "914e6fec-a39b-4398-b2e6-1cb05c5e4f21",
+          "error_keyword_lines": 0,
+          "error_level_lines": 0,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:14:56.707246193Z",
+          "invalid_lines": 0,
+          "label": "authoritative-new-only",
+          "last_timestamp": "2026-08-10T20:15:15.078949422Z",
+          "line_count": 45,
+          "stream": "build",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "b5e25199-4396-4dbc-8a42-0aab92fc72f9",
+          "error_keyword_lines": 0,
+          "error_level_lines": 0,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T14:45:19.321936211Z",
+          "invalid_lines": 0,
+          "label": "provider",
+          "last_timestamp": "2026-08-10T14:45:19.729210410Z",
+          "line_count": 2,
+          "stream": "runtime",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "b5e25199-4396-4dbc-8a42-0aab92fc72f9",
+          "error_keyword_lines": 0,
+          "error_level_lines": 0,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T14:44:52.712543468Z",
+          "invalid_lines": 0,
+          "label": "provider",
+          "last_timestamp": "2026-08-10T14:45:20.067305992Z",
+          "line_count": 49,
+          "stream": "build",
+          "warning_level_lines": 0
+        },
+        {
+          "deployment_id": "fd1293ab-b464-4fbe-bb35-e01e80d91e22",
+          "error_keyword_lines": 0,
+          "error_level_lines": 8,
+          "exact_secret_matches": 0,
+          "first_timestamp": "2026-08-10T20:04:44.671201070Z",
+          "invalid_lines": 0,
+          "label": "postgres-v7-window",
+          "last_timestamp": "2026-08-10T20:19:45.902242750Z",
+          "line_count": 8,
+          "stream": "runtime",
+          "warning_level_lines": 0
+        }
+      ],
+      "runtime_stream_note": "Railway labels Rust stderr records as error level; semantic error-keyword counts are recorded separately.",
+      "secret_patterns_checked": 8
+    },
+    "public_auth_boundary": [
+      {
+        "path": "/health/live",
+        "status": 200
+      },
+      {
+        "path": "/health/ready",
+        "status": 200
+      },
+      {
+        "cache_control": "no-store",
+        "path": "/capabilities",
+        "status": 401
+      },
+      {
+        "cache_control": "no-store",
+        "path": "/metrics",
+        "status": 401
+      }
+    ]
+  },
+  "schema": "ironcrew-railway-v7-platform-canary-v1",
+  "scope_boundary": "This receipt adds the only literal missing Railway requirement after the retained route, replay/conflict/cancellation/HITL/SSE, owner-replacement, and IC-020 lifecycle evidence. It does not claim a complete v7 rerun of those already accepted cases.",
+  "test_run": "ic007-final-v7-20260810"
+}

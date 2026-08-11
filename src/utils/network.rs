@@ -14,7 +14,7 @@ pub enum OutboundNetworkPolicy {
     AllowLoopback,
 }
 
-fn private_ips_override_enabled() -> bool {
+pub(crate) fn private_ips_override_enabled() -> bool {
     std::env::var("IRONCREW_ALLOW_PRIVATE_IPS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -32,6 +32,14 @@ pub fn validate_url_not_private(url: &str) -> Result<(), String> {
 }
 
 pub fn validate_url_with_policy(url: &str, policy: OutboundNetworkPolicy) -> Result<(), String> {
+    validate_url_with_private_access(url, policy, private_ips_override_enabled())
+}
+
+pub(crate) fn validate_url_with_private_access(
+    url: &str,
+    policy: OutboundNetworkPolicy,
+    allow_private: bool,
+) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!(
@@ -41,7 +49,7 @@ pub fn validate_url_with_policy(url: &str, policy: OutboundNetworkPolicy) -> Res
     }
 
     let host = parsed.host_str().ok_or("URL has no host")?;
-    if private_ips_override_enabled() {
+    if allow_private {
         return Ok(());
     }
     if host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
@@ -155,11 +163,19 @@ fn check_ip(ip: IpAddr, policy: OutboundNetworkPolicy) -> Result<(), String> {
 #[derive(Clone, Copy, Debug)]
 pub struct SafeDnsResolver {
     policy: OutboundNetworkPolicy,
+    allow_private: bool,
 }
 
 impl SafeDnsResolver {
     pub fn new(policy: OutboundNetworkPolicy) -> Self {
-        Self { policy }
+        Self::with_private_access(policy, private_ips_override_enabled())
+    }
+
+    pub(crate) fn with_private_access(policy: OutboundNetworkPolicy, allow_private: bool) -> Self {
+        Self {
+            policy,
+            allow_private,
+        }
     }
 }
 
@@ -173,6 +189,7 @@ impl Resolve for SafeDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let hostname = name.as_str().to_owned();
         let policy = self.policy;
+        let allow_private = self.allow_private;
         Box::pin(async move {
             let addresses = tokio::net::lookup_host((hostname.as_str(), 0))
                 .await
@@ -190,7 +207,7 @@ impl Resolve for SafeDnsResolver {
                     as Box<dyn std::error::Error + Send + Sync>);
             }
 
-            if !private_ips_override_enabled() {
+            if !allow_private {
                 // Loopback is only intentional for the literal loopback forms
                 // or the conventional localhost name. Do not let an arbitrary
                 // public-looking hostname rebind to 127/8 or ::1.
@@ -227,10 +244,20 @@ impl Resolve for SafeDnsResolver {
 /// the destination itself, bypassing the in-process resolver. Callers can still
 /// opt into private destinations explicitly with `IRONCREW_ALLOW_PRIVATE_IPS`.
 pub fn secure_client_builder(policy: OutboundNetworkPolicy) -> reqwest::ClientBuilder {
+    secure_client_builder_with_private_access(policy, private_ips_override_enabled())
+}
+
+pub(crate) fn secure_client_builder_with_private_access(
+    policy: OutboundNetworkPolicy,
+    allow_private: bool,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
-        .dns_resolver(SafeDnsResolver::new(policy))
-        .redirect(ssrf_redirect_policy_with_policy(policy))
+        .dns_resolver(SafeDnsResolver::with_private_access(policy, allow_private))
+        .redirect(ssrf_redirect_policy_with_private_access(
+            policy,
+            allow_private,
+        ))
 }
 
 /// Build an SSRF-aware client with redirects disabled. This is useful for
@@ -244,14 +271,22 @@ pub fn secure_no_redirect_client(
         .build()
 }
 
+#[allow(dead_code)] // public helper retained for embedders; built-ins use a captured override
 pub fn ssrf_redirect_policy_with_policy(
     policy: OutboundNetworkPolicy,
+) -> reqwest::redirect::Policy {
+    ssrf_redirect_policy_with_private_access(policy, private_ips_override_enabled())
+}
+
+fn ssrf_redirect_policy_with_private_access(
+    policy: OutboundNetworkPolicy,
+    allow_private: bool,
 ) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 10 {
             return attempt.error("too many redirects (max 10)".to_string());
         }
-        match validate_url_with_policy(attempt.url().as_str(), policy) {
+        match validate_url_with_private_access(attempt.url().as_str(), policy, allow_private) {
             Ok(()) => attempt.follow(),
             Err(reason) => attempt.error(reason),
         }

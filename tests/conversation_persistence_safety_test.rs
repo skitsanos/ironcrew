@@ -54,6 +54,7 @@ async fn failed_autosave_does_not_publish_or_duplicate_a_conversation_turn() {
         "test-model".into(),
         "system".into(),
         Some(10),
+        ironcrew::llm::provider::DEFAULT_CHAT_HISTORY_MAX_BYTES,
         false,
         2,
         EventBus::new(16),
@@ -64,6 +65,8 @@ async fn failed_autosave_does_not_publish_or_duplicate_a_conversation_turn() {
         true,
         temp.path().to_path_buf(),
         reqwest::Client::new(),
+        format!("sha256:{}", "1".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
     )
     .await
     .unwrap();

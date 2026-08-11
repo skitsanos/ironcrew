@@ -1,0 +1,272 @@
+{
+  "contract": {
+    "manifest_entries": 113,
+    "optional_values": 1,
+    "required_non_secret_values": 107,
+    "secret_presence_fields": 5,
+    "unexpected_non_secret_ironcrew_overrides": "fail_closed"
+  },
+  "cross_platform": {
+    "config_equality_claimed": false,
+    "difference": "provider URL, table prefix, secret-presence profile, platform identity, and routing are intentionally platform-specific",
+    "openshift_v7_config_fingerprint": "sha256:65d63e3ff35f7268f0b9365d8fbb39e3442ee7f3499b9a7e1277889e32391fc8"
+  },
+  "deployment_phases": [
+    {
+      "config_manifest": "v7_rotation",
+      "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+      "instance_ids": [
+        "461fc1b5-df3b-4586-bb55-822112e2fecb",
+        "c56893e2-5554-43a9-93c6-87041ebc94a8"
+      ],
+      "keyring_manifest": "expanded_old_active",
+      "phase": "expanded-old",
+      "process_start_ids": [
+        "e07139d8-7f45-48f0-b780-7b276e9ae93c",
+        "f4c94941-324a-45b0-95c1-433bf4c013a4"
+      ]
+    },
+    {
+      "config_manifest": "v7_rotation",
+      "deployment_id": "f8f98254-5d54-417c-817e-3b75b0c2dc83",
+      "instance_ids": [
+        "461fc1b5-df3b-4586-bb55-822112e2fecb",
+        "c56893e2-5554-43a9-93c6-87041ebc94a8"
+      ],
+      "keyring_manifest": "expanded_old_active",
+      "phase": "mixed-expanded-old",
+      "process_start_ids": [
+        "e07139d8-7f45-48f0-b780-7b276e9ae93c",
+        "f4c94941-324a-45b0-95c1-433bf4c013a4"
+      ]
+    },
+    {
+      "config_manifest": "v7_rotation",
+      "deployment_id": "f192da61-8766-45b2-a9eb-a4f69da844f5",
+      "instance_ids": [
+        "585f3a1d-9a56-4fdc-858c-58899afc3138",
+        "b33c903d-6e5f-4c16-b5fd-5c86b34faf1a"
+      ],
+      "keyring_manifest": "expanded_new_active",
+      "phase": "mixed-expanded-new",
+      "process_start_ids": [
+        "37905c1b-b621-4968-98d4-c5346bf187e9",
+        "960c7be7-2fc1-45b5-aace-203390861749"
+      ]
+    },
+    {
+      "config_manifest": "v7_rotation",
+      "deployment_id": "914e6fec-a39b-4398-b2e6-1cb05c5e4f21",
+      "instance_ids": [
+        "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+        "2079b924-17e6-44af-9e99-aaebec10e59a"
+      ],
+      "keyring_manifest": "new_only",
+      "phase": "new-only",
+      "process_start_ids": [
+        "a4d32b14-de11-427b-872c-afb0e20862e0",
+        "ae477290-fcd0-4ea1-9135-4a169d23be51"
+      ]
+    }
+  ],
+  "effective_config_manifests": {
+    "v7_rotation": {
+      "fingerprint": "sha256:2fdce42777ac9107eca671fe031cfa2a8913abf99b54db1f510d1a4daaa6e6a2",
+      "values": {
+        "DATABASE_URL_PRESENT": "true",
+        "IRONCREW_ADMISSION_CONTROL_BURST": "present:20",
+        "IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE": "present:120",
+        "IRONCREW_ADMISSION_OBSERVATION_BURST": "present:20",
+        "IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE": "present:600",
+        "IRONCREW_ADMISSION_WORK_BURST": "present:10",
+        "IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE": "present:60",
+        "IRONCREW_ALLOW_PRIVATE_IPS": "present:true",
+        "IRONCREW_ALLOW_UNAUTHENTICATED": "present:false",
+        "IRONCREW_API_CONVERSATION_MAX_HISTORY": "present:50",
+        "IRONCREW_API_MESSAGE_MAX_BYTES": "present:262144",
+        "IRONCREW_API_PRINCIPAL": "present:platform-canary",
+        "IRONCREW_API_TOKENS_PRESENT": "false",
+        "IRONCREW_API_TOKEN_PRESENT": "true",
+        "IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES": "present:16384",
+        "IRONCREW_ASK_HUMAN_MAX_CHOICES": "present:16",
+        "IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES": "present:16384",
+        "IRONCREW_ASK_HUMAN_MAX_PENDING": "present:8",
+        "IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES": "present:262144",
+        "IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES": "present:16384",
+        "IRONCREW_ASK_HUMAN_MAX_TIMEOUT": "present:300",
+        "IRONCREW_ASK_HUMAN_TIMEOUT": "present:120",
+        "IRONCREW_CHAT_HISTORY_MAX_BYTES": "present:33554432",
+        "IRONCREW_CHAT_SESSION_IDLE_SECS": "present:1800",
+        "IRONCREW_CONVERSATION_MAX_HISTORY": "present:50",
+        "IRONCREW_CREW_GOAL_MAX_BYTES": "present:65536",
+        "IRONCREW_DB_CONNECT_BACKOFF_MS": "present:1000",
+        "IRONCREW_DB_CONNECT_RETRIES": "present:10",
+        "IRONCREW_DB_CONNECT_TIMEOUT_SECS": "present:30",
+        "IRONCREW_DB_POOL_SIZE": "present:2",
+        "IRONCREW_ENV_ALLOWLIST": "present:PLATFORM_CANARY_PROVIDER_BASE_URL",
+        "IRONCREW_EVENT_CHANNEL_CAPACITY": "present:8",
+        "IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES": "present:16777216",
+        "IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS": "present:2000",
+        "IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES": "present:131072",
+        "IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS": "present:250",
+        "IRONCREW_EVENT_JOURNAL_PRUNE_BATCH": "present:100",
+        "IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS": "present:2000",
+        "IRONCREW_EVENT_JOURNAL_RETENTION_SECS": "present:600",
+        "IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS": "present:5000",
+        "IRONCREW_EVENT_MAX_BYTES": "present:65536",
+        "IRONCREW_EVENT_REPLAY_MAX_BYTES": "present:1048576",
+        "IRONCREW_FILE_WRITE_MAX_BYTES": "present:262144",
+        "IRONCREW_FILE_WRITE_ROOT": "present:/data/outputs",
+        "IRONCREW_HITL_ENCRYPTION_KEYS_PRESENT": "true",
+        "IRONCREW_HITL_PG_MAX_CONCURRENT_READS": "present:1",
+        "IRONCREW_HITL_POLL_INTERVAL_MS": "present:5000",
+        "IRONCREW_HITL_READ_TIMEOUT_MS": "present:2000",
+        "IRONCREW_HTTP_MAX_HEADER_BYTES": "present:32768",
+        "IRONCREW_HTTP_MAX_JSON_BYTES": "present:262144",
+        "IRONCREW_HTTP_MAX_OUTPUT_BYTES": "present:524288",
+        "IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES": "present:262144",
+        "IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES": "present:32768",
+        "IRONCREW_HTTP_MAX_RESPONSE_BYTES": "present:262144",
+        "IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL": "present:8",
+        "IRONCREW_IDEMPOTENCY_MAX_RECORDS": "present:1000",
+        "IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL": "present:250",
+        "IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES": "present:1048576",
+        "IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES": "present:16777216",
+        "IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL": "present:4194304",
+        "IRONCREW_IDEMPOTENCY_PRUNE_BATCH": "present:100",
+        "IRONCREW_IDEMPOTENCY_TTL_SECONDS": "present:7200",
+        "IRONCREW_LOG": "present:info",
+        "IRONCREW_LUA_FS_MAX_READ_BYTES": "present:1048576",
+        "IRONCREW_LUA_FS_MAX_WRITE_BYTES": "present:1048576",
+        "IRONCREW_LUA_JSON_MAX_DEPTH": "present:64",
+        "IRONCREW_LUA_JSON_MAX_NODES": "present:100000",
+        "IRONCREW_LUA_JSON_MAX_OUTPUT_BYTES": "present:16777216",
+        "IRONCREW_LUA_JSON_MAX_STRING_BYTES": "present:8388608",
+        "IRONCREW_LUA_MAX_EXECUTION_SECONDS": "present:300",
+        "IRONCREW_LUA_MAX_INSTRUCTIONS": "present:10000000",
+        "IRONCREW_LUA_MAX_MEMORY_BYTES": "present:16777216",
+        "IRONCREW_LUA_MAX_SOURCE_BYTES": "present:1048576",
+        "IRONCREW_MAX_ACTIVE_CONVERSATIONS": "present:2",
+        "IRONCREW_MAX_ACTIVE_RUNS": "present:2",
+        "IRONCREW_MAX_AGENTS": "present:64",
+        "IRONCREW_MAX_BODY_SIZE": "present:10485760",
+        "IRONCREW_MAX_CONCURRENT_TASKS": "present:2",
+        "IRONCREW_MAX_CONVERSATION_LIFECYCLES": "present:32",
+        "IRONCREW_MAX_CONVERSATION_TURN_SECS": "present:300",
+        "IRONCREW_MAX_EVENTS": "present:256",
+        "IRONCREW_MAX_PROMPT_CHARS": "present:16384",
+        "IRONCREW_MAX_REASONING_BYTES": "present:1048576",
+        "IRONCREW_MAX_RUN_LIFETIME": "present:300",
+        "IRONCREW_MAX_SSE_CONNECTIONS": "present:8",
+        "IRONCREW_MAX_TASKS": "present:8",
+        "IRONCREW_MAX_TASK_RETRIES": "present:10",
+        "IRONCREW_MAX_TASK_TIMEOUT_SECS": "present:86400",
+        "IRONCREW_MCP_ALLOWED_COMMANDS": "present:__disabled__",
+        "IRONCREW_MCP_ALLOWED_HTTP_HOSTS": "present:__disabled__",
+        "IRONCREW_MCP_ALLOW_LOCALHOST": "present:false",
+        "IRONCREW_MCP_TOOL_RESULT_MAX_BYTES": "present:262144",
+        "IRONCREW_PG_TABLE_PREFIX": "present:ic007_final_rw_v7_20260810_",
+        "IRONCREW_PROVIDER_MAX_ERROR_BYTES": "present:65536",
+        "IRONCREW_PROVIDER_MAX_OUTPUT_BYTES": "present:1048576",
+        "IRONCREW_PROVIDER_MAX_RESPONSE_BYTES": "present:1048576",
+        "IRONCREW_PROVIDER_MAX_STREAM_BYTES": "present:2097152",
+        "IRONCREW_READINESS_CACHE_MS": "present:500",
+        "IRONCREW_REQUIRE_IDEMPOTENCY_KEY": "present:true",
+        "IRONCREW_RUN_LEASE_TTL_SECONDS": "present:60",
+        "IRONCREW_RUN_RESULTS_MAX_BYTES": "present:4194304",
+        "IRONCREW_RUN_SSE_RETENTION_SECS": "present:5",
+        "IRONCREW_SHUTDOWN_DRAIN_MS": "present:1000",
+        "IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS": "present:5",
+        "IRONCREW_SHUTDOWN_TIMEOUT_SECS": "present:15",
+        "IRONCREW_SSE_OUTPUT_MAX_CHARS": "absent",
+        "IRONCREW_STORE": "present:postgres",
+        "IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES": "present:1048576",
+        "IRONCREW_TASK_RESULT_MAX_REASONING_BYTES": "present:524288",
+        "IRONCREW_TOOL_TIMEOUT": "present:60",
+        "IRONCREW_TRUST_PROXY": "present:false",
+        "OPENAI_API_KEY_PRESENT": "false",
+        "PLATFORM_CANARY_PROVIDER_BASE_URL": "present:http://ic007-final-provider.railway.internal:8080/v1"
+      }
+    }
+  },
+  "environment_id": "4ef85b76-84c6-470f-8a18-825c4d32222a",
+  "extraction": {
+    "advertised_and_computed_match": true,
+    "field_count_per_process": [
+      113,
+      113
+    ],
+    "instance_ids": [
+      "021524f9-b3b3-4ef1-8368-70a4b88d52af",
+      "2079b924-17e6-44af-9e99-aaebec10e59a"
+    ],
+    "manifests_identical": true,
+    "source": "independent targeted Railway SSH into each final IronCrew child process environment"
+  },
+  "keyring_manifests": {
+    "expanded_new_active": {
+      "active_key_id": "new",
+      "active_material_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+      "configured": true,
+      "fingerprint": "sha256:4b8bed9d1f66d878c75ece05ca127c252443cf78136bd7c581b056d1edb0d0cf",
+      "material_retained": false,
+      "readable_material_fingerprints": [
+        "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+        "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09"
+      ],
+      "readable_keys": {
+        "new": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+        "old": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada"
+      }
+    },
+    "expanded_old_active": {
+      "active_key_id": "old",
+      "active_material_fingerprint": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+      "configured": true,
+      "fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613",
+      "material_retained": false,
+      "readable_material_fingerprints": [
+        "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada",
+        "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09"
+      ],
+      "readable_keys": {
+        "new": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+        "old": "ccd041c57de0a2e3924c541d58208a8836f36fb62946e931f184c8238fb43ada"
+      }
+    },
+    "new_only": {
+      "active_key_id": "new",
+      "active_material_fingerprint": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09",
+      "configured": true,
+      "fingerprint": "sha256:0573837f87b58edb018b661d86eebaf63a377c78e03547b5d9d50e197b507df1",
+      "material_retained": false,
+      "readable_material_fingerprints": [
+        "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09"
+      ],
+      "readable_keys": {
+        "new": "d2e776b6e0ffaa85c31b17118aa273e9be5c92c73e410b3719533e3d11e0df09"
+      }
+    }
+  },
+  "platform": "railway",
+  "platform_bindings": {
+    "injected_port": "8080",
+    "platform_manifest_delta": {
+      "overlap_seconds": 600,
+      "supervisor_start_command_sha256": "sha256:7778c2514d6ac9bee46f9c01f0d58bcc6fbd8d8a46655a9cfa8821033b29f8af"
+    },
+    "private_provider_url": "http://ic007-final-provider.railway.internal:8080/v1",
+    "rotation_only_overrides": {
+      "IRONCREW_HITL_POLL_INTERVAL_MS": "5000",
+      "IRONCREW_LUA_MAX_EXECUTION_SECONDS": "300"
+    },
+    "table_prefix": "ic007_final_rw_v7_20260810_"
+  },
+  "project_id": "d0eda4bf-f0ed-4258-bdb6-5b76cfdb8761",
+  "schema": "ironcrew-platform-effective-config-receipt-v1",
+  "secrets": {
+    "representation": "presence booleans, keyring fingerprints, and random-key material fingerprints only",
+    "values_retained": false
+  },
+  "test_run": "ic007-final-v7-20260810"
+}

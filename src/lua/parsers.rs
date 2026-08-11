@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mlua::{Function, Result as LuaResult, Table, Value};
 
@@ -374,10 +375,17 @@ pub struct LuaToolDef {
     pub description: String,
     pub parameters: serde_json::Value,
     pub source_path: PathBuf,
+    /// The same bytes that produced the validated metadata above. Runtime
+    /// registration must never reopen `source_path` and execute different code.
+    pub source: Arc<str>,
 }
 
 /// Parse tool definition from a Lua table. Validates all required fields including execute.
-pub fn tool_def_from_lua_table(table: &Table, source_path: &Path) -> LuaResult<LuaToolDef> {
+pub fn tool_def_from_lua_table(
+    table: &Table,
+    source_path: &Path,
+    source: Arc<str>,
+) -> LuaResult<LuaToolDef> {
     let name: String = table.raw_get("name")?;
     let description: String = table.raw_get("description")?;
     validate_provider_name(&name, "tool.name")?;
@@ -457,46 +465,80 @@ pub fn tool_def_from_lua_table(table: &Table, source_path: &Path) -> LuaResult<L
         description,
         parameters: schema,
         source_path: source_path.to_path_buf(),
+        source,
     })
 }
 
-/// Load tool definitions from Lua files (metadata only, not execute functions).
+/// Parse tool metadata while retaining the exact validated source for execution.
 pub fn load_tool_defs_from_files(files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
+    load_tool_defs_from_files_inner(files, false)
+}
+
+fn load_tool_defs_from_files_inner(
+    files: &[PathBuf],
+    http_conversation_bootstrap: bool,
+) -> Result<Vec<LuaToolDef>> {
     let mut tools = Vec::new();
     for file in files {
-        let source = crate::lua::source::read_lua_source(file).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
-        })?;
-        let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
-        let table: Table = {
-            let _execution = LuaExecutionGuard::begin(&tool_lua).map_err(IronCrewError::Lua)?;
-            tool_lua
-                .load(&source)
-                .into_function()
-                .map_err(IronCrewError::Lua)?
-                .call(())
-                .map_err(IronCrewError::Lua)?
-        };
-        let tool_def = tool_def_from_lua_table(&table, file).map_err(|e| {
-            IronCrewError::Validation(format!(
-                "Invalid tool definition in {}: {}",
-                file.display(),
-                e
-            ))
-        })?;
-        if tool_def.name.starts_with("agent__") {
-            return Err(IronCrewError::Validation(format!(
-                "Custom Lua tool at {} uses the reserved prefix 'agent__' \
-                 (tool name '{}'). This prefix is reserved for agent-as-tool \
-                 references.",
-                file.display(),
-                tool_def.name
-            )));
-        }
-        tracing::info!("Loaded tool '{}' from {}", tool_def.name, file.display());
-        tools.push(tool_def);
+        let source: Arc<str> = crate::lua::source::read_lua_source(file)
+            .map(Arc::from)
+            .map_err(|e| {
+                IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
+            })?;
+        tools.push(parse_tool_source(
+            file,
+            source,
+            http_conversation_bootstrap,
+        )?);
     }
     Ok(tools)
+}
+
+pub(crate) fn load_tool_defs_from_snapshot(
+    sources: &[crate::engine::conversation_definition::SnapshotLuaSource],
+) -> Result<Vec<LuaToolDef>> {
+    sources
+        .iter()
+        .map(|source| parse_tool_source(source.relative_path(), source.shared_source(), true))
+        .collect()
+}
+
+fn parse_tool_source(
+    file: &Path,
+    source: Arc<str>,
+    http_conversation_bootstrap: bool,
+) -> Result<LuaToolDef> {
+    let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+    if http_conversation_bootstrap {
+        tool_lua.set_app_data(super::bootstrap::HttpConversationBootstrap);
+    }
+    let table: Table = {
+        let _execution = LuaExecutionGuard::begin(&tool_lua).map_err(IronCrewError::Lua)?;
+        tool_lua
+            .load(source.as_ref())
+            .into_function()
+            .map_err(IronCrewError::Lua)?
+            .call(())
+            .map_err(IronCrewError::Lua)?
+    };
+    let tool_def = tool_def_from_lua_table(&table, file, source).map_err(|e| {
+        IronCrewError::Validation(format!(
+            "Invalid tool definition in {}: {}",
+            file.display(),
+            e
+        ))
+    })?;
+    if tool_def.name.starts_with("agent__") {
+        return Err(IronCrewError::Validation(format!(
+            "Custom Lua tool at {} uses the reserved prefix 'agent__' \
+                 (tool name '{}'). This prefix is reserved for agent-as-tool \
+                 references.",
+            file.display(),
+            tool_def.name
+        )));
+    }
+    tracing::info!("Loaded tool '{}' from {}", tool_def.name, file.display());
+    Ok(tool_def)
 }
 
 // ---------------------------------------------------------------------------
@@ -505,32 +547,65 @@ pub fn load_tool_defs_from_files(files: &[PathBuf]) -> Result<Vec<LuaToolDef>> {
 
 /// Load agent definitions from Lua files.
 pub fn load_agents_from_files(files: &[PathBuf]) -> Result<Vec<Agent>> {
+    load_agents_from_files_inner(files, false)
+}
+
+fn load_agents_from_files_inner(
+    files: &[PathBuf],
+    http_conversation_bootstrap: bool,
+) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     for file in files {
-        let source = crate::lua::source::read_lua_source(file).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
-        })?;
-        let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
-        let table: Table = {
-            let _execution = LuaExecutionGuard::begin(&tool_lua).map_err(IronCrewError::Lua)?;
-            tool_lua
-                .load(&source)
-                .into_function()
-                .map_err(IronCrewError::Lua)?
-                .call(())
-                .map_err(IronCrewError::Lua)?
-        };
-        let agent = agent_from_lua_table(&table).map_err(|e| {
-            IronCrewError::Validation(format!(
-                "Invalid agent definition in {}: {}",
-                file.display(),
-                e
-            ))
-        })?;
-        tracing::info!("Loaded agent '{}' from {}", agent.name, file.display());
-        agents.push(agent);
+        let source: Arc<str> = crate::lua::source::read_lua_source(file)
+            .map(Arc::from)
+            .map_err(|e| {
+                IronCrewError::Validation(format!("Failed to read {}: {}", file.display(), e))
+            })?;
+        agents.push(parse_agent_source(
+            file,
+            source,
+            http_conversation_bootstrap,
+        )?);
     }
     Ok(agents)
+}
+
+pub(crate) fn load_agents_from_snapshot(
+    sources: &[crate::engine::conversation_definition::SnapshotLuaSource],
+) -> Result<Vec<Agent>> {
+    sources
+        .iter()
+        .map(|source| parse_agent_source(source.relative_path(), source.shared_source(), true))
+        .collect()
+}
+
+fn parse_agent_source(
+    file: &Path,
+    source: Arc<str>,
+    http_conversation_bootstrap: bool,
+) -> Result<Agent> {
+    let tool_lua = create_tool_lua().map_err(IronCrewError::Lua)?;
+    if http_conversation_bootstrap {
+        tool_lua.set_app_data(super::bootstrap::HttpConversationBootstrap);
+    }
+    let table: Table = {
+        let _execution = LuaExecutionGuard::begin(&tool_lua).map_err(IronCrewError::Lua)?;
+        tool_lua
+            .load(source.as_ref())
+            .into_function()
+            .map_err(IronCrewError::Lua)?
+            .call(())
+            .map_err(IronCrewError::Lua)?
+    };
+    let agent = agent_from_lua_table(&table).map_err(|e| {
+        IronCrewError::Validation(format!(
+            "Invalid agent definition in {}: {}",
+            file.display(),
+            e
+        ))
+    })?;
+    tracing::info!("Loaded agent '{}' from {}", agent.name, file.display());
+    Ok(agent)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +839,7 @@ mod parser_agent_tool_validation {
             .set("execute", lua.create_function(|_, ()| Ok(())).unwrap())
             .unwrap();
         assert!(
-            tool_def_from_lua_table(&table, Path::new("tool.lua"))
+            tool_def_from_lua_table(&table, Path::new("tool.lua"), Arc::from("return {}"))
                 .err()
                 .unwrap()
                 .to_string()
@@ -776,7 +851,7 @@ mod parser_agent_tool_validation {
         parameters.set("query", "not a table").unwrap();
         table.set("parameters", parameters).unwrap();
         assert!(
-            tool_def_from_lua_table(&table, Path::new("tool.lua"))
+            tool_def_from_lua_table(&table, Path::new("tool.lua"), Arc::from("return {}"))
                 .err()
                 .unwrap()
                 .to_string()

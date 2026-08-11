@@ -6,6 +6,7 @@ use crate::utils::error::{IronCrewError, Result};
 
 const MAX_REQUEST_BODY_HARD_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
+const MAX_SHUTDOWN_ROUTING_GRACE_SECS: u64 = 300;
 const MAX_SHUTDOWN_DRAIN_MS: u64 = 30_000;
 
 enum StartupPruneOutcome {
@@ -158,6 +159,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let public_bind = public_bind_requires_auth(host);
     prepare_file_write_root(public_bind, &flows_dir)?;
     require_public_mcp_policy(public_bind)?;
+    let runtime_identity = api::deployment::RuntimeIdentity::from_env()?;
     let auth = Arc::new(api::auth::AuthConfig::from_env()?);
     let admission = Arc::new(api::admission::AdmissionController::from_env()?);
     if public_bind
@@ -206,6 +208,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     };
 
     let max_active_conversations = api::conversations::max_active_conversations();
+    let max_active_conversation_lifecycles =
+        api::conversation_lifecycle::max_active_conversation_lifecycles();
     let max_active_runs = api::handlers::max_active_runs();
     let max_sse_connections = api::handlers::max_sse_connections();
     let max_run_lifetime = api::handlers::max_run_lifetime();
@@ -233,11 +237,17 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     }
     let state = Arc::new(api::AppState {
         flows_dir: flows_dir.clone(),
+        runtime_identity,
         auth,
         admission,
-        accepting_traffic: std::sync::atomic::AtomicBool::new(true),
+        lifecycle: api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                max_active_conversation_lifecycles,
+            ),
+        ),
         max_active_conversations,
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_active_conversations)),
         max_active_runs,
@@ -295,7 +305,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     });
 
     // Background task: evict idle chat session handles.
-    tokio::spawn(api::conversations::idle_eviction_loop(state.clone()));
+    let idle_eviction_handle = tokio::spawn(api::conversations::idle_eviction_loop(state.clone()));
 
     // CORS: use IRONCREW_CORS_ORIGINS env var (comma-separated) or deny all
     let cors = match std::env::var("IRONCREW_CORS_ORIGINS") {
@@ -329,6 +339,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
                 ])
                 .expose_headers([
                     api::idempotency::IDEMPOTENCY_REPLAYED_HEADER,
+                    api::lifecycle::INSTANCE_ID_HEADER,
                     http::header::RETRY_AFTER,
                 ])
         }
@@ -379,151 +390,35 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     println!("  DELETE /flows/{{flow}}/conversations/{{id}}          - Delete a conversation");
     println!("  GET    /nodes                         - List built-in tools");
 
-    // Hard deadline applied *after* the shutdown signal fires — if
-    // clients hold connections open past this budget we exit anyway
-    // instead of hanging the process. Configurable via
-    // `IRONCREW_SHUTDOWN_TIMEOUT_SECS` (default 10 s).
+    // After SIGTERM/Ctrl-C, fail readiness and reject mutations for a bounded
+    // routing interval before stopping the listener. The teardown deadline
+    // begins only once the lifecycle advances to stopping.
+    let routing_grace_secs = bounded_env_u64(
+        "IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS",
+        5,
+        0,
+        MAX_SHUTDOWN_ROUTING_GRACE_SECS,
+    )?;
     let shutdown_timeout_secs = bounded_env_u64(
         "IRONCREW_SHUTDOWN_TIMEOUT_SECS",
         10,
         1,
         MAX_SHUTDOWN_TIMEOUT_SECS,
     )?;
-
-    // Signal-flag channel: the graceful-shutdown future fires `tx` the
-    // moment a signal arrives so the hard-deadline timer can start
-    // counting from that point (not from server startup).
-    let (tx_signaled, rx_signaled) = tokio::sync::oneshot::channel::<()>();
-    let mut tx_signaled = Some(tx_signaled);
-
-    // Graceful shutdown: listen for SIGTERM (Kubernetes) and Ctrl+C. On
-    // signal, actively tear down the per-session state so long-lived SSE
-    // streams terminate and axum's graceful-shutdown future can resolve.
-    // Without this, axum waits for every in-flight EventSource
-    // connection to complete, which never happens with keepalives.
-    let shutdown_state = state.clone();
-    let shutdown = async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => tracing::info!("Received Ctrl+C, shutting down"),
-                _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-            tracing::info!("Received Ctrl+C, shutting down");
-        }
-
-        // Start the hard-deadline clock as early as possible so the
-        // teardown below can't blow past the budget.
-        if let Some(tx) = tx_signaled.take() {
-            let _ = tx.send(());
-        }
-
-        // Fail readiness before cancelling or draining any work, allowing
-        // Railway/OpenShift routing to stop sending new requests first.
-        shutdown_state
-            .accepting_traffic
-            .store(false, std::sync::atomic::Ordering::Release);
-
-        // Take ownership of all active runs, abort their work, then wait until
-        // each monitor has persisted and emitted its terminal state before
-        // dropping the handles/event buses.
-        let mut active_runs: Vec<api::ActiveRun> = {
-            let mut map = shutdown_state.active_runs.write().await;
-            map.drain().map(|(_, run)| run).collect()
-        };
-        let run_count = active_runs.len();
-        for run in &active_runs {
-            run.abort_handle.abort();
-        }
-        for run in &mut active_runs {
-            if !*run.terminal.borrow() {
-                let _ = run.terminal.changed().await;
-            }
-        }
-        if run_count > 0 {
-            tracing::info!(run_count, "Terminalized active runs");
-        }
-        drop(active_runs);
-
-        // Cancel active chat turns, wait for their rollback guards to release
-        // the per-session lock, then make one final revision-guarded save.
-        // Holding the drained Arcs keeps event buses and admission permits
-        // alive until this drain is complete.
-        let active_conversations = {
-            let mut map = shutdown_state.active_conversations.write().await;
-            map.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
-        };
-        for handle in &active_conversations {
-            handle.shutdown.send_replace(true);
-        }
-        for handle in &active_conversations {
-            let _turn_guard = handle.turn_lock.lock().await;
-            if let Err(error) = handle.conv.persist().await {
-                tracing::warn!(
-                    conversation_id = %handle.id,
-                    %error,
-                    "Failed to persist conversation while draining shutdown"
-                );
-            }
-        }
-        if !active_conversations.is_empty() {
-            tracing::info!(
-                count = active_conversations.len(),
-                "Cancelled and closed active chat sessions"
-            );
-        }
-        drop(active_conversations);
-    };
-
-    let serve_fut = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown);
-
-    // Race the server against a post-signal timeout. The timeout future
-    // first waits for the signal, then sleeps `shutdown_timeout_secs`;
-    // if axum hasn't finished by then we exit anyway.
-    let hard_deadline = async move {
-        let _ = rx_signaled.await;
-        tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout_secs)).await;
-    };
-
-    tokio::select! {
-        result = serve_fut => {
-            result.map_err(|e| IronCrewError::Validation(format!("Server error: {}", e)))?;
-        }
-        _ = hard_deadline => {
-            tracing::warn!(
-                "Graceful shutdown exceeded {}s — exiting anyway",
-                shutdown_timeout_secs
-            );
-        }
-    }
-
-    heartbeat_handle.abort();
-    let _ = heartbeat_handle.await;
-
-    // Post-serve drain window: background tasks spawned from `Drop` paths
-    // (notably `McpConnectionManager::shutdown_blocking` for reaping stdio
-    // MCP child processes) need a moment to complete before the tokio
-    // runtime tears them down. Configurable for cloud deployments with
-    // tight SIGTERM grace periods (Kubernetes `terminationGracePeriodSeconds`).
     let drain_ms = bounded_env_u64("IRONCREW_SHUTDOWN_DRAIN_MS", 1000, 0, MAX_SHUTDOWN_DRAIN_MS)?;
-    if drain_ms > 0 {
-        tracing::info!(drain_ms, "Draining background shutdown tasks");
-        tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
-    }
-
-    Ok(())
+    super::server_shutdown::serve_with_lifecycle(
+        listener,
+        app,
+        state,
+        heartbeat_handle,
+        idle_eviction_handle,
+        super::server_shutdown::ShutdownConfig {
+            routing_grace: std::time::Duration::from_secs(routing_grace_secs),
+            teardown_timeout: std::time::Duration::from_secs(shutdown_timeout_secs),
+            background_drain: std::time::Duration::from_millis(drain_ms),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

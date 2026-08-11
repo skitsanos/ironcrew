@@ -23,6 +23,7 @@
 pub mod bridge;
 pub mod client;
 pub mod config;
+mod execution_policy;
 pub mod manager;
 
 pub use config::{McpConfig, parse_mcp_config};

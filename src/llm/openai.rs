@@ -12,6 +12,7 @@ pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
     rate_limit: Option<RateLimiter>,
+    execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
 /// Simple token-bucket rate limiter for LLM API calls.
@@ -49,17 +50,15 @@ impl OpenAiProvider {
         .build()
         .expect("Failed to build HTTP client");
 
-        // Optional rate limiting via env var (milliseconds between calls)
-        let rate_limit = std::env::var("IRONCREW_RATE_LIMIT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(RateLimiter::new);
+        // Capture provider policy once so durable conversation identity and
+        // execution cannot drift between replicas or later environment reads.
+        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         if rate_limit.is_some() {
             tracing::info!(
                 "LLM rate limiting enabled: {}ms between calls",
-                std::env::var("IRONCREW_RATE_LIMIT_MS").unwrap_or_default()
+                execution_policy.rate_limit_ms().unwrap_or_default()
             );
         }
 
@@ -68,6 +67,7 @@ impl OpenAiProvider {
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             api_key,
             rate_limit,
+            execution_policy,
         }
     }
 
@@ -207,15 +207,9 @@ impl OpenAiProvider {
         // Read with a strict byte budget before parsing. This remains resilient
         // to HTTP/2 framing quirks without allowing an unbounded allocation.
         let response_limit = if status.is_success() {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_RESPONSE_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_RESPONSE_BYTES,
-            )
+            self.execution_policy.response_bytes()
         } else {
-            crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            )
+            self.execution_policy.error_bytes()
         };
         let resp_bytes =
             crate::utils::http::read_response_bytes(resp, response_limit, "OpenAI response")
@@ -322,10 +316,7 @@ impl OpenAiProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let limit = crate::utils::http::byte_limit_from_env(
-                "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-                crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-            );
+            let limit = self.execution_policy.error_bytes();
             let bytes =
                 crate::utils::http::read_response_bytes(resp, limit, "OpenAI error response")
                     .await
@@ -346,10 +337,7 @@ impl OpenAiProvider {
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
-        let output_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_OUTPUT_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_OUTPUT_BYTES,
-        );
+        let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
         // Track tool call assembly (streaming sends deltas)
         let mut tool_call_buffers: std::collections::HashMap<usize, (String, String, String)> =
@@ -358,10 +346,7 @@ impl OpenAiProvider {
         // Read SSE stream
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        let stream_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_STREAM_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_STREAM_BYTES,
-        );
+        let stream_limit = self.execution_policy.stream_bytes();
         let mut buffer = crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI stream");
         // Track terminal delivery: a mid-stream `{"error": …}` chunk or a stream
         // that ends before `data: [DONE]` must fail rather than return whatever
@@ -583,6 +568,16 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn execution_fingerprint(&self) -> Result<String> {
+        crate::engine::conversation_provider::provider_execution_fingerprint(
+            "openai",
+            &self.base_url,
+            &serde_json::json!({
+                "execution_policy": self.execution_policy.definition(),
+            }),
+        )
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         tracing::debug!(
             provider = "openai",

@@ -18,14 +18,63 @@ const DEFAULT_GLOB_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const HARD_GLOB_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const HARD_GLOB_PATTERN_BYTES: usize = 8 * 1024;
 
-#[derive(Default)]
 pub struct FileReadGlobTool {
-    base_dir: Option<PathBuf>,
+    root: super::execution_policy::CapabilityRoot,
+    max_files: usize,
+    max_total_bytes: usize,
+    max_entries: usize,
+    max_file_bytes: usize,
+    max_output_bytes: usize,
+}
+
+impl Default for FileReadGlobTool {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl FileReadGlobTool {
     pub fn new(base_dir: Option<PathBuf>) -> Self {
-        Self { base_dir }
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(base_dir),
+            max_files: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_FILES",
+                DEFAULT_GLOB_MAX_FILES,
+                HARD_GLOB_MAX_FILES,
+            ),
+            max_total_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_BYTES",
+                DEFAULT_GLOB_MAX_BYTES,
+                HARD_GLOB_MAX_BYTES,
+            ),
+            max_entries: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_ENTRIES",
+                DEFAULT_GLOB_MAX_ENTRIES,
+                HARD_GLOB_MAX_ENTRIES,
+            ),
+            max_file_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_FILE_READ_MAX_BYTES",
+                DEFAULT_FILE_READ_MAX_BYTES,
+                HARD_FILE_READ_MAX_BYTES,
+            ),
+            max_output_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_OUTPUT_BYTES",
+                DEFAULT_GLOB_MAX_OUTPUT_BYTES,
+                HARD_GLOB_MAX_OUTPUT_BYTES,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(base_dir: PathBuf, marker: usize) -> Self {
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(Some(base_dir)),
+            max_files: marker,
+            max_total_bytes: marker,
+            max_entries: marker,
+            max_file_bytes: marker,
+            max_output_bytes: marker,
+        }
     }
 }
 
@@ -56,6 +105,18 @@ impl Tool for FileReadGlobTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "root_fingerprint": self.root.fingerprint()?,
+            "max_files": self.max_files,
+            "max_total_bytes": self.max_total_bytes,
+            "max_entries": self.max_entries,
+            "max_file_bytes": self.max_file_bytes,
+            "max_output_bytes": self.max_output_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let pattern = args["pattern"]
             .as_str()
@@ -84,31 +145,20 @@ impl Tool for FileReadGlobTool {
                 message: format!("Invalid glob pattern: {error}"),
             })?;
 
-        // Resource budgets. Zero/invalid values fall back to bounded defaults.
-        let max_files = super::project_fs::bounded_env_usize(
-            "IRONCREW_GLOB_MAX_FILES",
-            DEFAULT_GLOB_MAX_FILES,
-            HARD_GLOB_MAX_FILES,
-        );
-        let max_total_bytes = super::project_fs::bounded_env_usize(
-            "IRONCREW_GLOB_MAX_BYTES",
-            DEFAULT_GLOB_MAX_BYTES,
-            HARD_GLOB_MAX_BYTES,
-        );
-        let max_entries = super::project_fs::bounded_env_usize(
-            "IRONCREW_GLOB_MAX_ENTRIES",
-            DEFAULT_GLOB_MAX_ENTRIES,
-            HARD_GLOB_MAX_ENTRIES,
-        );
-        let max_file_bytes = super::project_fs::bounded_env_usize(
-            "IRONCREW_FILE_READ_MAX_BYTES",
-            DEFAULT_FILE_READ_MAX_BYTES,
-            HARD_FILE_READ_MAX_BYTES,
-        );
-        let base_dir = self.base_dir.clone();
+        let max_files = self.max_files;
+        let max_total_bytes = self.max_total_bytes;
+        let max_entries = self.max_entries;
+        let max_file_bytes = self.max_file_bytes;
+        let base_dir = self
+            .root
+            .cloned_path()
+            .map_err(|message| IronCrewError::ToolExecution {
+                tool: "file_read_glob".into(),
+                message: message.into(),
+            })?;
 
         let (files, total_bytes, truncated) = tokio::task::spawn_blocking(move || {
-            let root = super::project_fs::open_root(base_dir.as_deref())?;
+            let root = super::project_fs::open_root(Some(&base_dir))?;
             let (candidates, scan_truncated) =
                 super::project_fs::collect_regular_files(&root, max_entries)?;
             let options = glob::MatchOptions {
@@ -197,11 +247,7 @@ impl Tool for FileReadGlobTool {
             "truncated": truncated,
         });
 
-        let max_output_bytes = super::project_fs::bounded_env_usize(
-            "IRONCREW_GLOB_MAX_OUTPUT_BYTES",
-            DEFAULT_GLOB_MAX_OUTPUT_BYTES,
-            HARD_GLOB_MAX_OUTPUT_BYTES,
-        );
+        let max_output_bytes = self.max_output_bytes;
         crate::utils::http::to_json_pretty_limited(&output, max_output_bytes).map_err(|e| {
             IronCrewError::ToolExecution {
                 tool: "file_read_glob".into(),

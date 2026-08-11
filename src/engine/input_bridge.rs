@@ -678,6 +678,7 @@ impl InputBridge {
                 let _ = self.answer(question_id, value);
                 Ok(outcome)
             }
+            outcome @ HumanInputAnswerOutcome::OwnerDraining { .. } => Ok(outcome),
             HumanInputAnswerOutcome::AlreadyAnswered => {
                 Ok(HumanInputAnswerOutcome::AlreadyAnswered)
             }
@@ -818,6 +819,13 @@ impl InputBridge {
                 question.transport = match outcome {
                     HumanInputRegistrationOutcome::Registered => PendingTransport::SharedStore,
                     HumanInputRegistrationOutcome::NotDurable => PendingTransport::ProcessLocal,
+                    HumanInputRegistrationOutcome::OwnerDraining {
+                        ref owner_instance_id,
+                    } => {
+                        return Err(IronCrewError::OwnerDraining {
+                            owner_instance_id: owner_instance_id.clone(),
+                        });
+                    }
                 };
             }
             match outcome {
@@ -828,6 +836,9 @@ impl InputBridge {
                         .expect("durable registration cleanup must be armed")
                         .disarm();
                     None
+                }
+                HumanInputRegistrationOutcome::OwnerDraining { .. } => {
+                    unreachable!("draining owner registrations return before transport selection")
                 }
             }
         } else {

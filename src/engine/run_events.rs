@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::run_event_timing::RunEventWriteTiming;
 use super::run_history::{RunStatus, validate_run_id};
 use crate::utils::error::{IronCrewError, Result};
 
@@ -39,6 +40,9 @@ pub const MAX_JOURNAL_POLL_INTERVAL_MS: u64 = 5_000;
 pub const DEFAULT_JOURNAL_READ_TIMEOUT_MS: u64 = 2_000;
 pub const MIN_JOURNAL_READ_TIMEOUT_MS: u64 = 100;
 pub const MAX_JOURNAL_READ_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_JOURNAL_WRITE_TIMEOUT_MS: u64 = 1_500;
+pub const MIN_JOURNAL_WRITE_TIMEOUT_MS: u64 = 100;
+pub const MAX_JOURNAL_WRITE_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_JOURNAL_PRUNE_BATCH: usize = 1_000;
 pub const HARD_JOURNAL_PRUNE_BATCH: usize = 10_000;
 
@@ -80,6 +84,10 @@ pub struct RunEventJournalConfig {
     /// Per-page database deadline applied by SSE handlers. It bounds pool and
     /// network stalls independently from the client connection lifetime.
     pub read_timeout: Duration,
+    /// Outer deadline for one PostgreSQL append attempt, including pool
+    /// acquisition and the complete transaction. Database statements receive
+    /// a smaller derived timeout so lock waits end before this deadline.
+    pub write_timeout: Duration,
     pub prune_batch: usize,
 }
 
@@ -96,6 +104,7 @@ impl Default for RunEventJournalConfig {
             page_max_bytes: DEFAULT_JOURNAL_PAGE_MAX_BYTES,
             poll_interval: Duration::from_millis(DEFAULT_JOURNAL_POLL_INTERVAL_MS),
             read_timeout: Duration::from_millis(DEFAULT_JOURNAL_READ_TIMEOUT_MS),
+            write_timeout: Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS),
             prune_batch: DEFAULT_JOURNAL_PRUNE_BATCH,
         }
     }
@@ -158,6 +167,12 @@ impl RunEventJournalConfig {
             MIN_JOURNAL_READ_TIMEOUT_MS,
             MAX_JOURNAL_READ_TIMEOUT_MS,
         )?;
+        let write_timeout_ms = env_u64(
+            "IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS",
+            DEFAULT_JOURNAL_WRITE_TIMEOUT_MS,
+            MIN_JOURNAL_WRITE_TIMEOUT_MS,
+            MAX_JOURNAL_WRITE_TIMEOUT_MS,
+        )?;
         let prune_batch = env_usize(
             "IRONCREW_EVENT_JOURNAL_PRUNE_BATCH",
             DEFAULT_JOURNAL_PRUNE_BATCH,
@@ -176,6 +191,7 @@ impl RunEventJournalConfig {
             page_max_bytes,
             poll_interval: Duration::from_millis(poll_interval_ms),
             read_timeout: Duration::from_millis(read_timeout_ms),
+            write_timeout: Duration::from_millis(write_timeout_ms),
             prune_batch,
         };
         config.validate()?;
@@ -243,6 +259,15 @@ impl RunEventJournalConfig {
             MIN_JOURNAL_READ_TIMEOUT_MS,
             MAX_JOURNAL_READ_TIMEOUT_MS,
         )?;
+        validate_duration_millis(
+            "write_timeout",
+            self.write_timeout,
+            MIN_JOURNAL_WRITE_TIMEOUT_MS,
+            MAX_JOURNAL_WRITE_TIMEOUT_MS,
+        )?;
+        if RunEventWriteTiming::checked(self.write_timeout).is_none() {
+            return Err(config_error("write_timeout timing arithmetic overflow"));
+        }
         validate_usize_range("prune_batch", self.prune_batch, 1, HARD_JOURNAL_PRUNE_BATCH)?;
 
         if self.max_event_bytes > self.max_bytes_per_run {
@@ -1066,6 +1091,10 @@ mod tests {
         assert_eq!(config.max_event_bytes, DEFAULT_MAX_EVENT_BYTES);
         assert_eq!(config.page_max_events, 64);
         assert!(config.page_max_bytes >= config.max_event_bytes);
+        assert_eq!(
+            config.write_timeout,
+            Duration::from_millis(DEFAULT_JOURNAL_WRITE_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -1085,6 +1114,14 @@ mod tests {
             },
             RunEventJournalConfig {
                 read_timeout: Duration::from_millis(MAX_JOURNAL_READ_TIMEOUT_MS + 1),
+                ..RunEventJournalConfig::default()
+            },
+            RunEventJournalConfig {
+                write_timeout: Duration::from_millis(MIN_JOURNAL_WRITE_TIMEOUT_MS - 1),
+                ..RunEventJournalConfig::default()
+            },
+            RunEventJournalConfig {
+                write_timeout: Duration::from_millis(MAX_JOURNAL_WRITE_TIMEOUT_MS + 1),
                 ..RunEventJournalConfig::default()
             },
             RunEventJournalConfig {
@@ -1119,6 +1156,7 @@ mod tests {
             page_max_bytes: HARD_JOURNAL_PAGE_MAX_BYTES,
             poll_interval: Duration::from_millis(MAX_JOURNAL_POLL_INTERVAL_MS),
             read_timeout: Duration::from_millis(MAX_JOURNAL_READ_TIMEOUT_MS),
+            write_timeout: Duration::from_millis(MAX_JOURNAL_WRITE_TIMEOUT_MS),
             prune_batch: HARD_JOURNAL_PRUNE_BATCH,
         };
         config.validate().unwrap();

@@ -1,0 +1,43 @@
+{
+  "schema_version": "ironcrew.crew-eval-plan.v1",
+  "flow": {
+    "path": "crew.lua",
+    "sha256": "db16afe8621b344311076dfe5075edd21ef7978791a8763f3a81722087c0e720",
+    "variants": {
+      "single": {
+        "planned_llm_calls": 1,
+        "maximum_output_tokens": 800
+      },
+      "dag": {
+        "planned_llm_calls": 3,
+        "maximum_output_tokens": 1800
+      },
+      "collaborative": {
+        "planned_llm_calls": 4,
+        "maximum_output_tokens": 2300
+      }
+    }
+  },
+  "limits": {
+    "max_cli_runs": 90,
+    "max_planned_llm_calls": 240,
+    "max_planned_output_tokens": 147000,
+    "max_case_input_bytes": 65536
+  },
+  "uncertainty": {
+    "familywise_confidence_level": 0.95,
+    "multiplicity_correction": "bonferroni",
+    "comparison_count": 2,
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20260808
+  },
+  "selection": {
+    "minimum_paired_count": 30,
+    "minimum_unique_case_count": 6,
+    "minimum_success_rate": 1.0,
+    "minimum_mean_grounded_correctness_delta": 0.05,
+    "minimum_confidence_lower_bound": 0.0,
+    "maximum_mean_token_multiplier": 6.0,
+    "maximum_mean_latency_multiplier": 6.0
+  }
+}

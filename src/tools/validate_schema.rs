@@ -20,23 +20,23 @@ const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub fn compile_local_draft7(
     schema: &serde_json::Value,
 ) -> std::result::Result<jsonschema::Validator, String> {
-    let max_bytes = match std::env::var("IRONCREW_JSON_SCHEMA_MAX_BYTES") {
-        Ok(raw) => {
-            let parsed = raw.parse::<usize>().map_err(|_| {
-                format!(
-                    "IRONCREW_JSON_SCHEMA_MAX_BYTES must be between 1024 and {HARD_MAX_SCHEMA_BYTES}"
-                )
-            })?;
-            if !(1024..=HARD_MAX_SCHEMA_BYTES).contains(&parsed) {
-                return Err(format!(
-                    "IRONCREW_JSON_SCHEMA_MAX_BYTES must be between 1024 and {HARD_MAX_SCHEMA_BYTES}"
-                ));
-            }
-            parsed
-        }
-        Err(_) => DEFAULT_MAX_SCHEMA_BYTES,
-    };
+    let max_bytes = schema_limit_from_env()?;
+    compile_local_draft7_with_limit(schema, max_bytes)
+}
 
+fn schema_limit_from_env() -> std::result::Result<usize, String> {
+    super::execution_policy::strict_env_usize(
+        "IRONCREW_JSON_SCHEMA_MAX_BYTES",
+        DEFAULT_MAX_SCHEMA_BYTES,
+        1024,
+        HARD_MAX_SCHEMA_BYTES,
+    )
+}
+
+fn compile_local_draft7_with_limit(
+    schema: &serde_json::Value,
+    max_bytes: usize,
+) -> std::result::Result<jsonschema::Validator, String> {
     crate::utils::http::to_json_pretty_limited(schema, max_bytes)
         .map_err(|error| format!("JSON Schema exceeds {max_bytes} bytes: {error}"))?;
 
@@ -69,12 +69,28 @@ fn reject_external_refs(value: &serde_json::Value) -> std::result::Result<(), St
     Ok(())
 }
 
-#[derive(Default)]
-pub struct ValidateSchemaTool;
+pub struct ValidateSchemaTool {
+    max_schema_bytes: std::result::Result<usize, String>,
+}
+
+impl Default for ValidateSchemaTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ValidateSchemaTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            max_schema_bytes: schema_limit_from_env(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limit_for_test(max_schema_bytes: usize) -> Self {
+        Self {
+            max_schema_bytes: Ok(max_schema_bytes),
+        }
     }
 }
 
@@ -109,6 +125,17 @@ impl Tool for ValidateSchemaTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        let max_schema_bytes = *self
+            .max_schema_bytes
+            .as_ref()
+            .map_err(|message| IronCrewError::Validation(message.clone()))?;
+        Ok(json!({
+            "schema": self.schema(),
+            "max_schema_bytes": max_schema_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let data_str = args["data"]
             .as_str()
@@ -131,6 +158,14 @@ impl Tool for ValidateSchemaTool {
                 message: "Missing 'schema' argument".into(),
             })?
             .clone();
+        let max_schema_bytes =
+            *self
+                .max_schema_bytes
+                .as_ref()
+                .map_err(|message| IronCrewError::ToolExecution {
+                    tool: "validate_schema".into(),
+                    message: message.clone(),
+                })?;
 
         tokio::task::spawn_blocking(move || {
             let data: serde_json::Value =
@@ -138,8 +173,8 @@ impl Tool for ValidateSchemaTool {
                     tool: "validate_schema".into(),
                     message: format!("Invalid JSON data: {e}"),
                 })?;
-            let validator =
-                compile_local_draft7(&schema_value).map_err(|e| IronCrewError::ToolExecution {
+            let validator = compile_local_draft7_with_limit(&schema_value, max_schema_bytes)
+                .map_err(|e| IronCrewError::ToolExecution {
                     tool: "validate_schema".into(),
                     message: format!("Invalid JSON Schema: {e}"),
                 })?;

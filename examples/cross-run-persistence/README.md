@@ -28,6 +28,12 @@ ironcrew run examples/cross-run-persistence
 ironcrew run examples/cross-run-persistence
 ```
 
+Run this direct-Lua example with the default JSON store or SQLite. Persistent
+PostgreSQL conversation turns intentionally require the keyed HTTP
+`/messages` endpoint; a direct `conversation:send()` fails closed because it
+does not own the shared durable turn claim. The dialog portion retains its
+ordinary persisted-snapshot behavior.
+
 The **second run** is the interesting one: the output explicitly reports
 the number of prior messages loaded, and the follow-up turn references
 something that was only said on the first run.
@@ -93,7 +99,7 @@ the flow project directory:
 |---|---|
 | `json` (default) | `<project>/.ironcrew/conversations/<flow_path>/<id>.json` and `<project>/.ironcrew/dialogs/<flow_path>/<id>.json` |
 | `sqlite` | `conversations` and `dialogs` in `<project>/.ironcrew/ironcrew.db`, uniquely keyed by `(flow_path, id)` |
-| `postgres` | Prefixed `conversations` and `dialogs` tables, uniquely keyed by `(flow_path, id)` |
+| `postgres` | Prefixed `conversations` and `dialogs` tables, uniquely keyed by `(flow_path, id)`; persistent conversation turns use keyed HTTP rehydration rather than this direct-Lua example |
 
 Want to wipe a session for a fresh test run?
 
@@ -154,10 +160,11 @@ debate:delete()
   `agents = { "alice", "carol" }`, the resume fails with a clear validation
   error. Dialogs are tied to their participant set.
 - **Concurrent writers are rejected.** Session records carry an optimistic
-  revision. If two processes update the same `(flow_path, id)`, a stale write
-  fails with a revision conflict instead of silently overwriting newer state.
-  Re-open the session to reload before deciding whether to retry. HTTP message
-  retries additionally follow the idempotency contract in `docs/rest-api.md`.
+  revision. Persistent conversations also carry a UUID incarnation and
+  source/definition fingerprints. PostgreSQL HTTP messages claim that exact
+  incarnation and revision before cold rehydration; stale writers and
+  delete/recreate ABA reuse fail closed. HTTP message retries follow the
+  idempotency contract in `docs/rest-api.md`.
 - **Flow scope is part of identity.** Reusing `support-ticket-4821` in a
   different flow creates a distinct session; it does not resume this one.
 - **IDs are restricted.** Alphanumerics + `-`, `_`, `.`, 1-128 chars. Spaces,

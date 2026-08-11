@@ -1,79 +1,8 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 
+use super::json_policy::JsonLimits;
 use mlua::{Lua, Result as LuaResult, Table, Value};
-
-const DEFAULT_MAX_DEPTH: usize = 64;
-const DEFAULT_MAX_NODES: usize = 100_000;
-const DEFAULT_MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-
-const MAX_DEPTH_CEILING: usize = 256;
-const MAX_NODES_CEILING: usize = 1_000_000;
-const MAX_STRING_BYTES_CEILING: usize = 256 * 1024 * 1024;
-const MAX_OUTPUT_BYTES_CEILING: usize = 256 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug)]
-struct JsonLimits {
-    max_depth: usize,
-    max_nodes: usize,
-    max_string_bytes: usize,
-    max_output_bytes: usize,
-}
-
-impl JsonLimits {
-    fn from_env() -> LuaResult<Self> {
-        Ok(Self {
-            max_depth: bounded_env(
-                "IRONCREW_LUA_JSON_MAX_DEPTH",
-                DEFAULT_MAX_DEPTH,
-                1,
-                MAX_DEPTH_CEILING,
-            )?,
-            max_nodes: bounded_env(
-                "IRONCREW_LUA_JSON_MAX_NODES",
-                DEFAULT_MAX_NODES,
-                1,
-                MAX_NODES_CEILING,
-            )?,
-            max_string_bytes: bounded_env(
-                "IRONCREW_LUA_JSON_MAX_STRING_BYTES",
-                DEFAULT_MAX_STRING_BYTES,
-                1,
-                MAX_STRING_BYTES_CEILING,
-            )?,
-            max_output_bytes: bounded_env(
-                "IRONCREW_LUA_JSON_MAX_OUTPUT_BYTES",
-                DEFAULT_MAX_OUTPUT_BYTES,
-                1,
-                MAX_OUTPUT_BYTES_CEILING,
-            )?,
-        })
-    }
-}
-
-fn bounded_env(name: &str, default: usize, min: usize, max: usize) -> LuaResult<usize> {
-    let raw = match std::env::var(name) {
-        Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => return Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(mlua::Error::external(format!(
-                "{name} must contain valid Unicode digits"
-            )));
-        }
-    };
-    let value = raw.parse::<usize>().map_err(|_| {
-        mlua::Error::external(format!(
-            "{name} must be a whole number between {min} and {max}"
-        ))
-    })?;
-    if !(min..=max).contains(&value) {
-        return Err(mlua::Error::external(format!(
-            "{name} must be between {min} and {max}; got {value}"
-        )));
-    }
-    Ok(value)
-}
 
 #[derive(Debug)]
 struct ConversionState {
@@ -319,13 +248,23 @@ pub fn lua_table_to_json(table: &Table) -> LuaResult<serde_json::Value> {
     lua_value_to_json(Value::Table(table.clone()))
 }
 
+pub(crate) fn lua_table_to_json_with_limits(
+    table: &Table,
+    limits: JsonLimits,
+) -> LuaResult<serde_json::Value> {
+    lua_value_to_json_with_limits(Value::Table(table.clone()), limits)
+}
+
 /// Convert a Lua value to JSON without silently coercing unsupported values.
 pub fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
     let limits = JsonLimits::from_env()?;
     lua_value_to_json_with_limits(value, limits)
 }
 
-fn lua_value_to_json_with_limits(value: Value, limits: JsonLimits) -> LuaResult<serde_json::Value> {
+pub(crate) fn lua_value_to_json_with_limits(
+    value: Value,
+    limits: JsonLimits,
+) -> LuaResult<serde_json::Value> {
     let mut state = ConversionState::new(limits);
     let value = value_to_json(value, &mut state, 0)?;
     ensure_output_fits(&value, limits.max_output_bytes)?;
@@ -406,6 +345,14 @@ fn json_to_lua_unchecked(lua: &Lua, value: &serde_json::Value) -> LuaResult<Valu
 /// Convert a JSON value into Lua after validating its complete resource cost.
 pub fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<Value> {
     let limits = JsonLimits::from_env()?;
+    json_value_to_lua_with_limits(lua, value, limits)
+}
+
+pub(crate) fn json_value_to_lua_with_limits(
+    lua: &Lua,
+    value: &serde_json::Value,
+    limits: JsonLimits,
+) -> LuaResult<Value> {
     let mut state = ConversionState::new(limits);
     validate_json_value(value, &mut state, 0)?;
     ensure_output_fits(value, limits.max_output_bytes)?;

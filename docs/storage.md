@@ -28,7 +28,7 @@ hardening step.
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |
 | SQLite | `sqlite` | Single-server and Docker deployments, faster queries |
-| PostgreSQL | `postgres` | Durable cloud records, cross-replica run SSE replay, keyed-run coordination, and optional encrypted cross-replica HITL. PostgreSQL 15+ required |
+| PostgreSQL | `postgres` | Durable cloud records, cross-replica run SSE replay, keyed-run coordination, keyed conversation-turn rehydration, and optional encrypted cross-replica HITL. PostgreSQL 15+ required |
 
 ## Configuration
 
@@ -47,10 +47,10 @@ Environment variables control storage:
 | `IRONCREW_INSTANCE_ID` | Optional 1–255 byte printable ASCII process/pod owner identity; generated once per process when absent | generated |
 | `IRONCREW_RUN_LEASE_TTL_SECONDS` | Stale-run lease threshold (production range 6–86400 seconds); owner heartbeats and replica maintenance run every TTL/3 | `60` |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | Secret JSON keyring for the PostgreSQL human-input mailbox: at most 8 key ids mapped to canonical base64 32-byte keys; maximum 16 KiB | unset (mailbox disabled) |
-| `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id used to encrypt new human-input metadata and answers; must be set with the keyring | unset |
+| `IRONCREW_HITL_ACTIVE_KEY_ID` | Key id used to encrypt newly registered question metadata; answers inherit the authenticated question's key; must be set with the keyring | unset |
 | `IRONCREW_HITL_POLL_INTERVAL_MS` | Owner poll interval per pending durable question (effective range 50–5000 ms) | `500` |
 | `IRONCREW_HITL_READ_TIMEOUT_MS` | Owner-side durable-answer read deadline (effective range 100–30000 ms) | `2000` |
-| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | Per-process concurrent PostgreSQL question-list/decrypt cap (range 1–64) | `8` |
+| `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` | Per-process concurrent PostgreSQL question-list decryption and answer-authentication cap (range 1–64) | `8` |
 | `IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES` | Aggregate serialized pending-question metadata per run (hard ceiling 16 MiB); PostgreSQL allows this plus 28 AEAD bytes per allowed row | `1048576` (1 MiB) |
 | `IRONCREW_EVENT_JOURNAL_RETENTION_SECS` | PostgreSQL run-event logical retention (range 60–2592000 seconds) | `3600` |
 | `IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS` | Global logical event count (range 1–10000000; at least the per-run `IRONCREW_MAX_EVENTS`) | `100000` |
@@ -58,8 +58,9 @@ Environment variables control storage:
 | `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES` | Logical bytes read per SSE page (range 1 KiB–64 MiB; at least one max event) | `max(524288, IRONCREW_EVENT_MAX_BYTES)` |
 | `IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS` | Per-open-stream PostgreSQL poll interval (range 100–5000 ms) | `500` |
 | `IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS` | Deadline for one PostgreSQL journal page read (range 100–30000 ms) | `2000` |
+| `IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS` | Outer deadline for one PostgreSQL journal-append attempt, including pool acquisition and the complete transaction (range 100–5000 ms) | `1500` |
 | `IRONCREW_EVENT_JOURNAL_PRUNE_BATCH` | Rows per bounded physical prune step (range 1–10000; no greater than global event cap) | `1000` |
-| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require `Idempotency-Key` on run/message mutation endpoints | `false` |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require `Idempotency-Key` on run and JSON/SQLite message mutation endpoints; PostgreSQL conversation messages always require it | `false` |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | Terminal ledger retention, 60–2592000 seconds; must be at least max run lifetime + 3600 | `86400` |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS` | Maximum retained in-flight and terminal ledger records (hard ceiling 100000) | `10000` |
 | `IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL` | Maximum records charged to one authenticated principal; cannot exceed the global cap | global record cap |
@@ -100,6 +101,17 @@ attempt/owner ids, bounded response JSON, leases, and retention timestamps are
 stored. Bearer tokens and raw principal labels are never ledger fields.
 Deleting a run does not delete its ledger entry, because doing so would make
 the same client key executable again during the retention window.
+PostgreSQL-backed conversation messages require a key even when the global
+`IRONCREW_REQUIRE_IDEMPOTENCY_KEY` setting is false: the claim is the durable
+cross-replica turn fence, not only a retry convenience.
+
+SQLite and PostgreSQL replay reads measure a stored response body in the
+database and project `NULL` when it exceeds the hard 64 MiB decoded-record
+ceiling, before Rust materializes the text. The decoded ledger record is then
+validated against the same bound and a conversation replay is checked against
+its flow, conversation, incarnation, definition, base revision, and committed
+response revision. Corrupt or mismatched rows therefore fail closed instead of
+being returned as a valid replay.
 
 Claims and terminal rows count toward `IRONCREW_IDEMPOTENCY_MAX_RECORDS` and
 the authenticated principal's
@@ -151,7 +163,10 @@ idempotency keys.
 Backend guarantees differ:
 
 - PostgreSQL claims and conversation transcript+ledger commits are database
-  transactions and coordinate independent processes. Transaction-scoped
+  transactions and coordinate independent processes. A claim binds the
+  conversation incarnation and base revision; the transcript and retained
+  response advance atomically. A replica with no live handle constructs one
+  from durable history only after its claim is active. Transaction-scoped
   advisory locks are partitioned by quota, opaque principal, resource,
   exclusive scope, and key, so heartbeats and lookups for unrelated keys do
   not take a table-wide lock. A trigger incrementally maintains compact global
@@ -165,12 +180,16 @@ Backend guarantees differ:
   a process-local critical section. It is intentionally single-process and
   must not be mounted read/write by multiple pods.
 
-Even with PostgreSQL, live Lua VMs, conversation handles/SSE, JSON/SQLite run
-SSE, and admission limits remain process-local. PostgreSQL adds shared bounded
-run SSE plus cancellation and encrypted questions/answers for
-idempotency-keyed runs, but it cannot move or resume their execution. Deploy
-multiple HTTP replicas only when clients can operate within that explicit
-boundary; see
+Even with PostgreSQL, each Lua VM and conversation handle exists in one
+process, but a later keyed message can reconstruct a cold handle from the
+durable, definition-fenced transcript on another replica. PostgreSQL does not
+move an in-flight provider/tool call or make its effects transactional.
+Conversation SSE, JSON/SQLite run SSE, and admission limits remain
+process-local; PostgreSQL conversation SSE instead returns a truthful `409`
+unsupported boundary. PostgreSQL also adds shared bounded run SSE plus
+cancellation and encrypted questions/answers for idempotency-keyed runs.
+Deploy multiple HTTP replicas only when clients can operate within those
+explicit boundaries; see
 [Multi-Replica Deployment Contract](multi-replica.md).
 
 ## JSON File Backend (default)
@@ -300,6 +319,8 @@ for extension-capable deployments such as installations that use `pgvector`.
 - Full SQL querying power (joins, aggregation, GIN indexes on JSONB)
 - Production-grade durability and replication
 - Bounded cross-replica run SSE journal with cursor replay
+- Keyed conversation turns that can rehydrate a durable conversation on either
+  replica under an incarnation and revision fence
 - Optional encrypted cross-replica question listing/answer delivery for
   idempotency-keyed HTTP runs
 - Async I/O — non-blocking database operations via `sqlx`
@@ -308,27 +329,38 @@ for extension-capable deployments such as installations that use `pgvector`.
 - Requires an external PostgreSQL server
 - Requires PostgreSQL 15+
 - Adds compile-time dependency on `sqlx`
-- Does not distribute active run handles, conversation Lua VMs, or execution
-  takeover after owner loss. Unkeyed runs and deployments without a HITL
-  keyring retain process-local question delivery; conversation SSE remains
-  process-local even though run SSE uses the shared journal
+- Does not distribute active run handles, move an in-flight conversation Lua
+  VM, or provide execution takeover. Unkeyed runs and deployments without a
+  HITL keyring retain process-local question delivery. Conversation SSE is not
+  supported in shared-store mode even though run SSE uses the shared journal
 
 ### Encrypted human-input mailbox
 
 For an HTTP run created with an `Idempotency-Key`, PostgreSQL can persist a
 bounded pending-question mailbox that any replica can list or answer. Enable it
 by setting both `IRONCREW_HITL_ENCRYPTION_KEYS` and
-`IRONCREW_HITL_ACTIVE_KEY_ID` identically on every replica. Omitting both keeps
-the process-local bridge; setting only one or providing malformed key material
-fails store startup.
+`IRONCREW_HITL_ACTIVE_KEY_ID`. Steady-state replicas use the same key set and
+active id. A controlled rotation may temporarily mix active ids only after
+every process has restarted with the complete old+new keyring. Omitting both
+keeps the process-local bridge; setting only one or providing malformed key
+material fails store startup.
 
 The `{prefix}human_inputs` table stores routing/fencing identifiers in clear
 text and AES-256-GCM ciphertext for prompt/choice/timing metadata and the
 answer. The first answer changes the row from `pending` to `answered` under a
-database lock; later writers receive `404` from the API. The owner polls and
+database lock after authenticating the retained question. The answer uses the
+question fingerprint rather than the responder's active key, preserving
+owner readability during a mixed-active rotation; later writers receive `404`
+from the API. The owner polls and
 decrypts the accepted answer, resumes Lua, and deletes the row. Expired,
 cancelled, terminal, and explicitly deleted runs are fenced from delivery and
 their mailbox rows are cleaned up.
+
+The process keyring is immutable after startup. PostgreSQL startup checks every
+retained question and answer fingerprint and refuses to bind HTTP if a key is
+missing. This bounded check is a snapshot; safe retirement still requires all
+old-active writers to exit and both fingerprint columns to reach zero old-key
+references before the old key is removed.
 
 Resource use is bounded by the per-run pending-question, prompt/choice, and
 answer limits. Each pending question produces one owner read every
@@ -337,7 +369,8 @@ approximately `pending questions × 1000 / interval_ms` for each suspended
 run. The defaults allow 16 pending questions and 1 MiB of aggregate serialized
 question metadata per run; the hard ceilings are 256 questions and 16 MiB
 aggregate. Prompt, choices, and answer retain their separate per-item caps.
-`IRONCREW_HITL_PG_MAX_CONCURRENT_READS` bounds question-list decryption, while
+`IRONCREW_HITL_PG_MAX_CONCURRENT_READS` jointly bounds question-list decryption
+and answer-side question authentication, while
 `IRONCREW_HITL_READ_TIMEOUT_MS` bounds each owner answer read. Pool, IOPS,
 database size, and pod-memory budgets must include these limits across all
 replicas. The mailbox does not rehydrate an owner after pod loss.
@@ -367,6 +400,24 @@ queue only enough for one event and never beyond the per-run byte cap. The
 ordinary in-memory EventBus replay exists alongside that queue. Each SSE read
 materializes at most 64 events and `IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES`, and
 `IRONCREW_MAX_SSE_CONNECTIONS` bounds concurrent streams per replica.
+
+Journal writes have a separate bounded timing policy. Let
+`W = IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS`: one append gets at most three
+attempts separated by 50 ms and 100 ms, so its outer retry envelope is
+`3W + 150 ms`. Each PostgreSQL transaction sets `lock_timeout` and
+`statement_timeout` to `4W/5`, ending one blocked database statement before the
+outer attempt expires; the outer deadline also covers pool acquisition and
+cumulative transaction work. Flush and terminal publication wait at most one
+retry envelope plus 500 ms (`3W + 650 ms`). That bound includes queue admission
+but does not promise to drain an arbitrary backlog. The authoritative terminal
+run row is written before the numbered `run_complete` append, so observing
+terminal run status is not a journal-flush barrier. A read can return an
+unnumbered incomplete fallback while idempotency
+finalization and the bounded terminal append are still pending. Use a
+client-bounded reconnect policy when a resumable terminal cursor is required.
+If the append ultimately expires, the
+run's terminal record remains authoritative and replay uses the unnumbered
+`journal_complete: false` fallback when no numbered `run_complete` was stored.
 
 Journal payload is plaintext JSONB. The journal deliberately replaces a
 `human_input_requested` prompt/choices with an authenticated question-endpoint
@@ -507,7 +558,8 @@ All IronCrew features use the same store:
 | `GET /flows/{flow}/runs/{id}` | `get_run` — API endpoint |
 | `DELETE /flows/{flow}/runs/{id}` | `delete_run` — API endpoint |
 | `ironcrew run --json` | `get_run` — reads back the saved record for output |
-| `crew:conversation({id=...})` | `save_conversation` / `get_conversation` — resume-by-id chat sessions |
+| `crew:conversation({id=...})` | `save_conversation` / `get_conversation` — identity-checked resume-by-id chat sessions |
+| keyed HTTP conversation message | `claim_idempotency_with_limits` + `commit_conversation_idempotency_with_limits` — incarnation/revision-fenced turn and atomic transcript/replay commit |
 | `crew:dialog({id=...})` | `save_dialog_state` / `get_dialog_state` — resume-by-id multi-agent dialogs |
 
 ### Run ownership and terminal writes
@@ -752,6 +804,32 @@ for runs (because `get_run` is always called with an id the caller believes
 exists). Session saves use optimistic concurrency: each loaded snapshot carries
 a `revision`, a successful save returns the next revision, and a stale writer
 fails with a conflict instead of overwriting turns completed by another pod.
+Conversation snapshots also carry a versioned execution object: a canonical
+non-nil UUID incarnation, source and definition SHA-256 fingerprints, and the
+original message/byte history limits. The incarnation prevents delete/recreate
+ABA reuse; the fingerprints and limits make a cold resume fail closed on
+definition drift. The source fingerprint names one bounded no-follow immutable
+Lua snapshot; the definition also covers captured effective non-secret
+provider and reachable-tool policy. Credentials and raw capability roots are
+excluded. Legacy identity-less records remain readable for history/export and
+may be deleted, but they cannot be resumed or mutated.
+
+SQLite and PostgreSQL measure conversation metadata, execution-identity bytes,
+transcript bytes, top-level array shape, and message count in SQL before
+returning the corresponding strings to Rust. Before typed deserialization, an
+allocation-free JSON scan caps nesting at 64 levels, values plus object keys at
+262,144, and members of any one array or object at 16,384; each string remains
+inside its already-bounded stored field. JSON files receive the same scan over
+the whole record. SQL list views keep using bounded metadata and top-level
+summary projections and never materialize the transcript. Decoded messages
+must then satisfy the hard in-memory and persisted-history invariants.
+Oversized, structurally amplified, non-array, or invalid records fail closed
+instead of being materialized as resumable state.
+The legacy read/export/delete allowance applies only to otherwise valid,
+bounded identity-less records; it does not convert corrupt data into a modern
+execution identity. Deletion itself identifies the row without deserializing
+the transcript, so an operator can still remove a corrupt record when no turn
+claim is active.
 
 ### Session storage layout
 
@@ -778,6 +856,7 @@ CREATE TABLE IF NOT EXISTS {prefix}conversations (
     flow_name   TEXT NOT NULL,
     flow_path   TEXT,
     agent_name  TEXT NOT NULL,
+    execution   JSONB NOT NULL DEFAULT '{}',
     messages    JSONB NOT NULL DEFAULT '[]',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
@@ -826,6 +905,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     flow_name  TEXT NOT NULL,
     flow_path  TEXT,
     agent_name TEXT NOT NULL,
+    execution  TEXT NOT NULL DEFAULT '{}',
     messages   TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -851,8 +931,10 @@ CREATE TABLE IF NOT EXISTS dialogs (
 ```
 
 Bootstrap migrates legacy `id PRIMARY KEY` session tables to these composite
-keys and adds `revision` with a zero default. Revision zero is accepted only
-for a new row or the first guarded update of a legacy row.
+keys and adds `execution` plus `revision` defaults. An empty execution object
+is intentionally detectable legacy data, not an inferred identity. Revision
+zero is accepted for a fresh insert; an identity-less legacy row is not
+upgraded in place.
 
 ### Session ID validation
 
@@ -898,5 +980,5 @@ A future `ironcrew migrate` command may automate this.
 | Debugging runs | `json` — human-readable files |
 | CI/CD pipelines | `json` — ephemeral, no state needed |
 | Production single-server | `sqlite` — handles concurrent reads well |
-| Production HTTP service | `postgres` — durable shared records, bounded run SSE, and optional keyed-run HITL mailbox; execution/conversations remain owner-local |
+| Production HTTP service | `postgres` — durable shared records, bounded run SSE, keyed conversation-turn rehydration, and optional keyed-run HITL mailbox; live execution and conversation SSE remain process-local/unsupported as documented |
 | Cloud deployment (Railway, OpenShift) | `postgres` — managed/cluster database; scale replicas only within the documented live-control boundary |

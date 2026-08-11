@@ -54,6 +54,11 @@ curl -sX POST http://127.0.0.1:3000/flows/chat-http/conversations/demo/messages 
 
 ## Tail live events
 
+This command applies to the default JSON store and SQLite. Conversation SSE is
+process-local and does not support `Last-Event-ID` replay. With PostgreSQL,
+`/events` returns `409` for an existing conversation; use durable `/history`
+for recovery instead.
+
 ```sh
 curl -sN http://127.0.0.1:3000/flows/chat-http/conversations/demo/events \
      -H "Authorization: Bearer $IRONCREW_API_TOKEN"
@@ -93,4 +98,13 @@ curl -sX DELETE http://127.0.0.1:3000/flows/chat-http/conversations/demo \
 | `IRONCREW_CONVERSATIONS_DEFAULT_LIMIT`   | 20      | Default page size for list                      |
 | `IRONCREW_CONVERSATIONS_MAX_LIMIT`       | 100     | Hard cap on `?limit=` parameter                 |
 | `IRONCREW_CONVERSATION_MAX_HISTORY`      | 50      | Default per-session message cap                 |
-| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY`        | false   | Require retry-safe keys for run/message mutations; use `true` in production |
+| `IRONCREW_REQUIRE_IDEMPOTENCY_KEY`        | false   | Require retry-safe keys for runs and JSON/SQLite messages; PostgreSQL conversation messages always require a key; use `true` in production |
+
+With `IRONCREW_STORE=postgres`, the keyed message may be sent through any
+replica and will cold-rehydrate the durable conversation when that process has
+no live handle. Keep the same key only for the same logical message. Each HTTP
+build executes one immutable bounded snapshot of the flow's Lua sources,
+including `_lib` modules and nested `run_flow`, and binds the effective
+non-secret reachable-tool policy. Deploy identical flow, configuration, and
+artifact identities on every replica; drift returns `409` instead of mixing
+definitions.

@@ -92,14 +92,92 @@ than the acceptance field to discover each control surface.
 
 `GET /capabilities` is protected by the normal API authentication policy and
 returns `Cache-Control: no-store`. It reports the current instance id and the
-scope of each live-control surface. `multi_replica_control: false` means not
+top-level `lifecycle_state` (`accepting`, `fencing`, `draining`, or `stopping`)
+alongside the scope of each live-control surface. Authenticated protected
+responses also include `X-IronCrew-Instance-Id`; use it to attribute the
+receiving replica during tests, never as a routable address.
+`multi_replica_control: false` means not
 all run/HITL/SSE/conversation controls can enter through an arbitrary replica;
 it remains `false` even when PostgreSQL supports shared SSE replay and keyed
 runs support bounded cross-instance cancellation/encrypted HITL delivery. Inspect
 `live_control.human_input`: `"shared_store_for_keyed_runs"` means the keyring
 is active, while `"process"` means questions still require the owner replica.
 `live_control.sse_replay` is `"shared_store"` for PostgreSQL and `"process"`
-for JSON/SQLite.
+for JSON/SQLite. `live_control.conversations` is `"shared_store_keyed"` for
+PostgreSQL because a keyed `/messages` request can rehydrate from the durable
+transcript on any replica; it is `"process"` for JSON/SQLite.
+`live_control.conversation_sse` is `"unsupported_shared_store"` for PostgreSQL
+and `"process_no_cursor_replay"` for JSON/SQLite.
+
+Every response also contains a UUID `process_start_id` generated once for that
+operating-system process. It always changes after a restart, while `instance_id`
+may be explicitly stable or a platform may reuse one replica id for the
+replacement process. It is observation metadata, not a durable run owner or a
+routable address.
+
+Operators may additionally configure this all-or-none deployment-evidence
+tuple:
+
+| Response field | Environment variable |
+|---|---|
+| `deployment.revision` | `IRONCREW_DEPLOYMENT_REVISION` |
+| `deployment.artifact_fingerprint` | `IRONCREW_ARTIFACT_FINGERPRINT` |
+| `deployment.flow_fingerprint` | `IRONCREW_FLOW_FINGERPRINT` |
+| `deployment.config_fingerprint` | `IRONCREW_CONFIG_FINGERPRINT` |
+| `deployment.hitl_keyring_fingerprint` | `IRONCREW_HITL_KEYRING_FINGERPRINT` |
+
+When all five variables are absent, `deployment` is `null`. If any one is set,
+all five are required or `serve` fails before binding HTTP. The revision is
+1–128 ASCII letters, digits, `.`, `-`, `_`, `:`, or `+`. Every fingerprint must
+be exactly `sha256:` followed by 64 lowercase hexadecimal characters.
+
+```json
+{
+  "version": "2.24.0",
+  "instance_id": "replica-a",
+  "process_start_id": "9b0d1822-c5e8-4bf1-8b78-8133f9287710",
+  "deployment": {
+    "revision": "develop-c4799a3+manifest-9a0198ad",
+    "artifact_fingerprint": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "flow_fingerprint": "sha256:123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+    "config_fingerprint": "sha256:23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
+    "hitl_keyring_fingerprint": "sha256:3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
+  },
+  "lifecycle_state": "accepting",
+  "topology": "single_executor",
+  "control_scope": "process",
+  "multi_replica_control": false,
+  "live_control": {
+    "run_abort": {
+      "local": "process",
+      "cross_instance": "keyed_store_if_supported"
+    },
+    "human_input": "shared_store_for_keyed_runs",
+    "sse_replay": "shared_store",
+    "conversations": "shared_store_keyed",
+    "conversation_sse": "unsupported_shared_store"
+  }
+}
+```
+
+These values are operator-supplied attestations. IronCrew validates their shape
+but does not hash its own executable, flow tree, environment, or keyring and
+does not prove that two equal strings describe equal runtime state. A platform
+acceptance gate must inventory every active process, independently hash the
+running binary and canonical flow/config/keyring manifests inside that process,
+then compare those results with its authenticated capability response.
+
+The effective-config manifest must contain the resolved non-secret settings
+whose parity matters, including storage/prefix, authentication policy shape,
+idempotency policy, and relevant limits. It must never contain bearer tokens,
+database/provider credentials, raw HITL keys, or guessable-secret hashes. The
+keyring manifest may contain key ids, the active id, and fingerprints derived
+from random 32-byte key material, but never the material itself. Unique
+instance/platform ids, `process_start_id`, injected bind addresses/ports,
+timestamps, and pod-specific paths are attribution fields, not parity inputs;
+platform CPU/memory limits are recorded and compared separately. During a
+controlled key rotation, explicitly map each process to its expected revision
+instead of misclassifying the intentional mixed-compatible phase as drift.
 
 An optional top-level `tags` array is attached to the run record. It accepts
 unique, non-empty, trimmed strings without control characters. The defaults
@@ -115,10 +193,12 @@ Configure via `IRONCREW_MAX_RUN_LIFETIME` env var (seconds).
 ### Safe retries with `Idempotency-Key`
 
 `POST /flows/{flow}/run` and
-`POST /flows/{flow}/conversations/{id}/messages` accept one optional
-`Idempotency-Key` header. Production deployments should set
-`IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`, which makes the header mandatory on
-both endpoints. A key must contain 1–128 visible ASCII bytes with no
+`POST /flows/{flow}/conversations/{id}/messages` accept one
+`Idempotency-Key` header. PostgreSQL-backed conversation messages always
+require it because that ledger is their cross-replica turn fence. Run requests
+and JSON/SQLite conversation messages make it optional unless
+`IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`; production deployments should enable
+that setting for a uniform mutation policy. A key must contain 1–128 visible ASCII bytes with no
 whitespace. IronCrew hashes it before persistence; the raw key is never stored
 or written to the audit log. Use an unguessable value (for example, a UUIDv4
 or 128-bit random token), because retaining the prior raw key is also the
@@ -139,13 +219,19 @@ same `run_id`, with
 `Idempotency-Replayed: true`. Object-key order does not change a fingerprint;
 array order does. A missing run body is distinct from explicit JSON `null`.
 For messages, an absent, `null`, or empty `images` list is equivalent.
+PostgreSQL conversation messages accept only public HTTP(S) image locators;
+project-relative image paths remain available with JSON/SQLite stores but are
+rejected for shared storage because their bytes are process-local.
 
 - Reusing a key for another endpoint, flow, conversation, or request body
   returns `409 Conflict`.
 - A matching message that is still executing returns `409`; it is not queued.
-- If another pod has already advanced the durable conversation revision, the
-  stale local handle is discarded and the request returns `409`; call
-  `/start` to reload before retrying.
+- A PostgreSQL message can land on a replica without a live handle. After it
+  claims the exact `(flow, conversation, incarnation, revision)` mutation, that
+  replica rehydrates from durable history and verifies the complete definition
+  before provider/tool work. A stale cache entry is discarded. A true revision
+  race returns `409`; retry the same logical request with its same key after
+  observing the durable result.
 - If a pod dies after a message may have invoked a provider or tool, the key
   becomes an indeterminate tombstone and returns `409` instead of executing
   those effects again. A different key cannot silently bypass an expired
@@ -169,7 +255,9 @@ For messages, an absent, `null`, or empty `images` list is equivalent.
   preventing overlap with a stale worker that is still unwinding. Retry the
   identical recovery request after that grace interval (60 seconds by
   default); earlier retries continue to return `409`.
-  Re-open an evicted/restarted conversation with `/start` before recovery.
+  PostgreSQL does not require `/start` merely to rebuild a cold handle; the
+  keyed message path rehydrates it. `/start` remains required to create the
+  initial durable conversation.
 - A crashed run claim is reconciled to an `abandoned` run with its original
   `run_id`; retries continue to return that original acceptance response.
 - While a keyed run executes, one fenced heartbeat atomically renews both its
@@ -215,6 +303,13 @@ compare-and-set commits, lease reconciliation records `abandoned`, not
 `aborted`. No durable `run_complete` event is invented for the dead process;
 PostgreSQL SSE recovery instead emits one unnumbered fallback completion with
 `journal_complete: false` and `synthesized_from_run_record: true`.
+
+Once the exact PostgreSQL idempotency attempt's owner has started draining, a
+peer cancellation returns non-cacheable `503` with
+`code: "run_owner_draining"`; it does not write a new cancellation
+acknowledgement that the owner may never observe. A direct request whose
+lifecycle middleware check occurs after that replica entered
+`fencing`/`draining` returns `503 instance_draining` instead.
 
 If an active run belongs to another instance and the configured backend has no
 durable cancellation mailbox (including JSON, SQLite, or an unkeyed run), the
@@ -311,6 +406,16 @@ consumed the answer. An owner-local or non-durable answer instead returns
 `200 OK` and `status: "delivered"`. In both modes, the first accepted writer
 wins and subsequent attempts return `404`.
 
+If the exact keyed owner/attempt has been fenced for drain, a peer answer
+returns non-cacheable `503` with `code: "run_owner_draining"` and leaves the
+question pending. A direct answer whose lifecycle check occurs after the owner
+entered `fencing`/`draining` returns `503 instance_draining`. Neither response
+claims that the suspended coroutine received the value. A keyed run that
+reaches a new `ask_human` registration after its exact owner/attempt was fenced
+fails that registration with the typed owner-draining condition and creates no
+new durable mailbox row; questions registered before the fence remain readable
+but cannot be answered while the owner drains.
+
 ### Cross-replica delivery
 
 Arbitrary replicas can list and answer a pending question only when all of the
@@ -318,8 +423,10 @@ following are true:
 
 - the run was started over HTTP with an `Idempotency-Key`;
 - every replica uses the same PostgreSQL database and table prefix;
-- every replica has the same `IRONCREW_HITL_ENCRYPTION_KEYS` JSON keyring and
-  a valid `IRONCREW_HITL_ACTIVE_KEY_ID`.
+- every replica has the same readable `IRONCREW_HITL_ENCRYPTION_KEYS` key set
+  and a valid `IRONCREW_HITL_ACTIVE_KEY_ID`. Steady state uses one active id;
+  the controlled rotation overlap may mix active ids only after every process
+  has both keys.
 
 The keyring is a JSON object whose values are canonical base64 encodings of
 32-byte keys. It accepts at most eight keys and 16 KiB of JSON. Question
@@ -346,21 +453,27 @@ questions from accumulating when they exceed 1 MiB together. PostgreSQL
 ciphertext admission additionally accounts for 28 AEAD bytes per allowed row.
 Keep the aggregate cap conservative on small pods.
 
-Concurrent PostgreSQL question-list/decrypt operations are bounded per process
-by `IRONCREW_HITL_PG_MAX_CONCURRENT_READS` (default `8`, range `1`–`64`). The
+Concurrent PostgreSQL question-list decryptions and answer-side question
+authentications share the per-process
+`IRONCREW_HITL_PG_MAX_CONCURRENT_READS` bound (default `8`, range `1`–`64`). The
 question-list endpoint is also subject to the process-local per-principal
 observation bucket (`IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE=600`,
 `IRONCREW_ADMISSION_OBSERVATION_BURST=20` by default); neither limit throttles
 the owner's internal answer polling.
 
 Keep the keyring in a Railway variable, OpenShift/Kubernetes `Secret`, or an
-external secret manager. Rotate it in two deployments: first add the new key
-to every replica while the old key remains active; then select the new active
-key everywhere while retaining the old key until no mailbox row references its
-question or answer fingerprint. Answer consumption, timeout, terminalization,
-and abandoned-run reconciliation normally clear those rows. Removing an old
-key based only on wall-clock age can strand an answer queued during an owner
-outage. Never place the keyring in the image or a checked-in manifest.
+external secret manager. IronCrew reads it once at process startup. Rotate it
+through three revisions: deploy `{old,new}` with old active everywhere; deploy
+the same expanded set with new active everywhere; after every old-active writer
+has exited and both mailbox fingerprint columns have zero old references,
+deploy new-only. The active id selects new question metadata, while an answer
+inherits its authenticated question's key so the current owner can decrypt it.
+Startup fails before HTTP binds if any retained question or answer requires a
+missing key, and answer requests authenticate the question before mutation.
+This startup check is not a recurring fleet audit, so inventorying and stopping
+old writers remains mandatory. Answer consumption, timeout, terminalization,
+and abandoned-run reconciliation normally clear rows. Never place the keyring
+in the image or a checked-in manifest.
 
 This mailbox routes a command to the current owner; it does **not** move or
 recreate the Lua VM. It does not provide execution takeover after owner death
@@ -390,10 +503,10 @@ PostgreSQL replay follows the durable journal contract below.
 curl -N http://localhost:3000/flows/research-crew/events/a1b2c3d4-...
 ```
 
-Successful SSE responses use `Cache-Control: no-store, no-transform` and
-`X-Accel-Buffering: no`; validation/error responses are also non-cacheable.
-These streams can contain model output, reasoning, tool/log text, and other
-sensitive run data.
+Successful SSE responses use `Content-Type: text/event-stream`,
+`Cache-Control: no-store, no-transform`, and `X-Accel-Buffering: no`;
+validation/error responses are also non-cacheable. These streams can contain
+model output, reasoning, tool/log text, and other sensitive run data.
 
 ### PostgreSQL replay and `Last-Event-ID`
 
@@ -439,9 +552,21 @@ Cursor failures are deterministic:
 | sequence is older than the retained boundary | `409` | `cursor_expired` |
 | `Last-Event-ID` used with JSON or SQLite | `409` | shared replay is unavailable |
 
+Authentication runs before cursor parsing, and every cursor error is returned
+with `Cache-Control: no-store`. With PostgreSQL, cursor classification is based
+on the shared journal bounds rather than the serving process's local registry,
+so a non-owner replica returns the same status and code as the owner.
+
 Active-stream completeness is best-effort. The producer uses bounded queues,
 bytes, batches, retries, and deadlines; saturation or a database outage can
-create an explicit gap while the authoritative run continues. A normal
+create an explicit gap while the authoritative run continues. With
+`W = IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS` (default 1500 ms, range
+100–5000), one append attempt includes pool acquisition and the complete
+transaction. PostgreSQL sets transaction-local `lock_timeout` and
+`statement_timeout` to `4W/5`; the writer makes three attempts with 50/100 ms
+backoffs. Flush and terminal acknowledgement use the derived `3W + 650 ms`
+deadline. It includes queue admission but does not guarantee that every queued
+batch drains before terminal persistence. A normal
 persisted `run_complete` has a sequence/id and closes the stream. If that event
 was omitted or physically pruned but the run record is terminal, IronCrew
 synthesizes an unnumbered `run_complete` from the durable run record with
@@ -450,6 +575,15 @@ That fallback proves terminal state, not complete event history, and provides
 no cursor to acknowledge. After five consecutive journal read failures or
 timeouts, the stream emits an SSE `error` event and closes so the client can
 retry with its last fully processed id.
+
+The authoritative terminal run row is committed before the numbered
+`run_complete` append. A terminal `GET /flows/{flow}/runs/{run_id}` response is
+therefore not a journal-flush barrier. An SSE request can receive the same
+unnumbered incomplete fallback while idempotency finalization and the bounded
+terminal append are still pending. A client that requires a resumable terminal
+cursor must use its own bounded reconnect/poll policy until the shared journal
+reports that numbered event; the fallback itself remains truthful
+terminal-state evidence.
 
 JSON and SQLite keep the earlier process-local behavior: late subscribers on
 the owner receive its bounded in-memory replay and then live broadcasts. A
@@ -741,8 +875,8 @@ JSON Schema parameter definitions.
 
 Phase 1 exposes the existing `crew:conversation({...})` primitive as six
 HTTP endpoints. Sessions are created explicitly with `POST /start`, turns
-are serialized per-id, and records persist through the same `StateStore`
-used by `ironcrew chat`.
+are fenced per durable incarnation, and records persist through the same
+`StateStore` used by `ironcrew chat`.
 
 | Method | Path                                                | Purpose                             |
 | ------ | --------------------------------------------------- | ----------------------------------- |
@@ -753,15 +887,81 @@ used by `ironcrew chat`.
 | DELETE | `/flows/{flow}/conversations/{id}`                  | Drop handle + delete record         |
 | GET    | `/flows/{flow}/conversations`                       | Paginated list (filtered by flow)   |
 
-`POST /messages` against an unknown id returns `404` — sessions never
-auto-create. Only one mutating operation may be active for a conversation;
-an overlapping message returns `409 Conflict` so the server does not retain
-an unbounded per-session request queue. Clients should retry with bounded
-backoff after the current turn completes. The hard cap on simultaneously-active sessions is
-`IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default 8); breaches return `503`.
+Every response produced by these registered conversation routes carries
+`Cache-Control: no-store`, including authentication, extractor, admission,
+validation, conflict, and capacity failures. Successful JSON responses use
+`no-store`; successful local SSE uses `no-store, no-transform` and
+`X-Accel-Buffering: no`.
+
+`POST /messages` against an unknown durable id returns `404` — sessions never
+auto-create. PostgreSQL requires `Idempotency-Key` on every message and can
+cold-rehydrate the exact transcript on either replica. Only one mutating
+operation may be active for an incarnation; an overlapping message returns
+`409 Conflict` so the server does not retain an unbounded per-session request
+queue. Delete is fenced by the same durable resource lock and returns `409`
+promptly from both the turn-owning replica and a peer while a keyed turn is
+active; it does not wait for or cancel the turn. Clients should retry with
+bounded backoff after the current turn completes. The hard cap on
+simultaneously-active sessions is `IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default
+8); breaches return `503`.
 Text and image inputs are independently bounded; see the
 [chat environment table](chat.md#environment-variables) for the exact defaults
 and hard ceilings.
+
+A dead owner can be recovered only at a committed turn boundary. After owner
+death between turns, another replica can accept the next keyed message and
+rehydrate the exact stored revision. Death during provider/tool work or commit
+does not transfer the Lua VM: the active key remains indeterminate, external
+effects may already have occurred, and the client must inspect durable history
+before using the documented `Idempotency-Recovery-Key` barrier.
+
+`POST /start` requires `agent` for a new conversation. When reopening a
+persisted conversation, clients may send `{}` to reuse the stored agent. If a
+non-empty `agent` is supplied, IronCrew trims surrounding whitespace and
+requires an exact match with the stored agent. A mismatch returns `409 Conflict`
+before the flow is evaluated or a live Lua conversation is constructed, without
+changing the stored transcript or active-session state.
+
+`/start`, `/messages`, and `/history` expose the durable `revision`, a UUID
+`incarnation_id`, and canonical source/definition fingerprints as applicable.
+The definition covers the Lua source tree, selected Agent, resolved model and
+system prompt, transcript limits, maximum tool rounds, effective non-secret
+provider endpoint/options and rate/response/output limits, and the resolved
+tool graph. Each HTTP build executes one bounded no-follow snapshot for
+`config.lua`, `crew.lua`, direct agent/tool files, `_lib` modules, and nested
+`run_flow`; a second capture only detects rollout drift. The capture rejects
+symlinks, special files, invalid UTF-8, and concurrent file changes. It applies
+`IRONCREW_LUA_MAX_SOURCE_BYTES` per file and hard limits of 1,024 Lua files,
+64 MiB of Lua source, 16,384 tree entries, and 32 directory levels. A platform
+without secure no-follow traversal rejects HTTP conversation construction
+instead of using a fallback loader. The resolved tool graph binds the
+constructed runtime's effective non-secret Lua/JSON/HTTP/conversation-input,
+reasoning, approval, dispatch, network, nested-flow, and reachable
+capability-root policies. Execution uses those captured values rather than
+re-reading mutable process environment settings. Credentials, secret values,
+and raw capability roots are excluded, while code-fixed behavior is carried by
+the deployment's separately attested artifact identity. Provider base URLs with
+userinfo, a query, or a fragment are rejected. A persistent conversation that
+reaches an MCP tool also requires the server configuration to declare a
+non-secret `execution_identity`; see
+[MCP configuration](crews.md#mcp-model-context-protocol-tool-servers).
+
+Records created before this execution identity existed remain readable through
+`/history` and removable with `DELETE`, but `/start` and `/messages` reject
+them. Export their history, delete the record, and create a new conversation.
+This does not grandfather malformed or unbounded data. All backends reject
+structurally amplified JSON, an oversized/non-array transcript, excessive
+message count, invalid message shape, or oversized identity/metadata before
+adopting the record. SQL reads apply byte/count checks before returning JSON to
+Rust; JSON files apply the same bounded structural preflight to the whole
+record. `DELETE` can still remove a corrupt record without deserializing its
+transcript, subject to the active-turn fence.
+
+Conversation SSE is deliberately not made durable by PostgreSQL. `/events`
+returns `409` for an existing shared-store conversation and directs clients to
+durable history. JSON/SQLite keep process-local in-memory SSE, but reject
+`Last-Event-ID` with `409`; a lagged subscriber receives `conversation_gap`
+and the stream closes.
 
 See [docs/chat.md](chat.md) for the full reference, request/response
 shapes, and a worked curl session.
@@ -851,6 +1051,25 @@ curl http://localhost:3000/health
 The `version` field is populated from the crate's `CARGO_PKG_VERSION`, so it
 always reflects the binary you are actually running.
 
+Use `/health/live` for liveness and `/health/ready` for routing. After any
+lifecycle withdrawal, readiness returns `503` with the exact current phase:
+
+```json
+{
+  "status": "not_ready",
+  "component": "lifecycle",
+  "lifecycle_state": "draining",
+  "version": "2.24.0"
+}
+```
+
+Protected `/metrics` remains available while draining and exposes the one-hot
+`ironcrew_process_lifecycle_state{state="..."}` gauge for the four fixed state
+values plus
+`ironcrew_process_lifecycle_rejections_total{class="work|control"}` for direct
+mutation rejects. Keep the scrape target's replica identity outside metric
+labels.
+
 ## Authentication
 
 Set `IRONCREW_API_TOKEN` to require Bearer token authentication on all endpoints
@@ -904,7 +1123,8 @@ IRONCREW_CORS_ORIGINS=*
 Allowed methods: GET, POST, DELETE, OPTIONS. Allowed request headers:
 `Authorization`, `Content-Type`, `Idempotency-Key`, and
 `Idempotency-Recovery-Key`. Browser clients may read the exposed
-`Idempotency-Replayed` response header.
+`Idempotency-Replayed`, `X-IronCrew-Instance-Id`, and `Retry-After` response
+headers.
 
 ## Request Size Limits
 
@@ -922,28 +1142,58 @@ Values must be positive and cannot exceed 64 MiB.
 API error responses are sanitized to prevent leaking internal filesystem paths
 or server structure. Full error details are logged server-side.
 
+Lifecycle mutation rejections use structured, non-cacheable `503` responses:
+
+- `code: "instance_draining"` means the receiving replica is no longer
+  accepting protected `POST`/`DELETE`; the body also includes its current
+  `lifecycle_state` and `instance_id`.
+- `code: "run_owner_draining"` means a PostgreSQL peer observed the exact
+  keyed owner/attempt drain fence and refused to acknowledge cancellation or
+  HITL delivery falsely. The body identifies the `run_id`, opaque
+  `owner_instance_id`, and `control_scope: "shared_store"`.
+
+Both responses include `Retry-After: 1`. Authenticated
+`GET`/`HEAD`, including metrics, run and question reads, and new or existing
+SSE, remain available in `fencing`/`draining` subject to their ordinary
+authentication, admission, retention, and ownership rules.
+
+The lifecycle middleware phase read is the mutation-admission linearization
+point. A request admitted while the instance was still `accepting` remains a
+pre-fence request even if an inner race check later rejects it; that path
+returns a generic non-cacheable `503` with numeric `Retry-After`, not
+necessarily the structured `instance_draining` body.
+
 ## Graceful Shutdown
 
-The server handles `SIGTERM` and `Ctrl+C` for graceful shutdown. On receipt of
-the signal, IronCrew:
+The server lifecycle is monotonic:
+`accepting -> fencing -> draining -> stopping`.
 
-1. Marks readiness unavailable, stops accepting new work, and enters Axum's
-   graceful-shutdown path.
-2. Aborts every active run, waits for its monitor to persist an `aborted`
-   terminal record and emit the terminal event, then drops run and conversation
-   event buses so SSE streams close cleanly.
-3. Waits out a short post-serve drain window to let background cleanup tasks
-   (e.g. MCP child-process reapers) finish.
+- On Unix, `SIGUSR1` enters `fencing`, fails readiness, durably fences exact
+  owned PostgreSQL keyed attempts, then remains in `draining` without exiting.
+  A failed fence leaves the process in `fencing`; another `SIGUSR1` retries.
+  Accepted work and authenticated observation/SSE continue; protected
+  `POST`/`DELETE` rejects in either non-accepting state.
+- `SIGTERM` and Ctrl+C start the routing deadline and perform the same fence.
+  Fence errors/timeouts retry with bounded store attempts and exponential
+  backoff from 100 ms capped at 5 seconds while the process stays `fencing`;
+  `stopping` is not entered until the fence commits. Active runs and chat turns
+  are then cancelled, terminal state is persisted within the teardown bound,
+  and SSE closes.
 
-Two environment variables tune the behavior:
+Three environment variables tune the behavior:
 
-| Variable                         | Default | Purpose                                                                                   |
-|----------------------------------|---------|-------------------------------------------------------------------------------------------|
-| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10`    | Hard deadline after the signal is received; the server exits even if Axum graceful shutdown has not finished yet. |
-| `IRONCREW_SHUTDOWN_DRAIN_MS`     | `1000`  | Post-serve drain window for background cleanup tasks (MCP child-process reaping, etc.).   |
+| Variable | Default | Purpose |
+|---|---|---|
+| `IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS` | `5` | Routing deadline from SIGTERM/Ctrl+C (range `0..300`); fencing consumes part of it and any remainder is spent in `draining`. A failed fence retries beyond the deadline and blocks `stopping`. An explicit successful `SIGUSR1` drain waits indefinitely for a later termination signal. |
+| `IRONCREW_SHUTDOWN_TIMEOUT_SECS` | `10` | Hard teardown deadline started at `stopping`; the server exits if graceful teardown has not completed (range `1..300`). |
+| `IRONCREW_SHUTDOWN_DRAIN_MS` | `1000` | Post-serve cleanup window for background tasks such as MCP child-process reapers (range `0..30000`). |
 
-This is essential for Kubernetes rolling updates and Railway deployments —
-SSE consumers see a clean disconnect and can reconnect to a fresh pod.
+For Kubernetes/Railway, budget routing grace + teardown deadline + cleanup +
+an operator margin inside the platform SIGTERM-to-SIGKILL window, assuming the
+owner fence commits within routing grace. If it cannot, IronCrew remains
+fail-closed in `fencing`; the platform may use `SIGKILL`, and lease
+reconciliation later records unfinished work as `abandoned`. SSE clients see
+the final clean disconnect at `stopping` and can reconnect to a fresh replica.
 
 ## Docker Deployment
 
@@ -959,10 +1209,12 @@ docker run -p 3000:3000 \
   ironcrew
 ```
 
-The Dockerfile uses a reproducible multi-stage build: Rust `1.96.0` with
+The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.96.0` with
 `cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
-certificates. The image runs as numeric non-root UID `10001` (group `0`) and
-provides `ironcrew serve --flows-dir /flows` as its default command.
+certificates. Those tags and the runtime package repositories are not a
+bit-for-bit reproducibility guarantee. The image runs as numeric non-root UID
+`10001` (group `0`) and provides `ironcrew serve --flows-dir /flows` as its
+default command.
 
 The image sets `IRONCREW_HOST=0.0.0.0`, so the published port is reachable
 without an extra bind flag. A host-built binary still defaults to `127.0.0.1`

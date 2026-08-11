@@ -5,10 +5,12 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 use async_trait::async_trait;
+use ironcrew::engine::conversation_definition::{ConversationSourceContext, capture_flow_source};
 use ironcrew::engine::runtime::Runtime;
 use ironcrew::llm::provider::{ChatRequest, ChatResponse, LlmProvider, TokenUsage, ToolSchema};
 use ironcrew::lua::api::{
@@ -350,6 +352,130 @@ async fn nested_run_flow_through_tool_reuses_registry() {
     let out2 = h2.await.unwrap().expect("second delegator call");
     assert_eq!(out1, "got=2");
     assert_eq!(out2, "got=11");
+}
+
+#[test]
+fn nested_subflow_uses_runtime_captured_policy_after_env_drift() {
+    if std::env::var_os("IRONCREW_SUBFLOW_POLICY_CHILD").is_some() {
+        return;
+    }
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "nested_subflow_uses_runtime_captured_policy_after_env_drift_child",
+            "--nocapture",
+        ])
+        .env("IRONCREW_SUBFLOW_POLICY_CHILD", "1")
+        .env("IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES", "4")
+        .env_remove("IRONCREW_ALLOW_PRIVATE_IPS")
+        .env("IRONCREW_ENV_ALLOWLIST", "IRONCREW_TEST_VISIBLE")
+        .env("IRONCREW_TEST_VISIBLE", "before")
+        .status()
+        .expect("run isolated policy child");
+    assert!(status.success(), "isolated policy child failed: {status}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nested_subflow_uses_runtime_captured_policy_after_env_drift_child() {
+    if std::env::var_os("IRONCREW_SUBFLOW_POLICY_CHILD").is_none() {
+        return;
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("tools")).unwrap();
+    std::fs::write(
+        project.path().join("crew.lua"),
+        "return Crew.new({ goal = 'test' })",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tools/policy_delegate.lua"),
+        r#"
+        return {
+            name = "policy_delegate",
+            description = "exercise nested policy",
+            parameters = {},
+            execute = function()
+                local _, env_error = pcall(function()
+                    return env("IRONCREW_TEST_VISIBLE")
+                end)
+                return tostring(env_error) .. "\n" .. run_flow("nested.lua", {})
+            end,
+        }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("nested.lua"),
+        r#"
+        local _, env_error = pcall(function()
+            return env("IRONCREW_TEST_VISIBLE")
+        end)
+        local _, body_error = pcall(function()
+            return http.post("ftp://invalid.example/never", { body = "12345" })
+        end)
+        local _, network_error = pcall(function()
+            return http.get("http://127.0.0.1:9")
+        end)
+        return tostring(env_error) .. "\n" .. tostring(body_error) .. "\n" .. tostring(network_error)
+        "#,
+    )
+    .unwrap();
+
+    let loader = ProjectLoader::from_directory(project.path()).unwrap();
+    let tool_defs = load_tool_defs_from_files(loader.tool_files()).unwrap();
+    let snapshot = Arc::new(capture_flow_source(project.path()).unwrap());
+    let mut runtime = Runtime::new_with_conversation_source(
+        Box::new(NoopProvider),
+        Some(project.path()),
+        Some(ConversationSourceContext::root(snapshot)),
+    );
+    runtime.register_lua_tools(tool_defs).unwrap();
+    let runtime = Arc::new(runtime);
+    runtime.set_self_ref(Arc::downgrade(&runtime));
+    let selected = vec!["policy_delegate".to_string()];
+    let before = runtime
+        .tool_registry
+        .conversation_execution_fingerprint(&selected)
+        .unwrap();
+
+    unsafe {
+        std::env::set_var("IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES", "64");
+        std::env::set_var("IRONCREW_ALLOW_PRIVATE_IPS", "1");
+        std::env::set_var("IRONCREW_ENV_ALLOWLIST", "IRONCREW_TEST_VISIBLE");
+        std::env::set_var("IRONCREW_TEST_VISIBLE", "after");
+    }
+
+    let after = runtime
+        .tool_registry
+        .conversation_execution_fingerprint(&selected)
+        .unwrap();
+    assert_eq!(before, after, "captured definition must be immutable");
+
+    let output = runtime
+        .tool_registry
+        .execute(
+            "policy_delegate",
+            serde_json::json!({}),
+            &ToolCallContext::default(),
+        )
+        .await
+        .expect("nested policy probe returns its captured errors");
+    assert!(
+        output.contains("(4)"),
+        "unexpected body-limit error: {output}"
+    );
+    assert!(
+        output.contains("SSRF blocked") && output.contains("127.0.0.1"),
+        "unexpected network-policy error: {output}"
+    );
+    assert!(
+        output
+            .matches("env() is unavailable in persistent conversation")
+            .count()
+            >= 2,
+        "tool and nested snapshot env() must both fail closed: {output}"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────

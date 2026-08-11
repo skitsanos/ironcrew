@@ -342,11 +342,15 @@ VM boundary via JSON.
 - **Synchronous from Lua's perspective, async under the hood.** Callers just
   receive the return value; IronCrew awaits the sub-flow on the Tokio runtime.
 - **Fresh Lua VM per sub-flow.** Each invocation builds a new sandboxed VM
-  (same sandbox rules as the parent crew: no `os`, `io`, `require`, `loadfile`,
-  `dofile`; `http`, `fs`, `template`, `regex`, `json_parse`, etc. are
-  available). Sub-flows do not inherit memory, tasks, or agents from the caller.
-- **Agents auto-load.** The sub-flow's directory is scanned for `agents/*.lua`
-  just like a top-level crew.
+  (same sandbox rules as the parent crew: no `os`, `io`, `loadfile`, `dofile`;
+  `http`, `fs`, `template`, `regex`, `json_parse`, etc. are available).
+  Sub-flows do not inherit memory, tasks, or agents from the caller. During an
+  HTTP conversation, the sub-flow source and its `require` modules come from
+  the conversation's immutable snapshot; ordinary run/CLI execution keeps the
+  filesystem-backed loader.
+- **Agents auto-load.** Direct `agents/*.lua` children are loaded from that
+  same conversation snapshot, or scanned from the sub-flow directory for an
+  ordinary filesystem-backed invocation.
 - **Available in both sandboxes.** `run_flow` is registered on the top-level
   crew Lua VM *and* on the per-tool Lua VM used by custom `tools/*.lua` files
   (including tools invoked during a `crew:conversation()` tool-call loop). This
@@ -425,6 +429,24 @@ crew:add_agent(Agent.new({
 ```
 
 See [Crews](crews.md) for `mcp_servers` configuration.
+
+For persistent conversations, every reachable MCP server must also declare a
+non-secret `execution_identity`. IronCrew hashes it together with the resolved
+tool schema/graph so a cold resume on another replica cannot silently switch
+server behavior. The field is not a credential: rotate it when executable or
+API behavior changes and never include tokens or secret-bearing configuration.
+Ordinary runs and ephemeral conversations do not require it.
+
+The same persistent-conversation definition binds each reachable tool's
+captured effective non-secret execution policy. This includes fingerprints of
+filesystem and Lua-tool capability roots, configured byte/count/output limits,
+extension or domain filters, the private-network opt-in, shell/default tool
+timeouts, and maximum nested-flow depth. Tool execution uses those captured
+values rather than re-reading mutable environment policy mid-conversation.
+Secrets and raw root paths are excluded. Fixed compiled ceilings and semantics
+are not copied into each conversation record; replicas must carry the same
+attested artifact identity so those constants remain equal. A behavior-changing
+policy drift changes the definition fingerprint and makes resume fail closed.
 
 **Result size cap.** MCP tool results are size-capped at
 `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` (default `262144` / 256 KiB; hard ceiling

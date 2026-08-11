@@ -17,7 +17,7 @@ const LOADING_KEY: &str = "__ic_modules_loading";
 /// `[A-Za-z0-9_-]`. This rejects `..`, `/`, `\`, `:`, absolute paths, and
 /// leading/trailing/double dots at the name level. `"credentials"` ->
 /// `credentials.lua`; `"auth.jwt"` -> `auth/jwt.lua`.
-fn module_name_to_relpath(name: &str) -> Result<PathBuf, String> {
+pub(super) fn module_name_to_relpath(name: &str) -> Result<PathBuf, String> {
     if name.is_empty() {
         return Err(format!("invalid module name '{name}'"));
     }

@@ -44,6 +44,27 @@ pub async fn load_image_with_limit(
         "IRONCREW_MAX_IMAGE_BYTES",
         crate::utils::http::DEFAULT_IMAGE_BYTES,
     );
+    let error_limit = crate::utils::http::byte_limit_from_env(
+        "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
+        crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
+    );
+    load_image_with_policy(
+        path_or_url,
+        project_dir,
+        max_bytes,
+        configured_limit,
+        error_limit,
+    )
+    .await
+}
+
+pub(crate) async fn load_image_with_policy(
+    path_or_url: &str,
+    project_dir: &std::path::Path,
+    max_bytes: usize,
+    configured_limit: usize,
+    error_limit: usize,
+) -> Result<ImageInput> {
     let limit = max_bytes.min(configured_limit);
     if limit == 0 {
         return Err(IronCrewError::Validation(
@@ -52,7 +73,7 @@ pub async fn load_image_with_limit(
     }
 
     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-        load_image_from_url(path_or_url, limit).await
+        load_image_from_url(path_or_url, limit, error_limit).await
     } else {
         load_image_from_file(path_or_url, project_dir, limit)
     }
@@ -81,7 +102,11 @@ fn load_image_from_file(
     Ok(ImageInput { mime_type, data })
 }
 
-async fn load_image_from_url(url: &str, max_bytes: usize) -> Result<ImageInput> {
+async fn load_image_from_url(
+    url: &str,
+    max_bytes: usize,
+    error_limit: usize,
+) -> Result<ImageInput> {
     // SSRF protection: a remote image URL is attacker-influenced input, so it
     // must not be able to reach cloud metadata or internal services.
     crate::utils::network::validate_url_not_private(url).map_err(IronCrewError::Validation)?;
@@ -94,19 +119,16 @@ async fn load_image_from_url(url: &str, max_bytes: usize) -> Result<ImageInput> 
         .await
         .map_err(|e| IronCrewError::Validation(format!("Failed to download image: {}", e)))?;
 
-    decode_remote_image_response(response, max_bytes).await
+    decode_remote_image_response(response, max_bytes, error_limit).await
 }
 
 async fn decode_remote_image_response(
     response: reqwest::Response,
     max_bytes: usize,
+    error_limit: usize,
 ) -> Result<ImageInput> {
     let status = response.status();
     if !status.is_success() {
-        let error_limit = crate::utils::http::byte_limit_from_env(
-            "IRONCREW_PROVIDER_MAX_ERROR_BYTES",
-            crate::utils::http::DEFAULT_PROVIDER_ERROR_BYTES,
-        );
         let body = crate::utils::http::read_response_bytes(
             response,
             error_limit,
@@ -202,7 +224,7 @@ mod tests {
             b"HTTP/1.1 404 Not Found\r\nContent-Type: image/png\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
         )
         .await;
-        let error = decode_remote_image_response(response, 1024)
+        let error = decode_remote_image_response(response, 1024, 1024)
             .await
             .expect_err("error status must fail");
         assert!(error.to_string().contains("HTTP 404"));
@@ -214,7 +236,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops",
         )
         .await;
-        let error = decode_remote_image_response(response, 1024)
+        let error = decode_remote_image_response(response, 1024, 1024)
             .await
             .expect_err("unsupported MIME must fail");
         assert!(
@@ -230,7 +252,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
         )
         .await;
-        let error = decode_remote_image_response(response, 8)
+        let error = decode_remote_image_response(response, 8, 1024)
             .await
             .expect_err("oversized chunked image must fail");
         assert!(error.to_string().contains("8-byte limit"));

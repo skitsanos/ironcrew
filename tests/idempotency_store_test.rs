@@ -2,15 +2,18 @@ use std::sync::Arc;
 
 use ironcrew::api::{AppState, create_router};
 use ironcrew::engine::idempotency::{
-    CONVERSATION_MESSAGE_OPERATION, IdempotencyClaim, IdempotencyClaimOutcome,
-    IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup, IdempotencyQuotaResource,
-    IdempotencyQuotaScope, IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION,
-    RunFenceHeartbeat,
+    CONVERSATION_MESSAGE_OPERATION, HARD_IDEMPOTENCY_RESPONSE_BYTES, IdempotencyClaim,
+    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyLimits, IdempotencyLookup,
+    IdempotencyQuotaResource, IdempotencyQuotaScope, IdempotencyState, IdempotencyUsage,
+    PrincipalId, RUN_OPERATION, RunFenceHeartbeat,
 };
 use ironcrew::engine::run_history::{
     JsonFileStore, RunCompletion, RunIntent, RunRecord, RunStatus, RunTransition,
 };
-use ironcrew::engine::sessions::ConversationRecord;
+use ironcrew::engine::sessions::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+    conversation_mutation_scope,
+};
 use ironcrew::engine::sqlite_store::SqliteStore;
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
@@ -42,8 +45,12 @@ fn conversation_claim(
     fingerprint_byte: char,
     attempt: &str,
     resource_id: &str,
-    exclusive_scope: &str,
 ) -> IdempotencyClaim {
+    let exclusive_scope = conversation_mutation_scope(
+        "flow-a",
+        resource_id,
+        &conversation_execution().incarnation_id,
+    );
     IdempotencyClaim {
         key_hash: digest(key_byte),
         principal_id: PrincipalId::legacy(),
@@ -52,10 +59,10 @@ fn conversation_claim(
         operation: CONVERSATION_MESSAGE_OPERATION.into(),
         scope: "flow-a".into(),
         resource_id: resource_id.into(),
-        exclusive_scope: Some(exclusive_scope.into()),
+        exclusive_scope: Some(exclusive_scope),
         attempt_id: attempt.into(),
         owner_instance_id: "pod-a".into(),
-        base_revision: Some(0),
+        base_revision: Some(1),
         response_status: None,
         response_body: None,
         max_total_response_bytes: usize::MAX,
@@ -233,12 +240,18 @@ async fn exercise_principal_quota_and_recovery_isolation(store: Arc<dyn StateSto
     let recovery_owner = PrincipalId::from_label("recovery-owner");
     let recovery_foreign = PrincipalId::from_label("recovery-foreign");
     let recovery_limits = principal_limits(16, 8);
+    assert_eq!(
+        store
+            .save_conversation(&conversation("principal-recovery-conversation"))
+            .await
+            .unwrap(),
+        1
+    );
     let mut expired_hazard = conversation_claim(
         'a',
         'b',
         "recovery-hazard-attempt",
         "principal-recovery-conversation",
-        "flow-a:principal-recovery-conversation",
     );
     expired_hazard.principal_id = recovery_owner.clone();
     expired_hazard.created_at = "2026-07-19T11:58:00Z".into();
@@ -256,7 +269,6 @@ async fn exercise_principal_quota_and_recovery_isolation(store: Arc<dyn StateSto
         'd',
         "foreign-recovery-attempt",
         "principal-recovery-conversation",
-        "flow-a:principal-recovery-conversation",
     );
     foreign_recovery.principal_id = recovery_foreign;
     foreign_recovery.recovery_key_hash = Some(expired_hazard.key_hash.clone());
@@ -284,7 +296,6 @@ async fn exercise_principal_quota_and_recovery_isolation(store: Arc<dyn StateSto
         'f',
         "owner-recovery-attempt",
         "principal-recovery-conversation",
-        "flow-a:principal-recovery-conversation",
     );
     owner_recovery.principal_id = recovery_owner;
     owner_recovery.recovery_key_hash = Some(expired_hazard.key_hash);
@@ -445,10 +456,22 @@ fn conversation(id: &str) -> ConversationRecord {
         flow_name: "Flow A".into(),
         flow_path: Some("flow-a".into()),
         agent_name: "assistant".into(),
-        messages: vec![ChatMessage::user("hello")],
+        execution: conversation_execution(),
+        messages: vec![ChatMessage::system("system")],
         created_at: CREATED_AT.into(),
         updated_at: COMPLETED_AT.into(),
         revision: 0,
+    }
+}
+
+fn conversation_execution() -> ConversationExecution {
+    ConversationExecution {
+        schema_version: CONVERSATION_EXECUTION_SCHEMA_VERSION,
+        incarnation_id: "00000000-0000-4000-8000-000000000001".into(),
+        source_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        definition_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        max_history: 50,
+        history_max_bytes: 1024 * 1024,
     }
 }
 
@@ -456,13 +479,14 @@ async fn exercise_idempotency_contract(
     store: Arc<dyn StateStore>,
     competing_store: Arc<dyn StateStore>,
 ) {
-    let claim = conversation_claim(
-        'a',
-        'b',
-        "attempt-a",
-        "conversation-a",
-        "flow-a:conversation-a",
-    );
+    let mut initial = conversation("conversation-a");
+    initial.messages = vec![ChatMessage::system("system")];
+    initial.revision = store.save_conversation(&initial).await.unwrap();
+    assert_eq!(initial.revision, 1);
+    let mut candidate = initial.clone();
+    candidate.messages.push(ChatMessage::user("hello"));
+
+    let claim = conversation_claim('a', 'b', "attempt-a", "conversation-a");
     let left_store = Arc::clone(&store);
     let right_store = competing_store;
     let left_claim = claim.clone();
@@ -494,24 +518,13 @@ async fn exercise_idempotency_contract(
         IdempotencyClaimOutcome::Conflict
     ));
 
-    let busy = conversation_claim(
-        'd',
-        'e',
-        "attempt-b",
-        "conversation-a",
-        "flow-a:conversation-a",
-    );
+    let busy = conversation_claim('d', 'e', "attempt-b", "conversation-a");
     assert!(matches!(
         store.claim_idempotency(busy, 100, 10).await.unwrap(),
         IdempotencyClaimOutcome::Busy
     ));
 
-    assert!(
-        store
-            .save_conversation(&conversation("conversation-a"))
-            .await
-            .is_err()
-    );
+    assert!(store.save_conversation(&candidate).await.is_err());
     assert!(
         store
             .delete_conversation(Some("flow-a"), "conversation-a")
@@ -530,14 +543,10 @@ async fn exercise_idempotency_contract(
     ));
 
     let committed = store
-        .commit_conversation_idempotency(
-            completion(&claim, "{\"ok\":true}"),
-            &conversation("conversation-a"),
-            4096,
-        )
+        .commit_conversation_idempotency(completion(&claim, "{\"ok\":true}"), &candidate, 4096)
         .await
         .unwrap();
-    assert_eq!(committed.revision, 1);
+    assert_eq!(committed.revision, 2);
     assert!(committed.replayable);
     assert!(!committed.already_completed);
     let stored = store
@@ -545,8 +554,8 @@ async fn exercise_idempotency_contract(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.revision, 1);
-    assert_eq!(stored.messages.len(), 1);
+    assert_eq!(stored.revision, 2);
+    assert_eq!(stored.messages.len(), 2);
 
     assert!(matches!(
         store
@@ -563,23 +572,86 @@ async fn exercise_idempotency_contract(
         "same-attempt completion is not a lost fence"
     );
     let replay_commit = store
+        .commit_conversation_idempotency(completion(&claim, "{\"ok\":true}"), &candidate, 4096)
+        .await
+        .unwrap();
+    assert!(replay_commit.already_completed);
+    assert_eq!(replay_commit.revision, 2);
+
+    let expected_scope = conversation_mutation_scope(
+        "flow-a",
+        "conversation-a",
+        &initial.execution.incarnation_id,
+    );
+    match store
+        .lookup_idempotency(&claim.key_hash, &claim.request_fingerprint, COMPLETED_AT)
+        .await
+        .unwrap()
+    {
+        IdempotencyLookup::Replay(record) => {
+            assert_eq!(
+                record.exclusive_scope.as_deref(),
+                Some(expected_scope.as_str())
+            );
+        }
+        other => panic!("expected first-turn replay, got {other:?}"),
+    }
+
+    let mut next_claim = conversation_claim('4', '6', "attempt-next", "conversation-a");
+    next_claim.key_hash = numbered_digest(90_001);
+    next_claim.request_fingerprint = numbered_digest(90_002);
+    next_claim.base_revision = Some(stored.revision);
+    assert!(matches!(
+        store
+            .claim_idempotency(next_claim.clone(), 100, 10)
+            .await
+            .unwrap(),
+        IdempotencyClaimOutcome::Claimed(_)
+    ));
+    assert!(
+        store
+            .delete_conversation(Some("flow-a"), "conversation-a")
+            .await
+            .is_err(),
+        "a newly claimed turn must fence deletion"
+    );
+
+    let mut next_candidate = stored.clone();
+    next_candidate
+        .messages
+        .push(ChatMessage::assistant(Some("hi".into()), None));
+    let next_commit = store
         .commit_conversation_idempotency(
-            completion(&claim, "{\"ok\":true}"),
-            &conversation("conversation-a"),
+            completion(&next_claim, "{\"ok\":\"next\"}"),
+            &next_candidate,
             4096,
         )
         .await
         .unwrap();
-    assert!(replay_commit.already_completed);
-    assert_eq!(replay_commit.revision, 1);
+    assert_eq!(next_commit.revision, 3);
+    assert!(!next_commit.already_completed);
 
-    let stale_revision = conversation_claim(
-        '0',
-        '1',
-        "stale-revision-attempt",
-        "conversation-a",
-        "flow-a:conversation-a",
-    );
+    for replay_claim in [&claim, &next_claim] {
+        match store
+            .lookup_idempotency(
+                &replay_claim.key_hash,
+                &replay_claim.request_fingerprint,
+                COMPLETED_AT,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyLookup::Replay(record) => {
+                assert_eq!(
+                    record.exclusive_scope.as_deref(),
+                    Some(expected_scope.as_str())
+                );
+            }
+            other => panic!("expected completed-turn replay, got {other:?}"),
+        }
+    }
+
+    let stale_revision = conversation_claim('0', '1', "stale-revision-attempt", "conversation-a");
     assert!(matches!(
         store
             .claim_idempotency(stale_revision.clone(), 100, 10)
@@ -599,13 +671,8 @@ async fn exercise_idempotency_contract(
         IdempotencyLookup::Miss
     ));
 
-    let mut missing_with_stale_revision = conversation_claim(
-        'c',
-        'd',
-        "missing-stale-attempt",
-        "missing-conversation",
-        "flow-a:missing-conversation",
-    );
+    let mut missing_with_stale_revision =
+        conversation_claim('c', 'd', "missing-stale-attempt", "missing-conversation");
     missing_with_stale_revision.base_revision = Some(1);
     assert!(matches!(
         store
@@ -615,13 +682,20 @@ async fn exercise_idempotency_contract(
         IdempotencyClaimOutcome::Conflict
     ));
 
-    let mut expired_hazard = conversation_claim(
-        'b',
-        'e',
-        "expired-hazard-attempt",
-        "hazard-conversation",
-        "flow-a:hazard-conversation",
+    assert_eq!(
+        store
+            .save_conversation(&conversation("hazard-conversation"))
+            .await
+            .unwrap(),
+        1
     );
+    let hazard_scope = conversation_mutation_scope(
+        "flow-a",
+        "hazard-conversation",
+        &conversation_execution().incarnation_id,
+    );
+    let mut expired_hazard =
+        conversation_claim('b', 'e', "expired-hazard-attempt", "hazard-conversation");
     expired_hazard.created_at = "2026-07-19T11:58:00Z".into();
     expired_hazard.lease_expires_at = "2026-07-19T11:59:00Z".into();
     assert!(matches!(
@@ -632,13 +706,7 @@ async fn exercise_idempotency_contract(
         IdempotencyClaimOutcome::Claimed(_)
     ));
 
-    let discovery = conversation_claim(
-        '3',
-        '4',
-        "hazard-discovery-attempt",
-        "hazard-conversation",
-        "flow-a:hazard-conversation",
-    );
+    let discovery = conversation_claim('3', '4', "hazard-discovery-attempt", "hazard-conversation");
     assert!(matches!(
         store
             .claim_idempotency(discovery.clone(), 100, 10)
@@ -667,16 +735,11 @@ async fn exercise_idempotency_contract(
             .await
             .unwrap(),
         IdempotencyLookup::Indeterminate(ref record)
-            if record.exclusive_scope.as_deref() == Some("flow-a:hazard-conversation")
+            if record.exclusive_scope.as_deref() == Some(hazard_scope.as_str())
     ));
 
-    let without_recovery = conversation_claim(
-        '5',
-        '6',
-        "without-recovery-attempt",
-        "hazard-conversation",
-        "flow-a:hazard-conversation",
-    );
+    let without_recovery =
+        conversation_claim('5', '6', "without-recovery-attempt", "hazard-conversation");
     assert!(matches!(
         store
             .claim_idempotency(without_recovery, 100, 10)
@@ -690,7 +753,6 @@ async fn exercise_idempotency_contract(
         '8',
         "mismatched-recovery-attempt",
         "hazard-conversation",
-        "flow-a:hazard-conversation",
     );
     mismatched_recovery.recovery_key_hash = Some(digest('a'));
     assert!(matches!(
@@ -701,13 +763,8 @@ async fn exercise_idempotency_contract(
         IdempotencyClaimOutcome::Busy
     ));
 
-    let mut matching_recovery = conversation_claim(
-        '9',
-        '0',
-        "matching-recovery-attempt",
-        "hazard-conversation",
-        "flow-a:hazard-conversation",
-    );
+    let mut matching_recovery =
+        conversation_claim('9', '0', "matching-recovery-attempt", "hazard-conversation");
     matching_recovery.recovery_key_hash = Some(expired_hazard.key_hash.clone());
     assert!(matches!(
         store
@@ -751,25 +808,17 @@ async fn exercise_idempotency_contract(
         IdempotencyLookup::Indeterminate(ref record) if record.exclusive_scope.is_none()
     ));
 
-    let expired = IdempotencyClaim {
-        key_hash: digest('f'),
-        principal_id: PrincipalId::legacy(),
-        recovery_key_hash: None,
-        request_fingerprint: digest('1'),
-        operation: CONVERSATION_MESSAGE_OPERATION.into(),
-        scope: "flow-a".into(),
-        resource_id: "expired-conversation".into(),
-        exclusive_scope: Some("flow-a:expired-conversation".into()),
-        attempt_id: "attempt-expired".into(),
-        owner_instance_id: "pod-a".into(),
-        base_revision: Some(0),
-        response_status: None,
-        response_body: None,
-        max_total_response_bytes: usize::MAX,
-        lease_expires_at: "2026-07-19T11:59:00Z".into(),
-        created_at: "2026-07-19T11:58:00Z".into(),
-        ttl_seconds: 60,
-    };
+    assert_eq!(
+        store
+            .save_conversation(&conversation("expired-conversation"))
+            .await
+            .unwrap(),
+        1
+    );
+    let mut expired = conversation_claim('f', '1', "attempt-expired", "expired-conversation");
+    expired.lease_expires_at = "2026-07-19T11:59:00Z".into();
+    expired.created_at = "2026-07-19T11:58:00Z".into();
+    expired.ttl_seconds = 60;
     assert!(matches!(
         store
             .claim_idempotency(expired.clone(), 100, 10)
@@ -1061,25 +1110,22 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
         .await
         .unwrap();
 
-    let expired_message = IdempotencyClaim {
-        key_hash: digest('8'),
-        principal_id: PrincipalId::legacy(),
-        recovery_key_hash: None,
-        request_fingerprint: digest('9'),
-        operation: CONVERSATION_MESSAGE_OPERATION.into(),
-        scope: "flow-a".into(),
-        resource_id: "reconciled-conversation".into(),
-        exclusive_scope: Some("flow-a:reconciled-conversation".into()),
-        attempt_id: "expired-message-attempt".into(),
-        owner_instance_id: owner,
-        base_revision: Some(0),
-        response_status: None,
-        response_body: None,
-        max_total_response_bytes: usize::MAX,
-        lease_expires_at: "2026-07-19T11:01:00Z".into(),
-        created_at: "2026-07-19T11:00:00Z".into(),
-        ttl_seconds: 600,
-    };
+    assert_eq!(
+        store
+            .save_conversation(&conversation("reconciled-conversation"))
+            .await
+            .unwrap(),
+        1
+    );
+    let mut expired_message = conversation_claim(
+        '8',
+        '9',
+        "expired-message-attempt",
+        "reconciled-conversation",
+    );
+    expired_message.owner_instance_id = owner;
+    expired_message.lease_expires_at = "2026-07-19T11:01:00Z".into();
+    expired_message.created_at = "2026-07-19T11:00:00Z".into();
     store
         .claim_idempotency(expired_message.clone(), 100, 10)
         .await
@@ -1138,16 +1184,13 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
             .unwrap_err(),
         IronCrewError::Conflict(_)
     ));
-    assert!(
-        store
-            .get_conversation(Some("flow-a"), "reconciled-conversation")
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    let conversation = conversation("reconciled-conversation");
-    assert_eq!(store.save_conversation(&conversation).await.unwrap(), 1);
+    let persisted = store
+        .get_conversation(Some("flow-a"), "reconciled-conversation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.revision, 1);
+    assert_eq!(persisted.messages.len(), 1);
     store
         .delete_conversation(Some("flow-a"), "reconciled-conversation")
         .await
@@ -1654,7 +1697,7 @@ async fn sqlite_store_enforces_idempotency_contract() {
     exercise_run_lifecycle_reconciliation(Arc::clone(&store)).await;
     exercise_idempotent_run_heartbeat(Arc::clone(&store)).await;
     let wrong_owner = create_wrong_owner_run_fixture(Arc::clone(&store)).await;
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         conn.execute(
             "UPDATE runs SET owner_instance_id = 'foreign-owner' WHERE run_id = ?1",
@@ -1665,7 +1708,33 @@ async fn sqlite_store_enforces_idempotency_contract() {
     );
     drop(conn);
     assert_wrong_owner_run_loses_fence(Arc::clone(&store), &wrong_owner).await;
-    exercise_provisional_run_hydration(store).await;
+    exercise_provisional_run_hydration(Arc::clone(&store)).await;
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (key_hash, principal_digest, request_fingerprint): (String, String, String) = conn
+        .query_row(
+            "SELECT key_hash, principal_id, request_fingerprint FROM idempotency \
+             WHERE state = 'completed' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE idempotency SET response_body = CAST(zeroblob(?1) AS TEXT) WHERE key_hash = ?2",
+        rusqlite::params![
+            i64::try_from(HARD_IDEMPOTENCY_RESPONSE_BYTES + 1).unwrap(),
+            &key_hash,
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let principal = PrincipalId::from_digest(principal_digest).unwrap();
+    let error = store
+        .lookup_idempotency_for_principal(&principal, &key_hash, &request_fingerprint, COMPLETED_AT)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("response body exceeds the hard byte limit"));
 }
 
 #[tokio::test]
@@ -1792,11 +1861,17 @@ async fn metrics_omit_persisted_principal_identifiers() {
 
     let state = Arc::new(AppState {
         flows_dir: directory.path().to_path_buf(),
+        runtime_identity: ironcrew::api::deployment::RuntimeIdentity::disabled(),
         auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
         admission: Arc::new(ironcrew::api::admission::AdmissionController::default()),
-        accepting_traffic: std::sync::atomic::AtomicBool::new(true),
+        lifecycle: ironcrew::api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            ironcrew::api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                ironcrew::api::conversation_lifecycle::max_active_conversation_lifecycles(),
+            ),
+        ),
         max_active_conversations: 1,
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_active_runs: 1,
@@ -1804,18 +1879,20 @@ async fn metrics_omit_persisted_principal_identifiers() {
         max_sse_connections: 1,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_run_lifetime: std::time::Duration::from_secs(60),
-        terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
-        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
+        terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(3),
+        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(false),
         readiness_cache: tokio::sync::Mutex::new(None),
         idempotency: Default::default(),
         store,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let server_state = state.clone();
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            create_router(server_state)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .unwrap();
@@ -1825,10 +1902,43 @@ async fn metrics_omit_persisted_principal_identifiers() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
     let body = response.text().await.unwrap();
-    server.abort();
 
+    assert!(body.contains("ironcrew_build_info{"));
+    assert!(body.contains("ironcrew_process_active_runs 0"));
+    assert!(body.contains("ironcrew_idempotency_global_usage{resource=\"records\"} 2"));
     assert!(body.contains("ironcrew_idempotency_principals 2"));
+    for (name, help, value) in [
+        (
+            "ironcrew_store_maintenance_healthy",
+            "Whether the latest completed store maintenance cycle succeeded (1 healthy, 0 unhealthy).",
+            "0",
+        ),
+        (
+            "ironcrew_process_terminal_persistence_degraded_finalizers",
+            "Current run or conversation finalizers retrying durable persistence in this process.",
+            "3",
+        ),
+    ] {
+        assert!(body.contains(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+        )));
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(&format!("{name} ")))
+                .count(),
+            1,
+            "critical gauge must have exactly one unlabeled sample"
+        );
+    }
     for secret_identifier in [
         principal_a.as_str(),
         principal_b.as_str(),
@@ -1840,4 +1950,20 @@ async fn metrics_omit_persisted_principal_identifiers() {
             "metrics exposed principal identifier {secret_identifier}"
         );
     }
+
+    state
+        .store_maintenance_healthy
+        .store(true, std::sync::atomic::Ordering::Release);
+    state
+        .terminal_persistence_failures
+        .store(0, std::sync::atomic::Ordering::Release);
+    let reset = reqwest::get(format!("http://{address}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(reset.contains("ironcrew_store_maintenance_healthy 1\n"));
+    assert!(reset.contains("ironcrew_process_terminal_persistence_degraded_finalizers 0\n"));
+    server.abort();
 }

@@ -2,9 +2,10 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 
+use crate::engine::eventbus_metrics::EventBusMetricRegistration;
+use crate::engine::run_event_timing::RunEventWriteTiming;
 use crate::engine::run_events::{
     EventJournalScope, RunEventAppendBatch, RunEventAppendEntry, RunEventJournalConfig,
 };
@@ -22,9 +23,6 @@ const HARD_LIVE_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_DURABLE_QUEUE_MAX_EVENTS: usize = 64;
 const DEFAULT_DURABLE_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_DURABLE_BATCH_MAX_EVENTS: usize = 32;
-const DURABLE_APPEND_MAX_ATTEMPTS: usize = 3;
-const DURABLE_APPEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_500);
-const DURABLE_TERMINAL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const TRUNCATION_MARKER: &str = "... [truncated]";
 
 fn bounded_env(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -299,10 +297,10 @@ pub struct TokenUsageSummary {
 /// Size is tracked to enforce the byte budget in `IRONCREW_EVENT_REPLAY_MAX_BYTES`.
 type ReplayEntry = (Arc<CrewEvent>, usize);
 
-#[derive(Default)]
 struct ReplayState {
     history: VecDeque<ReplayEntry>,
     current_bytes: usize,
+    metrics: EventBusMetricRegistration,
 }
 
 /// Result of waiting for a terminal event's best-effort durable append.
@@ -360,6 +358,7 @@ struct DurableProducer {
     sequence: Mutex<DurableSequenceState>,
     dropped_events: AtomicU64,
     config: RunEventJournalConfig,
+    timing: RunEventWriteTiming,
     flow: String,
     run_id: String,
 }
@@ -375,6 +374,13 @@ impl DurableProducer {
             );
             return None;
         }
+        let Some(timing) = RunEventWriteTiming::checked(config.write_timeout) else {
+            tracing::warn!(
+                run_id = %run_id,
+                "Durable run-event producer disabled because write timing overflowed"
+            );
+            return None;
+        };
 
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle,
@@ -406,6 +412,7 @@ impl DurableProducer {
             }),
             dropped_events: AtomicU64::new(0),
             config: config.clone(),
+            timing,
             flow: flow.clone(),
             run_id: run_id.clone(),
         });
@@ -415,6 +422,7 @@ impl DurableProducer {
             store,
             receiver,
             config,
+            timing,
             flow,
             run_id,
             owner_instance_id,
@@ -542,7 +550,7 @@ impl DurableProducer {
 
     async fn flush(&self) -> DurableEventPersistence {
         let mut barrier = FlushBarrierGuard::new(self);
-        let deadline = tokio::time::Instant::now() + DURABLE_TERMINAL_ACK_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.timing.acknowledgement_timeout();
         let sender_permit = match tokio::time::timeout_at(deadline, self.sender.reserve()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return DurableEventPersistence::Failed,
@@ -626,7 +634,7 @@ impl DurableProducer {
     }
 
     async fn enqueue_terminal(&self, reserved: ReservedTerminalEvent) -> DurableEventPersistence {
-        let deadline = tokio::time::Instant::now() + DURABLE_TERMINAL_ACK_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.timing.acknowledgement_timeout();
         let permit_count = match u32::try_from(reserved.entry.payload_bytes) {
             Ok(permit_count) => permit_count,
             Err(_) => {
@@ -686,6 +694,8 @@ impl DurableProducer {
         queue_max_events: usize,
         queue_max_bytes: usize,
     ) -> (Arc<Self>, mpsc::Receiver<DurableCommand>) {
+        let timing = RunEventWriteTiming::checked(config.write_timeout)
+            .expect("test journal config must have valid write timing");
         let (sender, receiver) = mpsc::channel(queue_max_events);
         (
             Arc::new(Self {
@@ -698,6 +708,7 @@ impl DurableProducer {
                 }),
                 dropped_events: AtomicU64::new(0),
                 config,
+                timing,
                 flow: flow.to_string(),
                 run_id: run_id.to_string(),
             }),
@@ -765,6 +776,7 @@ async fn durable_event_writer(
     store: Arc<dyn StateStore>,
     mut receiver: mpsc::Receiver<DurableCommand>,
     config: RunEventJournalConfig,
+    timing: RunEventWriteTiming,
     flow: String,
     run_id: String,
     owner_instance_id: String,
@@ -833,7 +845,7 @@ async fn durable_event_writer(
             .entries
             .iter()
             .any(|entry| entry.event_type == "run_complete");
-        let outcome = if append_durable_batch_with_retries(&store, &batch).await {
+        let outcome = if append_durable_batch_with_retries(&store, &batch, timing).await {
             DurableEventPersistence::Persisted
         } else {
             writer_failed = true;
@@ -872,13 +884,11 @@ fn push_durable_envelope(
 async fn append_durable_batch_with_retries(
     store: &Arc<dyn StateStore>,
     batch: &RunEventAppendBatch,
+    timing: RunEventWriteTiming,
 ) -> bool {
-    for attempt in 1..=DURABLE_APPEND_MAX_ATTEMPTS {
-        let append = tokio::time::timeout(
-            DURABLE_APPEND_ATTEMPT_TIMEOUT,
-            store.append_run_events(batch),
-        )
-        .await;
+    for attempt in 1..=timing.max_attempts() {
+        let append =
+            tokio::time::timeout(timing.attempt_timeout(), store.append_run_events(batch)).await;
         match append {
             Ok(Ok(_)) => return true,
             Ok(Err(error)) => {
@@ -886,12 +896,12 @@ async fn append_durable_batch_with_retries(
                 tracing::warn!(
                     run_id = %batch.run_id,
                     attempt,
-                    max_attempts = DURABLE_APPEND_MAX_ATTEMPTS,
+                    max_attempts = timing.max_attempts(),
                     error_kind = durable_error_kind(&error),
                     retryable,
                     "Durable run-event append failed"
                 );
-                if !retryable || attempt == DURABLE_APPEND_MAX_ATTEMPTS {
+                if !retryable || attempt == timing.max_attempts() {
                     return false;
                 }
             }
@@ -899,16 +909,17 @@ async fn append_durable_batch_with_retries(
                 tracing::warn!(
                     run_id = %batch.run_id,
                     attempt,
-                    max_attempts = DURABLE_APPEND_MAX_ATTEMPTS,
+                    max_attempts = timing.max_attempts(),
                     "Durable run-event append timed out"
                 );
-                if attempt == DURABLE_APPEND_MAX_ATTEMPTS {
+                if attempt == timing.max_attempts() {
                     return false;
                 }
             }
         }
-        let backoff_ms = 50u64.saturating_mul(1u64 << (attempt - 1));
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        if let Some(backoff) = timing.backoff_after(attempt) {
+            tokio::time::sleep(backoff).await;
+        }
     }
     false
 }
@@ -1099,6 +1110,7 @@ impl EventBus {
             history: Arc::new(Mutex::new(ReplayState {
                 history: VecDeque::with_capacity(max_replay.min(2048)),
                 current_bytes: 0,
+                metrics: EventBusMetricRegistration::new(max_replay, max_replay_bytes),
             })),
             max_replay,
             max_replay_bytes,
@@ -1153,6 +1165,9 @@ impl EventBus {
             }
             state.history.push_back((Arc::clone(&event), size));
             state.current_bytes += size;
+            state
+                .metrics
+                .set_retained(state.history.len(), state.current_bytes);
         }
         // Broadcast to live subscribers (ignore if none). This deliberately
         // occurs before releasing the replay lock; see the atomicity note.
@@ -1170,7 +1185,8 @@ impl EventBus {
     /// a run record to terminal status, ensuring the strict terminal fence
     /// cannot reject legitimate nonterminal events still in the writer queue.
     /// The wait, including queue admission and append acknowledgement, is
-    /// bounded by the same five-second deadline as terminal publication.
+    /// bounded by the configured write retry window plus scheduling/rollback
+    /// headroom, the same derived deadline used by terminal publication.
     pub async fn flush_durable(&self) -> DurableEventPersistence {
         let Some(producer) = &self.durable else {
             return DurableEventPersistence::NotConfigured;
@@ -1213,6 +1229,9 @@ impl EventBus {
                 }
                 state.history.push_back((Arc::clone(&event), size));
                 state.current_bytes += size;
+                state
+                    .metrics
+                    .set_retained(state.history.len(), state.current_bytes);
             }
             let _ = self.sender.send(event);
             self.durable
@@ -1268,6 +1287,7 @@ impl EventBus {
             history: Arc::new(Mutex::new(ReplayState {
                 history: VecDeque::with_capacity(max_replay.min(2048)),
                 current_bytes: 0,
+                metrics: EventBusMetricRegistration::new(max_replay, max_replay_bytes),
             })),
             max_replay,
             max_replay_bytes,
@@ -1436,6 +1456,7 @@ mod replay_buffer_tests {
 #[cfg(test)]
 mod durable_producer_tests {
     use super::*;
+    use std::time::Duration;
 
     fn test_bus(
         queue_max_events: usize,
@@ -1556,6 +1577,11 @@ mod durable_producer_tests {
         ));
         assert!(durable_append_error_is_retryable(
             &IronCrewError::Validation("PostgreSQL run-event append transaction failed".into())
+        ));
+        assert!(durable_append_error_is_retryable(
+            &IronCrewError::Validation(
+                "PostgreSQL run-event transaction timeout configuration failed".into()
+            )
         ));
         assert!(!durable_append_error_is_retryable(
             &IronCrewError::Conflict("owner fence lost".into())

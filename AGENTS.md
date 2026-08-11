@@ -54,6 +54,16 @@
 - Storage integration tests are destructive. Use disposable, explicitly named
   PostgreSQL databases or containers and remove only resources created by the
   test. Never point a test at shared or production infrastructure.
+- Docker-backed PostgreSQL tests use the newest patched image of IronCrew's
+  minimum supported major. Pull the moving `postgres:15` tag immediately before
+  a local run, reuse that tag across test suites, and keep CI on `postgres:15`.
+  Do not substitute `postgres:latest`, which can silently change the database
+  major, or create dated/per-test image tags that accumulate locally.
+- Start disposable test containers with an explicit name and `--rm`; stop them
+  after the gate and verify they disappeared. Inspect Docker ownership before
+  cleanup. Never run a global Docker system, image, builder, container, or volume
+  prune as part of a gate. Remove only resources positively attributed to the
+  current IronCrew test, and never remove resources owned by another project.
 
 ## Documentation, Lua examples, and evaluations
 
