@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
 
 use tempfile::TempDir;
