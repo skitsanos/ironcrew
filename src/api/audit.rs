@@ -68,6 +68,7 @@ pub async fn record(
     };
 
     if let Err(e) = store.save_audit_event(&event).await {
+        crate::metrics::record_store_failure(crate::metrics::StoreOperation::Audit);
         tracing::error!(
             action = %event.action,
             target = ?event.target,
@@ -315,6 +316,18 @@ mod tests {
 
     #[tokio::test]
     async fn record_is_nonfatal_on_store_failure() {
+        let series = "ironcrew_store_failures_total{operation=\"audit\"}";
+        let before = {
+            let mut body = String::new();
+            crate::metrics::append_prometheus(&mut body);
+            body.lines()
+                .find_map(|line| {
+                    line.strip_prefix(series)
+                        .and_then(|value| value.strip_prefix(' '))
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .expect("audit failure series")
+        };
         let store: Arc<dyn StateStore> = Arc::new(FailingStore {
             save_calls: Mutex::new(0),
         });
@@ -333,7 +346,17 @@ mod tests {
             None,
         )
         .await;
-        // Reaching here means record() returned without panicking.
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let after = body
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(series)
+                    .and_then(|value| value.strip_prefix(' '))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("audit failure series");
+        assert!(after >= before.saturating_add(1));
     }
 
     #[test]

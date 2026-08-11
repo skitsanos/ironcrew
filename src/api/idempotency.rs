@@ -113,6 +113,7 @@ impl LeaseHeartbeat {
                         operation,
                         "Idempotency lease expired before the next heartbeat completed"
                     );
+                    crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Conversation);
                     let _ = loss_tx.send(true);
                     return;
                 }
@@ -136,25 +137,36 @@ impl LeaseHeartbeat {
                     }
                     Some(Ok(false)) | Some(Err(IronCrewError::Conflict(_))) => {
                         tracing::warn!(operation, "Idempotency claim was fenced during execution");
+                        crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Conversation);
                         let _ = loss_tx.send(true);
                         return;
                     }
                     Some(Err(error)) => {
+                        crate::metrics::record_store_failure(
+                            crate::metrics::StoreOperation::LeaseHeartbeat,
+                        );
                         tracing::error!(operation, %error, "Failed to heartbeat idempotency claim");
                         if tokio::time::Instant::now() >= lease_deadline {
                             tracing::warn!(
                                 operation,
                                 "Idempotency storage remained unavailable through the lease deadline"
                             );
+                            crate::metrics::record_lease_loss(
+                                crate::metrics::LeaseScope::Conversation,
+                            );
                             let _ = loss_tx.send(true);
                             return;
                         }
                     }
                     None => {
+                        crate::metrics::record_store_failure(
+                            crate::metrics::StoreOperation::LeaseHeartbeat,
+                        );
                         tracing::warn!(
                             operation,
                             "Idempotency heartbeat exceeded the remaining lease window"
                         );
+                        crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Conversation);
                         let _ = loss_tx.send(true);
                         return;
                     }
@@ -175,13 +187,28 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
-pub async fn wait_for_lease_loss(loss: &mut tokio::sync::watch::Receiver<bool>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLossSource {
+    Heartbeat,
+    ClosedChannel,
+}
+
+async fn lease_loss_source(loss: &mut tokio::sync::watch::Receiver<bool>) -> LeaseLossSource {
     if *loss.borrow() {
-        return;
+        return LeaseLossSource::Heartbeat;
     }
+    match loss.wait_for(|lost| *lost).await {
+        Ok(_) => LeaseLossSource::Heartbeat,
+        Err(_) => LeaseLossSource::ClosedChannel,
+    }
+}
+
+pub async fn wait_for_lease_loss(loss: &mut tokio::sync::watch::Receiver<bool>) {
     // A closed channel means the heartbeat worker exited unexpectedly. Treat
     // that exactly like a lost fence; continuing side effects would be unsafe.
-    let _ = loss.wait_for(|lost| *lost).await;
+    if lease_loss_source(loss).await == LeaseLossSource::ClosedChannel {
+        crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Conversation);
+    }
 }
 
 /// Heartbeat for an idempotent run. Unlike a conversation operation, a run
@@ -318,6 +345,37 @@ impl Drop for RunFenceTaskGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialRunHeartbeatMetric {
+    None,
+    LeaseLoss,
+    StoreFailure,
+}
+
+fn initial_run_heartbeat_metric(
+    established: &Option<Result<RunFenceHeartbeat>>,
+) -> InitialRunHeartbeatMetric {
+    match established {
+        Some(Ok(RunFenceHeartbeat::Lost)) | Some(Err(IronCrewError::Conflict(_))) => {
+            InitialRunHeartbeatMetric::LeaseLoss
+        }
+        Some(Err(_)) | None => InitialRunHeartbeatMetric::StoreFailure,
+        Some(Ok(_)) => InitialRunHeartbeatMetric::None,
+    }
+}
+
+fn record_initial_run_heartbeat_metric(established: &Option<Result<RunFenceHeartbeat>>) {
+    match initial_run_heartbeat_metric(established) {
+        InitialRunHeartbeatMetric::None => {}
+        InitialRunHeartbeatMetric::LeaseLoss => {
+            crate::metrics::record_lease_loss(crate::metrics::LeaseScope::Run);
+        }
+        InitialRunHeartbeatMetric::StoreFailure => {
+            crate::metrics::record_store_failure(crate::metrics::StoreOperation::LeaseHeartbeat);
+        }
+    }
+}
+
 impl RunLeaseHeartbeat {
     /// Confirm the claimed run fence before any Lua work is admitted, then
     /// keep it alive in the background. A claimed ledger without a run row is
@@ -344,12 +402,17 @@ impl RunLeaseHeartbeat {
             initial_lease_deadline,
             store.heartbeat_idempotent_run(&run_id, &key_hash, &attempt_id, &deadline),
         )
-        .await
-        .ok_or_else(|| {
-            IronCrewError::Validation(
-                "The initial run-fence heartbeat exceeded the remaining lease window".into(),
-            )
-        })??;
+        .await;
+        record_initial_run_heartbeat_metric(&established);
+        let established = match established {
+            Some(Ok(established)) => established,
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(IronCrewError::Validation(
+                    "The initial run-fence heartbeat exceeded the remaining lease window".into(),
+                ));
+            }
+        };
         match established {
             RunFenceHeartbeat::Owned => {}
             RunFenceHeartbeat::CancelRequested => {
@@ -457,6 +520,9 @@ impl RunLeaseHeartbeat {
                         return;
                     }
                     Some(Err(error)) => {
+                        crate::metrics::record_store_failure(
+                            crate::metrics::StoreOperation::LeaseHeartbeat,
+                        );
                         tracing::error!(run_id, %error, "Failed to heartbeat idempotent run fence");
                         if task_coordinator.lose_if_expired(lease_deadline) {
                             tracing::warn!(
@@ -467,6 +533,9 @@ impl RunLeaseHeartbeat {
                         }
                     }
                     None => {
+                        crate::metrics::record_store_failure(
+                            crate::metrics::StoreOperation::LeaseHeartbeat,
+                        );
                         tracing::warn!(
                             run_id,
                             "Run-fence heartbeat exceeded the remaining lease window"
@@ -947,6 +1016,17 @@ impl Write for BoundedWriter {
 mod tests {
     use super::*;
 
+    fn global_lease_losses(scope: &str) -> u64 {
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let prefix = format!("ironcrew_lease_losses_total{{scope=\"{scope}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect("fixed lease-loss series is rendered")
+            .parse()
+            .expect("lease-loss value is numeric")
+    }
+
     #[test]
     fn request_key_is_hashed_and_malformed_or_multiple_values_fail() {
         let principal = PrincipalId::legacy();
@@ -1063,6 +1143,46 @@ mod tests {
         assert_eq!(
             wait_for_heartbeat_or_expiry(&mut interval, deadline).await,
             HeartbeatWake::Tick
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_lease_channel_records_loss_but_published_loss_is_not_double_counted() {
+        let before = global_lease_losses("conversation");
+        let (loss_tx, mut loss) = tokio::sync::watch::channel(false);
+        loss_tx.send(true).unwrap();
+        wait_for_lease_loss(&mut loss).await;
+        assert_eq!(global_lease_losses("conversation"), before);
+
+        let (loss_tx, mut loss) = tokio::sync::watch::channel(false);
+        drop(loss_tx);
+        wait_for_lease_loss(&mut loss).await;
+        assert_eq!(global_lease_losses("conversation"), before + 1);
+    }
+
+    #[test]
+    fn initial_run_heartbeat_metrics_distinguish_fencing_from_store_failure() {
+        assert_eq!(
+            initial_run_heartbeat_metric(&Some(Ok(RunFenceHeartbeat::Owned))),
+            InitialRunHeartbeatMetric::None
+        );
+        assert_eq!(
+            initial_run_heartbeat_metric(&Some(Ok(RunFenceHeartbeat::Lost))),
+            InitialRunHeartbeatMetric::LeaseLoss
+        );
+        assert_eq!(
+            initial_run_heartbeat_metric(&Some(Err(IronCrewError::Conflict("fenced".into())))),
+            InitialRunHeartbeatMetric::LeaseLoss
+        );
+        assert_eq!(
+            initial_run_heartbeat_metric(&Some(Err(IronCrewError::Provider(
+                "database unavailable".into()
+            )))),
+            InitialRunHeartbeatMetric::StoreFailure
+        );
+        assert_eq!(
+            initial_run_heartbeat_metric(&None),
+            InitialRunHeartbeatMetric::StoreFailure
         );
     }
 

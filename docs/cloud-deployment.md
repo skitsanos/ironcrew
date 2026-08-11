@@ -799,6 +799,38 @@ as storage failure.
 `ironcrew_process_lifecycle_rejections_total{class="work|control"}` counts
 direct lifecycle-boundary mutation rejections with two fixed class labels.
 
+Execution and storage instrumentation uses only closed label vocabularies:
+
+| Series | Type | Exact fixed labels |
+|---|---|---|
+| `ironcrew_runs_total`; `ironcrew_run_duration_seconds` | counter; histogram | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
+| `ironcrew_tasks_total`; `ironcrew_task_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `skipped`, `cancelled` |
+| `ironcrew_tool_calls_total`; `ironcrew_tool_call_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_provider_requests_total`; `ironcrew_provider_request_duration_seconds` | counter; histogram | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_sse_connections_total` | counter | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
+| `ironcrew_lease_losses_total` | counter | `scope`: `run`, `conversation` |
+| `ironcrew_reconciliation_cycles_total` | counter | `outcome`: `success`, `error` |
+| `ironcrew_reconciliation_records_total` | counter | none |
+| `ironcrew_terminal_persistence_total` | counter | `scope`: `run_record`, `run_idempotency`, `run_indeterminate`, `conversation_commit`, `conversation_indeterminate`; `outcome`: `success`, `error`, `fenced` |
+| `ironcrew_store_failures_total` | counter | `operation`: `metrics_snapshot`, `readiness`, `maintenance_heartbeat`, `reconciliation`, `lease_heartbeat`, `terminal_persistence`, `event_append`, `event_read`, `audit`, `run`, `idempotency`, `conversation`, `human_input` |
+
+Every fixed combination is emitted even when its value is zero. The duration
+histograms use cumulative second buckets `0.005`, `0.01`, `0.025`, `0.05`,
+`0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, `300`, and
+`+Inf`, plus `_sum` and `_count`. Reconciliation can count an abandoned run
+without a trustworthy duration, so the matching run counter can exceed the
+histogram count. Skipped tasks contribute a zero-second sample. Provider tokens
+are added only from successful responses that report usage; they are not an
+invoice, price, retry, or billing signal.
+
+All of these counters and histograms are in-memory and per process. They use
+non-blocking saturating atomic updates, are not persisted, and reset at process
+start. A dropped in-flight task attempt or instrumented tool/provider future
+records the closed `cancelled` outcome without putting an error or caller value
+into a label. Store-failure counts cover explicitly instrumented operation
+failures; they do not replace database-server, network, or platform telemetry.
+
 The resource-acceptance families below are unlabeled, fixed-cardinality, and
 describe only the process behind one scrape target:
 
@@ -830,12 +862,6 @@ gauges do not describe provider-side acceptance, retries, billing, or a
 cluster-wide quota. Those remain external platform, database, and trusted
 gateway/provider telemetry.
 
-Preserve the scrape target identity outside metric labels. Aggregate only
-after deduplicating targets: sum current resource use and per-process limits
-when planning fleet capacity, while treating each process peak as a
-target-local high-water mark. A load-balanced public endpoint cannot prove
-that every replica was sampled.
-
 Store reads are coalesced for one second. The durable series expose global
 record/response-byte usage and limits, global in-flight count, maximum usage by
 any one principal, per-principal limits, principal count, and counts at
@@ -843,40 +869,72 @@ any one principal, per-principal limits, principal count, and counts at
 flow names, and other caller-controlled values are deliberately omitted.
 
 If the store snapshot fails, `/metrics` returns `503` rather than serving
-fabricated or stale durable utilization.
+fabricated or stale durable utilization. That failed request records
+`ironcrew_store_failures_total{operation="metrics_snapshot"}` for a later
+successful scrape.
 
-Scrape with a dedicated bearer principal used only by the monitoring client,
-and alert before a pod reaches its active run/conversation/SSE limits, on
-sustained admission `limited` outcomes, and on idempotency utilization
-thresholds. Also alert when a pod's maintenance-health gauge remains `0` across
-multiple scrapes or when its degraded-finalizer gauge remains above `0`; either
-condition already removes that pod from readiness, so sustained values indicate
-storage work that has not recovered rather than a separate health policy.
-For a two-minute example window, use
-`max_over_time(ironcrew_store_maintenance_healthy[2m]) == 0` for continuously
-failed maintenance and
-`min_over_time(ironcrew_process_terminal_persistence_degraded_finalizers[2m]) > 0`
-for continuously degraded finalization; monitor scrape-target absence
-separately. Tune the window to the configured scrape and lease-maintenance
-cadence.
-Structured tracing output remains available for Loki/Promtail or similar log
-pipelines. Do not expose `/metrics` through an unauthenticated ServiceMonitor or
-public exception.
+#### Scraping and aggregation
 
-These process gauges are per replica. Preserve the pod/instance scrape target
-for diagnosis, use the minimum maintenance-health value to detect any
-unhealthy pod, and sum degraded finalizers only when estimating cluster-wide
-impact. Do not sum the one-hot lifecycle gauge without grouping by `state`.
-Railway
-or another load balancer may route repeated public scrapes to the same healthy
-replica, so use a platform/private per-instance metrics integration when
-claiming fleet coverage. On OpenShift, prefer authenticated per-pod scraping;
-a Service-level aggregate cannot prove every pod was observed.
+Scrape with a dedicated bearer principal used only by the monitoring client.
+Preserve pod/instance target identity in the scraper rather than adding it to
+IronCrew's metric labels, and deduplicate targets before aggregation.
 
-The OpenShift baseline admits only ingress-controller traffic. Scrape through
-the authenticated Route, or add a separate ingress rule limited to the actual
-monitoring namespace/pod labels and TCP 8080; do not broaden the application
-policy to every cluster namespace.
+- Sum `rate()` or `increase()` of the process-local counters across unique pod
+  targets. Sum current per-process resource use and configured limits only when
+  calculating fleet capacity; keep each process peak as a target-local
+  high-water mark.
+- Aggregate histogram bucket rates by `le` plus the dimensions being retained
+  before calling `histogram_quantile`. For example, provider success latency is
+  `histogram_quantile(0.95, sum by (le, provider, operation) (rate(ironcrew_provider_request_duration_seconds_bucket{outcome="success"}[10m])))`.
+- Do not sum health booleans. Evaluate maintenance health per target or use the
+  minimum to find any unhealthy process. Group the lifecycle one-hot gauge by
+  `state`; sum degraded finalizers only for an impact total.
+- The store-backed `ironcrew_idempotency_*` utilization snapshot represents the
+  same shared PostgreSQL table prefix on every matching replica. Use one target
+  or `max`, not `sum`, after verifying configuration parity.
+
+Railway or another load balancer can route repeated public scrapes to the same
+healthy replica. Use a private/platform integration that discovers and scrapes
+each instance before claiming fleet coverage. On OpenShift, use authenticated
+per-pod discovery rather than treating a Service-level scrape as proof that
+every pod was observed. The baseline NetworkPolicy admits only ingress-controller
+traffic: either scrape through authenticated per-pod Routes, or add a narrow
+rule for the actual monitoring namespace/pod labels and TCP 8080. Do not expose
+`/metrics` through an unauthenticated ServiceMonitor, public exception, or
+cluster-wide ingress allowance.
+
+#### Initial alert set
+
+Start with a small set tied to an operator action, then tune windows and
+thresholds from measured traffic:
+
+1. **Target/readiness:** alert separately on a missing scrape target, and on
+   `max_over_time(ironcrew_store_maintenance_healthy[2m]) == 0` or
+   `min_over_time(ironcrew_process_terminal_persistence_degraded_finalizers[2m]) > 0`.
+   Correlate a non-`accepting` lifecycle state with planned deployment events.
+2. **Durability:** alert on increases in `ironcrew_lease_losses_total`,
+   `ironcrew_terminal_persistence_total{outcome="error"}`, or
+   `ironcrew_store_failures_total`, grouped by their fixed `scope`/`operation`.
+   Starting five-minute expressions are
+   `sum by (scope) (increase(ironcrew_lease_losses_total[5m])) > 0`,
+   `sum by (scope) (increase(ironcrew_terminal_persistence_total{outcome="error"}[5m])) > 0`,
+   and `sum by (operation) (increase(ironcrew_store_failures_total[5m])) > 0`.
+   Page on sustained terminal/lease failures; route isolated recoverable
+   operation failures to investigation rather than paging every increment.
+3. **Provider quality:** alert on a sustained provider error ratio grouped by
+   `provider,operation` only after a minimum request volume, and use the success
+   histogram for a separately tuned p95 latency threshold. Treat cancellations
+   as their own signal rather than silently folding them into provider errors.
+4. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
+   on sustained admission `limited` outcomes, and at the existing durable
+   idempotency 80/90/100-percent thresholds.
+
+Structured tracing remains available for Loki/Promtail or similar pipelines.
+IronCrew does not ship or operate a hosted telemetry backend, dashboard,
+long-term metrics store, or billing system. It deliberately omits
+high-cardinality run/principal/flow/task/tool/error/URL labels. Container/cgroup,
+PostgreSQL-server, provider-side, and platform measurements remain the
+responsibility of Railway, OpenShift/Kubernetes, the database, and the provider.
 
 ---
 

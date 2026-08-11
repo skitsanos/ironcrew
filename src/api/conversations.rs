@@ -144,7 +144,7 @@ async fn validated_message_replay(
         .store
         .get_conversation(Some(flow), id)
         .await
-        .map_err(message_idempotency_store_error)?;
+        .map_err(conversation_store_error)?;
     if current
         .as_ref()
         .is_none_or(|record| record.execution != *execution)
@@ -169,6 +169,18 @@ fn message_idempotency_store_error(error: IronCrewError) -> (StatusCode, Json<Er
         StatusCode::SERVICE_UNAVAILABLE,
         "Idempotency storage is temporarily unavailable".into(),
     )
+}
+
+fn observed_message_idempotency_store_error(
+    error: IronCrewError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
+    message_idempotency_store_error(error)
+}
+
+fn conversation_store_error(error: IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::Conversation, &error);
+    map_err_to_response(&error)
 }
 
 fn message_idempotency_quota_error(
@@ -602,7 +614,7 @@ async fn start_conversation_inner(
         .store
         .get_conversation(Some(&flow_slug), &id)
         .await
-        .map_err(|e| map_err_to_response(&e))?;
+        .map_err(conversation_store_error)?;
 
     // Agent and limit conflicts are checked before reading or executing the
     // current flow, so a mismatched resume cannot trigger Lua side effects.
@@ -732,7 +744,7 @@ async fn start_conversation_inner(
             .store
             .get_conversation(Some(&flow_slug), &id)
             .await
-            .map_err(|error| map_err_to_response(&error))?
+            .map_err(conversation_store_error)?
             .ok_or_else(|| {
                 error_response(
                     StatusCode::CONFLICT,
@@ -756,6 +768,10 @@ async fn start_conversation_inner(
         && let Err(error) = handle.conv.persist().await
     {
         if !matches!(error, IronCrewError::Conflict(_)) {
+            crate::metrics::record_store_error(
+                crate::metrics::StoreOperation::Conversation,
+                &error,
+            );
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to persist conversation bootstrap: {error}"),
@@ -766,7 +782,7 @@ async fn start_conversation_inner(
             .store
             .get_conversation(Some(&flow_slug), &id)
             .await
-            .map_err(|error| map_err_to_response(&error))?;
+            .map_err(conversation_store_error)?;
         let winner = stored.as_ref().ok_or_else(|| {
             error_response(
                 StatusCode::CONFLICT,
@@ -1076,6 +1092,10 @@ async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdem
             .await
         {
             Ok(updated) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationIndeterminate,
+                    crate::metrics::TerminalOutcome::from_applied(updated),
+                );
                 if !updated {
                     tracing::warn!(
                         "Conversation idempotency claim disappeared before indeterminate finalization"
@@ -1089,6 +1109,10 @@ async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdem
                 return;
             }
             Err(error @ IronCrewError::Conflict(_)) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationIndeterminate,
+                    crate::metrics::TerminalOutcome::Fenced,
+                );
                 tracing::warn!(%error, "Indeterminate conversation finalization was fenced");
                 if persistence_degraded {
                     state
@@ -1098,6 +1122,13 @@ async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdem
                 return;
             }
             Err(error) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationIndeterminate,
+                    crate::metrics::TerminalOutcome::Error,
+                );
+                crate::metrics::record_store_failure(
+                    crate::metrics::StoreOperation::TerminalPersistence,
+                );
                 if !persistence_degraded {
                     persistence_degraded = true;
                     state
@@ -1122,6 +1153,7 @@ async fn release_message_claim(state: &Arc<AppState>, attempt: &MessageIdempoten
         .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
         .await
     {
+        crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
         tracing::error!(%error, "Failed to release a conversation idempotency claim before provider execution");
     }
 }
@@ -1159,6 +1191,10 @@ async fn commit_message_with_retry(
             .await
         {
             Ok(committed) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationCommit,
+                    crate::metrics::TerminalOutcome::from_applied(!committed.already_completed),
+                );
                 if persistence_degraded {
                     state
                         .terminal_persistence_failures
@@ -1167,6 +1203,10 @@ async fn commit_message_with_retry(
                 return Ok(committed);
             }
             Err(error @ IronCrewError::Conflict(_)) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationCommit,
+                    crate::metrics::TerminalOutcome::Fenced,
+                );
                 if persistence_degraded {
                     state
                         .terminal_persistence_failures
@@ -1175,6 +1215,13 @@ async fn commit_message_with_retry(
                 return Err(error);
             }
             Err(error) => {
+                crate::metrics::record_terminal_persistence(
+                    crate::metrics::TerminalScope::ConversationCommit,
+                    crate::metrics::TerminalOutcome::Error,
+                );
+                crate::metrics::record_store_failure(
+                    crate::metrics::StoreOperation::TerminalPersistence,
+                );
                 if !persistence_degraded {
                     persistence_degraded = true;
                     state
@@ -1462,7 +1509,7 @@ pub async fn post_message(
         .store
         .get_conversation(Some(&flow_slug), &id)
         .await
-        .map_err(|error| map_err_to_response(&error))?;
+        .map_err(conversation_store_error)?;
     let Some(durable) = durable else {
         state
             .active_conversations
@@ -1497,7 +1544,7 @@ pub async fn post_message(
                 &now,
             )
             .await
-            .map_err(message_idempotency_store_error)?
+            .map_err(observed_message_idempotency_store_error)?
         {
             IdempotencyLookup::Miss => {}
             IdempotencyLookup::Replay(record) => {
@@ -1612,7 +1659,7 @@ pub async fn post_message(
             .store
             .claim_idempotency_with_limits(claim, state.idempotency.limits())
             .await
-            .map_err(message_idempotency_store_error)?
+            .map_err(observed_message_idempotency_store_error)?
         {
             IdempotencyClaimOutcome::Claimed(_) => {}
             IdempotencyClaimOutcome::Replay(record) => {
@@ -1671,6 +1718,10 @@ pub async fn post_message(
                 .release_idempotency(&attempt.key_hash, &attempt.attempt_id)
                 .await
             {
+                crate::metrics::record_store_error(
+                    crate::metrics::StoreOperation::Idempotency,
+                    &error,
+                );
                 tracing::error!(%error, "Failed to release an expired conversation idempotency claim");
             }
             return Err(error_response(
@@ -1936,7 +1987,7 @@ pub async fn get_history(
         .store
         .get_conversation(Some(&flow_slug), &id)
         .await
-        .map_err(|e| map_err_to_response(&e))?
+        .map_err(conversation_store_error)?
         .ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -2018,7 +2069,7 @@ pub async fn conversation_events(
             .store
             .get_conversation(Some(&key.0), &id)
             .await
-            .map_err(|error| map_err_to_response(&error))?
+            .map_err(conversation_store_error)?
             .is_some();
         if !exists {
             return Err(error_response(
@@ -2043,6 +2094,10 @@ pub async fn conversation_events(
         ));
     }
     let sse_permit = state.sse_permits.clone().try_acquire_owned().map_err(|_| {
+        crate::metrics::record_sse(
+            crate::metrics::SseScope::ConversationProcess,
+            crate::metrics::SseOutcome::Limited,
+        );
         error_response(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -2111,6 +2166,10 @@ pub async fn conversation_events(
                 .text("keepalive"),
         )
         .into_response();
+    crate::metrics::record_sse(
+        crate::metrics::SseScope::ConversationProcess,
+        crate::metrics::SseOutcome::Accepted,
+    );
     Ok(super::sse::hardened_response(response))
 }
 
@@ -2189,7 +2248,7 @@ pub async fn delete_conversation(
             .store
             .delete_conversation(Some(&flow_slug), &id)
             .await
-            .map_err(|e| map_err_to_response(&e))?;
+            .map_err(conversation_store_error)?;
 
         Ok(Json(serde_json::json!({ "deleted": id })))
     }
@@ -2239,12 +2298,12 @@ pub async fn list_conversations(
         .store
         .list_conversations(Some(&flow_slug), limit, offset)
         .await
-        .map_err(|e| map_err_to_response(&e))?;
+        .map_err(conversation_store_error)?;
     let total = state
         .store
         .count_conversations(Some(&flow_slug))
         .await
-        .map_err(|e| map_err_to_response(&e))?;
+        .map_err(conversation_store_error)?;
 
     // Mark active sessions.
     let active_keys: std::collections::HashSet<String> = {

@@ -33,12 +33,16 @@ where
     };
     match prune_result {
         Ok(count) => Ok(StartupPruneOutcome::Pruned(count)),
-        Err(error) if maintenance_watchdog.is_some() => {
-            Ok(StartupPruneOutcome::MaintenanceUnhealthy(error))
+        Err(error) => {
+            crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
+            if maintenance_watchdog.is_some() {
+                Ok(StartupPruneOutcome::MaintenanceUnhealthy(error))
+            } else {
+                Err(IronCrewError::Validation(format!(
+                    "Failed to prune the idempotency ledger at startup: {error}"
+                )))
+            }
         }
-        Err(error) => Err(IronCrewError::Validation(format!(
-            "Failed to prune the idempotency ledger at startup: {error}"
-        ))),
     }
 }
 
@@ -424,6 +428,15 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{StartupPruneOutcome, public_bind_requires_auth, startup_prune_with_policy};
+
+    fn idempotency_store_failures() -> u64 {
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let prefix = "ironcrew_store_failures_total{operation=\"idempotency\"} ";
+        body.lines()
+            .find_map(|line| line.strip_prefix(prefix)?.parse().ok())
+            .expect("idempotency store failure series")
+    }
     use crate::utils::error::IronCrewError;
 
     #[test]
@@ -442,6 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_prune_outer_timeout_is_a_watchdog_backend_soft_failure() {
+        let failures_before = idempotency_store_failures();
         let outcome = startup_prune_with_policy(
             Some(std::time::Duration::from_millis(1)),
             std::future::pending(),
@@ -452,6 +466,7 @@ mod tests {
             panic!("outer timeout unexpectedly reported successful pruning");
         };
         assert!(error.to_string().contains("maintenance timeout"));
+        assert!(idempotency_store_failures() > failures_before);
     }
 
     #[tokio::test]

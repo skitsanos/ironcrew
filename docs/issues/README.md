@@ -7,7 +7,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts check`.
 
 - Total findings: 20
-- Active findings: 5
+- Active findings: 4
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -22,7 +22,7 @@ priority, area, and title. The registry is generated with
 | [IC-007](./IC-007.md) | P1 | Resolved | Deployment validation | Railway and OpenShift replica routing lacks platform evidence |
 | [IC-008](./IC-008.md) | P1 | Resolved | Distributed conversations | Live conversation control remains process-owned |
 | [IC-009](./IC-009.md) | P1 | In progress | Product evidence | Crew effectiveness evidence is too small for product claims |
-| [IC-010](./IC-010.md) | P1 | In progress | Observability | Execution and storage metrics are incomplete |
+| [IC-010](./IC-010.md) | P1 | Resolved | Observability | Execution and storage metrics are incomplete |
 | [IC-011](./IC-011.md) | P2 | Open | Maintainability | Legacy oversized Rust modules lack a growth ratchet |
 | [IC-012](./IC-012.md) | P2 | Resolved | Release governance | Accidental off-main release tags lacked a guard |
 | [IC-013](./IC-013.md) | P1 | Resolved | Supply chain | Dependency audit allowed an unsound transitive warning |

@@ -793,6 +793,10 @@ fn merge_consecutive_roles(messages: Vec<Value>) -> Vec<Value> {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn metrics_family(&self) -> crate::metrics::ProviderFamily {
+        crate::metrics::ProviderFamily::Anthropic
+    }
+
     fn execution_fingerprint(&self) -> Result<String> {
         let server_tools = self
             .config

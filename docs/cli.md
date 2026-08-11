@@ -143,7 +143,7 @@ deliberately enabled. Local
 | GET    | `/health/live`                   | Process liveness check |
 | GET    | `/health/ready`                  | Lifecycle-, storage-, and lease-maintenance-aware readiness (`503` unless the process is accepting and dependencies are healthy) |
 | GET    | `/capabilities`                  | Protected runtime/process identity, optional deployment evidence, and `lifecycle_state` contract |
-| GET    | `/metrics`                       | Protected Prometheus process/admission metrics |
+| GET    | `/metrics`                       | Protected Prometheus process, execution, and storage metrics |
 | POST   | `/flows/{flow}/run`              | Run a crew (async, returns run_id) |
 | GET    | `/flows/{flow}/events/{run_id}`  | SSE event stream for a run |
 | GET    | `/flows/{flow}/runs`             | List past runs for a flow |
@@ -544,9 +544,15 @@ Use the explicit formulas and caveats in [HTTP Scaling](http-scaling.md#multi-re
 before changing replica count.
 `GET /metrics` is protected by the same API authentication and exposes only
 fixed, low-cardinality labels—never principal names, bearer tokens, audit
-actors, flow names, or idempotency keys. Two unlabeled instantaneous gauges
-surface the readiness-critical storage signals already maintained by each
-process:
+actors, flow/task/tool names, URLs, errors, prompts, provider output, or
+idempotency keys. In addition to build, admission, resource, and durable-ledger
+utilization, it exports process-local execution counters and duration
+histograms for runs, tasks, tools, and provider requests; token, SSE, lease-loss,
+reconciliation, terminal-persistence, and instrumented store-failure counters.
+The exact new series and closed labels are listed in
+[REST API: GET /metrics](rest-api.md#get-metrics). Two unlabeled instantaneous
+gauges surface the readiness-critical storage signals already maintained by
+each process:
 
 - `ironcrew_store_maintenance_healthy` is `1` when the latest completed
   heartbeat-plus-reconciliation maintenance cycle succeeded and `0` after a
@@ -570,8 +576,12 @@ cluster-global measurements. See
 and aggregation rules.
 
 These process series reset with the process. In a multi-replica deployment,
-scrape and alert on every pod: do not sum the maintenance-health boolean or
-assume a load-balanced scrape sampled every replica.
+scrape and alert on every pod. Sum counter rates across unique targets and
+aggregate histogram buckets by `le` plus their fixed dimensions before calling
+`histogram_quantile`; do not sum the maintenance-health boolean, duplicate the
+shared durable-ledger snapshot, or assume a load-balanced scrape sampled every
+replica. Provider token counters advance only when reported by a successful
+provider response and are not billing data.
 
 **Security:**
 

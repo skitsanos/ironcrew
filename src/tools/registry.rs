@@ -1,10 +1,46 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::Result;
+
+struct ToolObservation {
+    started_at: Instant,
+    completed: bool,
+}
+
+impl ToolObservation {
+    fn start() -> Self {
+        Self {
+            started_at: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn finish(mut self, result: &Result<String>) {
+        let outcome = if result.is_ok() {
+            crate::metrics::ToolOutcome::Success
+        } else {
+            crate::metrics::ToolOutcome::Error
+        };
+        crate::metrics::record_tool(outcome, self.started_at.elapsed());
+        self.completed = true;
+    }
+}
+
+impl Drop for ToolObservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            crate::metrics::record_tool(
+                crate::metrics::ToolOutcome::Cancelled,
+                self.started_at.elapsed(),
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -177,6 +213,18 @@ impl ToolRegistry {
     }
 
     pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolCallContext,
+    ) -> Result<String> {
+        let observation = ToolObservation::start();
+        let result = self.execute_inner(name, args, ctx).await;
+        observation.finish(&result);
+        result
+    }
+
+    async fn execute_inner(
         &self,
         name: &str,
         args: serde_json::Value,

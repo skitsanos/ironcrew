@@ -594,6 +594,12 @@ pub enum StreamChunk {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Fixed, non-secret provider implementation family used for process
+    /// metrics. Custom providers default to the bounded `other` family.
+    fn metrics_family(&self) -> crate::metrics::ProviderFamily {
+        crate::metrics::ProviderFamily::Other
+    }
+
     /// Canonical identity of the effective, non-secret provider behavior used
     /// to resume durable conversations. Providers that do not implement this
     /// must fail closed for persistent conversation construction.

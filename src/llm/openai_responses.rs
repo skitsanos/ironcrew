@@ -754,6 +754,10 @@ fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn metrics_family(&self) -> crate::metrics::ProviderFamily {
+        crate::metrics::ProviderFamily::OpenAiResponses
+    }
+
     fn execution_fingerprint(&self) -> Result<String> {
         let server_tools = self
             .config

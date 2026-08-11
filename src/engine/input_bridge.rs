@@ -244,6 +244,10 @@ impl DurableInputContext {
     }
 }
 
+fn record_human_input_store_failure(error: &IronCrewError) {
+    crate::metrics::record_store_error(crate::metrics::StoreOperation::HumanInput, error);
+}
+
 /// Best-effort durable row cleanup for cancelled suspension futures. Normal
 /// completion calls `close`; dropping an in-flight branch schedules the same
 /// fenced delete without blocking the executor.
@@ -264,7 +268,13 @@ impl DurableRegistrationCleanup {
         let Some(registration) = self.registration.as_ref() else {
             return Ok(());
         };
-        self.context.store.close_human_input(registration).await?;
+        self.context
+            .store
+            .close_human_input(registration)
+            .await
+            .inspect_err(|error| {
+                record_human_input_store_failure(error);
+            })?;
         self.registration = None;
         Ok(())
     }
@@ -283,6 +293,7 @@ impl Drop for DurableRegistrationCleanup {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Err(error) = store.close_human_input(&registration).await {
+                    record_human_input_store_failure(&error);
                     tracing::warn!(%error, "Cancelled human-input mailbox cleanup failed");
                 }
             });
@@ -668,8 +679,10 @@ impl InputBridge {
             .store
             .answer_human_input(&durable.flow, &durable.run_id, question_id, &value)
             .await
-            .map_err(|error| AnswerError::Unavailable(error.to_string()))?
-        {
+            .map_err(|error| {
+                record_human_input_store_failure(&error);
+                AnswerError::Unavailable(error.to_string())
+            })? {
             outcome @ HumanInputAnswerOutcome::Queued { .. } => {
                 // A successful mailbox CAS is authoritative. Best-effort
                 // local wake-up minimizes owner latency; if the waiter crossed
@@ -803,7 +816,13 @@ impl InputBridge {
                 durable.clone(),
                 registration.clone(),
             ));
-            let outcome = durable.store.register_human_input(&registration).await?;
+            let outcome = durable
+                .store
+                .register_human_input(&registration)
+                .await
+                .inspect_err(|error| {
+                    record_human_input_store_failure(error);
+                })?;
             {
                 let mut pending = self.pending.lock().expect("input bridge lock poisoned");
                 let question = pending.get_mut(question_id).ok_or_else(|| {
@@ -979,8 +998,15 @@ async fn poll_durable_answer(
     )
     .await
     {
-        Ok(result) => DurablePollResult::Read(result),
-        Err(_) => DurablePollResult::QueryTimedOut,
+        Ok(Ok(outcome)) => DurablePollResult::Read(Ok(outcome)),
+        Ok(Err(error)) => {
+            record_human_input_store_failure(&error);
+            DurablePollResult::Read(Err(error))
+        }
+        Err(_) => {
+            crate::metrics::record_store_failure(crate::metrics::StoreOperation::HumanInput);
+            DurablePollResult::QueryTimedOut
+        }
     }
 }
 

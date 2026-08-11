@@ -568,6 +568,10 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn metrics_family(&self) -> crate::metrics::ProviderFamily {
+        crate::metrics::ProviderFamily::OpenAi
+    }
+
     fn execution_fingerprint(&self) -> Result<String> {
         crate::engine::conversation_provider::provider_execution_fingerprint(
             "openai",

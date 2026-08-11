@@ -38,4 +38,5 @@ pub mod sqlite_store;
 pub mod store;
 pub mod store_sql;
 pub mod task;
+pub(crate) mod task_observation;
 pub mod task_runner;
