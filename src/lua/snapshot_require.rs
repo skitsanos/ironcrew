@@ -57,7 +57,7 @@ pub fn install_snapshot_require(lua: &Lua, context: ConversationSourceContext) -
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::sync::Arc;

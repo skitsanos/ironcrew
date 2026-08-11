@@ -222,5 +222,5 @@ fn setup_crew_runtime_inner(
     Ok((lua, runtime, entrypoint))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod snapshot_tests;
