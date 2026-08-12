@@ -285,7 +285,7 @@ production-monitoring result is claimed; the dirty artifacts were not published.
 
 ## Release-image promotion checkpoint — 2026-08-12
 
-The in-progress IC-015 implementation moves multi-platform image construction
+The IC-015 implementation moves multi-platform image construction
 into the exact tag's release workflow. It produces one signed OCI archive and
 a strict signed receipt bound to the tag commit, checksummed release binaries,
 Dockerfile, content-addressed Wolfi base index, OCI index and platform objects,
@@ -316,9 +316,14 @@ after exact UI cleanup. The sanitized retained receipt is
 [`2026-08-12-ic015-dockerhub.json`](../../evaluations/release-acceptance/reports/2026-08-12-ic015-dockerhub.json),
 SHA-256
 `6635719fcda499cadc3a076182f7c7ab3b00cd19f362edbcd6781636bc9e2a11`.
-IC-015 remains in progress only until the exact harness/evidence commit passes
-the affected local and platform CI gates; production Docker publication remains
-deferred.
+The implementation and acceptance receipt landed in commit
+`8bccba9b1c19f2deb9bd4353406b4623ebfeab14`. After a bounded test-only
+stabilization for IC-017's minimum journal-read deadline, exact-head commit
+`56fd1d96d3ae1f78ea92ed1590643e434f7cb98b` passed all nine jobs in
+[CI run 31596627801](https://github.com/skitsanos/ironcrew/actions/runs/31596627801),
+including PostgreSQL integration and replica-soak smoke. IC-015 is resolved;
+production Docker publication remains deferred under IC-014 and the user's
+release-last sequence.
 
 This is a next-release protocol, not a historical-image backfill: the current
 legacy `v2.22.0` release has none of the new OCI/receipt assets. A newer release
@@ -429,8 +434,4 @@ gaps retain their issue-registry owners:
   ruleset rejected a real creation canary. The remote environment, independent
   reviewer, protected/default-branch and verified workflow-execution policy,
   constrained request authority, successful protected validation run, and
-  environment-level secret scoping remain absent; and
-- Docker Hub enforcement and non-production registry acceptance for IC-015's
-  locally implemented release-bound promotion protocol. The 2026-08-12 public
-  API snapshot found immutable tags disabled and `latest` behind GitHub's
-  stable release; no remote setting or image was changed.
+  environment-level secret scoping remain absent.

@@ -1521,14 +1521,15 @@ archive; it does not rebuild a historical release from the current default
 branch. The release image retains the source image's permissions, numeric user,
 environment, and command contract.
 
-This promotion protocol is still in progress under
-[IC-015](issues/IC-015.md). On 2026-08-12, Docker Hub's production repository
-was changed to the exact stable-semver-only immutability rule while leaving
-`latest` mutable. A disposable repository passed the real
+This promotion protocol is resolved under [IC-015](issues/IC-015.md). On
+2026-08-12, Docker Hub's production repository was changed to the exact
+stable-semver-only immutability rule while leaving `latest` mutable. A
+disposable repository passed the real
 replay/conflict/concurrent-`latest` protocol and was then removed exactly; the
 retained machine receipt is linked from IC-015. No production image or tag was
-published or moved. Production Docker publication remains deferred pending the
-exact harness/evidence commit's platform CI and IC-014's release-control gate.
+published or moved. The exact harness/evidence commit passed all platform CI
+jobs. Production Docker publication remains deferred under IC-014's
+release-control gate and the user's release-last sequence.
 The protocol starts with the first release produced by the new tag workflow;
 it does not retroactively rebuild or promote legacy releases that lack the
 signed OCI archive and receipt.
@@ -1579,8 +1580,8 @@ Repository deletion is destructive and removes its images permanently. The
 cleanup phase is read-only: it passes only after the authenticated API reports
 that exact bound repository absent and `skopeo` cannot resolve any of its three
 acceptance tags. The dated IC-015 receipt records one completed run of this
-procedure. Production publication remains deferred pending platform CI for the
-exact harness/evidence commit and IC-014's separate release-control gate.
+procedure. Production publication remains deferred under IC-014's separate
+release-control gate and the user's release-last sequence.
 
 ### Excluding MCP
 
