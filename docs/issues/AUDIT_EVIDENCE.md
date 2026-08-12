@@ -339,16 +339,17 @@ and creates the release once; only the Docker promotion job references Docker
 credentials. These are local workflow and policy-test properties, not proof of
 remote enforcement.
 
-Read-only GitHub API checks on 2026-08-12 found zero repository rulesets, zero
-environments, and no `main` protection object (`404`). The sole direct
-collaborator was owner `skitsanos` with administrator access, so no independent
-release reviewer currently exists. Actions allowed all actions, did not require
-full-SHA pinning, used read as the default workflow permission, and did not
-allow workflows to approve pull-request reviews. `DOCKERHUB_USERNAME` and
-`DOCKERHUB_TOKEN` remained repository-scoped Actions secrets. Immutable GitHub
-releases were disabled (`enabled: false`, `enforced_by_owner: false`). The new
-preview workflow-execution-policy control was not available as authoritative
-stable-API evidence and its state remains unverified.
+Initial read-only GitHub API checks on 2026-08-12 found zero repository
+rulesets, zero environments, and no `main` protection object (`404`). The sole
+direct collaborator was owner `skitsanos` with administrator access, so no
+independent release reviewer currently exists. Actions allowed all actions, did
+not require full-SHA pinning, used read as the default workflow permission, and
+did not allow workflows to approve pull-request reviews.
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` remained repository-scoped Actions
+secrets. Immutable GitHub releases were initially disabled (`enabled: false`,
+`enforced_by_owner: false`). The new preview workflow-execution-policy control
+was not available as authoritative stable-API evidence and its state remains
+unverified.
 
 Default-branch dispatch selection does not prevent a tag-capable actor from
 placing a separate tag-push workflow in an off-main commit. GitHub's preview
@@ -366,14 +367,33 @@ restrict creation and prevent update/deletion without administrator bypass, and
 immutable GitHub releases must be enabled, before the exact tag can be treated
 as stable through publication.
 
-No remote control, collaborator, secret scope, tag, run, release, image, or
-registry state was changed. No denied adversarial canary or successful
-protected-main validation run was attempted. IC-014 remains in progress until
-reviewed default-branch and workflow-execution controls, protected environment,
-immutable tag/release controls, and constrained request authority exist; an
-independent approver and bypass policy are documented; secrets are moved into
-that environment; and both required remote canaries are captured. Release and
-Docker publication remain prohibited in the meantime.
+Live remediation later on 2026-08-12 enabled immutable GitHub releases. The API
+now reports `enabled: true` and `enforced_by_owner: false`; this applies to
+future releases and did not retroactively change legacy release `v2.22.0`,
+which still reports `immutable: false`.
+
+Active repository tag ruleset `20741649`, named
+`Lock v* release tags pending trusted publisher`, now targets
+`refs/tags/v*` with creation, update, and deletion restrictions. It has no
+bypass actors, and the API reports that the current user can never bypass it.
+This deliberately fail-closed interim state prevents release-tag creation until
+a constrained trusted publisher is available; it is not the final release-role
+configuration.
+
+A real push of canary tag `v0.0.0-ic014-lock-canary-20260812` was rejected by
+GitHub with `GH013`. A follow-up ref lookup confirmed the remote tag is absent.
+No release, image, workflow run, environment, `main` rule, collaborator, secret
+scope, or registry state was created or changed by that canary.
+
+IC-014 remains in progress until reviewed default-branch and
+workflow-execution controls, a protected environment, and constrained request
+authority exist; an independent approver and bypass policy are documented; the
+repository-scoped Docker credentials are moved into that environment; and one
+successful protected `validate` request is captured. The UI-only workflow-
+execution-policy state remains unverified. The interim tag ruleset must be
+converted to a least-privilege trusted-publisher policy without weakening
+update/deletion protection. Release and Docker publication remain prohibited in
+the meantime.
 
 ## Current evidence boundaries
 
@@ -394,10 +414,13 @@ gaps retain their issue-registry owners:
   generality beyond IC-009's bounded local GPT-5.6 Luna result;
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
-- a platform-enforced trusted release control plane; IC-014's local default-
-  branch dispatch and validation paths are implemented, but the remote
-  environment, independent reviewer, rulesets, canaries, and secret scoping are
-  absent; and
+- a complete platform-enforced trusted release control plane; IC-014's local
+  default-branch dispatch and validation paths are implemented, immutable
+  releases are enabled for future releases, and an active fail-closed `v*` tag
+  ruleset rejected a real creation canary. The remote environment, independent
+  reviewer, protected/default-branch and verified workflow-execution policy,
+  constrained request authority, successful protected validation run, and
+  environment-level secret scoping remain absent; and
 - Docker Hub enforcement and non-production registry acceptance for IC-015's
   locally implemented release-bound promotion protocol. The 2026-08-12 public
   API snapshot found immutable tags disabled and `latest` behind GitHub's
