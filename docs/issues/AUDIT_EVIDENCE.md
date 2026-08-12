@@ -283,6 +283,40 @@ retained. This closes IC-018's provider-free local-process evidence gap. No
 live-provider, Railway, OpenShift, load-balancer, cgroup/OOM, autoscaling, or
 production-monitoring result is claimed; the dirty artifacts were not published.
 
+## Release-image promotion checkpoint — 2026-08-12
+
+The in-progress IC-015 implementation moves multi-platform image construction
+into the exact tag's release workflow. It produces one signed OCI archive and
+a strict signed receipt bound to the tag commit, checksummed release binaries,
+Dockerfile, content-addressed Wolfi base index, OCI index and platform objects,
+and builder. The separately authorized Docker publisher verifies those assets
+and promotes the archive without rebuilding current default-branch source.
+Version promotion is absent-or-identical only; a conflicting existing digest
+fails closed. Shared workflow coordination and bounded post-write GitHub
+release revalidation cover the repository-side `latest` race between releases
+that carry the complete signed IC-015 asset set.
+
+Read-only GitHub and Docker Hub API checks on 2026-08-12 found GitHub stable
+release `v2.22.0` (published 2026-07-07), but Docker Hub `latest` still matched
+`2.20.0` at
+`sha256:fa336f85a0347001438d576f2e945136eb40485f7a6a0355a77ea0dbf38230c6`;
+the `2.21.0` and `2.22.0` tag endpoints returned `404`. Docker Hub also
+reported immutable tags disabled, with the inactive rule `.*`. No remote
+setting, tag, image, or release was changed.
+
+This is local implementation and read-only external-state evidence. The
+required exact Docker Hub immutable semantic-version rule has not been enabled,
+and the initial/replay/conflict/concurrent-`latest` protocol has not run against
+an authorized non-production registry. IC-015 remains in progress and
+production Docker publication remains deferred until those acceptance
+boundaries pass.
+
+This is a next-release protocol, not a historical-image backfill: the current
+legacy `v2.22.0` release has none of the new OCI/receipt assets. A newer release
+created outside the trusted workflow, or observed before its complete signed
+asset set exists, fails closed; preventing that authority-level event remains
+IC-014's platform boundary.
+
 ## Current evidence boundaries
 
 The following remain explicitly unproven, incomplete, or unsupported. Tracked
@@ -303,8 +337,7 @@ gaps retain their issue-registry owners:
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
 - a platform-enforced trusted release control plane; and
-- repository-enforced immutable, release-bound Docker version publication and
-  rollback-safe `latest` coordination, reopened under IC-015 after the
-  2026-08-11 revalidation found an unconditional version-tag push with no
-  repository-side existing-tag/digest guard. External Docker Hub tag policy
-  was not inspected.
+- Docker Hub enforcement and non-production registry acceptance for IC-015's
+  locally implemented release-bound promotion protocol. The 2026-08-12 public
+  API snapshot found immutable tags disabled and `latest` behind GitHub's
+  stable release; no remote setting or image was changed.

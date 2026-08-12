@@ -3,10 +3,10 @@
 How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**, **Railway**, and similar platforms. This doc covers graceful shutdown, resource limits, security posture, and platform-specific recipes.
 
 IronCrew is distributed as a single Rust executable. The default Linux release
-and container image use the GNU target and are dynamically linked against
-glibc; the Debian runtime image supplies that runtime environment. IronCrew
-runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a
-one-shot job.
+uses the GNU target and is dynamically linked against glibc. The source-build
+container uses Debian; the tag-owned release-image recipe uses a pinned Wolfi
+base index with the required glibc, OpenSSL, and CA runtime. IronCrew runs in
+`serve` mode as a long-lived HTTP server, or in `run` mode as a one-shot job.
 
 For HTTP-specific capacity planning, active conversation sizing, SSE tuning,
 and RAM limits, see [HTTP Scaling](http-scaling.md). For the exact shared-state
@@ -25,7 +25,8 @@ image contains those capabilities.
 
 - Single application executable; default Linux artifacts require a compatible glibc runtime.
 - Release build strips symbols and enables LTO — typical size is 15–25 MB.
-- Source and release container images use `debian:13-slim` plus CA certificates.
+- The source container uses `debian:13-slim`; the release-image recipe uses a
+  content-addressed Wolfi base index and performs no moving package install.
 - The image defaults to numeric UID `10001` and group `0`; writable directories are group-writable so OpenShift can substitute its namespace-assigned UID.
 - The image has a runnable `CMD` (`ironcrew serve --flows-dir /flows`) and listens on port `3000` unless an environment port overrides it.
 - No systemd, no daemonization — runs in the foreground; logs to stderr.
@@ -1512,8 +1513,23 @@ The runtime stage:
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
 with GNU/Linux artifacts built by the release workflow using Rust `1.96.0` and
-`--locked`. It has the same Debian, permissions, user, environment, and command
-contract as the source image.
+`--locked`. The exact tag workflow assembles one `linux/amd64` plus
+`linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
+source and OCI object hashes in a signed receipt, and publishes both as release
+assets. The separately authorized Docker workflow verifies and promotes that
+archive; it does not rebuild a historical release from the current default
+branch. The release image retains the source image's permissions, numeric user,
+environment, and command contract.
+
+This promotion protocol is still in progress under
+[IC-015](issues/IC-015.md). As of the 2026-08-12 read-only check, Docker Hub
+immutable tags were disabled and its public `latest` still matched `2.20.0`,
+while GitHub's current stable release was `v2.22.0`. Production Docker
+publication remains deferred until the immutable semantic-version rule and a
+non-production replay/conflict/concurrent-`latest` acceptance run are recorded.
+The protocol starts with the first release produced by the new tag workflow;
+it does not retroactively rebuild or promote legacy releases that lack the
+signed OCI archive and receipt.
 
 ### Excluding MCP
 

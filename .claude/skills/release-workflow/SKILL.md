@@ -51,14 +51,20 @@ After approval:
    version matches.
 5. Show the evidence and ask before pushing the tag. Monitor release CI. A
    release created with `GITHUB_TOKEN` does not cascade into a release-event
-   workflow, so image publication requires a separate, explicitly authorized
-   manual dispatch of `docker-publish.yml` from `main` with the exact tag.
-   IC-015 remains open because a repeated dispatch makes an unconditional
-   version-tag push without a repository-side existing-digest guard, and the
-   `latest` update has a time-of-check/time-of-use race. While IC-015 is open,
-   stop before that dispatch and keep Docker image publication deferred; do not
-   describe its aliases as immutable or rollback-proof. Publish crates only
+   workflow. The tag workflow must create the release once and publish its
+   signed multi-platform OCI archive and strict image receipt without updating
+   existing release assets. Image publication requires a separate, explicitly
+   authorized manual dispatch of `docker-publish.yml` from `main` with the
+   exact tag and latest-reconciliation boolean; it verifies and promotes those
+   tag-owned assets instead of rebuilding source. Before dispatch, require the
+   exact Docker Hub stable-semver immutability rule and IC-015's recorded
+   non-production replay/conflict/concurrent-`latest` acceptance. While IC-015
+   remains in progress, stop before dispatch and keep Docker publication
+   deferred. After authorization, monitor the version digest and final
+   `latest` digest against GitHub's current stable release. Publish crates only
    with separate authorization too.
+   Do not backfill a legacy release that lacks the signed OCI archive and
+   receipt; promotion begins with the first release produced by this workflow.
 
 If an unpushed local step is wrong, make a corrective edit or ask for direction.
 After a push, prefer a forward fix. Do not use destructive reset or broad

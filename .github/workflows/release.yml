@@ -7,8 +7,16 @@ on:
 
 permissions: {}
 
+# Serialize release selection with registry promotion/latest repair in the
+# manual publisher. GitHub concurrency groups span workflows in a repository.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  BASE_IMAGE_REFERENCE: cgr.dev/chainguard/wolfi-base
+  BASE_IMAGE_INDEX_DIGEST: sha256:30f03343947c7ae3581fda727a6e2aa7b8ce7009b7bfc2ab8d5c9483ace5812f
 
 jobs:
   guard:
@@ -20,6 +28,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.ref }}
       - name: Verify tag version and main ancestry
         env:
           TAG_NAME: ${{ github.ref_name }}
@@ -51,6 +60,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
 
       # Keep release artifacts aligned with Cargo.toml's rust-version and the
       # source Dockerfile instead of silently moving with the stable channel.
@@ -102,6 +113,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Bind release checkout to the tag commit
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse "${GITHUB_REF}^{commit}")"
+
+      - name: Refuse release-asset replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -B scripts/verify_release_absent.py
+          --repository "$GITHUB_REPOSITORY"
+          --tag "$GITHUB_REF_NAME"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -115,6 +138,69 @@ jobs:
           echo "## Checksums" > release/checksums.txt
           cat release/*.sha256 >> release/checksums.txt
           cat release/checksums.txt
+
+      - name: Prepare immutable image inputs
+        run: |
+          cd release
+          sha256sum --check ironcrew-linux-amd64.tar.gz.sha256
+          sha256sum --check ironcrew-linux-arm64.tar.gz.sha256
+          cd ..
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          tar xzf release/ironcrew-linux-amd64.tar.gz -C dist/linux/amd64
+          tar xzf release/ironcrew-linux-arm64.tar.gz -C dist/linux/arm64
+          test -x dist/linux/amd64/ironcrew
+          test -x dist/linux/arm64/ironcrew
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build tag-owned multi-platform OCI archive once
+        run: |
+          source_epoch=$(git show -s --format=%ct HEAD)
+          archive="release/ironcrew-${GITHUB_REF_NAME}-linux-oci.tar"
+          docker buildx build \
+            --file docker/runtime.Dockerfile \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false \
+            --sbom=false \
+            --output "type=oci,dest=${archive},tar=true,rewrite-timestamp=true" \
+            --build-arg "SOURCE_DATE_EPOCH=${source_epoch}" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            .
+
+      - name: Create and verify strict image receipt
+        run: |
+          tag="$GITHUB_REF_NAME"
+          archive="release/ironcrew-${tag}-linux-oci.tar"
+          receipt="release/ironcrew-${tag}-image-receipt.v1.json"
+          buildx_version=$(docker buildx version | tr -d '\n')
+          python3 -B scripts/release_image_receipt.py generate \
+            --receipt "$receipt" \
+            --archive "$archive" \
+            --tag "$tag" \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --source-date-epoch "$(git show -s --format=%ct HEAD)" \
+            --dockerfile docker/runtime.Dockerfile \
+            --base-reference "$BASE_IMAGE_REFERENCE" \
+            --base-digest "$BASE_IMAGE_INDEX_DIGEST" \
+            --builder-implementation docker-buildx \
+            --builder-version "$buildx_version" \
+            --binary "linux/amd64=ironcrew-linux-amd64.tar.gz=release/ironcrew-linux-amd64.tar.gz" \
+            --binary "linux/arm64=ironcrew-linux-arm64.tar.gz=release/ironcrew-linux-arm64.tar.gz"
+          python3 -B scripts/verify_release_image.py \
+            --receipt "$receipt" \
+            --archive "$archive" \
+            --tag "$tag"
+          (
+            cd release
+            sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256"
+            sha256sum "$(basename "$receipt")" > "$(basename "$receipt").sha256"
+            cat "$(basename "$archive").sha256" "$(basename "$receipt").sha256" >> checksums.txt
+          )
 
       # CycloneDX SBOM generated from Cargo.lock via Syft. Lands in the
       # release bundle as ironcrew-<tag>-sbom.cdx.json so downstream
@@ -140,7 +226,11 @@ jobs:
       - name: Sign release artifacts with cosign
         run: |
           cd release
-          for artifact in *.tar.gz ironcrew-${GITHUB_REF_NAME}-sbom.cdx.json; do
+          for artifact in \
+            *.tar.gz \
+            ironcrew-${GITHUB_REF_NAME}-sbom.cdx.json \
+            ironcrew-${GITHUB_REF_NAME}-linux-oci.tar \
+            ironcrew-${GITHUB_REF_NAME}-image-receipt.v1.json; do
             [ -f "$artifact" ] || continue
             echo "Signing $artifact"
             cosign sign-blob --yes \
@@ -196,17 +286,25 @@ jobs:
               "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\" \
               '  ironcrew-linux-amd64.tar.gz' \
               '```' \
+              '' \
+              'The release also includes a signed, multi-platform OCI archive and a strict receipt.' \
+              'Registry publication promotes that exact archive; it does not rebuild historical source.' \
               ''
             printf "The SBOM is at \`ironcrew-%s-sbom.cdx.json\` (CycloneDX 1.x).\n" \
               "$GITHUB_REF_NAME"
           } > "$RELEASE_BODY_PATH"
 
-      - name: Create or update release
-        uses: softprops/action-gh-release@v3
-        with:
-          name: IronCrew ${{ github.ref_name }}
-          body_path: ${{ runner.temp }}/ironcrew-release-body.md
-          files: release/*
-          draft: false
-          prerelease: false
-          make_latest: true
+      # `gh release create` refuses an existing release; unlike an update-capable
+      # release action, the final publication primitive cannot replace assets.
+      - name: Create release once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "IronCrew $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/ironcrew-release-body.md" \
+            --verify-tag \
+            --latest \
+            -- \
+            release/*
