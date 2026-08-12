@@ -17,6 +17,7 @@ from release_image_receipt import (  # noqa: E402
     generate,
     validate,
 )
+from verify_release_bindings import verify as verify_bindings  # noqa: E402
 
 
 def encoded(value):
@@ -177,6 +178,37 @@ class ReleaseImageReceiptTests(unittest.TestCase):
         self.dockerfile.write_text("FROM example.invalid/base:latest\n", encoding="utf-8")
         with self.assertRaisesRegex(ReceiptError, "digest-pinned base"):
             generate(arguments)
+
+    def test_final_verification_binds_source_commit_epoch_and_binaries(self):
+        arguments = self._arguments()
+        generate(arguments)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        options = {
+            "commit_sha": arguments.commit_sha,
+            "source_date_epoch": arguments.source_date_epoch,
+            "dockerfile": self.dockerfile,
+            "binary_paths": arguments.binary,
+        }
+        verify_bindings(self.receipt, **options)
+
+        for key, value, message in (
+            ("commit_sha", "2" * 40, "authorized tag commit"),
+            ("source_date_epoch", 1, "epoch"),
+        ):
+            changed = dict(options)
+            changed[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ReceiptError, message):
+                verify_bindings(self.receipt, **changed)
+
+        self.amd64.write_bytes(b"tampered")
+        with self.assertRaisesRegex(ReceiptError, "binary SHA-256 mismatch"):
+            verify_bindings(self.receipt, **options)
+        self.amd64.write_bytes(b"amd64")
+        self.dockerfile.write_text(
+            "FROM example.invalid/base@sha256:" + "b" * 64 + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ReceiptError, "digest-pinned base"):
+            verify_bindings(self.receipt, **options)
 
     def test_accepts_sha1_and_sha256_commit_ids_only(self):
         arguments = self._arguments()

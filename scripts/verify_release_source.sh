@@ -21,6 +21,12 @@ if [[ "$tag_type" != "tag" ]]; then
   exit 1
 fi
 
+tag_target_type=$(git cat-file -p "$tag_ref" | sed -n 's/^type //p' | head -n 1)
+if [[ "$tag_target_type" != "commit" ]]; then
+  echo "release source verification: annotated tag $tag_name must point directly to a commit" >&2
+  exit 1
+fi
+
 if [[ ! -f Cargo.toml ]]; then
   echo "release source verification: Cargo.toml is missing" >&2
   exit 1

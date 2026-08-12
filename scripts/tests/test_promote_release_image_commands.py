@@ -102,7 +102,7 @@ class CommandBackendTests(unittest.TestCase):
         self.assertEqual(len(cosign), 2)
         identity = (
             "https://github.com/skitsanos/ironcrew/.github/workflows/"
-            "release.yml@refs/tags/v1.2.3"
+            "release.yml@refs/heads/main"
         )
         self.assertTrue(all(identity in command for command in cosign))
         validator = next(
