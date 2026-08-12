@@ -322,18 +322,19 @@ stabilization for IC-017's minimum journal-read deadline, exact-head commit
 `56fd1d96d3ae1f78ea92ed1590643e434f7cb98b` passed all nine jobs in
 [CI run 31596627801](https://github.com/skitsanos/ironcrew/actions/runs/31596627801),
 including PostgreSQL integration and replica-soak smoke. IC-015 is resolved;
-production Docker publication remains deferred under IC-014 and the user's
-release-last sequence.
+production Docker publication remains deferred to the user's release-last
+sequence and the protected IC-014 path.
 
 This is a next-release protocol, not a historical-image backfill: the current
 legacy `v2.22.0` release has none of the new OCI/receipt assets. A newer release
 created outside the trusted workflow, or observed before its complete signed
-asset set exists, fails closed; preventing that authority-level event remains
-IC-014's platform boundary.
+asset set exists, fails closed. At that checkpoint, preventing the former event
+remained IC-014's platform boundary; the trusted-control closure below supplies
+that boundary under the accepted sole-owner model.
 
-## Trusted release-control checkpoint — 2026-08-12
+## Trusted release-control closure — 2026-08-12
 
-The in-progress IC-014 source checkpoint replaces release tag-push and
+The resolved IC-014 source checkpoint replaces release tag-push and
 branch-selectable manual triggers with versioned `repository_dispatch` events.
 GitHub selects these workflows from the default branch. The request validator
 accepts an exact stable tag and `validate` or `publish` mode, rejects extra or
@@ -362,8 +363,8 @@ did not allow workflows to approve pull-request reviews.
 `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` remained repository-scoped Actions
 secrets. Immutable GitHub releases were initially disabled (`enabled: false`,
 `enforced_by_owner: false`). The new preview workflow-execution-policy control
-was not available as authoritative stable-API evidence and its state remains
-unverified.
+was not available as authoritative stable-API evidence during that initial
+check; the later authenticated UI review recorded below found zero policies.
 
 Default-branch dispatch selection does not prevent a tag-capable actor from
 placing a separate tag-push workflow in an off-main commit. In the original
@@ -387,13 +388,11 @@ now reports `enabled: true` and `enforced_by_owner: false`; this applies to
 future releases and did not retroactively change legacy release `v2.22.0`,
 which still reports `immutable: false`.
 
-Active repository tag ruleset `20741649`, named
-`Lock v* release tags pending trusted publisher`, now targets
-`refs/tags/v*` with creation, update, and deletion restrictions. It has no
-bypass actors, and the API reports that the current user can never bypass it.
-This deliberately fail-closed interim state prevents release-tag creation until
-a constrained trusted publisher is available; it is not the final release-role
-configuration.
+At the interim checkpoint, active repository tag ruleset `20741649`, named
+`Lock v* release tags pending trusted publisher`, targeted `refs/tags/v*` with
+creation, update, and deletion restrictions. It had no bypass actors, and the
+API reported that the current user could never bypass it. This deliberately
+fail-closed state preceded the final owner-only tag-creation rule.
 
 A real push of canary tag `v0.0.0-ic014-lock-canary-20260812` was rejected by
 GitHub with `GH013`. A follow-up ref lookup confirmed the remote tag is absent.
@@ -437,14 +436,51 @@ the automation transcript and was revoked before use or GitHub storage; a
 separate token was transferred without rendering or retaining its value. No
 release, tag, image, registry alias, or dispatch was created.
 
-IC-014 remains in progress until that controller reaches trusted `main`, a
-protected environment with deliberate owner self-approval and main-only
-deployment policy exists, default-branch policy exists, repository-scoped
-Docker credentials have moved into the environment, and the interim tag rules
-permit only the trusted owner to create release tags while continuing to deny
-updates and deletion. One successful protected `validate` request for each
-downstream workflow must be captured without publication. Release and Docker
-publication remain prohibited in the meantime.
+The controller and downstream workflows reached trusted `main` through
+protected pull request
+[#63](https://github.com/skitsanos/ironcrew/pull/63). Exact PR head
+`bd829415dff114c5cfc7faafb5a72d15c4b7f755` passed all nine required jobs in
+[PR CI run 31633359970](https://github.com/skitsanos/ironcrew/actions/runs/31633359970),
+and merge commit `0ece62c4973d343b83f8ea8d31a28a7bc7cb043c` passed the same nine-job
+matrix on `main` in
+[CI run 31634085607](https://github.com/skitsanos/ironcrew/actions/runs/31634085607).
+
+The two protected live validation receipts are:
+
+- owner issue [#64](https://github.com/skitsanos/ironcrew/issues/64), release
+  controller [run 31635027122](https://github.com/skitsanos/ironcrew/actions/runs/31635027122),
+  and release downstream
+  [run 31635064079](https://github.com/skitsanos/ironcrew/actions/runs/31635064079);
+- owner issue [#65](https://github.com/skitsanos/ironcrew/issues/65), Docker
+  controller [run 31635324542](https://github.com/skitsanos/ironcrew/actions/runs/31635324542),
+  and Docker downstream
+  [run 31635348636](https://github.com/skitsanos/ironcrew/actions/runs/31635348636).
+
+Each exact canonical issue selected `mode: validate`, each controller selected
+only its requested fixed dispatch, and each downstream run bound itself to the
+trusted `main` workflow. Owner `skitsanos` supplied a normal approval for
+environment `release` (`19770322300`) in both runs. The release target builds,
+immutable-image build, and release-creation job were skipped; the Docker
+promotion job was skipped. Both downstream runs reported zero Actions
+artifacts.
+
+Branch ruleset `20762614`, owner-only tag-creation ruleset `20762625`,
+no-bypass tag-update/deletion ruleset `20741649`, and main-only environment
+branch policy `57181717` remained active. Normalized snapshots of exact `main`,
+all `v*` refs, releases, release assets, and public Docker tags were identical
+before and after each canary at SHA-256
+`0ec913fd66f5bfc4bfee560d5d4100f3edd6d50368e406898b09f7e4c357aa31`.
+No release, Git tag, release asset, image, registry alias, or additional product
+version change occurred. Issues #64 and #65 were closed after their downstream
+runs completed.
+
+This is trusted-control and non-publishing dry-run evidence under the accepted
+sole-owner model, not a publish-mode run or a new release. `skitsanos` remains
+the trusted root and only current `develop` to `main` and release approver;
+malicious or compromised owner authority remains outside the claimed boundary.
+A future release still requires separate authorization, a product version bump
+in `Cargo.toml` and the root `Cargo.lock`, a matching annotated tag, and the
+protected publish path.
 
 ## Current evidence boundaries
 
@@ -465,14 +501,14 @@ gaps retain their issue-registry owners:
   generality beyond IC-009's bounded local GPT-5.6 Luna result;
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
-- a complete platform-enforced trusted release control plane; IC-014's local
-  default-branch dispatch and validation paths are implemented, immutable
-  releases are enabled for future releases, and an active fail-closed `v*` tag
-  ruleset rejected a real creation canary. Under the accepted sole-owner model,
-  the remote environment, protected default-branch and tag policies, request
-  label, and environment-level secret scoping are now configured. The owner-
-  only controller is not yet on `main`, and the two successful protected
-  non-publishing validation runs remain outstanding.
+- publish-mode execution of the resolved trusted release path. IC-014's
+  default-branch controller, remote environment, protected default branch and
+  tags, future immutable releases, environment-scoped credentials, denied tag
+  canary, protected integration, and both owner-approved non-publishing
+  validation runs are complete. No new release was attempted; version/tag and
+  publication evidence remain intentionally deferred to the eventual release
+  phase.
+
 The preview Actions Policies page currently contains zero policies. Under the
 accepted sole-owner boundary that is recorded rather than treated as a closure
 blocker: only the trusted owner may create `v*` tags, owner compromise is out of

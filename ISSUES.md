@@ -8,7 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-014](docs/issues/IC-014.md) | P1 | In progress | Release security | Release publication lacks a platform-enforced trusted control plane |
+| — | — | — | — | No active findings |
 
 ## Working agreement
 
