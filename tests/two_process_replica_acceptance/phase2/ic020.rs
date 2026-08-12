@@ -73,6 +73,11 @@ async fn scenario(pair: &mut ProcessPair) {
         "draining mutations changed durable state"
     );
 
+    // The preceding read-only drain assertions may span most of a heartbeat
+    // interval on a contended runner. Align the clean-shutdown boundary with
+    // a fresh database-backed lease while retaining the supported six-second
+    // minimum that this acceptance test intentionally exercises.
+    let _fresh_lease = wait_for_next_lease(pair, &run_id).await;
     process::shutdown_cleanly(
         &mut pair.owner_a,
         &pair.client,
@@ -81,7 +86,13 @@ async fn scenario(pair: &mut ProcessPair) {
     )
     .await;
     assert_eq!(
-        wait_for_status(pair, &run_id, "Aborted").await["status"],
+        wait_for_status_with_context(
+            pair,
+            &run_id,
+            "Aborted",
+            "IC-020 explicitly drained owner A",
+        )
+        .await["status"],
         "Aborted"
     );
     observability::assert_terminal_observable(pair, &peer_id, &run_id).await;
@@ -115,6 +126,11 @@ async fn scenario(pair: &mut ProcessPair) {
         after_first_terminal.events + 1
     );
 
+    // The blocked-fence scenario deliberately holds the global run fence for
+    // at least one maintenance watchdog. Start it immediately after an
+    // observed renewal so CI scheduling delay cannot consume the six-second
+    // minimum test lease before the shutdown path gets to prove its retry.
+    let _fresh_lease = wait_for_next_lease(pair, &replacement_run).await;
     let owner_fence = fence::RunFenceLock::acquire(pair).await;
     let blocker_pid = owner_fence.backend_pid;
     let sigterm_sent_at = process::signal_terminate(&mut pair.owner_a);
@@ -146,7 +162,13 @@ async fn scenario(pair: &mut ProcessPair) {
     )
     .await;
     assert_eq!(
-        wait_for_status(pair, &replacement_run, "Aborted").await["status"],
+        wait_for_status_with_context(
+            pair,
+            &replacement_run,
+            "Aborted",
+            "IC-020 replacement C direct SIGTERM",
+        )
+        .await["status"],
         "Aborted"
     );
     observability::assert_terminal_observable(pair, &peer_id, &replacement_run).await;

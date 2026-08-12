@@ -72,6 +72,13 @@ pub(super) async fn wait_clean_exit(
                 "{label} did not shut down cleanly with SIGTERM: {status}\n{}",
                 process.logs()
             );
+            assert!(
+                !process
+                    .logs()
+                    .contains("Graceful shutdown exceeded its teardown deadline"),
+                "{label} exited through the teardown-timeout fallback\n{}",
+                process.logs()
+            );
             assert!(sigterm_sent_at.elapsed() < Duration::from_secs(8));
             return;
         }
