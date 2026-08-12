@@ -135,7 +135,7 @@ jobs:
             --report /tmp/ironcrew-replica-soak-ci/result.json
       - name: Upload replica soak contract evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: replica-soak-contract
           path: /tmp/ironcrew-replica-soak-ci
