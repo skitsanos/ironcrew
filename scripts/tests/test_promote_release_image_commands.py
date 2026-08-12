@@ -155,13 +155,15 @@ class CommandBackendTests(unittest.TestCase):
         self.assertFalse(any(command[0] == "cosign" for command in self.commands))
 
     def test_registry_inspection_distinguishes_absence_from_errors(self) -> None:
+        raw_index = '{"manifests":[],"schemaVersion":2}'
+        raw_digest = "sha256:" + hashlib.sha256(raw_index.encode()).hexdigest()
         responses = iter([
             subprocess.CompletedProcess([], 1, "", "manifest unknown"),
             subprocess.CompletedProcess([], 1, "", "helper executable not found"),
             subprocess.CompletedProcess([], 1, "", "proxy returned HTTP 404"),
             subprocess.CompletedProcess([], 1, "", "permission denied"),
-            subprocess.CompletedProcess([], 0, "not-a-digest\n", ""),
-            subprocess.CompletedProcess([], 0, DIGEST + "\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, raw_index, ""),
         ])
 
         def run(command: list[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
@@ -177,9 +179,10 @@ class CommandBackendTests(unittest.TestCase):
             self.backend.inspect("1.2.3")
         with self.assertRaisesRegex(PromotionError, "inspection failed"):
             self.backend.inspect("1.2.3")
-        with self.assertRaisesRegex(PromotionError, "invalid digest"):
+        with self.assertRaisesRegex(PromotionError, "empty manifest"):
             self.backend.inspect("1.2.3")
-        self.assertEqual(self.backend.inspect("1.2.3"), DIGEST)
+        self.assertEqual(self.backend.inspect("1.2.3"), raw_digest)
+        self.assertEqual(self.commands[-1][1:3], ["inspect", "--raw"])
 
     def test_copy_uses_archive_all_platforms_and_preserves_digests(self) -> None:
         self.install_fake()

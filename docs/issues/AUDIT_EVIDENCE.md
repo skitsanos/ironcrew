@@ -296,20 +296,29 @@ fails closed. Shared workflow coordination and bounded post-write GitHub
 release revalidation cover the repository-side `latest` race between releases
 that carry the complete signed IC-015 asset set.
 
-Read-only GitHub and Docker Hub API checks on 2026-08-12 found GitHub stable
+Initial read-only GitHub and Docker Hub API checks on 2026-08-12 found GitHub stable
 release `v2.22.0` (published 2026-07-07), but Docker Hub `latest` still matched
 `2.20.0` at
 `sha256:fa336f85a0347001438d576f2e945136eb40485f7a6a0355a77ea0dbf38230c6`;
 the `2.21.0` and `2.22.0` tag endpoints returned `404`. Docker Hub also
-reported immutable tags disabled, with the inactive rule `.*`. No remote
-setting, tag, image, or release was changed.
+reported immutable tags disabled, with the inactive rule `.*`.
 
-This is local implementation and read-only external-state evidence. The
-required exact Docker Hub immutable semantic-version rule has not been enabled,
-and the initial/replay/conflict/concurrent-`latest` protocol has not run against
-an authorized non-production registry. IC-015 remains in progress and
-production Docker publication remains deferred until those acceptance
-boundaries pass.
+Later live remediation enabled the exact stable-semver-only rule on
+`skitsanos/ironcrew`; `latest` remains mutable. No production image or tag was
+published or moved, and the pre-existing tag snapshot stayed unchanged. A
+uniquely named disposable Docker Hub repository then passed initial promotion,
+identical replay, conflict refusal, direct immutable-tag enforcement, second
+version publication, and a two-attempt `latest` repair. Same-archive mutable
+`latest` write/restore controls ruled out an unrelated copy failure as the
+immutable-version rejection cause. Authenticated API and
+registry checks proved the repository and all three acceptance tags absent
+after exact UI cleanup. The sanitized retained receipt is
+[`2026-08-12-ic015-dockerhub.json`](../../evaluations/release-acceptance/reports/2026-08-12-ic015-dockerhub.json),
+SHA-256
+`6635719fcda499cadc3a076182f7c7ab3b00cd19f362edbcd6781636bc9e2a11`.
+IC-015 remains in progress only until the exact harness/evidence commit passes
+the affected local and platform CI gates; production Docker publication remains
+deferred.
 
 This is a next-release protocol, not a historical-image backfill: the current
 legacy `v2.22.0` release has none of the new OCI/receipt assets. A newer release
