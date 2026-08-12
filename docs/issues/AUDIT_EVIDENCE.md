@@ -366,14 +366,15 @@ was not available as authoritative stable-API evidence and its state remains
 unverified.
 
 Default-branch dispatch selection does not prevent a tag-capable actor from
-placing a separate tag-push workflow in an off-main commit. GitHub's preview
-workflow-execution protections can constrain actors and events before workflow
-execution, but no live policy was verified. Existing CI also uses push events
-on `main` and `develop`, so a blanket push denial would require an agreed CI
-trigger change. Repository dispatch is not itself least privilege: GitHub
-requires Contents write to create it, and sender/actor equality is only a
-consistency check. Closure needs a constrained release App/authority or a lower-
-authority request channel backed by trusted platform controls.
+placing a separate tag-push workflow in an off-main commit. In the original
+multi-actor threat model, GitHub's preview workflow-execution protections or an
+equivalent authority boundary were therefore required. The accepted sole-owner
+model below supersedes that requirement: only the trusted owner may create
+`v*` tags and compromised owner authority is out of scope. Existing CI also
+uses push events on `main` and `develop`, so no broad preview policy is enabled
+without a separate design and canary. Direct repository dispatch is still not
+used as the approval channel because it requires Contents write; the Issues
+controller below supplies a lower-standing-authority request path.
 
 There is also a tag time-of-check/time-of-use boundary: final tag revalidation
 and `gh release create --verify-tag` are not atomic. Active `v*` rules must
@@ -399,15 +400,32 @@ GitHub with `GH013`. A follow-up ref lookup confirmed the remote tag is absent.
 No release, image, workflow run, environment, `main` rule, collaborator, secret
 scope, or registry state was created or changed by that canary.
 
-IC-014 remains in progress until reviewed default-branch and
-workflow-execution controls, a protected environment, and constrained request
-authority exist; an independent approver and bypass policy are documented; the
-repository-scoped Docker credentials are moved into that environment; and one
-successful protected `validate` request is captured. The UI-only workflow-
-execution-policy state remains unverified. The interim tag ruleset must be
-converted to a least-privilege trusted-publisher policy without weakening
-update/deletion protection. Release and Docker publication remain prohibited in
-the meantime.
+The owner subsequently accepted an explicit sole-owner authority model:
+`skitsanos` is the trusted root and the only current `develop` to `main` and
+release approver. A second-person approval is no longer an IC-014 requirement;
+malicious or compromised owner authority is outside the claimed boundary. The
+local low-standing-authority request path is an owner-authored issue with the
+exact `release-request` label and canonical bounded JSON body. A trusted-main
+controller validates the owner, actor, repository, issue, target, stable tag,
+and mode before using only its run-scoped `GITHUB_TOKEN` for the fixed
+downstream repository dispatch. No long-lived Contents-write personal token is
+part of this design.
+
+Label removal/reapplication and owner-triggered workflow reruns are deliberate
+reauthorizations, not deduplicated retries. Attempts serialize per issue, both
+the original and rerunning actors remain owner-bound, and downstream
+publication remains fail-closed under replay. The request issue is closed after
+the downstream run completes rather than granting the controller Issues-write
+authority.
+
+IC-014 remains in progress until that controller reaches trusted `main`, a
+protected environment with deliberate owner self-approval and main-only
+deployment policy exists, default-branch policy exists, repository-scoped
+Docker credentials have moved into the environment, and the interim tag rules
+permit only the trusted owner to create release tags while continuing to deny
+updates and deletion. One successful protected `validate` request for each
+downstream workflow must be captured without publication. Release and Docker
+publication remain prohibited in the meantime.
 
 ## Current evidence boundaries
 
@@ -431,7 +449,12 @@ gaps retain their issue-registry owners:
 - a complete platform-enforced trusted release control plane; IC-014's local
   default-branch dispatch and validation paths are implemented, immutable
   releases are enabled for future releases, and an active fail-closed `v*` tag
-  ruleset rejected a real creation canary. The remote environment, independent
-  reviewer, protected/default-branch and verified workflow-execution policy,
-  constrained request authority, successful protected validation run, and
-  environment-level secret scoping remain absent.
+  ruleset rejected a real creation canary. Under the accepted sole-owner model,
+  the remote environment, owner-only request controller on `main`, protected
+  default-branch policy, final tag-creator policy, successful protected
+  validation runs, and environment-level secret scoping remain incomplete.
+The preview Actions Policies page currently contains zero policies. Under the
+accepted sole-owner boundary that is recorded rather than treated as a closure
+blocker: only the trusted owner may create `v*` tags, owner compromise is out of
+scope, and a broad event policy would interfere with current CI and controller
+events without closing the owner-authority boundary.
