@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release IronCrew"
+  short_description: "Prepare and cut a gated IronCrew release"
+  default_prompt: "Use $release-ironcrew to prepare and cut the next IronCrew release safely."

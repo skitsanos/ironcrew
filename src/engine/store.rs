@@ -1,14 +1,209 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::engine::audit::{AuditEvent, AuditFilter};
+use crate::engine::human_input::{
+    DurableHumanInputRegistration, HumanInputAnswerOutcome, HumanInputListOutcome,
+    HumanInputReadOutcome, HumanInputRegistrationOutcome,
+};
+use crate::engine::idempotency::{
+    ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
+    IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
+    IdempotencyUsage, PrincipalId, RunCancellationRequest, RunFenceHeartbeat,
+};
+use crate::engine::run_events::{
+    EventJournalScope, RunEventAppendBatch, RunEventAppendOutcome, RunEventJournalConfig,
+    RunEventPage,
+};
 use crate::engine::run_history::{
-    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary,
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
 };
 use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use crate::utils::error::Result;
 
+pub const DEFAULT_RUN_LEASE_TTL_SECONDS: u64 = 60;
+pub const MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS: u64 = 6;
+pub const MAX_RUN_LEASE_TTL_SECONDS: u64 = 86_400;
+const MAX_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(100);
+
+static PROCESS_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+
+/// Ownership configuration attached to every store handle in this process.
+///
+/// The generated id is stable for the lifetime of the process. Deployments can
+/// provide `IRONCREW_INSTANCE_ID` (for example, an OpenShift pod UID) when they
+/// already have a suitably unique runtime identity. The lease TTL controls how
+/// long another process waits after the last heartbeat before it may reconcile
+/// this process's unfinished runs.
+#[derive(Debug, Clone)]
+pub struct RunLeaseConfig {
+    instance_id: String,
+    ttl: Duration,
+}
+
+impl RunLeaseConfig {
+    pub fn from_env() -> Result<Self> {
+        let explicit_instance_id = read_optional_instance_env("IRONCREW_INSTANCE_ID")?;
+        let railway_replica_id = if explicit_instance_id.is_none() {
+            read_optional_instance_env("RAILWAY_REPLICA_ID")?
+        } else {
+            None
+        };
+        let configured_instance_id = select_instance_id(explicit_instance_id, railway_replica_id)?;
+        // Cache configured ids too: all independently constructed stores in
+        // this process must agree even if environment loading/mutation happens
+        // later in startup.
+        let instance_id = PROCESS_INSTANCE_ID
+            .get_or_init(|| {
+                configured_instance_id.unwrap_or_else(|| {
+                    format!("ironcrew-{}-{}", std::process::id(), uuid::Uuid::new_v4())
+                })
+            })
+            .clone();
+
+        let ttl_seconds = match std::env::var("IRONCREW_RUN_LEASE_TTL_SECONDS") {
+            Ok(value) => value.parse::<u64>().map_err(|_| {
+                crate::utils::error::IronCrewError::Validation(
+                    "IRONCREW_RUN_LEASE_TTL_SECONDS must be a positive integer".into(),
+                )
+            })?,
+            Err(std::env::VarError::NotPresent) => DEFAULT_RUN_LEASE_TTL_SECONDS,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(crate::utils::error::IronCrewError::Validation(
+                    "IRONCREW_RUN_LEASE_TTL_SECONDS must be valid UTF-8".into(),
+                ));
+            }
+        };
+        let ttl = production_run_lease_ttl(ttl_seconds)?;
+        Self::new(instance_id, ttl)
+    }
+
+    /// Explicit constructor used by deterministic storage and multi-instance
+    /// tests. Production callers should normally use [`Self::from_env`].
+    pub fn new(instance_id: impl Into<String>, ttl: Duration) -> Result<Self> {
+        let instance_id = validate_instance_id(instance_id.into())?;
+        if ttl < Duration::from_secs(1) || ttl.as_secs() > MAX_RUN_LEASE_TTL_SECONDS {
+            return Err(crate::utils::error::IronCrewError::Validation(
+                "Run lease TTL must be between 1 second and 24 hours".into(),
+            ));
+        }
+        Ok(Self { instance_id, ttl })
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub fn deadline_from(&self, now: DateTime<Utc>) -> String {
+        let ttl = ChronoDuration::seconds(self.ttl.as_secs() as i64);
+        now.checked_add_signed(ttl)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .to_rfc3339()
+    }
+
+    pub fn deadline_now(&self) -> String {
+        self.deadline_from(Utc::now())
+    }
+}
+
+fn production_run_lease_ttl(ttl_seconds: u64) -> Result<Duration> {
+    if !(MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS..=MAX_RUN_LEASE_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err(crate::utils::error::IronCrewError::Validation(format!(
+            "IRONCREW_RUN_LEASE_TTL_SECONDS must be between {MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS} and {MAX_RUN_LEASE_TTL_SECONDS}; shorter leases do not leave three heartbeat opportunities"
+        )));
+    }
+    Ok(Duration::from_secs(ttl_seconds))
+}
+
+/// Cadence shared by owner heartbeats and the replica maintenance loop.
+/// Production TTL validation guarantees at least three scheduled opportunities.
+pub fn run_lease_heartbeat_interval(ttl: Duration) -> Duration {
+    (ttl / 3).max(Duration::from_secs(1))
+}
+
+/// Per-operation outer bound for heartbeat and reconciliation maintenance.
+/// Two sequential operations consume at most two thirds of one cadence, with
+/// a five-second ceiling for long production leases.
+pub fn run_maintenance_timeout(ttl: Duration) -> Duration {
+    let milliseconds = (run_lease_heartbeat_interval(ttl).as_millis() / 3)
+        .max(MIN_RUN_MAINTENANCE_TIMEOUT.as_millis())
+        .min(MAX_RUN_MAINTENANCE_TIMEOUT.as_millis());
+    Duration::from_millis(milliseconds as u64)
+}
+
+/// PostgreSQL's per-statement timeout is smaller than the aggregate Tokio
+/// bound. It resolves an individual lock/query stall inside the database;
+/// the outer watchdog still bounds pool acquisition and cumulative statements.
+pub fn run_maintenance_database_timeout(ttl: Duration) -> Duration {
+    let milliseconds = (run_maintenance_timeout(ttl).as_millis() * 4 / 5).max(50);
+    Duration::from_millis(milliseconds as u64)
+}
+
+fn validate_instance_id(value: String) -> Result<String> {
+    validate_instance_id_from("IRONCREW_INSTANCE_ID", value)
+}
+
+fn read_optional_instance_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            crate::utils::error::IronCrewError::Validation(format!("{name} must be valid UTF-8")),
+        ),
+    }
+}
+
+fn select_instance_id(explicit: Option<String>, railway: Option<String>) -> Result<Option<String>> {
+    match explicit {
+        Some(value) => validate_instance_id_from("IRONCREW_INSTANCE_ID", value).map(Some),
+        None => railway
+            .map(|value| validate_instance_id_from("RAILWAY_REPLICA_ID", value))
+            .transpose(),
+    }
+}
+
+fn validate_instance_id_from(source: &str, value: String) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 255
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+    {
+        return Err(crate::utils::error::IronCrewError::Validation(format!(
+            "{source} must be 1-255 printable ASCII bytes"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Pluggable storage backend for run records and persistent sessions
 /// (conversations and dialogs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresPoolUsage {
+    pub open_connections: u32,
+    pub in_use_connections: u32,
+    pub connection_limit: u32,
+}
+
+/// Whether persistent conversation turns can be coordinated across processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationCoordinationScope {
+    /// The store is durable, but active turns and live handles are local to
+    /// one process. Idempotency keys remain optional for this mode.
+    ProcessLocal,
+    /// The store provides transactional revision and idempotency fences that
+    /// allow any replica to rebuild a handle and own one keyed turn.
+    SharedStore,
+}
+
 #[async_trait]
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
@@ -21,10 +216,14 @@ pub trait StateStore: Send + Sync {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
 
     /// Called when a run completes (success, partial failure, or hard
-    /// failure). Transitions an in-flight record (Running or WaitingForInput)
-    /// to a terminal state. Returns an error if the run_id doesn't exist or
-    /// is already terminal.
-    async fn update_run_completion(&self, run_id: &str, completion: RunCompletion) -> Result<()>;
+    /// failure). Atomically transitions an owned in-flight record (Running or
+    /// WaitingForInput) to a terminal state. The first terminal writer wins;
+    /// later writers receive `AlreadyTerminal` without replacing its payload.
+    async fn update_run_completion(
+        &self,
+        run_id: &str,
+        completion: RunCompletion,
+    ) -> Result<RunTransition>;
 
     /// Flip an in-flight run between `Running` and `WaitingForInput` (both
     /// directions — `crew:ask_human()` suspends and resumes). Narrow by
@@ -34,11 +233,83 @@ pub trait StateStore: Send + Sync {
     /// in-flight state.
     async fn update_run_status(&self, run_id: &str, status: RunStatus) -> Result<()>;
 
-    /// Called once at ironcrew {run,serve} startup. Atomically flips
-    /// every record whose status is Running to Abandoned, setting
-    /// finished_at = `now` and leaving task_results untouched. Returns
-    /// the count of records reconciled. Idempotent — a second immediate
-    /// call returns 0.
+    /// Stable identity used to own run records created through this handle.
+    fn instance_id(&self) -> &str;
+
+    /// Process-local SQLx pool usage. Non-PostgreSQL stores omit these metrics.
+    fn postgres_pool_usage(&self) -> Option<PostgresPoolUsage> {
+        None
+    }
+
+    /// Configured duration of an ownership lease. Heartbeat loops should run
+    /// at least three times within this interval.
+    fn run_lease_ttl(&self) -> Duration;
+
+    /// Optional outer watchdog for backends that can safely cancel in-flight
+    /// maintenance. PostgreSQL combines transaction-local statement limits
+    /// with SQLx transaction rollback-on-drop; local backends finish
+    /// synchronously or on owned blocking workers and therefore use no
+    /// cancellable wrapper.
+    fn run_maintenance_watchdog(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Whether this handle has a shared, encrypted human-input transport.
+    /// PostgreSQL requires a valid process keyring; local backends retain the
+    /// process-only bridge and therefore use this default.
+    fn supports_durable_human_input(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend can replay run events across processes.
+    fn event_journal_scope(&self) -> EventJournalScope {
+        EventJournalScope::ProcessLocal
+    }
+
+    /// Whether conversation mutations can be safely rehydrated and fenced on
+    /// a different process. PostgreSQL overrides this; local stores retain the
+    /// established process-only execution model.
+    fn conversation_coordination_scope(&self) -> ConversationCoordinationScope {
+        ConversationCoordinationScope::ProcessLocal
+    }
+
+    /// Immutable journal limits used by the event producer and page reader.
+    fn event_journal_config(&self) -> RunEventJournalConfig {
+        RunEventJournalConfig::default()
+    }
+
+    /// Append a strictly ordered event batch. Process-local stores reject
+    /// direct calls so a missed scope check cannot silently discard events.
+    async fn append_run_events(
+        &self,
+        _batch: &RunEventAppendBatch,
+    ) -> Result<RunEventAppendOutcome> {
+        Err(crate::utils::error::IronCrewError::Validation(
+            "State store does not provide a shared run-event journal".into(),
+        ))
+    }
+
+    /// Read one bounded replay page after `after_sequence` (zero = beginning).
+    async fn read_run_events(
+        &self,
+        _flow: &str,
+        _run_id: &str,
+        _after_sequence: u64,
+    ) -> Result<RunEventPage> {
+        Err(crate::utils::error::IronCrewError::Validation(
+            "State store does not provide a shared run-event journal".into(),
+        ))
+    }
+
+    /// Extend every in-flight run owned by this instance. Returns the number
+    /// of leases refreshed.
+    async fn heartbeat_owned_runs(&self) -> Result<usize>;
+
+    /// Minimal backend round-trip used by readiness checks.
+    async fn health_check(&self) -> Result<()>;
+
+    /// Atomically mark only expired (or legacy, unleased) in-flight records as
+    /// abandoned. A healthy run owned by another instance is never touched.
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize>;
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord>;
@@ -63,13 +334,234 @@ pub trait StateStore: Send + Sync {
 
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 
+    // Durable request idempotency.
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
+    async fn lookup_idempotency(
+        &self,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup> {
+        self.lookup_idempotency_for_principal(
+            &PrincipalId::legacy(),
+            key_hash,
+            request_fingerprint,
+            now,
+        )
+        .await
+    }
+
+    async fn lookup_idempotency_for_principal(
+        &self,
+        principal_id: &PrincipalId,
+        key_hash: &str,
+        request_fingerprint: &str,
+        now: &str,
+    ) -> Result<IdempotencyLookup>;
+
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
+    async fn claim_idempotency(
+        &self,
+        claim: IdempotencyClaim,
+        max_records: usize,
+        prune_batch: usize,
+    ) -> Result<IdempotencyClaimOutcome> {
+        let max_response_bytes = claim.max_total_response_bytes;
+        self.claim_idempotency_with_limits(
+            claim,
+            IdempotencyLimits {
+                global_max_records: max_records,
+                principal_max_records: max_records,
+                principal_max_in_flight: max_records,
+                global_max_response_bytes: max_response_bytes,
+                principal_max_response_bytes: max_response_bytes,
+                prune_batch,
+            },
+        )
+        .await
+    }
+
+    async fn claim_idempotency_with_limits(
+        &self,
+        claim: IdempotencyClaim,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyClaimOutcome>;
+
+    /// Extend an in-flight claim. `true` means this attempt still owns the
+    /// claim or has already completed it, and any renewal is committed before
+    /// return. JSON/SQLite persist the caller's candidate deadline; PostgreSQL
+    /// validates it but derives the durable deadline from its own clock. The
+    /// caller must conservatively start its local TTL at invocation, never at
+    /// response arrival. `false` means the claim is missing or indeterminate;
+    /// a different attempt is reported as `Conflict`.
+    async fn heartbeat_idempotency(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<bool>;
+
+    /// Atomically renew a keyed HTTP run's operation ledger and matching run
+    /// lease. `Owned` requires both in-flight fences to belong to this exact
+    /// attempt and confirms the renewal committed before return. As with the
+    /// ledger-only heartbeat, callers start their conservative local TTL when
+    /// invoking storage because PostgreSQL may sample its own deadline before
+    /// later transaction work. A terminal run is returned separately so the
+    /// API can preserve the winning result while stopping remaining Lua work.
+    async fn heartbeat_idempotent_run(
+        &self,
+        run_id: &str,
+        key_hash: &str,
+        attempt_id: &str,
+        new_lease_expires_at: &str,
+    ) -> Result<RunFenceHeartbeat>;
+
+    /// Fence every in-flight keyed run ledger owned by this process before it
+    /// advertises the draining lifecycle. Shared stores override this with an
+    /// atomic owner-scoped update; local stores have no cross-process control
+    /// plane and therefore use the no-op default.
+    async fn begin_owner_drain(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Durably request cancellation of a keyed HTTP run. PostgreSQL uses the
+    /// linked idempotency ledger as a cross-replica control mailbox; backends
+    /// without shared control return `NotDurable` and retain process-local
+    /// cancellation semantics.
+    async fn request_run_cancellation(
+        &self,
+        _run_id: &str,
+        _flow: &str,
+    ) -> Result<RunCancellationRequest> {
+        Ok(RunCancellationRequest::NotDurable)
+    }
+
+    // Durable human-input mailbox. Shared backends may override these methods
+    // to route pending questions and answers across replicas. Local stores
+    // deliberately preserve the existing process-local bridge semantics.
+    async fn register_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputRegistrationOutcome> {
+        Ok(HumanInputRegistrationOutcome::NotDurable)
+    }
+
+    async fn list_human_inputs(&self, _flow: &str, _run_id: &str) -> Result<HumanInputListOutcome> {
+        Ok(HumanInputListOutcome::NotDurable)
+    }
+
+    async fn answer_human_input(
+        &self,
+        _flow: &str,
+        _run_id: &str,
+        _question_id: &str,
+        _answer: &serde_json::Value,
+    ) -> Result<HumanInputAnswerOutcome> {
+        Ok(HumanInputAnswerOutcome::NotDurable)
+    }
+
+    async fn read_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<HumanInputReadOutcome> {
+        Ok(HumanInputReadOutcome::NotDurable)
+    }
+
+    /// Remove a single mailbox row after the owning runtime has resolved or
+    /// abandoned its suspension point. `false` means the backend has no
+    /// durable mailbox or the fenced row no longer exists.
+    async fn close_human_input(
+        &self,
+        _registration: &DurableHumanInputRegistration,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
+    async fn complete_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        max_total_response_bytes: usize,
+    ) -> Result<IdempotencyCompletionOutcome> {
+        self.complete_idempotency_with_limits(
+            completion,
+            IdempotencyLimits {
+                global_max_records: usize::MAX,
+                principal_max_records: usize::MAX,
+                principal_max_in_flight: usize::MAX,
+                global_max_response_bytes: max_total_response_bytes,
+                principal_max_response_bytes: max_total_response_bytes,
+                prune_batch: 1,
+            },
+        )
+        .await
+    }
+
+    async fn complete_idempotency_with_limits(
+        &self,
+        completion: IdempotencyCompletion,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyCompletionOutcome>;
+
+    #[allow(dead_code)] // retained for downstream StateStore API compatibility
+    async fn commit_conversation_idempotency(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        max_total_response_bytes: usize,
+    ) -> Result<ConversationIdempotencyCommit> {
+        self.commit_conversation_idempotency_with_limits(
+            completion,
+            conversation,
+            IdempotencyLimits {
+                global_max_records: usize::MAX,
+                principal_max_records: usize::MAX,
+                principal_max_in_flight: usize::MAX,
+                global_max_response_bytes: max_total_response_bytes,
+                principal_max_response_bytes: max_total_response_bytes,
+                prune_batch: 1,
+            },
+        )
+        .await
+    }
+
+    async fn commit_conversation_idempotency_with_limits(
+        &self,
+        completion: IdempotencyCompletion,
+        conversation: &ConversationRecord,
+        limits: IdempotencyLimits,
+    ) -> Result<ConversationIdempotencyCommit>;
+
+    async fn mark_idempotency_indeterminate(
+        &self,
+        key_hash: &str,
+        attempt_id: &str,
+        completed_at: &str,
+        expires_at: &str,
+    ) -> Result<bool>;
+
+    async fn release_idempotency(&self, key_hash: &str, attempt_id: &str) -> Result<bool>;
+
+    async fn prune_idempotency(&self, now: &str, limit: usize) -> Result<usize>;
+
+    /// Low-cardinality resource snapshot for the authenticated caller plus
+    /// global/high-water usage. Implementations must never return principal
+    /// identifiers or raw idempotency keys.
+    async fn idempotency_usage(
+        &self,
+        principal_id: &PrincipalId,
+        limits: IdempotencyLimits,
+    ) -> Result<IdempotencyUsage>;
+
     // ─── Persistent sessions ────────────────────────────────────────────────
 
-    /// Upsert a conversation record. The `(flow_path, id)` pair is the
+    /// Insert or revision-guarded update a conversation record. The returned
+    /// value is the new revision and must be supplied on the next save. The
+    /// `(flow_path, id)` pair is the
     /// effective unique key — a legacy record with `flow_path = None` is
     /// only reachable when the caller also passes `None` (by convention, a
     /// global-scope lookup, as used by the `ironcrew inspect` CLI).
-    async fn save_conversation(&self, record: &ConversationRecord) -> Result<()>;
+    async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64>;
     /// Look up a conversation by `(flow_path, id)`. Returns `Ok(None)` when
     /// no record matches — which is how `crew:conversation({id = ...})`
     /// distinguishes a fresh session from a resumed one. When `flow_path`
@@ -100,9 +592,10 @@ pub trait StateStore: Send + Sync {
     /// Count of conversations matching the flow filter.
     async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64>;
 
-    /// Upsert a dialog state record. Keyed by `(flow_path, id)` — same
-    /// scoping rules as conversations (see `get_conversation` docs).
-    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<()>;
+    /// Insert or revision-guarded update a dialog state record. Returns the
+    /// new revision; stale snapshots fail with `IronCrewError::Conflict`.
+    /// Keyed by `(flow_path, id)` — same scoping rules as conversations.
+    async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64>;
     /// Look up a dialog by `(flow_path, id)`. Returns `Ok(None)` when no
     /// record matches. Flow-scope semantics match `get_conversation`:
     /// `Some(path)` requires an exact flow match (legacy records with
@@ -139,7 +632,7 @@ pub trait StateStore: Send + Sync {
 
 /// Create a StateStore based on environment configuration.
 ///
-/// `IRONCREW_STORE=json` (default) — JSON files in the given directory
+/// `IRONCREW_STORE=json` (local default) — JSON files in the given directory
 /// `IRONCREW_STORE=sqlite` — SQLite database
 /// `IRONCREW_STORE=postgres` — PostgreSQL 15+ (requires `postgres` feature)
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
@@ -149,6 +642,8 @@ pub trait StateStore: Send + Sync {
 /// `IRONCREW_DB_CONNECT_RETRIES=10` — retries (after the first attempt) when the
 ///   database is unreachable at startup, with exponential backoff
 /// `IRONCREW_DB_CONNECT_BACKOFF_MS=1000` — base backoff between connect retries
+/// `IRONCREW_INSTANCE_ID=<unique runtime id>` — optional process/pod identity
+/// `IRONCREW_RUN_LEASE_TTL_SECONDS=60` — stale-run ownership timeout
 ///
 /// Returns an `Arc` so the same instance can be shared across the crew's
 /// `run()`, `conversation()`, and `dialog()` call paths without re-opening
@@ -156,9 +651,20 @@ pub trait StateStore: Send + Sync {
 pub async fn create_store(
     default_dir: std::path::PathBuf,
 ) -> Result<std::sync::Arc<dyn StateStore>> {
-    let store_type = std::env::var("IRONCREW_STORE").unwrap_or_else(|_| "json".into());
+    let store_type = match std::env::var("IRONCREW_STORE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "json".into(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::utils::error::IronCrewError::Validation(
+                "IRONCREW_STORE must contain valid UTF-8".into(),
+            ));
+        }
+    };
 
     match store_type.to_lowercase().as_str() {
+        "json" => Ok(std::sync::Arc::new(super::run_history::JsonFileStore::new(
+            default_dir,
+        )?)),
         "sqlite" => {
             let db_path = std::env::var("IRONCREW_STORE_PATH")
                 .map(std::path::PathBuf::from)
@@ -192,12 +698,80 @@ pub async fn create_store(
         "postgres" | "postgresql" => Err(crate::utils::error::IronCrewError::Validation(
             "PostgreSQL backend requires building with --features postgres".into(),
         )),
-        _ => {
-            // JsonFileStore creates `runs/`, `conversations/`, and `dialogs/`
-            // subdirectories inside the given `.ironcrew/` root.
-            Ok(std::sync::Arc::new(super::run_history::JsonFileStore::new(
-                default_dir,
-            )?))
-        }
+        other => Err(crate::utils::error::IronCrewError::Validation(format!(
+            "Unknown IRONCREW_STORE value '{other}'; expected json, sqlite, or postgres"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_lease_config_validates_identity_and_deadline() {
+        assert!(RunLeaseConfig::new("", Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("bad\nidentity", Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("pod-α", Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("x".repeat(256), Duration::from_secs(60)).is_err());
+        assert!(RunLeaseConfig::new("pod-a", Duration::ZERO).is_err());
+        assert!(RunLeaseConfig::new("pod-a", Duration::from_millis(999)).is_err());
+
+        let config = RunLeaseConfig::new(" pod-a ", Duration::from_secs(60)).unwrap();
+        assert_eq!(config.instance_id(), "pod-a");
+        let now = DateTime::parse_from_rfc3339("2026-07-18T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(config.deadline_from(now), "2026-07-18T10:01:00+00:00");
+    }
+
+    #[test]
+    fn explicit_instance_id_precedes_validated_railway_runtime_identity() {
+        assert_eq!(
+            select_instance_id(Some("explicit-owner".into()), Some("railway-owner".into()))
+                .unwrap()
+                .as_deref(),
+            Some("explicit-owner")
+        );
+        assert_eq!(
+            select_instance_id(None, Some("railway-owner".into()))
+                .unwrap()
+                .as_deref(),
+            Some("railway-owner")
+        );
+        assert!(select_instance_id(None, Some(String::new())).is_err());
+        assert_eq!(select_instance_id(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn production_lease_has_three_heartbeat_opportunities_and_bounded_maintenance() {
+        assert!(production_run_lease_ttl(5).is_err());
+        assert_eq!(production_run_lease_ttl(6).unwrap(), Duration::from_secs(6));
+        assert_eq!(
+            production_run_lease_ttl(86_400).unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert!(production_run_lease_ttl(86_401).is_err());
+        assert_eq!(
+            run_lease_heartbeat_interval(Duration::from_secs(6)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            run_maintenance_timeout(Duration::from_secs(6)),
+            Duration::from_millis(666)
+        );
+        assert_eq!(
+            run_maintenance_database_timeout(Duration::from_secs(6)),
+            Duration::from_millis(532)
+        );
+        assert_eq!(
+            run_maintenance_timeout(Duration::from_secs(60)),
+            Duration::from_secs(5)
+        );
+
+        // Explicit constructors remain available for deterministic tests that
+        // never pass through production environment validation.
+        let short_test_lease = RunLeaseConfig::new("test-owner", Duration::from_secs(3)).unwrap();
+        assert_eq!(short_test_lease.ttl(), Duration::from_secs(3));
     }
 }

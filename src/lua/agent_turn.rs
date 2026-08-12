@@ -14,24 +14,94 @@
 //! Extracted from the original `LuaConversationInner::run_turn` body
 //! so both paths share tool-loop logic without duplication.
 
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::CrewEvent;
-use crate::llm::provider::{ChatMessage, ChatRequest, LlmProvider};
+use crate::llm::provider::{
+    ChatMessage, ChatRequest, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES,
+    LlmProvider, append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
+    max_reasoning_bytes, validate_chat_history,
+};
 use crate::tools::ToolCallContext;
 use crate::utils::error::{IronCrewError, Result};
 
+/// Rolls back the currently-active user turn if the future is cancelled or
+/// returns before `commit`. Keeping this guard alive across provider/tool
+/// awaits makes Tokio timeout and shutdown cancellation history-safe.
+pub(crate) struct ActiveTurnGuard<'a> {
+    history: &'a mut Vec<ChatMessage>,
+    /// Exact transcript that existed before the active user message. History
+    /// limiting can drain old turn groups while a provider/tool request is in
+    /// flight, so remembering only the active user's index is not sufficient:
+    /// cancellation would otherwise keep the drain and silently lose older
+    /// persisted context.
+    rollback_snapshot: Option<Vec<ChatMessage>>,
+    committed: bool,
+}
+
+impl<'a> ActiveTurnGuard<'a> {
+    pub(crate) fn new(history: &'a mut Vec<ChatMessage>) -> Self {
+        let rollback_snapshot = history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .map(|active_start| history[..active_start].to_vec());
+        Self {
+            history,
+            rollback_snapshot,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+        self.rollback_snapshot = None;
+    }
+}
+
+impl Deref for ActiveTurnGuard<'_> {
+    type Target = Vec<ChatMessage>;
+
+    fn deref(&self) -> &Self::Target {
+        self.history
+    }
+}
+
+impl DerefMut for ActiveTurnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.history
+    }
+}
+
+impl Drop for ActiveTurnGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(snapshot) = self.rollback_snapshot.take()
+        {
+            *self.history = snapshot;
+        }
+    }
+}
+
 /// Returns the per-tool-call timeout in seconds.
 ///
-/// Reads `IRONCREW_TOOL_TIMEOUT` from the environment; falls back to 60s if
-/// the variable is absent or cannot be parsed as a `u64`.
-fn tool_timeout_secs() -> u64 {
-    std::env::var("IRONCREW_TOOL_TIMEOUT")
+/// Reads `IRONCREW_TOOL_TIMEOUT` from the environment. Missing, invalid, and
+/// zero values fall back to 60 seconds; excessive values are clamped to one
+/// hour so a malformed deployment setting cannot leave tool futures alive
+/// indefinitely.
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
+const MAX_TOOL_TIMEOUT_SECS: u64 = 3_600;
+
+pub(crate) fn tool_timeout_secs() -> u64 {
+    match std::env::var("IRONCREW_TOOL_TIMEOUT")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(value) if value > 0 => value.min(MAX_TOOL_TIMEOUT_SECS),
+        _ => DEFAULT_TOOL_TIMEOUT_SECS,
+    }
 }
 
 /// Run a single send/respond round (with tool-call loop) against `agent`
@@ -41,8 +111,9 @@ fn tool_timeout_secs() -> u64 {
 /// * `max_tool_rounds` caps how many tool-call rounds the helper will
 ///   process before returning an error. Each round corresponds to one
 ///   assistant tool_calls response followed by one or more tool results.
-/// * `max_history` optionally trims the oldest non-system messages after
-///   every append. `None` = unbounded.
+/// * `max_history` trims the oldest complete user-turn groups after every
+///   append. `None` selects the safe default; zero and values above the hard
+///   ceiling are rejected.
 /// * `ctx.tool_registry` supplies the tool schemas and dispatches each
 ///   tool call. `None` → no tools are advertised and tool dispatches
 ///   error with a "no tool registry available" message.
@@ -57,9 +128,26 @@ pub async fn run_single_agent_turn(
     model: &str,
     max_tool_rounds: usize,
     max_history: Option<usize>,
-    history: &mut Vec<ChatMessage>,
+    history_buffer: &mut Vec<ChatMessage>,
     ctx: &ToolCallContext,
 ) -> Result<(String, Option<String>)> {
+    let mut history = ActiveTurnGuard::new(history_buffer);
+    let max_history = match max_history {
+        Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
+        Some(value) => {
+            return Err(IronCrewError::Validation(format!(
+                "max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {value}"
+            )));
+        }
+        None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
+    };
+    let max_history_bytes = ctx.tool_registry.as_ref().map_or_else(
+        chat_history_max_bytes,
+        crate::tools::registry::ToolRegistry::chat_history_max_bytes,
+    );
+    enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
+    validate_chat_history(&history, max_history, max_history_bytes, true)?;
+
     let tool_schemas = match &ctx.tool_registry {
         Some(reg) => reg.schemas_for(&agent.tools),
         None => Vec::new(),
@@ -72,9 +160,15 @@ pub async fn run_single_agent_turn(
         .unwrap_or_else(|| format!("agent__{}", agent.name));
 
     let mut accumulated_reasoning = String::new();
+    let reasoning_limit = ctx.tool_registry.as_ref().map_or_else(
+        max_reasoning_bytes,
+        crate::tools::registry::ToolRegistry::max_reasoning_bytes,
+    );
+    let mut reasoning_truncated = false;
     let mut rounds = 0usize;
 
     loop {
+        validate_chat_history(&history, max_history, max_history_bytes, true)?;
         let messages_snapshot: Vec<ChatMessage> = history.clone();
         let request = ChatRequest {
             messages: messages_snapshot,
@@ -94,15 +188,19 @@ pub async fn run_single_agent_turn(
 
         if let Some(ref r) = response.reasoning {
             if !accumulated_reasoning.is_empty() {
-                accumulated_reasoning.push('\n');
+                reasoning_truncated |=
+                    append_text_bounded(&mut accumulated_reasoning, "\n", reasoning_limit);
             }
-            accumulated_reasoning.push_str(r);
+            reasoning_truncated |=
+                append_text_bounded(&mut accumulated_reasoning, r, reasoning_limit);
 
             if let Some(bus) = &ctx.eventbus {
+                let mut bounded = String::new();
+                append_text_bounded(&mut bounded, r, reasoning_limit);
                 bus.emit(CrewEvent::TaskThinking {
                     task: scope.clone(),
                     agent: agent.name.clone(),
-                    content: r.clone(),
+                    content: bounded,
                 });
             }
         }
@@ -114,13 +212,21 @@ pub async fn run_single_agent_turn(
                 .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
 
             history.push(ChatMessage::assistant(Some(content.clone()), None));
-            enforce_history_cap(history, max_history);
+            enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
 
             let reasoning = if accumulated_reasoning.is_empty() {
                 None
             } else {
+                if reasoning_truncated {
+                    tracing::warn!(
+                        agent = %agent.name,
+                        limit = reasoning_limit,
+                        "Reasoning text was truncated to the configured byte limit"
+                    );
+                }
                 Some(accumulated_reasoning)
             };
+            history.commit();
             return Ok((content, reasoning));
         }
 
@@ -139,7 +245,7 @@ pub async fn run_single_agent_turn(
             Some(response.tool_calls.clone()),
             response.raw_blocks.clone(),
         ));
-        enforce_history_cap(history, max_history);
+        enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
 
         // Execute each tool call and append its result.
         for tool_call in &response.tool_calls {
@@ -157,11 +263,14 @@ pub async fn run_single_agent_turn(
             // A call may extend its own dispatch deadline (ask_human waits
             // on a person; approval-gated tools wait for a sign-off);
             // everything else gets the global timeout.
-            let timeout = ctx
-                .tool_registry
-                .as_ref()
-                .and_then(|reg| reg.dispatch_timeout(&tool_call.function.name, &args))
-                .unwrap_or_else(|| Duration::from_secs(tool_timeout_secs()));
+            let timeout = ctx.tool_registry.as_ref().map_or_else(
+                || Duration::from_secs(tool_timeout_secs()),
+                |registry| {
+                    registry
+                        .dispatch_timeout(&tool_call.function.name, &args)
+                        .unwrap_or_else(|| registry.default_dispatch_timeout())
+                },
+            );
             let (result_text, ok) = match &ctx.tool_registry {
                 Some(reg) => {
                     let dispatch = reg.execute(&tool_call.function.name, args, ctx);
@@ -193,24 +302,9 @@ pub async fn run_single_agent_turn(
             }
 
             history.push(ChatMessage::tool(&tool_call.id, &result_text));
-            enforce_history_cap(history, max_history);
+            enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
         }
     }
-}
-
-/// Trim `history` in-place if it exceeds `limit` non-system messages.
-/// Preserves the system message at index 0.
-fn enforce_history_cap(history: &mut Vec<ChatMessage>, max_history: Option<usize>) {
-    let Some(cap) = max_history else {
-        return;
-    };
-    // +1 for the system message we always keep
-    let limit = cap + 1;
-    if history.len() <= limit {
-        return;
-    }
-    let excess = history.len() - limit;
-    history.drain(1..1 + excess);
 }
 
 #[cfg(test)]
@@ -229,6 +323,42 @@ mod tests {
     use crate::tools::registry::ToolRegistry;
     use crate::tools::{Tool, ToolCallContext};
     use crate::utils::error::Result;
+
+    #[test]
+    fn cancelled_turn_restores_history_removed_by_limit_enforcement() {
+        let original = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant(Some("old answer".into()), None),
+        ];
+        let mut history = original.clone();
+        history.push(ChatMessage::user("active question"));
+
+        {
+            let mut guard = ActiveTurnGuard::new(&mut history);
+            // Simulate history-limit enforcement draining the oldest complete
+            // turn while the active request is still cancellable.
+            guard.drain(1..3);
+            guard.push(ChatMessage::assistant(Some("partial".into()), None));
+        }
+
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn committed_turn_keeps_history_mutations() {
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("question")];
+        {
+            let mut guard = ActiveTurnGuard::new(&mut history);
+            guard.push(ChatMessage::assistant(Some("answer".into()), None));
+            guard.commit();
+        }
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].content.as_deref(), Some("answer"));
+    }
 
     // ── Stub provider ────────────────────────────────────────────────────────
 
@@ -282,6 +412,30 @@ mod tests {
                 usage: None,
                 raw_blocks: None,
             })
+        }
+    }
+
+    struct SlowProvider;
+
+    #[async_trait]
+    impl LlmProvider for SlowProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(ChatResponse {
+                content: Some("too late".into()),
+                reasoning: None,
+                tool_calls: vec![],
+                usage: None,
+                raw_blocks: None,
+            })
+        }
+
+        async fn chat_with_tools(
+            &self,
+            request: ChatRequest,
+            _tools: &[ToolSchema],
+        ) -> Result<ChatResponse> {
+            self.chat(request).await
         }
     }
 
@@ -403,6 +557,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cancelled_turn_rolls_back_active_history() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(SlowProvider);
+        let agent = Agent {
+            name: "cancellation-tester".into(),
+            goal: "test cancellation rollback".into(),
+            ..Default::default()
+        };
+        let mut history = vec![
+            ChatMessage::system("you are a tester"),
+            ChatMessage::user("this turn must be rolled back"),
+        ];
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            run_single_agent_turn(
+                &agent,
+                &provider,
+                "stub-model",
+                5,
+                Some(50),
+                &mut history,
+                &ToolCallContext::default(),
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "the deliberately slow turn must time out");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
     /// Sanity-check `tool_timeout_secs()`: missing / unparseable env var falls
     /// back to 60.
     #[test]
@@ -422,6 +608,35 @@ mod tests {
             std::env::set_var("IRONCREW_TOOL_TIMEOUT", "120");
         }
         assert_eq!(tool_timeout_secs(), 120);
+        unsafe {
+            std::env::remove_var("IRONCREW_TOOL_TIMEOUT");
+        }
+    }
+
+    #[test]
+    fn tool_timeout_secs_rejects_zero_and_invalid_values() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::set_var("IRONCREW_TOOL_TIMEOUT", "0");
+        }
+        assert_eq!(tool_timeout_secs(), DEFAULT_TOOL_TIMEOUT_SECS);
+
+        unsafe {
+            std::env::set_var("IRONCREW_TOOL_TIMEOUT", "not-a-number");
+        }
+        assert_eq!(tool_timeout_secs(), DEFAULT_TOOL_TIMEOUT_SECS);
+        unsafe {
+            std::env::remove_var("IRONCREW_TOOL_TIMEOUT");
+        }
+    }
+
+    #[test]
+    fn tool_timeout_secs_clamps_excessive_values() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::set_var("IRONCREW_TOOL_TIMEOUT", u64::MAX.to_string());
+        }
+        assert_eq!(tool_timeout_secs(), MAX_TOOL_TIMEOUT_SECS);
         unsafe {
             std::env::remove_var("IRONCREW_TOOL_TIMEOUT");
         }

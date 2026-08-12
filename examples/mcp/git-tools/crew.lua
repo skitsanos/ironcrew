@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal     = "Inspect the current Git repository and summarise recent activity",
     provider = "openai",
-    model    = "gpt-4.1-mini",
+    model    = "gpt-5.6-luna",
 
     -- Declare MCP servers. Tools become available as mcp__<label>__<tool_name>.
     mcp_servers = {
@@ -33,6 +33,7 @@ crew:add_agent({
 })
 
 crew:add_task({
+    name        = "inspect_repository",
     description = "Check the git status and list the last 5 commits of the repository at '.'.",
     agent       = "git_analyst",
     expected_output = "A brief summary: current branch, any uncommitted changes, last 5 commits with messages and authors.",

@@ -1,7 +1,7 @@
 # Tools
 
 Tools are functions that agents can invoke during task execution. IronCrew ships
-with 8 built-in tools by default (9 when the opt-in `shell` tool is enabled via
+with 9 built-in tools by default (10 when the opt-in `shell` tool is enabled via
 `IRONCREW_ALLOW_SHELL=1`) and supports custom tools written in Lua. Additional
 tools can be contributed by MCP servers configured on the crew (see
 [MCP Tools](#mcp-tools) below).
@@ -20,9 +20,12 @@ absolute paths and directory traversal (`..`) are rejected.
 { "path": "input/report.md" }
 ```
 
-**Limit:** files larger than `IRONCREW_FILE_READ_MAX_BYTES` (default 10 MB)
-are rejected with a clear error. Checked via filesystem metadata before
-any content is read into memory.
+**Limit:** files larger than `IRONCREW_FILE_READ_MAX_BYTES` (default 10 MiB,
+hard ceiling 256 MiB)
+are rejected. Reads are streamed through a capability directory and stop if a
+file grows past the limit. Absolute paths, traversal, symlink escapes, and
+non-regular files are rejected by descriptor-relative capability access,
+avoiding a path-check/path-open race.
 
 ### file_read_glob
 
@@ -53,12 +56,21 @@ Individual files that fail to read yield `{path, error}` entries in the
 `files` array instead of `{path, content}`.
 
 **Limits:**
-- `IRONCREW_GLOB_MAX_FILES` (default 500) — max number of files to return.
-- `IRONCREW_GLOB_MAX_BYTES` (default 50 MB) — max aggregated byte total across
+- The glob pattern itself is capped at 8192 bytes.
+- `IRONCREW_GLOB_MAX_FILES` (default 500, hard 10 000) — max number of files to return.
+- `IRONCREW_GLOB_MAX_BYTES` (default 50 MiB, hard 256 MiB) — max aggregated byte total across
   all returned files.
+- `IRONCREW_GLOB_MAX_ENTRIES` (default 10 000, hard 100 000) — max regular filesystem
+  entries scanned before matching.
+- `IRONCREW_FILE_READ_MAX_BYTES` (default 10 MiB, hard 256 MiB) — max bytes per file.
+- `IRONCREW_GLOB_MAX_OUTPUT_BYTES` (default 64 MiB, hard 256 MiB) — max final
+  serialized JSON bytes, including escaping and metadata. Exceeding this
+  final cap fails the tool call rather than returning partial JSON.
 
 When either limit is hit, the glob iteration stops and the result is returned
-with `truncated: true`. Set either env var to `0` to disable the cap.
+with `truncated: true`. Zero or invalid resource-limit values use the bounded
+defaults; they do not disable the caps. Directory traversal, symlink entries,
+and non-regular files are not included in a glob scan.
 
 ### file_write
 
@@ -72,6 +84,13 @@ whitelisted extensions are allowed by default: `txt`, `md`, `json`, `csv`,
 ```lua
 { "path": "output/summary.md", "content": "# Summary\n..." }
 ```
+
+Writes are capped by `IRONCREW_FILE_WRITE_MAX_BYTES` (default 10 MiB, hard
+ceiling 256 MiB), opened
+relative to the project capability directory, and committed by an atomic
+temporary-file rename. Absolute paths, traversal, and symlink targets are
+rejected; intermediate path resolution remains confined to the project
+capability directory.
 
 ### web_scrape
 
@@ -101,12 +120,15 @@ See [Shell Tool Safety](#shell-tool-safety) below.
 { "command": "wc -l data/*.csv" }
 ```
 
-**Output limits:** stdout and stderr are each capped at
-`IRONCREW_SHELL_MAX_OUTPUT_BYTES` bytes (default 1 MB per stream). The child
+**Execution limits:** the deadline defaults to
+`IRONCREW_SHELL_TIMEOUT_SECS=60`; a call-level `timeout_secs` can override it.
+Both values must be in `1..=3600`. stdout and stderr are each capped at
+`IRONCREW_SHELL_MAX_OUTPUT_BYTES` bytes (default 1 MiB, hard ceiling 16 MiB per stream). The child
 process is spawned with piped stdio and each stream is read with a bounded
 reader. When the cap is hit, further output is drained and discarded (so the
 child can still exit cleanly) and a truncation marker is appended to the
-captured output.
+captured output. Timeout, cancellation, and normal completion terminate the
+whole child process group, including background descendants.
 
 ### http_request
 
@@ -129,14 +151,28 @@ authentication. Supports bearer, basic, and API-key auth.
 ```
 
 **Security:** Requests to private/internal IP addresses (loopback, RFC1918,
-link-local, CGNAT) are blocked by default to prevent SSRF attacks. Override with
-`IRONCREW_ALLOW_PRIVATE_IPS=1`.
+link-local, CGNAT, metadata and reserved ranges) are blocked by default.
+Validation covers initial DNS answers, the addresses used for the actual
+connection, and redirect targets. Protected clients ignore environment proxy
+variables because a proxy could otherwise bypass address validation. Override
+with `IRONCREW_ALLOW_PRIVATE_IPS=1` only for trusted workloads.
 
-**Response size limit:** `IRONCREW_MAX_RESPONSE_SIZE` (default 50 MB). Enforced
-both via the `Content-Length` header (cheap pre-check) and during streaming
-read (handles chunked responses with no header) — the request aborts as soon
-as the byte budget is exceeded, so oversized responses never fully materialize
-in memory.
+**Request budgets:** The URL is limited to 8192 bytes. Explicit headers must
+be string-valued and, together with generated authentication headers, fit
+`IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES` (64 KiB by default, 1 MiB hard
+ceiling); no request may exceed 128 headers. String bodies are capped by
+`IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` (8 MiB by default, 64 MiB hard
+ceiling). Invalid header names or values fail before any request is sent.
+
+**Response budgets:** `IRONCREW_HTTP_MAX_RESPONSE_BYTES` is the primary body
+cap (default 8 MiB). `IRONCREW_MAX_RESPONSE_SIZE` remains a deprecated fallback
+only when the primary variable is absent. `IRONCREW_HTTP_MAX_HEADER_BYTES`
+defaults to 64 KiB, `IRONCREW_HTTP_MAX_JSON_BYTES` limits the additional parsed
+JSON tree to 2 MiB, and `IRONCREW_HTTP_MAX_OUTPUT_BYTES` limits the final
+serialized result to 16 MiB. Content length and chunked streaming are both
+enforced. Each network-body setting is also constrained by a 256 MiB process
+hard cap; invalid values use the safe default. A request-specific timeout must
+be finite and in `(0, 300]` seconds.
 
 ### hash
 
@@ -170,6 +206,11 @@ Validate a JSON string against a JSON Schema (Draft 7). Returns
 ```lua
 { "data": "{\"name\": \"Alice\"}", "schema": { "type": "object", "properties": { "name": { "type": "string" } } } }
 ```
+
+Schemas are capped by `IRONCREW_JSON_SCHEMA_MAX_BYTES` (default 256 KiB;
+range 1 KiB–4 MiB). External document retrieval is disabled: `$ref` may use a
+local `#` fragment, but HTTP, file, and other non-fragment references are
+rejected before compilation.
 
 ### ask_human
 
@@ -265,7 +306,7 @@ a top-level agent or crew:
 |---|---|---|
 | `agent__<name>` (tool entry) | one agent delegates a single question to another agent defined on the same crew | chat-driven, ephemeral |
 | `run_flow("<path>")` (Lua global) | top-level script or tool calls a sub-crew's full pipeline | programmatic, depth-bounded |
-| `crew:subworkflow(child_crew)` | Rust/Lua code structures nested crews at construction time | compile-time composition |
+| `crew:subworkflow("<path>", options?)` | top-level crew invokes a sub-flow and can wrap its result with `output_key` | programmatic, depth-bounded |
 
 All three share the `IRONCREW_MAX_FLOW_DEPTH` cap (default `5`) so deeply-nested
 delegation doesn't run away.
@@ -301,11 +342,15 @@ VM boundary via JSON.
 - **Synchronous from Lua's perspective, async under the hood.** Callers just
   receive the return value; IronCrew awaits the sub-flow on the Tokio runtime.
 - **Fresh Lua VM per sub-flow.** Each invocation builds a new sandboxed VM
-  (same sandbox rules as the parent crew: no `os`, `io`, `require`, `loadfile`,
-  `dofile`; `http`, `fs`, `template`, `regex`, `json_parse`, etc. are
-  available). Sub-flows do not inherit memory, tasks, or agents from the caller.
-- **Agents auto-load.** The sub-flow's directory is scanned for `agents/*.lua`
-  just like a top-level crew.
+  (same sandbox rules as the parent crew: no `os`, `io`, `loadfile`, `dofile`;
+  `http`, `fs`, `template`, `regex`, `json_parse`, etc. are available).
+  Sub-flows do not inherit memory, tasks, or agents from the caller. During an
+  HTTP conversation, the sub-flow source and its `require` modules come from
+  the conversation's immutable snapshot; ordinary run/CLI execution keeps the
+  filesystem-backed loader.
+- **Agents auto-load.** Direct `agents/*.lua` children are loaded from that
+  same conversation snapshot, or scanned from the sub-flow directory for an
+  ordinary filesystem-backed invocation.
 - **Available in both sandboxes.** `run_flow` is registered on the top-level
   crew Lua VM *and* on the per-tool Lua VM used by custom `tools/*.lua` files
   (including tools invoked during a `crew:conversation()` tool-call loop). This
@@ -360,6 +405,12 @@ The sub-flow `subs/math/math.lua` runs in its own sandbox with its own
 `agents/` folder and can use `http`, `fs`, and crew/agent constructors
 normally.
 
+All agent-facing filesystem reads deny flow-local secrets and state, including
+`.env`/`.env.*`, `.ironcrew`, common credential directories/files, and
+private-key extensions. Custom tools read ordinary project data from the flow
+root but write only beneath `IRONCREW_FILE_WRITE_ROOT`; source and executable
+extensions are never writable.
+
 ---
 
 ## MCP Tools
@@ -379,9 +430,38 @@ crew:add_agent(Agent.new({
 
 See [Crews](crews.md) for `mcp_servers` configuration.
 
+For persistent conversations, every reachable MCP server must also declare a
+non-secret `execution_identity`. IronCrew hashes it together with the resolved
+tool schema/graph so a cold resume on another replica cannot silently switch
+server behavior. The field is not a credential: rotate it when executable or
+API behavior changes and never include tokens or secret-bearing configuration.
+Ordinary runs and ephemeral conversations do not require it.
+
+The same persistent-conversation definition binds each reachable tool's
+captured effective non-secret execution policy. This includes fingerprints of
+filesystem and Lua-tool capability roots, configured byte/count/output limits,
+extension or domain filters, the private-network opt-in, shell/default tool
+timeouts, and maximum nested-flow depth. Tool execution uses those captured
+values rather than re-reading mutable environment policy mid-conversation.
+Secrets and raw root paths are excluded. Fixed compiled ceilings and semantics
+are not copied into each conversation record; replicas must carry the same
+attested artifact identity so those constants remain equal. A behavior-changing
+policy drift changes the definition fingerprint and makes resume fail closed.
+
 **Result size cap.** MCP tool results are size-capped at
-`IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` (default `262144` / 256 KB). Oversized
-results are truncated with a marker appended.
+`IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` (default `262144` / 256 KiB; hard ceiling
+16 MiB). Oversized text is UTF-8-safely truncated with a marker. MCP also caps
+discovery at 128 tools/32 pages, definitions at 128 KiB, arguments at 256 KiB,
+and result content at 256 blocks by default. Separate handshake, discovery,
+call, and shutdown deadlines prevent an unresponsive server from retaining a
+run indefinitely. HTTP MCP transport does not follow redirects; loopback is
+available only through the narrow `IRONCREW_MCP_ALLOW_LOCALHOST` opt-in.
+rmcp currently materializes stdio/HTTP transport frames before IronCrew can
+apply its post-decode result caps, so production must permit only trusted stdio
+commands and exact hosts (`IRONCREW_MCP_ALLOWED_HTTP_HOSTS`), or keep both MCP
+transports disabled. See
+the complete environment table in
+[CLI](cli.md#environment-variables).
 
 ---
 
@@ -595,8 +675,12 @@ Async HTTP client available in `crew.lua`, `config.lua`, and agent definitions.
 response table. Uses a shared connection pool (singleton `reqwest::Client`).
 
 **Security:** All `http.*` calls enforce SSRF protection — requests to
-private/loopback IPs are blocked by default (override: `IRONCREW_ALLOW_PRIVATE_IPS=1`).
-Response bodies exceeding `IRONCREW_MAX_RESPONSE_SIZE` (default 50MB) are rejected.
+private/internal IPs are blocked at DNS resolution, connection, and redirect
+time (override only for trusted workloads with `IRONCREW_ALLOW_PRIVATE_IPS=1`).
+Environment proxy variables are ignored. Response bodies use
+`IRONCREW_HTTP_MAX_RESPONSE_BYTES` (default 8 MiB), with the deprecated
+`IRONCREW_MAX_RESPONSE_SIZE` consulted only as a fallback. Headers default to a
+64 KiB cap and automatic JSON conversion is skipped above 2 MiB.
 
 ```lua
 local resp = http.get("https://api.example.com/data", {
@@ -631,6 +715,8 @@ end
 | `json`    | table  | Lua table serialized as JSON body |
 | `timeout` | number | Timeout in seconds (default 30) |
 
+`timeout` must be finite, greater than zero, and no more than 300 seconds.
+
 **Response table:**
 
 | Field     | Type   | Description |
@@ -646,7 +732,9 @@ end
 ## Tool Execution Timeout
 
 Every tool invocation is wrapped in a timeout to prevent runaway executions.
-The default timeout is **60 seconds**. Override it with the
+The default timeout is **60 seconds**. Missing, invalid, and zero values use
+that default; values above the one-hour hard ceiling clamp to 3600 seconds.
+Override it with the
 `IRONCREW_TOOL_TIMEOUT` environment variable (value in seconds):
 
 ```bash

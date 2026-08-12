@@ -96,7 +96,7 @@ export function App() {
   const [sessions, setSessions] = useState<ConversationEntry[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [draftSessionId, setDraftSessionId] = useState(makeSessionId);
-  const [agent, setAgent] = useState("concierge");
+  const [agent, setAgent] = useState("coordinator");
   const [maxHistory, setMaxHistory] = useState("50");
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<HistoryMessage[]>([]);
@@ -314,7 +314,10 @@ export function App() {
         icUrl(config, `/conversations/${encodeURIComponent(target)}/messages`),
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": crypto.randomUUID(),
+          },
           body: JSON.stringify({ content }),
         },
       );
@@ -376,9 +379,9 @@ export function App() {
           <p className="eyebrow">Bun + React showcase</p>
           <h1>chat-http operator console</h1>
           <p className="lede">
-            This UI talks to the IronCrew <code>chat-http</code> flow through
-            Bun proxy routes, so you can demo explicit start, message turns,
-            event streaming, history, list, and delete from one screen.
+            This UI talks directly to the IronCrew <code>chat-http</code> flow,
+            so you can demo explicit start, message turns, event streaming,
+            history, list, and delete from one screen.
           </p>
           <dl className="config-grid">
             <div>
@@ -392,10 +395,6 @@ export function App() {
             <div>
               <dt>Default agent</dt>
               <dd>{config?.defaultAgent ?? "loading"}</dd>
-            </div>
-            <div>
-              <dt>Auth token</dt>
-              <dd>{config?.authConfigured ? "configured" : "not configured"}</dd>
             </div>
           </dl>
         </div>
@@ -427,7 +426,7 @@ export function App() {
               <input
                 value={agent}
                 onChange={event => setAgent(event.target.value)}
-                placeholder="concierge"
+                placeholder="coordinator"
               />
             </label>
 
@@ -582,7 +581,7 @@ export function App() {
             <textarea
               value={message}
               onChange={event => setMessage(event.target.value)}
-              placeholder="Type a message for the concierge agent"
+              placeholder="Type a message for the coordinator agent"
             />
             <div className="composer-actions">
               <p>

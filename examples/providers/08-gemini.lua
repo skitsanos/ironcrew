@@ -2,7 +2,6 @@
 -- Model: gemini-2.5-flash
 -- Requires: GEMINI_API_KEY
 
--- API key is auto-resolved from GEMINI_API_KEY env var based on base_url.
 local crew = Crew.new({
     goal = "Verify Gemini via OpenAI compat",
     provider = "openai",

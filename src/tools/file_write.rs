@@ -1,63 +1,81 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
+const DEFAULT_FILE_WRITE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const HARD_FILE_WRITE_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub struct FileWriteTool {
-    base_dir: Option<PathBuf>,
+    root: super::execution_policy::CapabilityRoot,
     allowed_extensions: Vec<String>,
+    max_bytes: usize,
 }
 
 impl FileWriteTool {
     pub fn new(base_dir: Option<PathBuf>, allowed_extensions: Option<Vec<String>>) -> Self {
+        let mut allowed_extensions = allowed_extensions.unwrap_or_else(|| {
+            vec![
+                "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml", "html", "css",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        });
+        for extension in &mut allowed_extensions {
+            extension.make_ascii_lowercase();
+        }
+        allowed_extensions.sort_unstable();
+        allowed_extensions.dedup();
         Self {
-            base_dir,
-            allowed_extensions: allowed_extensions.unwrap_or_else(|| {
-                vec![
-                    "txt", "md", "json", "csv", "yaml", "yml", "toml", "xml", "html", "css", "js",
-                    "ts", "py", "rs", "lua", "sh",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            }),
+            root: super::execution_policy::CapabilityRoot::required(base_dir),
+            allowed_extensions,
+            max_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_FILE_WRITE_MAX_BYTES",
+                DEFAULT_FILE_WRITE_MAX_BYTES,
+                HARD_FILE_WRITE_MAX_BYTES,
+            ),
         }
     }
 
-    fn validate_path(&self, path: &str) -> Result<PathBuf> {
+    #[cfg(test)]
+    pub(crate) fn with_policy_for_test(
+        base_dir: PathBuf,
+        allowed_extensions: Vec<String>,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(Some(base_dir)),
+            allowed_extensions,
+            max_bytes,
+        }
+    }
+
+    fn validate_path(&self, path: &str) -> Result<()> {
         let path = Path::new(path);
+        super::project_fs::validate_agent_write_path(path).map_err(|error| {
+            IronCrewError::ToolExecution {
+                tool: "file_write".into(),
+                message: format!("Write path is not allowed: {error}"),
+            }
+        })?;
 
-        if path.is_absolute()
-            || path.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        let extension = extension.expect("shared validation requires an extension");
+        if !self
+            .allowed_extensions
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(extension))
         {
             return Err(IronCrewError::ToolExecution {
                 tool: "file_write".into(),
-                message: "Directory traversal not allowed".into(),
+                message: format!("Extension '.{extension}' not allowed"),
             });
         }
 
-        if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && !self.allowed_extensions.iter().any(|a| a == ext)
-        {
-            return Err(IronCrewError::ToolExecution {
-                tool: "file_write".into(),
-                message: format!("Extension '.{}' not allowed", ext),
-            });
-        }
-
-        if let Some(ref base) = self.base_dir {
-            Ok(base.join(path))
-        } else {
-            Ok(path.to_path_buf())
-        }
+        Ok(())
     }
 }
 
@@ -92,6 +110,15 @@ impl Tool for FileWriteTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "root_fingerprint": self.root.fingerprint()?,
+            "allowed_extensions": self.allowed_extensions,
+            "max_bytes": self.max_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let path = args["path"]
             .as_str()
@@ -106,23 +133,42 @@ impl Tool for FileWriteTool {
                 message: "Missing 'content' argument".into(),
             })?;
 
-        let validated = self.validate_path(path)?;
+        self.validate_path(path)?;
 
-        if let Some(parent) = validated.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| IronCrewError::ToolExecution {
-                    tool: "file_write".into(),
-                    message: format!("Failed to create directories: {}", e),
-                })?;
+        let max_bytes = self.max_bytes;
+        if content.len() > max_bytes {
+            return Err(IronCrewError::ToolExecution {
+                tool: "file_write".into(),
+                message: format!(
+                    "Content is {} bytes, exceeds IRONCREW_FILE_WRITE_MAX_BYTES ({max_bytes})",
+                    content.len()
+                ),
+            });
         }
 
-        tokio::fs::write(&validated, content)
-            .await
-            .map_err(|e| IronCrewError::ToolExecution {
+        let base_dir = self
+            .root
+            .cloned_path()
+            .map_err(|message| IronCrewError::ToolExecution {
                 tool: "file_write".into(),
-                message: format!("Failed to write '{}': {}", path, e),
+                message: message.into(),
             })?;
+        let relative = PathBuf::from(path);
+        let bytes = content.as_bytes().to_vec();
+        let display = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let root = super::project_fs::open_root(Some(&base_dir))?;
+            super::project_fs::atomic_write(&root, &relative, &bytes)
+        })
+        .await
+        .map_err(|error| IronCrewError::ToolExecution {
+            tool: "file_write".into(),
+            message: format!("Filesystem worker failed for '{display}': {error}"),
+        })?
+        .map_err(|error| IronCrewError::ToolExecution {
+            tool: "file_write".into(),
+            message: format!("Failed to write '{display}': {error}"),
+        })?;
 
         Ok(format!(
             "Successfully wrote {} bytes to {}",

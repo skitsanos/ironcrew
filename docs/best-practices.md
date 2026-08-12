@@ -65,6 +65,7 @@ long system prompts increase token costs on every request.
 
 **Temperature.** Set `temperature` low (0.1-0.3) for deterministic extraction tasks
 and higher (0.5-0.8) for creative generation. The default is provider-dependent.
+For `gpt-5.6-luna`, omit `temperature` and use the provider default.
 
 ## Task Design
 
@@ -97,7 +98,8 @@ Choose the right shape for the work:
 1. Two agents with **opposing committed views** debate via `crew:dialog()`
 2. Force each side to provide a **falsification criterion** per turn (use system prompts that mandate an `INVALIDATION:` line)
 3. A third **moderator** agent reads the transcript via `crew:conversation()` and produces structured output
-4. Use `response_format = "json_schema"` on the moderator so the synthesis is machine-readable
+4. Give the moderator a `response_format` table with `type = "json_schema"`,
+   a schema name, and a JSON Schema so the synthesis is machine-readable
 
 This pattern works for any binary decision under uncertainty: investment
 analysis, code review (ship-it vs critic), architectural choices (microservices
@@ -127,8 +129,10 @@ handle returned from `crew:conversation({})` (no id) within a single Lua
 script execution — that handle is scratch state and disappears when the
 script returns.
 
-**Limitations** (current):
-- Dialogs are two-agent only (multi-party round-robin is future work).
+Dialogs accept two or more distinct agents and rotate speakers in round-robin
+order. For a two-sided debate with a separate synthesis step, keep the moderator
+outside the dialog as shown above. Put the moderator inside `agents = {...}` only
+when it should participate in the live roundtable.
 
 Both primitives emit dedicated SSE events (`conversation_*`, `dialog_*`)
 through the EventBus, so REST API subscribers can stream conversation messages
@@ -145,12 +149,17 @@ due to transient issues (rate limits, network errors). The engine emits
 
 **Timeouts.** Set `timeout_secs` on long-running tasks to prevent them from
 blocking the entire crew. The server enforces a 30-minute maximum run lifetime
-(`IRONCREW_MAX_RUN_LIFETIME`). The server handles `SIGTERM` and `Ctrl+C`
-by actively dropping active chat sessions and aborting active runs so SSE
-streams terminate immediately; remaining non-SSE in-flight requests finish
-via Axum's graceful shutdown. A hard deadline
-(`IRONCREW_SHUTDOWN_TIMEOUT_SECS`, default 10 s) forces the process to
-exit if graceful shutdown overruns. See
+(`IRONCREW_MAX_RUN_LIFETIME`). `SIGUSR1` explicitly withdraws one Unix replica:
+readiness fails, owned keyed attempts are fenced, and new mutations are
+rejected while already accepted work and observation endpoints remain
+available. `SIGTERM` and Ctrl+C start the bounded routing deadline
+(`IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS`) and stop by cancelling active work and
+closing SSE only after the durable fence has committed and any remaining
+routing interval has elapsed. A fence that commits after the deadline leaves
+no remaining routing wait. Fence failures keep the replica non-accepting and
+retry rather than falsely advance to stopping. A hard deadline
+(`IRONCREW_SHUTDOWN_TIMEOUT_SECS`) forces the process to exit if shutdown
+overruns. See
 [Cloud Deployment – Graceful shutdown](cloud-deployment.md#graceful-shutdown)
 for the full sequence.
 
@@ -162,11 +171,15 @@ with a false condition emits a `task_skipped` event and does not count as failed
 **Parallel execution.** Structure tasks so that independent work runs concurrently.
 Tasks in the same dependency phase execute in parallel. A concurrency semaphore
 always applies — crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env
-var > default of 10. This prevents resource exhaustion in phases with many tasks.
+var > default of 4. This prevents resource exhaustion in phases with many tasks.
 
-**Model routing.** Use cheap models (`gpt-4.1-mini`, `gemini-2.5-flash`) for simple
+**Model routing.** Use efficient models (`gpt-5.6-luna`, `gemini-2.5-flash`) for simple
 tasks and reserve capable models for reasoning. Set `models` on the crew or
 `model` on individual agents and tasks.
+
+When `gpt-5.6-luna` is effective, omit explicit `temperature` values. Luna
+accepts only its provider default, and IronCrew forwards configured values
+rather than silently discarding an unsupported non-default setting.
 
 **Streaming.** Enable `stream = true` on the crew or individual tasks to get
 LLM output as it arrives. When reasoning-capable providers are used
@@ -187,14 +200,19 @@ citations, and one configuration flag instead of a whole tool implementation.
 
 **Server-wide operational caps.** Size these to your pod and traffic:
 
-- `IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default `100`) — hard cap on
+- `IRONCREW_MAX_ACTIVE_CONVERSATIONS` (default `8`) — hard cap on
   concurrent in-memory chat sessions. Exceeding returns `503`.
 - `IRONCREW_CHAT_SESSION_IDLE_SECS` (default `1800`) — idle window after
   which a chat session handle is evicted from memory. The underlying
   `ConversationRecord` in the store is untouched, so clients can resume
   the session by hitting `/start` again with the same id.
 - `IRONCREW_CONVERSATION_MAX_HISTORY` (default `50`) — per-session message
-  cap. Older messages are trimmed from the in-memory history on each turn.
+  cap (hard ceiling 4096; zero is rejected). Older messages are trimmed from
+  the in-memory history on each turn.
+- `IRONCREW_CHAT_HISTORY_MAX_BYTES` (default `32 MiB`) — aggregate estimated
+  byte cap for one provider history, including images/native reasoning blocks.
+- `IRONCREW_MAX_REASONING_BYTES` (default `1 MiB`) — retained thinking text
+  cap across one provider tool loop.
 - `IRONCREW_MAX_FLOW_DEPTH` (default `5`) — recursion cap for `run_flow`
   sub-flow invocation. Raise only when you intentionally chain deeply.
 
@@ -211,7 +229,8 @@ by default. This prevents Lua scripts from probing internal networks. Override
 with `IRONCREW_ALLOW_PRIVATE_IPS=1` if your agents legitimately need to reach
 internal services.
 
-**Environment variable security.** Lua `env()` is fail-closed: it reads
+**Environment variable security.** Lua `env()` and `${env.NAME}` interpolation
+are fail-closed: they read
 **only** the variables whose exact names appear in `IRONCREW_ENV_ALLOWLIST`
 (comma-separated, case-insensitive); every other name returns `nil`. Opt in
 the specific non-secret vars your crew needs and nothing else. See
@@ -228,9 +247,10 @@ source-IP capture. See `docs/rest-api.md`.
 
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
-- `IRONCREW_MCP_ALLOWED_COMMANDS` — comma-separated allowlist of binary
-  names for stdio MCP servers (e.g. `uvx,npx`). Leaving this unset allows
-  any command. **Recommended in production.**
+- `IRONCREW_MCP_ALLOWED_COMMANDS` — comma-separated allowlist of exact command
+  strings for stdio MCP servers (e.g. `uvx,npx`). Leaving this unset allows
+  any command; setting it to an empty value refuses all commands.
+  **Recommended in production.**
 - `IRONCREW_MCP_ALLOW_LOCALHOST` — by default IronCrew refuses `http://`
   MCP URLs pointing at loopback. Set to `1` only when the MCP server runs
   as a trusted sidecar in the same pod.
@@ -242,13 +262,24 @@ source-IP capture. See `docs/rest-api.md`.
 
 **Request/response size limits.** The server enforces a max request body size
 (`IRONCREW_MAX_BODY_SIZE`, default 10MB). HTTP tools and Lua `http.*` enforce
-a max response body size (`IRONCREW_MAX_RESPONSE_SIZE`, default 50MB). These
-prevent memory exhaustion from oversized payloads.
+a max response body size (`IRONCREW_HTTP_MAX_RESPONSE_BYTES`, default 8 MiB;
+the older `IRONCREW_MAX_RESPONSE_SIZE` is a deprecated fallback). Outbound
+`http_request` bodies and headers are separately bounded by
+`IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` and
+`IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES`. These prevent memory exhaustion
+from oversized payloads.
 
 **Prompt size limit.** User prompts (task description + context + dependency
-results) are capped at `IRONCREW_MAX_PROMPT_CHARS` (default 100KB). Large
+results) are capped at `IRONCREW_MAX_PROMPT_CHARS` (default 102400 Unicode characters). Large
 prompts are truncated with a warning to prevent OOM from large intermediate
 outputs.
+
+**Retained result limits.** Completed-task output, reasoning, and the aggregate
+serialized result map are bounded by `IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES`,
+`IRONCREW_TASK_RESULT_MAX_REASONING_BYTES`, and
+`IRONCREW_RUN_RESULTS_MAX_BYTES`. Keep the aggregate ceiling comfortably below
+the JSON-store record limit: all task results remain resident until the run is
+persisted, so task concurrency and result size multiply peak RAM use.
 
 **Error sanitization.** API error responses do not expose filesystem paths or
 internal server structure. Full details are logged server-side.
@@ -266,6 +297,12 @@ be scoped to specific directories.
 environment variables, never in Lua scripts or HTTP bodies. Use `env("KEY")`
 in Lua. Add `.env` to `.gitignore` and `.dockerignore`.
 
+Agent-facing `file_read`, `file_read_glob`, and custom-tool `fs.read` hard-deny
+`.env`/`.env.*`, `.ironcrew`, VCS/credential directories, common credential
+filenames, and private-key extensions. This prevents prompt injection from
+bypassing `IRONCREW_ENV_ALLOWLIST`. In Railway/OpenShift, prefer platform
+environment secrets and keep secret files outside the flow tree entirely.
+
 **Directory permissions.** The `.ironcrew/` directory is created with `0o700`
 permissions on Unix, preventing other users from reading run history that may
 contain sensitive task output.
@@ -282,10 +319,23 @@ but can be overridden with `IRONCREW_STORE_PATH`. SQLite is a good choice when
 you have many runs and want faster queries or a single-file store.
 
 **PostgreSQL backend.** Set `IRONCREW_STORE=postgres` with `DATABASE_URL` for
-multi-instance cloud deployments. Pool size is configurable via
+durable cloud records and restart recovery. PostgreSQL coordinates
+idempotency-keyed cancellation and, with the shared HITL encryption keyring,
+encrypted cross-replica question listing/answer delivery. Its bounded run-event
+journal also supports cross-replica run SSE replay with `Last-Event-ID`;
+JSON/SQLite run and conversation SSE remain process-local, while PostgreSQL
+conversation SSE returns `409` unsupported. The committed IC-008
+implementation lets a keyed PostgreSQL conversation message cold-rehydrate
+from its incarnation/revision-fenced transcript on either replica. Its local two-process
+gate and affinity-free OpenShift canary pass; Railway remains unrun, and the
+tested dirty artifact was unpublished and removed. PostgreSQL still does not
+distribute an in-flight Lua/provider/tool turn, and shared conversation SSE is
+unsupported. Keep one replica until a published release contains the behavior,
+on Railway until its own IC-008 canary passes, or whenever clients require the
+remaining owner-local surfaces through arbitrary routing. Pool size is configurable via
 `IRONCREW_DB_POOL_SIZE` (default 10). Table prefix (`IRONCREW_PG_TABLE_PREFIX`)
-allows sharing a database across projects — only alphanumeric and underscore are
-allowed.
+allows sharing a database across projects — at most 37 lowercase ASCII letters,
+digits, and underscores are allowed.
 
 **Store lifecycle.** The lifetime of the store depends on how IronCrew is
 launched:
@@ -346,8 +396,9 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile uses `rust:latest` for building and
-`debian:13-slim` for the runtime. Build for multiple architectures with:
+**Multi-arch builds.** The Dockerfile pins Rust `1.96.0`, builds with
+`--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
+architectures with:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 -t ironcrew .
@@ -359,7 +410,7 @@ avoid leaking secrets in shell history:
 ```bash
 docker run -p 3000:3000 \
   --env-file .env \
-  -e IRONCREW_API_TOKEN=your-secret-token \
+  -e IRONCREW_API_TOKEN=replace-with-a-random-32-byte-token \
   -e IRONCREW_CORS_ORIGINS=https://app.example.com \
   -v ./flows:/app/flows \
   ironcrew serve --host 0.0.0.0 --port 3000 --flows-dir /app/flows
@@ -368,9 +419,12 @@ docker run -p 3000:3000 \
 Bind to `0.0.0.0` inside the container so the port mapping works. Always set
 `IRONCREW_API_TOKEN` and `IRONCREW_CORS_ORIGINS` in production deployments.
 
-**Kubernetes.** The server handles `SIGTERM` gracefully, completing in-flight
-requests before shutdown. Set `terminationGracePeriodSeconds` in your pod spec
-to allow sufficient time for long-running crew executions to finish.
+**Kubernetes.** Endpoint removal and the pod's `SIGTERM` lifecycle overlap;
+readiness failure is not proof that every ingress path has already stopped
+routing. Configure the routing-drain interval and
+`terminationGracePeriodSeconds` together. Termination eventually cancels
+active work within IronCrew's shutdown bound, so do not size the grace period
+as a promise that every long-running crew execution will finish.
 
 ## Cost Optimization
 

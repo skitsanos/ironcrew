@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 
 use crate::engine::audit::AuditEvent;
 use crate::engine::store::StateStore;
@@ -18,6 +18,29 @@ const METADATA_MAX_BYTES: usize = 2 * 1024;
 
 /// Maximum length of the `X-Audit-Actor` value after trimming.
 const ACTOR_MAX_LEN: usize = 256;
+
+/// Retain only headers that can contribute to an audit event. Detached work
+/// must not keep bearer tokens or raw idempotency capabilities alive merely
+/// so it can record completion later.
+pub(crate) fn background_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut retained = HeaderMap::new();
+    if let Some(actor) = extract_actor(headers)
+        && let Ok(value) = HeaderValue::from_str(&actor)
+    {
+        retained.insert("x-audit-actor", value);
+    }
+    if let Some(forwarded_ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        && let Ok(value) = HeaderValue::from_str(&forwarded_ip.to_string())
+    {
+        retained.insert("x-forwarded-for", value);
+    }
+    retained
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
@@ -45,6 +68,7 @@ pub async fn record(
     };
 
     if let Err(e) = store.save_audit_event(&event).await {
+        crate::metrics::record_store_failure(crate::metrics::StoreOperation::Audit);
         tracing::error!(
             action = %event.action,
             target = ?event.target,
@@ -74,8 +98,8 @@ fn extract_source_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> Option<St
         && let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok())
     {
         let first = xff.split(',').next().unwrap_or("").trim();
-        if !first.is_empty() {
-            return Some(first.to_string());
+        if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+            return Some(ip.to_string());
         }
     }
     addr.map(|a| a.ip().to_string())
@@ -98,7 +122,12 @@ fn clamp_metadata(value: serde_json::Value) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::engine::audit::{AuditEvent, AuditFilter};
-    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary};
+    use crate::engine::idempotency::{
+        ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
+        IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
+        IdempotencyUsage, PrincipalId,
+    };
+    use crate::engine::run_history::{ListRunsFilter, RunRecord, RunSummary, RunTransition};
     use crate::engine::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
     use crate::utils::error::{IronCrewError, Result};
     use async_trait::async_trait;
@@ -139,7 +168,7 @@ mod tests {
             &self,
             _: &str,
             _: crate::engine::run_history::RunCompletion,
-        ) -> Result<()> {
+        ) -> Result<RunTransition> {
             unimplemented!()
         }
         async fn update_run_status(
@@ -147,6 +176,18 @@ mod tests {
             _: &str,
             _: crate::engine::run_history::RunStatus,
         ) -> Result<()> {
+            unimplemented!()
+        }
+        fn instance_id(&self) -> &str {
+            "failing-test-store"
+        }
+        fn run_lease_ttl(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        async fn heartbeat_owned_runs(&self) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> Result<()> {
             unimplemented!()
         }
         async fn reconcile_abandoned_runs(&self, _: &str) -> Result<usize> {
@@ -169,7 +210,72 @@ mod tests {
         async fn delete_run(&self, _: &str) -> Result<()> {
             unimplemented!()
         }
-        async fn save_conversation(&self, _: &ConversationRecord) -> Result<()> {
+        async fn lookup_idempotency_for_principal(
+            &self,
+            _: &PrincipalId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<IdempotencyLookup> {
+            Ok(IdempotencyLookup::Miss)
+        }
+        async fn claim_idempotency_with_limits(
+            &self,
+            _: IdempotencyClaim,
+            _: IdempotencyLimits,
+        ) -> Result<IdempotencyClaimOutcome> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn heartbeat_idempotency(&self, _: &str, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn heartbeat_idempotent_run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::engine::idempotency::RunFenceHeartbeat> {
+            Ok(crate::engine::idempotency::RunFenceHeartbeat::Lost)
+        }
+        async fn complete_idempotency_with_limits(
+            &self,
+            _: IdempotencyCompletion,
+            _: IdempotencyLimits,
+        ) -> Result<IdempotencyCompletionOutcome> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn commit_conversation_idempotency_with_limits(
+            &self,
+            _: IdempotencyCompletion,
+            _: &ConversationRecord,
+            _: IdempotencyLimits,
+        ) -> Result<ConversationIdempotencyCommit> {
+            Err(IronCrewError::Validation("not supported".into()))
+        }
+        async fn mark_idempotency_indeterminate(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+        async fn release_idempotency(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn prune_idempotency(&self, _: &str, _: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn idempotency_usage(
+            &self,
+            _: &PrincipalId,
+            _: IdempotencyLimits,
+        ) -> Result<IdempotencyUsage> {
+            Ok(IdempotencyUsage::default())
+        }
+        async fn save_conversation(&self, _: &ConversationRecord) -> Result<u64> {
             unimplemented!()
         }
         async fn get_conversation(
@@ -193,7 +299,7 @@ mod tests {
         async fn count_conversations(&self, _: Option<&str>) -> Result<u64> {
             unimplemented!()
         }
-        async fn save_dialog_state(&self, _: &DialogStateRecord) -> Result<()> {
+        async fn save_dialog_state(&self, _: &DialogStateRecord) -> Result<u64> {
             unimplemented!()
         }
         async fn get_dialog_state(
@@ -210,6 +316,18 @@ mod tests {
 
     #[tokio::test]
     async fn record_is_nonfatal_on_store_failure() {
+        let series = "ironcrew_store_failures_total{operation=\"audit\"}";
+        let before = {
+            let mut body = String::new();
+            crate::metrics::append_prometheus(&mut body);
+            body.lines()
+                .find_map(|line| {
+                    line.strip_prefix(series)
+                        .and_then(|value| value.strip_prefix(' '))
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .expect("audit failure series")
+        };
         let store: Arc<dyn StateStore> = Arc::new(FailingStore {
             save_calls: Mutex::new(0),
         });
@@ -228,7 +346,17 @@ mod tests {
             None,
         )
         .await;
-        // Reaching here means record() returned without panicking.
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let after = body
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(series)
+                    .and_then(|value| value.strip_prefix(' '))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("audit failure series");
+        assert!(after >= before.saturating_add(1));
     }
 
     #[test]
@@ -246,6 +374,27 @@ mod tests {
         let long = "a".repeat(257);
         h.insert("X-Audit-Actor", long.parse().unwrap());
         assert_eq!(extract_actor(&h), None);
+    }
+
+    #[test]
+    fn background_headers_drop_credentials_and_idempotency_capabilities() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("idempotency-key", "raw-operation-key".parse().unwrap());
+        headers.insert(
+            "idempotency-recovery-key",
+            "raw-recovery-key".parse().unwrap(),
+        );
+        headers.insert("x-audit-actor", "alice".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+
+        let retained = background_headers(&headers);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained["x-audit-actor"], "alice");
+        assert_eq!(retained["x-forwarded-for"], "203.0.113.9");
+        assert!(!retained.contains_key("authorization"));
+        assert!(!retained.contains_key("idempotency-key"));
+        assert!(!retained.contains_key("idempotency-recovery-key"));
     }
 
     #[test]

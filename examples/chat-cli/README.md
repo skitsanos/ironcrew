@@ -36,7 +36,13 @@ ironcrew chat examples/chat-cli --agent tutor --id my-session
 
 - Storage is governed by `IRONCREW_STORE` — JSON by default, SQLite or
   PostgreSQL if configured. Persisted records live in `.ironcrew/` next
-  to `crew.lua`.
+  to `crew.lua` for local stores. Direct turns on a persistent PostgreSQL
+  conversation fail closed; shared-store conversations must use the HTTP
+  `/messages` endpoint with an `Idempotency-Key` so the turn owns the durable
+  incarnation/revision fence.
 - The `IRONCREW_MODE` global is set to `"chat"` inside the REPL, so the
   common guard `if IRONCREW_MODE ~= "chat" then crew:run() end` lets you
   share a single `crew.lua` between `ironcrew run` and `ironcrew chat`.
+- The immutable no-follow source snapshot used for HTTP conversation
+  rehydration is an HTTP-only boundary. This CLI example keeps the ordinary
+  filesystem-backed loader behavior.

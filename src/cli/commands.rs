@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::lua::api::{load_agents_from_files, load_tool_defs_from_files};
+use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::sandbox::create_tool_lua;
 use crate::utils::error::{IronCrewError, Result};
 
+pub use super::init::cmd_init;
 use super::project::{load_project, setup_crew_runtime};
 
 pub async fn cmd_run(
@@ -15,18 +17,19 @@ pub async fn cmd_run(
     let loader = load_project(path)?;
     let (lua, _runtime) = setup_crew_runtime(&loader)?;
 
-    // Sweep orphaned Running records from a prior crashed ironcrew run
-    // process before this invocation's own save_run_intent writes. Safe:
-    // reconcile only touches status='running' rows; the new run's intent
-    // hasn't been written yet.
+    // Sweep only expired ownership leases from prior crashed processes before
+    // this invocation writes its own run intent.
     let ironcrew_dir = loader.project_dir().join(".ironcrew");
-    if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await {
+    let lease_store = if let Ok(store) = crate::engine::store::create_store(ironcrew_dir).await {
         let _ = crate::engine::reconciler::reconcile_stuck_runs(&store)
             .await
             .map_err(|e| {
                 tracing::debug!("Reconciler failed (non-fatal): {e}");
             });
-    }
+        Some(store)
+    } else {
+        None
+    };
 
     // Human-input transport for crew:ask_human(): CLI mode prompts on the
     // terminal (stderr prompt, stdin answer). `run_id: None` — the run
@@ -68,14 +71,37 @@ pub async fn cmd_run(
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = std::fs::read_to_string(entrypoint)?;
+    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
     tracing::info!("Running {}", entrypoint.display());
 
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(IronCrewError::Lua)?;
+    let heartbeat_handle = lease_store.map(|heartbeat_store| {
+        let heartbeat_interval =
+            (heartbeat_store.run_lease_ttl() / 3).max(std::time::Duration::from_secs(1));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = heartbeat_store.heartbeat_owned_runs().await {
+                    tracing::warn!(%error, "Failed to refresh CLI run leases");
+                }
+            }
+        })
+    });
+
+    let execution_result = {
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&script)
+            .exec_async()
+            .await
+            .map_err(IronCrewError::Lua)
+    };
+
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    execution_result?;
 
     // In --json mode, read the run record and output structured JSON
     if json_output {
@@ -168,7 +194,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
 
     // 3. Validate entrypoint syntax
     if let Some(entrypoint) = loader.entrypoint() {
-        let script = std::fs::read_to_string(entrypoint)?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
         lua.load(&script).into_function().map_err(|e| {
             IronCrewError::Validation(format!("Syntax error in {}: {}", entrypoint.display(), e))
         })?;
@@ -212,112 +238,6 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
         println!("      when crew.lua is executed (tasks are defined programmatically).");
         Ok(())
     }
-}
-
-pub fn cmd_init(name: &str) -> Result<()> {
-    let project_dir = Path::new(name);
-
-    if project_dir.exists() {
-        return Err(IronCrewError::Validation(format!(
-            "Directory '{}' already exists",
-            name
-        )));
-    }
-
-    // Create directory structure
-    std::fs::create_dir_all(project_dir.join("agents"))?;
-    std::fs::create_dir_all(project_dir.join("tools"))?;
-
-    // Write .env template
-    std::fs::write(
-        project_dir.join(".env"),
-        "# IronCrew Environment Configuration\n\
-         OPENAI_API_KEY=your-api-key-here\n\
-         OPENAI_BASE_URL=https://api.openai.com/v1\n\
-         OPENAI_MODEL=gpt-4.1-mini\n\
-         IRONCREW_LOG=info\n",
-    )?;
-
-    // Write .gitignore
-    std::fs::write(
-        project_dir.join(".gitignore"),
-        "/output\n\
-         .env\n\
-         .DS_Store\n\
-         .ironcrew/\n",
-    )?;
-
-    // Write sample agent
-    std::fs::write(
-        project_dir.join("agents/assistant.lua"),
-        r#"return {
-    name = "assistant",
-    goal = "Help with tasks by providing clear, accurate responses",
-    capabilities = {"general", "analysis", "writing"},
-    temperature = 0.7,
-}
-"#,
-    )?;
-
-    // Write crew.lua entrypoint
-    std::fs::write(
-        project_dir.join("crew.lua"),
-        format!(
-            r#"--[[
-    {name} - IronCrew Project
-
-    Run with: ironcrew run .
-    Validate with: ironcrew validate .
-]]
-
-local crew = Crew.new({{
-    goal = "Your crew goal here",
-    provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4.1-mini",
-    base_url = env("OPENAI_BASE_URL"),
-}})
-
--- Add tasks
-crew:add_task({{
-    name = "hello",
-    description = "Say hello and introduce yourself briefly",
-    expected_output = "A friendly greeting",
-}})
-
--- Run the crew
-local results = crew:run()
-
--- Display results
-for _, result in ipairs(results) do
-    if result.success then
-        print("=== " .. result.task .. " (" .. result.duration_ms .. "ms) ===")
-        print(result.output)
-    else
-        print("FAILED: " .. result.task .. " - " .. result.output)
-    end
-    print()
-end
-"#,
-            name = name
-        ),
-    )?;
-
-    println!("Created new IronCrew project: {}", name);
-    println!();
-    println!("  {}/", name);
-    println!("  \u{251c}\u{2500}\u{2500} .env              # API keys and config");
-    println!("  \u{251c}\u{2500}\u{2500} .gitignore");
-    println!("  \u{251c}\u{2500}\u{2500} agents/");
-    println!("  \u{2502}   \u{2514}\u{2500}\u{2500} assistant.lua # Sample agent");
-    println!("  \u{251c}\u{2500}\u{2500} tools/            # Custom tools (empty)");
-    println!("  \u{2514}\u{2500}\u{2500} crew.lua          # Entrypoint");
-    println!();
-    println!("Next steps:");
-    println!("  1. cd {}", name);
-    println!("  2. Edit .env with your API key");
-    println!("  3. ironcrew run .");
-
-    Ok(())
 }
 
 pub fn cmd_nodes() -> Result<()> {
@@ -475,7 +395,7 @@ pub fn cmd_doctor(path: &Path) -> Result<()> {
     if crew_path.exists() {
         // Check syntax
         let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
-        let script = std::fs::read_to_string(&crew_path)?;
+        let script = crate::lua::source::read_lua_source(&crew_path)?;
         match lua.load(&script).into_function() {
             Ok(_) => println!("    {}{} found (valid syntax)", crew_label, crew_dots),
             Err(e) => {
@@ -582,7 +502,7 @@ pub fn cmd_fmt(path: &Path) -> Result<()> {
     // Entrypoint
     if let Some(entrypoint) = loader.entrypoint() {
         let label = entrypoint.file_name().unwrap_or_default().to_string_lossy();
-        let script = std::fs::read_to_string(entrypoint)?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
         let lua = create_tool_lua().map_err(IronCrewError::Lua)?;
         let dots = ".".repeat(30usize.saturating_sub(label.len()));
         match lua.load(&script).into_function() {

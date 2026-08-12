@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::engine::conversation_definition::ConversationSourceContext;
 use crate::llm::provider::LlmProvider;
 use crate::tools::file_read::FileReadTool;
 use crate::tools::file_read_glob::FileReadGlobTool;
@@ -9,16 +10,19 @@ use crate::tools::hash::HashTool;
 use crate::tools::http_request::HttpRequestTool;
 use crate::tools::lua_tool::LuaScriptTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::runtime_policy::{LuaVmPolicy, RuntimeExecutionPolicy};
 use crate::tools::shell::ShellTool;
 use crate::tools::template_render::TemplateRenderTool;
 use crate::tools::validate_schema::ValidateSchemaTool;
 use crate::tools::web_scrape::WebScrapeTool;
-use crate::utils::error::{IronCrewError, Result};
+use crate::utils::error::Result;
 
 pub struct Runtime {
     pub tool_registry: ToolRegistry,
     pub provider: Arc<dyn LlmProvider>,
     project_dir: Option<PathBuf>,
+    write_dir: Option<PathBuf>,
+    conversation_source: Option<ConversationSourceContext>,
     /// Strong `Arc`s to every registered `LuaScriptTool`. Kept in parallel
     /// with the trait-object registry so `set_self_ref` can hand each tool
     /// its weak runtime reference without `Any`-downcasting.
@@ -30,16 +34,49 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    #[allow(dead_code)] // public constructor used by embedders and integration tests
     pub fn new(provider: Box<dyn LlmProvider>, project_dir: Option<&Path>) -> Self {
-        let mut tool_registry = ToolRegistry::new();
+        Self::new_with_conversation_source(provider, project_dir, None)
+    }
+
+    pub fn new_with_conversation_source(
+        provider: Box<dyn LlmProvider>,
+        project_dir: Option<&Path>,
+        conversation_source: Option<ConversationSourceContext>,
+    ) -> Self {
+        Self::new_with_conversation_source_and_execution_policy(
+            provider,
+            project_dir,
+            conversation_source,
+            RuntimeExecutionPolicy::capture(),
+        )
+    }
+
+    pub(crate) fn new_with_conversation_source_and_execution_policy(
+        provider: Box<dyn LlmProvider>,
+        project_dir: Option<&Path>,
+        conversation_source: Option<ConversationSourceContext>,
+        execution_policy: RuntimeExecutionPolicy,
+    ) -> Self {
+        let execution_policy = if conversation_source.is_some() {
+            execution_policy.block_persistent_lua_env()
+        } else {
+            execution_policy
+        };
+        let http_policy = execution_policy.lua_http_policy();
+        let mut tool_registry = ToolRegistry::with_execution_policy(execution_policy);
 
         let base_dir = project_dir.map(|p| p.to_path_buf());
+        let write_base_dir = std::env::var_os("IRONCREW_FILE_WRITE_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| base_dir.clone());
 
         tool_registry.register(Box::new(FileReadTool::new(base_dir.clone())));
         tool_registry.register(Box::new(FileReadGlobTool::new(base_dir.clone())));
-        tool_registry.register(Box::new(FileWriteTool::new(base_dir.clone(), None)));
+        tool_registry.register(Box::new(FileWriteTool::new(write_base_dir.clone(), None)));
         tool_registry.register(Box::new(WebScrapeTool::new(None)));
-        tool_registry.register(Box::new(HttpRequestTool::new()));
+        tool_registry.register(Box::new(HttpRequestTool::with_policy(http_policy)));
         tool_registry.register(Box::new(HashTool::new()));
         tool_registry.register(Box::new(TemplateRenderTool::new()));
         tool_registry.register(Box::new(ValidateSchemaTool::new()));
@@ -61,8 +98,10 @@ impl Runtime {
 
         Self {
             tool_registry,
-            provider: Arc::from(provider),
+            provider: crate::llm::metrics::observe_boxed_provider(provider),
             project_dir: base_dir,
+            write_dir: write_base_dir,
+            conversation_source,
             lua_tools: Vec::new(),
             self_ref: OnceLock::new(),
         }
@@ -73,25 +112,22 @@ impl Runtime {
         self.tool_registry.register(Box::new(ShellTool::new()));
     }
 
-    /// Register Lua-defined tools from tool definition metadata.
-    /// Reads source from each tool's file path and wraps it in a LuaScriptTool.
+    /// Register Lua-defined tools from metadata and the exact source bytes that
+    /// produced it. The source path is diagnostic only and is never reopened.
     pub fn register_lua_tools(
         &mut self,
         tool_defs: Vec<crate::lua::api::LuaToolDef>,
     ) -> Result<()> {
+        let vm_policy = self.tool_registry.lua_vm_policy()?;
         for def in tool_defs {
-            let source = std::fs::read_to_string(&def.source_path).map_err(|err| {
-                IronCrewError::Validation(format!(
-                    "Failed to read Lua tool source '{}': {}",
-                    def.name, err
-                ))
-            })?;
             let lua_tool = Arc::new(LuaScriptTool::new(
                 def.name,
                 def.description,
                 def.parameters,
-                source,
-                self.project_dir.clone(),
+                def.source,
+                (self.project_dir.clone(), self.write_dir.clone()),
+                vm_policy.clone(),
+                self.conversation_source.clone(),
             ));
             let as_tool: Arc<dyn crate::tools::Tool> = lua_tool.clone();
             self.tool_registry.register_arc(as_tool);
@@ -114,6 +150,10 @@ impl Runtime {
                 lua_tool.set_project_dir(dir.clone());
             }
         }
+    }
+
+    pub(crate) fn lua_vm_policy(&self) -> Result<LuaVmPolicy> {
+        self.tool_registry.lua_vm_policy()
     }
 
     /// Upgrade the stored weak self-reference to a strong `Arc<Runtime>`.

@@ -170,6 +170,59 @@ async fn test_file_read_glob_traversal_blocked() {
     assert!(result.is_err());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_file_read_glob_skips_symlinks_outside_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("inside.txt"), "inside").unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        project.path().join("secret.txt"),
+    )
+    .unwrap();
+    symlink(outside.path(), project.path().join("linked-dir")).unwrap();
+
+    let tool = FileReadGlobTool::new(Some(project.path().to_path_buf()));
+    let result = tool
+        .execute(json!({"pattern": "**/*.txt"}), &ToolCallContext::default())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let files = parsed["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "inside.txt");
+    assert_eq!(files[0]["content"], "inside");
+}
+
+#[tokio::test]
+async fn test_file_read_glob_rejects_oversized_files_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("large.txt"),
+        vec![b'x'; 10 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let tool = FileReadGlobTool::new(Some(dir.path().to_path_buf()));
+    let result = tool
+        .execute(json!({"pattern": "*.txt"}), &ToolCallContext::default())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["file_count"], 1);
+    assert!(
+        parsed["files"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("MAX_BYTES")
+    );
+    assert_eq!(parsed["total_bytes"], 0);
+}
+
 #[tokio::test]
 async fn test_validate_schema_valid() {
     let tool = ValidateSchemaTool::new();

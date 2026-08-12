@@ -3,6 +3,51 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const DEFAULT_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
+const HARD_MESSAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const HARD_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const HARD_HISTORY_MAX_BYTES: usize = 64 * 1024 * 1024;
+const HARD_PENDING_MAX_BYTES: usize = 64 * 1024 * 1024;
+const HARD_QUEUE_DEPTH: usize = 10_000;
+const HARD_HISTORY_DEPTH: usize = 10_000;
+const HARD_PENDING_DEPTH: usize = 5_000;
+
+fn positive_env_limit(name: &str, default: usize, hard_max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(hard_max))
+        .unwrap_or(default)
+}
+
+fn message_size(message: &Message) -> usize {
+    message
+        .content
+        .len()
+        .saturating_add(message.from.len())
+        .saturating_add(message.to.len())
+        .saturating_add(message.id.len())
+        .saturating_add(message.reply_to.as_ref().map_or(0, String::len))
+        .saturating_add(64)
+}
+
+fn truncate_message_content(content: &mut String, max_bytes: usize) -> bool {
+    if content.len() <= max_bytes {
+        return false;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    content.truncate(boundary);
+    content.shrink_to_fit();
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageType {
     Notification,
@@ -59,43 +104,34 @@ pub struct MessageBus {
 }
 
 /// Returns the max per-agent queue depth from the environment,
-/// defaulting to 1000 messages. A value of 0 disables the cap.
-fn queue_depth_limit() -> Option<usize> {
-    match std::env::var("IRONCREW_MESSAGEBUS_QUEUE_DEPTH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(0) => None,
-        Some(n) => Some(n),
-        None => Some(1000),
-    }
+/// defaulting to 1000 messages.
+fn queue_depth_limit() -> usize {
+    positive_env_limit("IRONCREW_MESSAGEBUS_QUEUE_DEPTH", 1_000, HARD_QUEUE_DEPTH)
 }
 
 /// Returns the max pending-broadcasts cap from the environment,
-/// defaulting to 500. A value of 0 disables the cap.
-fn pending_cap_limit() -> Option<usize> {
-    match std::env::var("IRONCREW_MESSAGEBUS_PENDING_CAP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(0) => None,
-        Some(n) => Some(n),
-        None => Some(500),
-    }
+/// defaulting to 500.
+fn pending_cap_limit() -> usize {
+    positive_env_limit("IRONCREW_MESSAGEBUS_PENDING_CAP", 500, HARD_PENDING_DEPTH)
 }
 
 /// Drop oldest messages from a single queue until it's under `cap`.
 /// Logs a warning on each eviction so operators can see the pressure.
-fn enforce_queue_cap(queue: &mut VecDeque<Arc<Message>>, agent_name: &str, cap: Option<usize>) {
-    let Some(cap) = cap else {
-        return;
-    };
-    while queue.len() > cap {
+fn enforce_queue_cap(queue: &mut VecDeque<Arc<Message>>, agent_name: &str, cap: usize) {
+    let byte_cap = positive_env_limit(
+        "IRONCREW_MESSAGEBUS_QUEUE_MAX_BYTES",
+        DEFAULT_QUEUE_MAX_BYTES,
+        HARD_QUEUE_MAX_BYTES,
+    );
+    while queue.len() > cap
+        || queue.iter().fold(0usize, |total, message| {
+            total.saturating_add(message_size(message))
+        }) > byte_cap
+    {
         queue.pop_front();
         tracing::warn!(
-            "MessageBus: queue for '{}' exceeded depth cap ({}), dropping oldest message",
+            "MessageBus: queue for '{}' exceeded its count/byte budget, dropping oldest message",
             agent_name,
-            cap
         );
     }
 }
@@ -115,14 +151,36 @@ impl MessageBus {
     }
 
     /// Send a message to a specific agent or broadcast to all.
-    pub async fn send(&self, message: Message) {
+    pub async fn send(&self, mut message: Message) {
+        let content_limit = positive_env_limit(
+            "IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES",
+            DEFAULT_MESSAGE_MAX_BYTES,
+            HARD_MESSAGE_MAX_BYTES,
+        );
+        if truncate_message_content(&mut message.content, content_limit) {
+            tracing::warn!(
+                message_id = %message.id,
+                content_limit,
+                "MessageBus message content was truncated"
+            );
+        }
         let message = Arc::new(message);
         let depth_cap = queue_depth_limit();
 
         let mut history = self.history.write().await;
         history.push_back(Arc::clone(&message));
-        // Cap history to last 500 messages (O(1) with VecDeque)
-        while history.len() > 500 {
+        let history_depth =
+            positive_env_limit("IRONCREW_MESSAGEBUS_HISTORY_DEPTH", 500, HARD_HISTORY_DEPTH);
+        let history_bytes = positive_env_limit(
+            "IRONCREW_MESSAGEBUS_HISTORY_MAX_BYTES",
+            DEFAULT_HISTORY_MAX_BYTES,
+            HARD_HISTORY_MAX_BYTES,
+        );
+        while history.len() > history_depth
+            || history.iter().fold(0usize, |total, item| {
+                total.saturating_add(message_size(item))
+            }) > history_bytes
+        {
             history.pop_front();
         }
         drop(history);
@@ -139,14 +197,27 @@ impl MessageBus {
                 let pending_cap = pending_cap_limit();
                 let mut pending = self.pending_broadcasts.write().await;
                 pending.push(message);
-                if let Some(cap) = pending_cap {
-                    while pending.len() > cap {
-                        pending.remove(0); // drop oldest
-                        tracing::warn!(
-                            "MessageBus: pending_broadcasts cap ({}) exceeded, dropping oldest",
-                            cap
-                        );
-                    }
+                while pending.len() > pending_cap {
+                    pending.remove(0); // drop oldest
+                    tracing::warn!(
+                        "MessageBus: pending_broadcasts cap ({}) exceeded, dropping oldest",
+                        pending_cap
+                    );
+                }
+                let pending_byte_cap = positive_env_limit(
+                    "IRONCREW_MESSAGEBUS_PENDING_MAX_BYTES",
+                    DEFAULT_PENDING_MAX_BYTES,
+                    HARD_PENDING_MAX_BYTES,
+                );
+                while pending.iter().fold(0usize, |total, item| {
+                    total.saturating_add(message_size(item))
+                }) > pending_byte_cap
+                {
+                    pending.remove(0);
+                    tracing::warn!(
+                        "MessageBus: pending broadcasts exceeded byte cap ({}), dropping oldest",
+                        pending_byte_cap
+                    );
                 }
                 return;
             }
@@ -218,5 +289,29 @@ impl MessageBus {
 impl Default for MessageBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod resource_limit_tests {
+    use super::*;
+
+    #[test]
+    fn message_truncation_preserves_utf8_boundary() {
+        let mut content = "🦀🦀🦀".to_string();
+        assert!(truncate_message_content(&mut content, 5));
+        assert_eq!(content, "🦀");
+        assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn message_size_is_saturating_and_includes_payload() {
+        let message = Message::new(
+            "a".into(),
+            "b".into(),
+            "payload".into(),
+            MessageType::Notification,
+        );
+        assert!(message_size(&message) >= message.content.len());
     }
 }

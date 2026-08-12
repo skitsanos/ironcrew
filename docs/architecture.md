@@ -142,7 +142,7 @@ Within each phase, standard tasks run concurrently using `FuturesUnordered`. Thi
 
 A Tokio semaphore always limits how many tasks execute at once. The limit is
 resolved as: crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env var
-> default of 10.
+> default of 4.
 
 ```lua
 local crew = Crew.new({
@@ -263,10 +263,10 @@ When executing a task, the model is resolved through a priority chain:
 
 ```lua
 local crew = Crew.new({
-    model = "gpt-4.1-mini",        -- default fallback
+    model = "gpt-5.6-luna",        -- default fallback
     models = {
         task_execution = "gpt-4o",
-        collaboration = "gpt-4.1-mini",
+        collaboration = "gpt-5.6-luna",
     },
 })
 ```
@@ -357,7 +357,19 @@ Run records are persisted via a pluggable `StateStore` trait:
 
 - **JSON files** (default) — individual `.json` files in `.ironcrew/runs/`
 - **SQLite** — single database file at `.ironcrew/ironcrew.db`
-- **PostgreSQL** — shared state for multi-instance cloud deployments, with JSONB columns for native SQL queries
+- **PostgreSQL** — durable cloud records and restart recovery, with JSONB
+  columns for native SQL queries. It coordinates idempotency-keyed cancellation,
+  encrypted HITL, bounded run SSE replay, leases, and exact drain fences across
+  replicas. The committed IC-008 implementation also rehydrates a keyed
+  conversation turn from a committed incarnation/revision on either replica;
+  its local two-process PostgreSQL gate and affinity-free OpenShift canary pass.
+  Railway
+  was not run, and the tested dirty artifact was unpublished and removed. The
+  result does not transfer in-flight Lua/provider/tool execution, and
+  PostgreSQL conversation SSE is unsupported, so the general-purpose
+  `ironcrew serve` baseline remains one replica until a published release
+  contains the behavior and whenever clients need an owner-local surface;
+  horizontal serving is limited to the documented PostgreSQL slice.
 
 Set `IRONCREW_STORE` to `sqlite` or `postgres` to switch backends. See
 [Storage](storage.md) for full configuration and [CLI Reference](cli.md) for
@@ -386,13 +398,37 @@ as `_ctx`) to every `execute` implementation.
 
 ## Graceful Shutdown
 
-The API server (`ironcrew serve`) handles `SIGTERM` and `Ctrl+C` for
-graceful shutdown: active chat sessions are dropped (closing their SSE
-broadcast channels so subscribers unblock), active crew runs are aborted,
-and MCP stdio children are reaped. A post-signal hard deadline —
-`IRONCREW_SHUTDOWN_TIMEOUT_SECS` (default `10`) — bounds how long the
-drain is allowed to take before the process exits anyway. A final
-`IRONCREW_SHUTDOWN_DRAIN_MS` (default `1000`) window gives background
-tasks spawned from `Drop` paths time to complete. See
-[Cloud Deployment](cloud-deployment.md#graceful-shutdown) for tuning on
-Kubernetes / Railway.
+The API server (`ironcrew serve`) has an explicit monotonic process lifecycle:
+
+```text
+Accepting -> Fencing -> Draining -> Stopping
+```
+
+- **Accepting** serves readiness and admits protected mutations.
+- **Fencing** first fails readiness and records an exact durable drain fence
+  for each in-flight PostgreSQL idempotency attempt owned by this process.
+  The lifecycle middleware phase read is the mutation-admission linearization
+  point: checks after the transition reject new mutations, while a request
+  admitted just before it remains a pre-fence request and can still lose an
+  inner race. A failed store fence leaves the process in Fencing rather than
+  reopening or falsely advancing.
+- **Draining** keeps observation endpoints available and lets already accepted
+  work continue, but rejects new work and owner-directed controls. A peer can
+  use the durable fence to reject control for the draining owner truthfully;
+  the fence does not transfer or resume execution.
+- **Stopping** is entered only for process termination. Active runs and chat
+  turns are cancelled and terminalized within a bounded shutdown budget, SSE
+  connections close, and MCP stdio children are reaped.
+
+On Unix, `SIGUSR1` performs the Accepting -> Fencing -> Draining transition
+without exiting, which lets an operator withdraw one replica before a later
+termination. `SIGTERM` and Ctrl+C start the
+`IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS` deadline, retry the durable fence until
+it commits, wait any remaining routing interval, and only then enter Stopping.
+The shutdown hard deadline and final background-cleanup window bound process
+exit after a successful fence. A termination-time fence failure is retried
+past the routing deadline while readiness stays down; the platform may
+ultimately use `SIGKILL` rather than let an unfenced owner claim a clean stop.
+See
+[Cloud Deployment](cloud-deployment.md#graceful-shutdown) for the exact timing
+knobs and Railway/OpenShift rollout constraints.

@@ -3,12 +3,13 @@
 //! so no shared state leaks between tests.
 
 use ironcrew::engine::run_history::{
-    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus,
+    ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunTransition,
 };
 use ironcrew::engine::sqlite_store::SqliteStore;
-use ironcrew::engine::store::StateStore;
+use ironcrew::engine::store::{RunLeaseConfig, StateStore};
 use ironcrew::engine::task::TaskResult;
 use ironcrew::utils::error::IronCrewError;
+use std::time::Duration;
 
 /// Test helper: write a Running intent + immediately update to
 /// terminal state. Mirrors the pre-Task 8 `save_run` call shape so
@@ -38,6 +39,7 @@ async fn save_completed_run(store: &SqliteStore, record: &RunRecord) -> Result<(
             },
         )
         .await
+        .map(|_| ())
 }
 
 fn fresh_store() -> SqliteStore {
@@ -150,6 +152,8 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
         total_tokens: 0,
         cached_tokens: 0,
         tags: vec![],
+        owner_instance_id: String::new(),
+        lease_expires_at: String::new(),
     };
     save_completed_run(&store, &success).await.unwrap();
 
@@ -161,7 +165,7 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
     save_completed_run(&store, &failed).await.unwrap();
 
     let count = store
-        .reconcile_abandoned_runs("2026-04-23T10:05:00Z")
+        .reconcile_abandoned_runs("9999-04-23T10:05:00Z")
         .await
         .unwrap();
     assert_eq!(count, 2);
@@ -172,7 +176,7 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
     );
     assert_eq!(
         store.get_run("r1").await.unwrap().finished_at,
-        "2026-04-23T10:05:00Z"
+        "9999-04-23T10:05:00Z"
     );
     assert_eq!(
         store.get_run("r2").await.unwrap().status,
@@ -185,7 +189,7 @@ async fn sqlite_store_reconcile_abandoned_selectivity() {
     assert_eq!(store.get_run("f1").await.unwrap().status, RunStatus::Failed);
 
     let second = store
-        .reconcile_abandoned_runs("2026-04-23T10:06:00Z")
+        .reconcile_abandoned_runs("9999-04-23T10:06:00Z")
         .await
         .unwrap();
     assert_eq!(second, 0);
@@ -549,11 +553,168 @@ async fn sqlite_reconcile_sweeps_waiting_for_input() {
         .unwrap();
 
     let count = store
-        .reconcile_abandoned_runs("2026-07-07T11:00:00Z")
+        .reconcile_abandoned_runs("9999-07-07T11:00:00Z")
         .await
         .unwrap();
     assert_eq!(count, 1);
     let r = store.get_run("wfi-2").await.unwrap();
     assert_eq!(r.status, RunStatus::Abandoned);
-    assert_eq!(r.finished_at, "2026-07-07T11:00:00Z");
+    assert_eq!(r.finished_at, "9999-07-07T11:00:00Z");
+}
+
+#[tokio::test]
+async fn sqlite_multi_instance_lease_prevents_live_run_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("leases.db");
+    let owner_a = SqliteStore::new_with_lease_config(
+        db.clone(),
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .unwrap();
+    let owner_b = SqliteStore::new_with_lease_config(
+        db,
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .unwrap();
+
+    owner_a
+        .save_run_intent(RunIntent {
+            suggested_id: Some("leased-sqlite".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-07-18T10:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(owner_a.heartbeat_owned_runs().await.unwrap(), 1);
+    owner_a.health_check().await.unwrap();
+
+    let record = owner_a.get_run("leased-sqlite").await.unwrap();
+    let deadline = chrono::DateTime::parse_from_rfc3339(&record.lease_expires_at).unwrap();
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&(deadline - chrono::Duration::seconds(1)).to_rfc3339())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&(deadline + chrono::Duration::seconds(1)).to_rfc3339())
+            .await
+            .unwrap(),
+        1
+    );
+    let late = owner_a
+        .update_run_completion(
+            "leased-sqlite",
+            RunCompletion {
+                status: RunStatus::Success,
+                finished_at: "9999-01-01T00:00:02Z".into(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(late, RunTransition::AlreadyTerminal(RunStatus::Abandoned));
+}
+
+#[tokio::test]
+async fn sqlite_persists_timeout_once() {
+    let store = fresh_store();
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("timeout-sqlite".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-07-18T10:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let completion = RunCompletion {
+        status: RunStatus::TimedOut,
+        finished_at: "2026-07-18T10:00:01Z".into(),
+        duration_ms: 1_000,
+        task_results: vec![],
+        total_tokens: 0,
+        cached_tokens: 0,
+    };
+    assert_eq!(
+        store
+            .update_run_completion("timeout-sqlite", completion.clone())
+            .await
+            .unwrap(),
+        RunTransition::Applied
+    );
+    assert_eq!(
+        store
+            .update_run_completion("timeout-sqlite", completion)
+            .await
+            .unwrap(),
+        RunTransition::AlreadyTerminal(RunStatus::TimedOut)
+    );
+    assert_eq!(
+        store.get_run("timeout-sqlite").await.unwrap().status,
+        RunStatus::TimedOut
+    );
+}
+
+#[tokio::test]
+async fn sqlite_migrates_legacy_runs_to_unleased_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                flow_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                task_results TEXT NOT NULL,
+                agent_count INTEGER NOT NULL,
+                task_count INTEGER NOT NULL,
+                total_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                tags TEXT DEFAULT '[]',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO runs (
+                run_id, flow_name, status, started_at, finished_at, duration_ms,
+                task_results, agent_count, task_count, total_tokens, cached_tokens, tags
+            ) VALUES (
+                'legacy-running', 'legacy', 'running', '2026-01-01T00:00:00Z', '',
+                0, '[]', 1, 1, 0, 0, '[]'
+            );",
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::new_with_lease_config(
+        db,
+        RunLeaseConfig::new("new-owner", Duration::from_secs(60)).unwrap(),
+    )
+    .unwrap();
+    let legacy = store.get_run("legacy-running").await.unwrap();
+    assert_eq!(legacy.flow, "");
+    assert_eq!(legacy.owner_instance_id, "");
+    assert_eq!(legacy.lease_expires_at, "");
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("2026-01-01T00:01:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_run("legacy-running").await.unwrap().status,
+        RunStatus::Abandoned
+    );
 }

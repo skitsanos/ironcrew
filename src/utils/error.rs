@@ -5,6 +5,15 @@ pub enum IronCrewError {
     #[error("LLM provider error: {0}")]
     Provider(String),
 
+    #[error(
+        "{provider} request body is {actual} bytes, exceeding the configured {limit}-byte limit"
+    )]
+    ProviderRequestTooLarge {
+        provider: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+
     #[error("Tool execution error: {tool}: {message}")]
     ToolExecution { tool: String, message: String },
 
@@ -16,6 +25,14 @@ pub enum IronCrewError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    /// A keyed run claim was durably fenced while its owner entered drain.
+    /// Callers must not start new physical execution for this claim.
+    #[error("Run owner instance '{owner_instance_id}' is draining")]
+    OwnerDraining { owner_instance_id: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

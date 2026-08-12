@@ -20,12 +20,21 @@ use crate::utils::error::{IronCrewError, Result};
 
 // ── Handshake timeout ─────────────────────────────────────────────────────────
 
-fn handshake_timeout() -> Duration {
-    let secs = std::env::var("IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
-    Duration::from_secs(secs)
+fn handshake_timeout() -> Result<Duration> {
+    let secs = match std::env::var("IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS") {
+        Ok(raw) => raw.parse::<u64>().map_err(|_| IronCrewError::Mcp {
+            server: String::new(),
+            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be an integer from 1 to 3600".into(),
+        })?,
+        Err(_) => 10,
+    };
+    if !(1..=3_600).contains(&secs) {
+        return Err(IronCrewError::Mcp {
+            server: String::new(),
+            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be from 1 to 3600".into(),
+        });
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 // ── McpConnectionManager ──────────────────────────────────────────────────────
@@ -46,7 +55,7 @@ impl McpConnectionManager {
     /// After successful connection, all discovered tools are registered into
     /// `tool_registry` using the `mcp__<label>__<tool>` naming scheme.
     pub async fn connect_all(config: &McpConfig, tool_registry: &mut ToolRegistry) -> Result<Self> {
-        let timeout = handshake_timeout();
+        let timeout = handshake_timeout()?;
 
         // Build one connect future per server
         let connect_futs: Vec<_> = config
@@ -105,7 +114,17 @@ impl McpConnectionManager {
             );
 
             for rmcp_tool in &tools {
-                match McpBridgeTool::from_rmcp_tool(label, rmcp_tool, client.clone()) {
+                let execution_identity_fingerprint = config
+                    .servers
+                    .iter()
+                    .find(|server| server.label == *label)
+                    .and_then(|server| server.execution_identity_fingerprint.clone());
+                match McpBridgeTool::from_rmcp_tool(
+                    label,
+                    rmcp_tool,
+                    client.clone(),
+                    execution_identity_fingerprint,
+                ) {
                     Ok(bridge) => {
                         tracing::debug!(
                             server = %label,

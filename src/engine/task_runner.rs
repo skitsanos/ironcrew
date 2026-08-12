@@ -13,6 +13,20 @@ use crate::engine::input_bridge::AskHumanContext;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
 
+const DEFAULT_MAX_RETRY_BACKOFF_SECS: f64 = 300.0;
+const HARD_MAX_RETRY_BACKOFF_SECS: f64 = 3_600.0;
+
+fn retry_backoff(attempt: u32, base_seconds: f64) -> std::time::Duration {
+    let cap = std::env::var("IRONCREW_MAX_RETRY_BACKOFF_SECS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= HARD_MAX_RETRY_BACKOFF_SECS)
+        .unwrap_or(DEFAULT_MAX_RETRY_BACKOFF_SECS);
+    let seconds = (base_seconds * 2f64.powi(attempt.min(63) as i32)).min(cap);
+    std::time::Duration::try_from_secs_f64(seconds)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(1))
+}
+
 /// Race `fut` against a budget that only ticks while the run is NOT
 /// suspended on a human question. A task that lawfully pauses on the
 /// agent-facing `ask_human` tool is observably waiting, not stuck — so
@@ -83,6 +97,7 @@ pub async fn run_single_task(
     Option<TaskTokenUsage>,
     Option<String>,
 ) {
+    let task_observation = crate::engine::task_observation::TaskObservation::start();
     // Build memory context for this task
     let memory_context = memory.build_context(&task.description, 5).await;
 
@@ -140,16 +155,16 @@ pub async fn run_single_task(
                 if attempt >= max_retries {
                     break (Err(e), None, None);
                 }
-                let backoff = base_backoff * 2f64.powi(attempt as i32);
+                let backoff = retry_backoff(attempt, base_backoff);
                 tracing::warn!(
                     "Task '{}' failed (attempt {}/{}), retrying in {:.1}s: {}",
                     task_owned.name,
                     attempt + 1,
                     max_retries + 1,
-                    backoff,
+                    backoff.as_secs_f64(),
                     e
                 );
-                tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
             Err(_) => {
@@ -163,21 +178,26 @@ pub async fn run_single_task(
                         None,
                     );
                 }
-                let backoff = base_backoff * 2f64.powi(attempt as i32);
+                let backoff = retry_backoff(attempt, base_backoff);
                 tracing::warn!(
                     "Task '{}' timed out (attempt {}/{}), retrying in {:.1}s",
                     task_owned.name,
                     attempt + 1,
                     max_retries + 1,
-                    backoff
+                    backoff.as_secs_f64()
                 );
-                tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
         }
     };
 
     let duration = start.elapsed().as_millis() as u64;
+    task_observation.finish(if output.is_ok() {
+        crate::metrics::TaskOutcome::Success
+    } else {
+        crate::metrics::TaskOutcome::Error
+    });
     (
         task_owned.name.clone(),
         agent_owned.name.clone(),
@@ -261,6 +281,7 @@ pub async fn handle_task_error(
     // Provide empty memory_context placeholder (consistent with original)
     let _memory = memory;
 
+    let task_observation = crate::engine::task_observation::TaskObservation::start();
     match execute_task_standalone(
         &error_task,
         error_agent,
@@ -276,6 +297,7 @@ pub async fn handle_task_error(
     .await
     {
         Ok((output, reasoning, token_usage)) => {
+            task_observation.finish(crate::metrics::TaskOutcome::Success);
             tracing::info!(
                 "Error handler '{}' succeeded, task '{}' recovered",
                 error_handler_name,
@@ -302,6 +324,7 @@ pub async fn handle_task_error(
             Some((recovered_result, Some(handler_result)))
         }
         Err(handler_err) => {
+            task_observation.finish(crate::metrics::TaskOutcome::Error);
             tracing::error!(
                 "Error handler '{}' also failed: {}",
                 error_handler_name,

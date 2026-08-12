@@ -9,6 +9,11 @@
 -- 2. `dialog:next_turn_from(agent_name)` — explicit control in a manual loop,
 --    where your Lua code decides who speaks next each turn.
 --
+-- Run the automatic selector (default):
+--   ironcrew run examples/moderator-dialog
+-- Run the explicit manual sequence:
+--   ironcrew run examples/moderator-dialog --input '{"mode":"manual"}'
+--
 -- Topic: a product launch go/no-go decision with three stakeholders.
 --
 -- Requires: OPENAI_API_KEY (for gpt-5.4-mini)
@@ -98,12 +103,20 @@ Should we launch next Tuesday, delay by 2 weeks, or do a limited launch
 to a subset of users? Discuss.
 ]]
 
-local dialog = crew:dialog({
+local mode = (input and input.mode) or "selector"
+if mode ~= "selector" and mode ~= "manual" then
+    error("input.mode must be 'selector' or 'manual'")
+end
+
+local dialog_options = {
     agents = { "product", "engineering", "customer_success" },
     starter = TOPIC,
     max_turns = 6,
-    -- The moderator picks who speaks next via LLM reasoning
-    turn_selector = function(transcript, agents)
+}
+
+if mode == "selector" then
+    -- The moderator picks who speaks next via LLM reasoning.
+    dialog_options.turn_selector = function(transcript, agents)
         if #transcript == 0 then
             -- First speaker: let the person with the strongest opinion go first
             return "product"
@@ -113,14 +126,39 @@ local dialog = crew:dialog({
         local next_name = mod_conv:send(prompt)
         -- Trim whitespace and return
         return next_name:match("^%s*(.-)%s*$")
-    end,
-})
+    end
+end
+
+local dialog = crew:dialog(dialog_options)
 
 print("=== Moderator-Driven Dialog ===")
-print("(moderator agent picks who speaks next each turn)")
+print(mode == "selector"
+    and "(moderator agent picks who speaks next each turn)"
+    or "(Lua explicitly picks each speaker with next_turn_from)")
 print("")
 
-local transcript = dialog:run()
+local transcript
+if mode == "manual" then
+    -- Approach 2: the flow owns speaker selection explicitly. `next_turn_from`
+    -- executes exactly one turn and returns it (or nil when the dialog ended).
+    local speaker_sequence = {
+        "product",
+        "engineering",
+        "customer_success",
+        "product",
+        "engineering",
+        "customer_success",
+    }
+    for _, speaker in ipairs(speaker_sequence) do
+        if dialog:next_turn_from(speaker) == nil then
+            break
+        end
+    end
+    transcript = dialog:transcript()
+else
+    -- Approach 1: `dialog:run()` invokes turn_selector before every turn.
+    transcript = dialog:run()
+end
 
 for _, turn in ipairs(transcript) do
     print(string.format("--- Turn %d: %s ---", turn.index + 1, string.upper(turn.agent)))
@@ -129,13 +167,20 @@ for _, turn in ipairs(transcript) do
 end
 
 -- Show the moderator's internal reasoning (what it decided and why)
-print("=== Moderator decisions (conversation history) ===")
-local mod_history = mod_conv:history()
-for i, msg in ipairs(mod_history) do
-    if msg.role == "assistant" then
-        print(string.format("  Turn %d → chose: %s", math.ceil((i - 1) / 2), msg.content))
+if mode == "selector" then
+    print("=== Moderator decisions (conversation history) ===")
+    local mod_history = mod_conv:history()
+    for i, msg in ipairs(mod_history) do
+        if msg.role == "assistant" then
+            print(string.format("  Turn %d → chose: %s", math.ceil((i - 1) / 2), msg.content))
+        end
     end
+    print("")
 end
-print("")
 
-print(string.format("Dialog complete: %d turns, %d participants", #transcript, #dialog:agents()))
+print(string.format(
+    "Dialog complete in %s mode: %d turns, %d participants",
+    mode,
+    #transcript,
+    #dialog:agents()
+))

@@ -7,55 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::provider::ChatMessage;
+#[allow(unused_imports)] // public compatibility re-export; binary module tree is private
+pub use super::conversation_identity::{
+    CONVERSATION_EXECUTION_SCHEMA_VERSION, ConversationExecution, ConversationRecord,
+    ConversationSummary, conversation_mutation_scope,
+};
 use crate::lua::dialog::DialogTurn;
 use crate::utils::error::{IronCrewError, Result};
-
-/// Persistent snapshot of a `crew:conversation({id = "..."})` session.
-/// Restored by re-opening the conversation with the same `id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationRecord {
-    pub id: String,
-    pub flow_name: String,
-    /// User-facing flow identifier (e.g. "chat-cli" — the last path segment
-    /// of the resolved flow directory). Used by the HTTP and CLI layers to
-    /// filter conversations per-flow. Legacy records without this field stay
-    /// addressable by id, but will not appear in per-flow listings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_path: Option<String>,
-    pub agent_name: String,
-    pub messages: Vec<ChatMessage>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// Lightweight conversation metadata — same as `ConversationRecord` without
-/// the full message list. Used for paginated list views.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationSummary {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_path: Option<String>,
-    pub agent_name: String,
-    pub created_at: String,
-    pub updated_at: String,
-    /// Number of user turns completed.
-    pub turn_count: usize,
-}
-
-impl From<&ConversationRecord> for ConversationSummary {
-    fn from(r: &ConversationRecord) -> Self {
-        let turn_count = r.messages.iter().filter(|m| m.role == "user").count();
-        Self {
-            id: r.id.clone(),
-            flow_path: r.flow_path.clone(),
-            agent_name: r.agent_name.clone(),
-            created_at: r.created_at.clone(),
-            updated_at: r.updated_at.clone(),
-            turn_count,
-        }
-    }
-}
 
 /// Persistent snapshot of a `crew:dialog({id = "..."})` session.
 /// Captures enough state to resume the dialog from the point where it
@@ -82,6 +40,9 @@ pub struct DialogStateRecord {
     pub stop_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Optimistic-concurrency revision; see `ConversationRecord::revision`.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// Validate a user-provided session ID.

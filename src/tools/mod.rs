@@ -1,13 +1,17 @@
 pub mod agent_as_tool;
 pub mod approval;
 pub mod ask_human;
+pub(crate) mod conversation_policy;
+pub(crate) mod execution_policy;
 pub mod file_read;
 pub mod file_read_glob;
 pub mod file_write;
 pub mod hash;
 pub mod http_request;
 pub mod lua_tool;
+pub(crate) mod project_fs;
 pub mod registry;
+pub(crate) mod runtime_policy;
 pub mod shell;
 pub mod template_render;
 pub mod validate_schema;
@@ -86,6 +90,23 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> ToolSchema;
+
+    /// Non-secret behavior descriptor used to fence durable conversation
+    /// rehydration. Built-ins and remote tools default to their provider-visible
+    /// schema; tools with hidden behavior inputs must override this method.
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.schema()).map_err(|error| {
+            crate::utils::error::IronCrewError::Validation(format!(
+                "failed to serialize tool '{}' for conversation identity: {error}",
+                self.name()
+            ))
+        })
+    }
+
+    /// Other registered tools whose behavior this tool can invoke.
+    fn conversation_dependencies(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Per-call dispatch deadline override. `None` (the default) means the
     /// caller applies the global `IRONCREW_TOOL_TIMEOUT`. Tools that

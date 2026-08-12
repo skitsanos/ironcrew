@@ -1,19 +1,80 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
-#[derive(Default)]
+const DEFAULT_GLOB_MAX_FILES: usize = 500;
+const HARD_GLOB_MAX_FILES: usize = 10_000;
+const DEFAULT_GLOB_MAX_BYTES: usize = 50 * 1024 * 1024;
+const HARD_GLOB_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_GLOB_MAX_ENTRIES: usize = 10_000;
+const HARD_GLOB_MAX_ENTRIES: usize = 100_000;
+const DEFAULT_FILE_READ_MAX_BYTES: usize = 10 * 1024 * 1024;
+const HARD_FILE_READ_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_GLOB_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const HARD_GLOB_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+const HARD_GLOB_PATTERN_BYTES: usize = 8 * 1024;
+
 pub struct FileReadGlobTool {
-    base_dir: Option<PathBuf>,
+    root: super::execution_policy::CapabilityRoot,
+    max_files: usize,
+    max_total_bytes: usize,
+    max_entries: usize,
+    max_file_bytes: usize,
+    max_output_bytes: usize,
+}
+
+impl Default for FileReadGlobTool {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl FileReadGlobTool {
     pub fn new(base_dir: Option<PathBuf>) -> Self {
-        Self { base_dir }
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(base_dir),
+            max_files: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_FILES",
+                DEFAULT_GLOB_MAX_FILES,
+                HARD_GLOB_MAX_FILES,
+            ),
+            max_total_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_BYTES",
+                DEFAULT_GLOB_MAX_BYTES,
+                HARD_GLOB_MAX_BYTES,
+            ),
+            max_entries: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_ENTRIES",
+                DEFAULT_GLOB_MAX_ENTRIES,
+                HARD_GLOB_MAX_ENTRIES,
+            ),
+            max_file_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_FILE_READ_MAX_BYTES",
+                DEFAULT_FILE_READ_MAX_BYTES,
+                HARD_FILE_READ_MAX_BYTES,
+            ),
+            max_output_bytes: super::project_fs::bounded_env_usize(
+                "IRONCREW_GLOB_MAX_OUTPUT_BYTES",
+                DEFAULT_GLOB_MAX_OUTPUT_BYTES,
+                HARD_GLOB_MAX_OUTPUT_BYTES,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(base_dir: PathBuf, marker: usize) -> Self {
+        Self {
+            root: super::execution_policy::CapabilityRoot::required(Some(base_dir)),
+            max_files: marker,
+            max_total_bytes: marker,
+            max_entries: marker,
+            max_file_bytes: marker,
+            max_output_bytes: marker,
+        }
     }
 }
 
@@ -24,7 +85,7 @@ impl Tool for FileReadGlobTool {
     }
 
     fn description(&self) -> &str {
-        "Read multiple files matching a glob pattern. Returns a JSON object: {files: [{path, content}, ...], file_count, total_bytes, truncated}. Per-call limits: IRONCREW_GLOB_MAX_FILES (default 500), IRONCREW_GLOB_MAX_BYTES (default 50 MB)."
+        "Read multiple project-relative regular files matching a glob pattern. Returns a JSON object: {files: [{path, content}, ...], file_count, total_bytes, truncated}. Per-call limits: IRONCREW_GLOB_MAX_FILES (default 500), IRONCREW_GLOB_MAX_BYTES (default 50 MB), IRONCREW_GLOB_MAX_ENTRIES (default 10000), and IRONCREW_FILE_READ_MAX_BYTES (default 10 MB per file)."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -44,6 +105,18 @@ impl Tool for FileReadGlobTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "root_fingerprint": self.root.fingerprint()?,
+            "max_files": self.max_files,
+            "max_total_bytes": self.max_total_bytes,
+            "max_entries": self.max_entries,
+            "max_file_bytes": self.max_file_bytes,
+            "max_output_bytes": self.max_output_bytes,
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let pattern = args["pattern"]
             .as_str()
@@ -51,91 +124,120 @@ impl Tool for FileReadGlobTool {
                 tool: "file_read_glob".into(),
                 message: "Missing 'pattern' argument".into(),
             })?;
-
-        // Validate the pattern doesn't escape
-        if pattern.contains("..") || pattern.starts_with('/') {
+        if pattern.len() > HARD_GLOB_PATTERN_BYTES {
             return Err(IronCrewError::ToolExecution {
                 tool: "file_read_glob".into(),
-                message: "Pattern must not contain '..' or start with '/'".into(),
+                message: format!(
+                    "Glob pattern exceeds the {HARD_GLOB_PATTERN_BYTES}-byte hard limit"
+                ),
             });
         }
 
-        // Resource budgets (see docs/cli.md). Set either to 0 to disable.
-        let max_files: usize = std::env::var("IRONCREW_GLOB_MAX_FILES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(500);
-        let max_total_bytes: u64 = std::env::var("IRONCREW_GLOB_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50 * 1024 * 1024); // 50 MB
-
-        let full_pattern = if let Some(ref base) = self.base_dir {
-            format!("{}/{}", base.display(), pattern)
-        } else {
-            pattern.to_string()
-        };
-
-        let mut files = Vec::new();
-        let mut total_bytes: u64 = 0;
-        let mut truncated = false;
-
-        let entries = glob::glob(&full_pattern).map_err(|e| IronCrewError::ToolExecution {
-            tool: "file_read_glob".into(),
-            message: format!("Invalid glob pattern: {}", e),
-        })?;
-
-        for entry in entries {
-            // Stop if we've hit the file-count cap.
-            if max_files > 0 && files.len() >= max_files {
-                truncated = true;
-                break;
-            }
-
-            let path = entry.map_err(|e| IronCrewError::ToolExecution {
+        super::project_fs::validate_relative(Path::new(pattern)).map_err(|error| {
+            IronCrewError::ToolExecution {
                 tool: "file_read_glob".into(),
-                message: format!("Glob error: {}", e),
+                message: format!("Pattern must be project-relative: {error}"),
+            }
+        })?;
+        let matcher =
+            glob::Pattern::new(pattern).map_err(|error| IronCrewError::ToolExecution {
+                tool: "file_read_glob".into(),
+                message: format!("Invalid glob pattern: {error}"),
             })?;
 
-            if path.is_file() {
-                let relative = if let Some(ref base) = self.base_dir {
-                    path.strip_prefix(base).unwrap_or(&path).to_path_buf()
-                } else {
-                    path.clone()
-                };
+        let max_files = self.max_files;
+        let max_total_bytes = self.max_total_bytes;
+        let max_entries = self.max_entries;
+        let max_file_bytes = self.max_file_bytes;
+        let base_dir = self
+            .root
+            .cloned_path()
+            .map_err(|message| IronCrewError::ToolExecution {
+                tool: "file_read_glob".into(),
+                message: message.into(),
+            })?;
 
-                match tokio::fs::read_to_string(&path).await {
+        let (files, total_bytes, truncated) = tokio::task::spawn_blocking(move || {
+            let root = super::project_fs::open_root(Some(&base_dir))?;
+            let (candidates, scan_truncated) =
+                super::project_fs::collect_regular_files(&root, max_entries)?;
+            let options = glob::MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: true,
+            };
+            let mut candidates: Vec<PathBuf> = candidates
+                .into_iter()
+                .filter(|path| matcher.matches_path_with(path, options))
+                .collect();
+            candidates.sort();
+
+            let mut truncated = scan_truncated || candidates.len() > max_files;
+            candidates.truncate(max_files);
+            let mut files = Vec::with_capacity(candidates.len());
+            let mut total_bytes = 0usize;
+
+            for path in candidates {
+                let display = path.display().to_string();
+                let metadata = match root.metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    Ok(_) => {
+                        files.push(json!({
+                            "path": display,
+                            "error": "Refused non-regular file"
+                        }));
+                        continue;
+                    }
+                    Err(error) => {
+                        files.push(json!({
+                            "path": display,
+                            "error": format!("Failed to inspect: {error}")
+                        }));
+                        continue;
+                    }
+                };
+                if metadata.len() > max_file_bytes as u64 {
+                    files.push(json!({
+                        "path": display,
+                        "error": format!(
+                            "File is {} bytes, exceeds IRONCREW_FILE_READ_MAX_BYTES ({max_file_bytes})",
+                            metadata.len()
+                        )
+                    }));
+                    continue;
+                }
+                let remaining = max_total_bytes.saturating_sub(total_bytes);
+                if metadata.len() > remaining as u64 || remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+
+                match super::project_fs::read_utf8_bounded(
+                    &root,
+                    &path,
+                    max_file_bytes.min(remaining),
+                ) {
                     Ok(content) => {
-                        // Enforce total-byte budget BEFORE appending, so we never
-                        // materialize a read that would push us over the cap.
-                        let next_total = total_bytes + content.len() as u64;
-                        if max_total_bytes > 0 && next_total > max_total_bytes {
-                            truncated = true;
-                            break;
-                        }
-                        total_bytes = next_total;
-                        files.push(json!({
-                            "path": relative.display().to_string(),
-                            "content": content
-                        }));
+                        total_bytes += content.len();
+                        files.push(json!({ "path": display, "content": content }));
                     }
-                    Err(e) => {
-                        files.push(json!({
-                            "path": relative.display().to_string(),
-                            "error": format!("Failed to read: {}", e)
-                        }));
-                    }
+                    Err(error) => files.push(json!({
+                        "path": display,
+                        "error": format!("Failed to read: {error}")
+                    })),
                 }
             }
-        }
-
-        // Sort by path for deterministic output
-        files.sort_by(|a, b| {
-            a["path"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["path"].as_str().unwrap_or(""))
-        });
+            Ok::<_, std::io::Error>((files, total_bytes, truncated))
+        })
+        .await
+        .map_err(|error| IronCrewError::ToolExecution {
+            tool: "file_read_glob".into(),
+            message: format!("Filesystem worker failed: {error}"),
+        })?
+        .map_err(|error| IronCrewError::ToolExecution {
+            tool: "file_read_glob".into(),
+            message: format!("Glob read failed: {error}"),
+        })?;
 
         let file_count = files.len();
         let output = json!({
@@ -145,9 +247,12 @@ impl Tool for FileReadGlobTool {
             "truncated": truncated,
         });
 
-        serde_json::to_string_pretty(&output).map_err(|e| IronCrewError::ToolExecution {
-            tool: "file_read_glob".into(),
-            message: format!("Serialization error: {}", e),
+        let max_output_bytes = self.max_output_bytes;
+        crate::utils::http::to_json_pretty_limited(&output, max_output_bytes).map_err(|e| {
+            IronCrewError::ToolExecution {
+                tool: "file_read_glob".into(),
+                message: format!("Serialization error: {}", e),
+            }
         })
     }
 }

@@ -1,13 +1,51 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::Result;
 
+struct ToolObservation {
+    started_at: Instant,
+    completed: bool,
+}
+
+impl ToolObservation {
+    fn start() -> Self {
+        Self {
+            started_at: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn finish(mut self, result: &Result<String>) {
+        let outcome = if result.is_ok() {
+            crate::metrics::ToolOutcome::Success
+        } else {
+            crate::metrics::ToolOutcome::Error
+        };
+        crate::metrics::record_tool(outcome, self.started_at.elapsed());
+        self.completed = true;
+    }
+}
+
+impl Drop for ToolObservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            crate::metrics::record_tool(
+                crate::metrics::ToolOutcome::Cancelled,
+                self.started_at.elapsed(),
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    execution_policy: crate::tools::runtime_policy::RuntimeExecutionPolicy,
     /// Human sign-off policy for gated tools. `None` = no gate (the
     /// common case, zero dispatch overhead). Clones share the policy's
     /// grant set via `Arc`, so "always" grants follow the augmented
@@ -25,6 +63,17 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            execution_policy: crate::tools::runtime_policy::RuntimeExecutionPolicy::capture(),
+            approval: None,
+        }
+    }
+
+    pub(crate) fn with_execution_policy(
+        execution_policy: crate::tools::runtime_policy::RuntimeExecutionPolicy,
+    ) -> Self {
+        Self {
+            tools: HashMap::new(),
+            execution_policy,
             approval: None,
         }
     }
@@ -67,6 +116,82 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Canonical identity of the exact ordered tool graph available to one
+    /// conversation agent. Unlike `schemas_for`, this fails closed if a named
+    /// tool is unavailable so replicas cannot silently construct different
+    /// provider requests under the same durable definition.
+    pub fn conversation_execution_fingerprint(&self, tool_names: &[String]) -> Result<String> {
+        let mut visited = HashSet::new();
+        let mut definitions = Vec::new();
+        for name in tool_names {
+            self.collect_conversation_definition(name, &mut visited, &mut definitions)?;
+        }
+        crate::engine::conversation_provider::resolved_tools_fingerprint(&serde_json::json!({
+            "global_execution_policy": self.execution_policy.definition()?,
+            "tools": definitions,
+        }))
+    }
+
+    pub(crate) fn default_dispatch_timeout(&self) -> std::time::Duration {
+        self.execution_policy.tool_timeout()
+    }
+
+    pub(crate) fn max_flow_depth(&self) -> usize {
+        self.execution_policy.max_flow_depth()
+    }
+
+    pub(crate) fn lua_vm_policy(&self) -> Result<crate::tools::runtime_policy::LuaVmPolicy> {
+        self.execution_policy.lua_vm_policy()
+    }
+
+    pub(crate) fn max_reasoning_bytes(&self) -> usize {
+        self.execution_policy.max_reasoning_bytes()
+    }
+
+    pub(crate) fn chat_history_max_bytes(&self) -> usize {
+        self.execution_policy.chat_history_max_bytes()
+    }
+
+    pub(crate) fn conversation_policy(
+        &self,
+    ) -> crate::tools::conversation_policy::ConversationTurnPolicy {
+        self.execution_policy.conversation_policy()
+    }
+
+    pub(crate) fn conversation_turn_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.conversation_policy().turn_timeout_secs())
+    }
+
+    fn collect_conversation_definition(
+        &self,
+        name: &str,
+        visited: &mut HashSet<String>,
+        definitions: &mut Vec<serde_json::Value>,
+    ) -> Result<()> {
+        if !visited.insert(name.to_string()) {
+            return Ok(());
+        }
+        let tool = self.tools.get(name).ok_or_else(|| {
+            crate::utils::error::IronCrewError::Validation(format!(
+                "Conversation tool '{name}' is not registered"
+            ))
+        })?;
+        let approval = self
+            .approval
+            .as_ref()
+            .filter(|policy| policy.requires(name))
+            .map(crate::tools::approval::ApprovalPolicy::conversation_definition);
+        definitions.push(serde_json::json!({
+            "name": name,
+            "approval": approval,
+            "definition": tool.conversation_definition()?,
+        }));
+        for dependency in tool.conversation_dependencies() {
+            self.collect_conversation_definition(&dependency, visited, definitions)?;
+        }
+        Ok(())
+    }
+
     /// Effective dispatch deadline for one call: the tool's own override
     /// (e.g. `ask_human` waiting on a person), further extended when the
     /// call is gated-and-not-yet-granted so the generic tool timeout can't
@@ -88,6 +213,18 @@ impl ToolRegistry {
     }
 
     pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolCallContext,
+    ) -> Result<String> {
+        let observation = ToolObservation::start();
+        let result = self.execute_inner(name, args, ctx).await;
+        observation.finish(&result);
+        result
+    }
+
+    async fn execute_inner(
         &self,
         name: &str,
         args: serde_json::Value,
@@ -121,3 +258,6 @@ impl ToolRegistry {
         tool.execute(args, ctx).await
     }
 }
+
+#[cfg(test)]
+mod tests;

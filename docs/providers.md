@@ -16,7 +16,7 @@ By default, IronCrew connects to the OpenAI API:
 | -------------------- | --------------------------- | ------------- |
 | `OPENAI_API_KEY`     | (required)                  | API key       |
 | `OPENAI_BASE_URL`    | `https://api.openai.com/v1` | API base URL  |
-| `OPENAI_MODEL`       | `gpt-4.1-mini`              | Default model |
+| `OPENAI_MODEL`       | `gpt-5.6-luna`              | Default model |
 
 Set these in a `.env` file in your project directory or export them in your shell.
 
@@ -32,15 +32,18 @@ No extra configuration needed beyond setting `OPENAI_API_KEY`.
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.6-luna",
 })
 ```
 
+GPT-5.6 Luna accepts only its provider-default temperature. Omit explicit
+`temperature` values when Luna is effective; IronCrew forwards configured
+values and the provider rejects unsupported non-default settings.
+
 ### Google Gemini
 
-Gemini exposes an OpenAI-compatible endpoint. Set `GEMINI_API_KEY` in your
-environment — IronCrew auto-detects it when the base URL contains
-`generativelanguage.googleapis.com` or `gemini`.
+Gemini exposes an OpenAI-compatible endpoint. Its exact built-in HTTPS host
+maps to `GEMINI_API_KEY` on the Rust side, without exposing the key to Lua.
 
 ```lua
 local crew = Crew.new({
@@ -66,7 +69,7 @@ responses, tool call arguments returned as objects instead of strings).
 
 ### Groq
 
-Set `GROQ_API_KEY`. Auto-detected when base URL contains `groq.com`.
+Set `GROQ_API_KEY`; the exact `api.groq.com` HTTPS host is recognized Rust-side.
 
 ```lua
 local crew = Crew.new({
@@ -79,9 +82,9 @@ local crew = Crew.new({
 
 ### Kimi / Moonshot AI
 
-Set `MOONSHOT_API_KEY`. Auto-detected when base URL contains `moonshot.ai` or
-`moonshot.cn`. Kimi returns `reasoning_content` in responses which IronCrew
-captures automatically into the `reasoning` field.
+Set `MOONSHOT_API_KEY`; the exact Moonshot HTTPS hosts are recognized
+Rust-side. Kimi returns `reasoning_content` in responses which IronCrew captures
+automatically into the `reasoning` field.
 
 ```lua
 local crew = Crew.new({
@@ -98,9 +101,9 @@ docs for the currently supported IDs.
 
 ### DeepSeek
 
-Set `DEEPSEEK_API_KEY`. Auto-detected when base URL contains `deepseek.com`.
-The `deepseek-reasoner` model returns `reasoning_content` which IronCrew
-captures into the `reasoning` field.
+Set `DEEPSEEK_API_KEY`; the exact `api.deepseek.com` HTTPS host is recognized
+Rust-side. The `deepseek-reasoner` model returns `reasoning_content` which
+IronCrew captures automatically into the `reasoning` field.
 
 ```lua
 local crew = Crew.new({
@@ -113,7 +116,13 @@ local crew = Crew.new({
 
 ### Ollama (Local)
 
-Run models locally with no API key required.
+Run models locally with no API key required. Private and loopback provider
+destinations are blocked by the production-safe network policy, so explicitly
+opt in for this trusted local endpoint:
+
+```bash
+IRONCREW_ALLOW_PRIVATE_IPS=1
+```
 
 ```lua
 local crew = Crew.new({
@@ -127,27 +136,19 @@ local crew = Crew.new({
 
 ### Azure OpenAI
 
-Use your Azure deployment endpoint as the base URL. Omit `api_key` — the Lua
-sandbox's `env()` is fail-closed, so `env("AZURE_OPENAI_API_KEY")` returns `nil`
-unless the name is allowlisted; by default the key must come from the Rust side.
+Use your Azure deployment endpoint as the base URL. The Lua sandbox's `env()`
+is fail-closed, so explicitly add `AZURE_OPENAI_API_KEY` to
+`IRONCREW_ENV_ALLOWLIST` and pair it with the custom URL.
 
 ```lua
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-4.1-mini",
+    model = "YOUR-DEPLOYMENT-MODEL",
     base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/v1",
+    api_key = env("AZURE_OPENAI_API_KEY"),
 })
 ```
-
-Azure is not covered by the URL-based key auto-detection table below, so the
-key falls back to `OPENAI_API_KEY`. In practice you have two options:
-
-1. Export your Azure key as `OPENAI_API_KEY` before running `ironcrew`.
-2. Grant the Lua sandbox explicit access to the Azure var via
-   `IRONCREW_ENV_ALLOWLIST=AZURE_OPENAI_API_KEY` (see
-   [docs/sandbox.md](sandbox.md)),
-   then call `api_key = env("AZURE_OPENAI_API_KEY")` in `crew.lua`.
 
 ## Anthropic Native (`provider = "anthropic"`)
 
@@ -219,7 +220,7 @@ built-in server-side tools, and cleaner streaming semantics. Also supported by
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-mini",
 })
 ```
 
@@ -229,7 +230,7 @@ local crew = Crew.new({
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-nano",
     reasoning_effort = "medium",      -- "low" | "medium" | "high"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
@@ -244,7 +245,7 @@ Reasoning summaries are streamed dim to stderr and persisted to the run record.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-mini",
     server_tools = { "web_search", "file_search", "code_interpreter" },
     web_search_context_size = "medium",           -- "low" | "medium" | "high"
     file_search_vector_store_ids = { "vs_abc" },  -- required for file_search
@@ -271,50 +272,34 @@ local crew = Crew.new({
 })
 ```
 
-Set `XAI_API_KEY`. Auto-detected when base URL contains `x.ai`. IronCrew
+Set `XAI_API_KEY`; exact `api.x.ai` HTTPS URLs resolve it Rust-side. IronCrew
 automatically falls back to a system-role message in `input` since Grok does
 not support the `instructions` parameter.
 
-## API Key Auto-Resolution
+## API Key Resolution and Custom Endpoints
 
-Key resolution depends on the `provider` value.
+Provider secrets are never selected from a caller-controlled hostname. This
+prevents a custom public endpoint from receiving Railway/OpenShift process
+credentials.
 
-### `provider = "openai"`
+- With no `base_url` or `api_key` in `Crew.new`, the default runtime reads
+  `OPENAI_BASE_URL` and `OPENAI_API_KEY` directly on the Rust side. The secret
+  is not exposed to Lua.
+- Exact built-in HTTPS provider hosts may select their matching provider key
+  Rust-side. Matching is by parsed hostname, never substring; lookalike domains
+  and plain HTTP receive no process secret.
+- Every other custom `base_url` must supply `api_key` in the same `Crew.new`
+  table, for `openai`, `openai-responses`, and `anthropic` alike.
+- Lua `env()` is fail-closed. To provide a custom endpoint key from an
+  environment variable, list that exact name in `IRONCREW_ENV_ALLOWLIST`.
+- A native `anthropic` or `openai-responses` crew with no custom URL may use
+  `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, respectively, from the Rust process.
 
-1. Explicit `api_key` in the Crew config (note: Lua `env()` is fail-closed, so
-   `env("…_API_KEY")` returns `nil` unless allowlisted — this is usually left
-   unset and env var auto-detection handles the key Rust-side).
-2. Provider-specific env var based on the `base_url`:
-
-| URL contains                                     | Env var              |
-|--------------------------------------------------|----------------------|
-| `generativelanguage.googleapis.com` or `gemini`  | `GEMINI_API_KEY`     |
-| `groq.com`                                       | `GROQ_API_KEY`       |
-| `anthropic.com`                                  | `ANTHROPIC_API_KEY`  |
-| `moonshot.ai` or `moonshot.cn`                   | `MOONSHOT_API_KEY`   |
-| `deepseek.com`                                   | `DEEPSEEK_API_KEY`   |
-| `x.ai`                                           | `XAI_API_KEY`        |
-| `openrouter.ai`                                  | `OPENROUTER_API_KEY` |
-
-3. Fallback to `OPENAI_API_KEY`.
-
-### `provider = "openai-responses"`
-
-The Responses provider currently only special-cases xAI:
-
-| URL contains | Env var       |
-|--------------|---------------|
-| `x.ai`       | `XAI_API_KEY` |
-
-Everything else falls back to `OPENAI_API_KEY`. OpenRouter requests may still
-be sent through the Responses path if OpenRouter itself accepts them, but
-**URL-based key auto-detection is not wired** for OpenRouter on this provider
-— export the key as `OPENAI_API_KEY` or set `api_key` explicitly.
-
-### `provider = "anthropic"`
-
-The key is always resolved from `ANTHROPIC_API_KEY`. No URL matching is
-performed.
+For an Azure, self-hosted, or other non-built-in endpoint, export an explicit
+allowlist such as `IRONCREW_ENV_ALLOWLIST=AZURE_OPENAI_API_KEY`, then place
+`api_key = env("AZURE_OPENAI_API_KEY")` beside its URL. An HTTP-input URL that
+is not one of the exact built-in hosts must carry the caller's matching key;
+Railway/OpenShift process credentials are intentionally unavailable.
 
 ## Reasoning & Thinking Support
 
@@ -348,11 +333,11 @@ the same crew, optimizing cost and performance.
 local crew = Crew.new({
     goal = "Cost-optimized crew",
     provider = "openai",
-    model = "gpt-4.1-mini",           -- default fallback
+    model = "gpt-5.6-luna",           -- default fallback
     models = {
-        task_execution = "gpt-4.1-mini",
-        collaboration = "gpt-4.1-mini",
-        collaboration_synthesis = "gpt-4.1",
+        task_execution = "gpt-5.6-luna",
+        collaboration = "gpt-5.6-luna",
+        collaboration_synthesis = "gpt-5.6-terra",
     },
 })
 ```
@@ -391,7 +376,7 @@ when `prompt_cache_key` is set on the crew.
 
 ## Tips
 
-- Use `gpt-4.1-mini`, `gemini-2.5-flash`, or `claude-haiku-4-5` for simple
+- Use `gpt-5.6-luna`, `gemini-2.5-flash`, or `claude-haiku-4-5` for simple
   tasks. Reserve stronger models for tasks requiring deep reasoning.
 - Set model overrides at the task level when a single task needs more capability
   than the rest of the crew.
@@ -402,9 +387,15 @@ when `prompt_cache_key` is set on the crew.
   SSRF concerns, and responses include proper citations.
 - For local development, Ollama avoids API costs entirely. Switch providers in
   production by changing only the `.env` file.
-- All providers communicate over HTTPS. The HTTP client has a 120-second timeout
-  per request. SSRF protection blocks private IPs (override with
-  `IRONCREW_ALLOW_PRIVATE_IPS=1`).
+- Remote providers should use HTTPS. Provider clients validate DNS answers,
+  actual connection addresses, and redirects, and ignore environment proxy
+  settings. Private endpoints (including local Ollama) require the explicit
+  `IRONCREW_ALLOW_PRIVATE_IPS=1` trust override.
+- Serialized JSON requests default to a 32 MiB cap and are rejected before any
+  network send when oversized. Non-streaming responses default to a 16 MiB cap,
+  raw SSE streams to 32 MiB, accumulated output to 16 MiB, and error bodies to
+  256 KiB. Tune these with the `IRONCREW_PROVIDER_MAX_*` variables in
+  [CLI](cli.md#environment-variables).
 
 ## See also: MCP servers
 

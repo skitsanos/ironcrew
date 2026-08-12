@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -8,9 +9,64 @@ use super::{Tool, ToolCallContext};
 use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
-/// Read from an async reader into a byte buffer until `max` bytes are
-/// collected. If `max` is reached, discard the rest of the stream and set
-/// `truncated` to true. Returns (bytes, truncated).
+mod policy;
+use policy::{MAX_TIMEOUT_SECS, ShellPolicy};
+
+const HARD_MAX_COMMAND_BYTES: usize = 64 * 1024;
+const TERMINATION_GRACE: Duration = Duration::from_millis(500);
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+fn shell_error(message: impl Into<String>) -> IronCrewError {
+    IronCrewError::ToolExecution {
+        tool: "shell".into(),
+        message: message.into(),
+    }
+}
+
+/// Process-group cleanup for cancellation and drop paths.
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_id: Option<u32>) -> Self {
+        #[cfg(not(unix))]
+        let _ = process_id;
+        Self {
+            #[cfg(unix)]
+            pgid: process_id.and_then(|id| i32::try_from(id).ok()),
+        }
+    }
+
+    fn terminate(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+
+    fn kill_and_disarm(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill_and_disarm();
+    }
+}
+
+/// Read at most `max` bytes while draining the stream to let the child exit.
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     max: usize,
@@ -37,7 +93,9 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     Ok((buf, truncated))
 }
 
-pub struct ShellTool;
+pub struct ShellTool {
+    policy: ShellPolicy,
+}
 
 impl Default for ShellTool {
     fn default() -> Self {
@@ -47,7 +105,16 @@ impl Default for ShellTool {
 
 impl ShellTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            policy: ShellPolicy::capture(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_policy_for_test(timeout_secs: u64, max_output_bytes: usize) -> Self {
+        Self {
+            policy: ShellPolicy::from_values(timeout_secs, max_output_bytes),
+        }
     }
 }
 
@@ -71,6 +138,12 @@ impl Tool for ShellTool {
                     "command": {
                         "type": "string",
                         "description": "Shell command to execute"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TIMEOUT_SECS,
+                        "description": "Command deadline in seconds (default 60, maximum 3600)"
                     }
                 },
                 "required": ["command"]
@@ -78,67 +151,114 @@ impl Tool for ShellTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "schema": self.schema(),
+            "policy": self.policy.definition()?,
+        }))
+    }
+
+    fn dispatch_timeout(&self, args: &serde_json::Value) -> Option<Duration> {
+        // Let the shell's own timeout path terminate and reap the process group
+        // before the generic dispatcher cancels this future.
+        self.policy
+            .requested_timeout(args)
+            .ok()
+            .and_then(|timeout| timeout.checked_add(READER_DRAIN_GRACE + TERMINATION_GRACE))
+    }
+
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
         let command = args["command"]
             .as_str()
-            .ok_or_else(|| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: "Missing 'command' argument".into(),
-            })?;
+            .ok_or_else(|| shell_error("Missing 'command' argument"))?;
+        if command.is_empty() || command.len() > HARD_MAX_COMMAND_BYTES {
+            return Err(shell_error(format!(
+                "'command' must contain 1..={HARD_MAX_COMMAND_BYTES} bytes"
+            )));
+        }
+
+        let timeout = self.policy.requested_timeout(&args)?;
 
         // Cap each output stream independently (default 1 MB per stream).
-        let max_output: usize = std::env::var("IRONCREW_SHELL_MAX_OUTPUT_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024 * 1024);
+        let max_output = self.policy.max_output_bytes()?;
 
-        let mut child = Command::new("sh")
+        let mut command_builder = Command::new("sh");
+        command_builder
             .arg("-c")
             .arg(command)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command_builder.process_group(0);
+
+        let mut child = command_builder
             .spawn()
-            .map_err(|e| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: format!("Failed to spawn: {}", e),
-            })?;
+            .map_err(|e| shell_error(format!("Failed to spawn: {e}")))?;
+        let mut process_group = ProcessGroupGuard::new(child.id());
 
         let stdout_pipe = child
             .stdout
             .take()
-            .ok_or_else(|| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: "Failed to capture stdout".into(),
-            })?;
+            .ok_or_else(|| shell_error("Failed to capture stdout"))?;
         let stderr_pipe = child
             .stderr
             .take()
-            .ok_or_else(|| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: "Failed to capture stderr".into(),
-            })?;
+            .ok_or_else(|| shell_error("Failed to capture stderr"))?;
 
-        // Read both streams concurrently with independent byte caps.
-        let (stdout_result, stderr_result, status) = tokio::join!(
-            read_bounded(BufReader::new(stdout_pipe), max_output),
-            read_bounded(BufReader::new(stderr_pipe), max_output),
-            child.wait()
-        );
+        let mut stdout_task = tokio::spawn(read_bounded(BufReader::new(stdout_pipe), max_output));
+        let mut stderr_task = tokio::spawn(read_bounded(BufReader::new(stderr_pipe), max_output));
+
+        let wait = tokio::time::timeout(timeout, child.wait()).await;
+        let (status, timed_out) = match wait {
+            Ok(Ok(status)) => (Some(status), false),
+            Ok(Err(error)) => {
+                process_group.kill_and_disarm();
+                return Err(shell_error(format!("Failed to wait for process: {error}")));
+            }
+            Err(_) => {
+                process_group.terminate();
+                if tokio::time::timeout(TERMINATION_GRACE, child.wait())
+                    .await
+                    .is_err()
+                {
+                    process_group.kill_and_disarm();
+                    let _ = child.kill().await;
+                }
+                (None, true)
+            }
+        };
+
+        // Close descendant-held output descriptors before draining.
+        process_group.kill_and_disarm();
+
+        let reader_results = tokio::time::timeout(READER_DRAIN_GRACE, async {
+            let stdout = (&mut stdout_task).await;
+            let stderr = (&mut stderr_task).await;
+            (stdout, stderr)
+        })
+        .await;
+        let (stdout_result, stderr_result) = match reader_results {
+            Ok((stdout, stderr)) => (
+                stdout.map_err(|error| shell_error(format!("stdout reader failed: {error}")))?,
+                stderr.map_err(|error| shell_error(format!("stderr reader failed: {error}")))?,
+            ),
+            Err(_) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(shell_error(
+                    "Timed out while closing command output streams",
+                ));
+            }
+        };
 
         let (stdout_bytes, stdout_truncated) =
-            stdout_result.map_err(|e| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: format!("Failed to read stdout: {}", e),
-            })?;
+            stdout_result.map_err(|e| shell_error(format!("Failed to read stdout: {e}")))?;
         let (stderr_bytes, stderr_truncated) =
-            stderr_result.map_err(|e| IronCrewError::ToolExecution {
-                tool: "shell".into(),
-                message: format!("Failed to read stderr: {}", e),
-            })?;
-        let status = status.map_err(|e| IronCrewError::ToolExecution {
-            tool: "shell".into(),
-            message: format!("Failed to wait for process: {}", e),
-        })?;
+            stderr_result.map_err(|e| shell_error(format!("Failed to read stderr: {e}")))?;
 
         let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
         if stdout_truncated {
@@ -155,6 +275,17 @@ impl Tool for ShellTool {
             ));
         }
 
+        if timed_out {
+            return Err(shell_error(format!(
+                "Command timed out after {} seconds; stdout: {}; stderr: {}",
+                timeout.as_secs(),
+                stdout,
+                stderr
+            )));
+        }
+
+        let status = status.expect("non-timeout wait must produce a status");
+
         if status.success() {
             Ok(stdout)
         } else {
@@ -163,5 +294,97 @@ impl Tool for ShellTool {
                 status, stdout, stderr
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_must_be_positive_and_capped() {
+        let policy = ShellPolicy::capture();
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": 0}))
+                .is_err()
+        );
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": MAX_TIMEOUT_SECS + 1}))
+                .is_err()
+        );
+        assert!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": 1.5}))
+                .is_err()
+        );
+        assert_eq!(
+            policy
+                .requested_timeout(&json!({"timeout_secs": 2}))
+                .unwrap(),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_size_is_bounded_before_spawn() {
+        let error = ShellTool::new()
+            .execute(
+                json!({"command": "x".repeat(HARD_MAX_COMMAND_BYTES + 1)}),
+                &ToolCallContext::default(),
+            )
+            .await
+            .expect_err("oversized command must fail");
+        assert!(error.to_string().contains("65536"));
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_background_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("(sleep 2; echo leaked > '{marker}') & wait");
+
+        let error = ShellTool::new()
+            .execute(
+                json!({"command": command, "timeout_secs": 1}),
+                &ToolCallContext::default(),
+            )
+            .await
+            .expect_err("command must time out");
+        assert!(error.to_string().contains("timed out"));
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert!(
+            !dir.path().join("descendant-survived").exists(),
+            "background child survived process-group cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drop_terminates_background_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cancelled-child-survived");
+        let marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("(sleep 1; echo leaked > '{marker}') & wait");
+
+        let task = tokio::spawn(async move {
+            ShellTool::new()
+                .execute(
+                    json!({"command": command, "timeout_secs": 10}),
+                    &ToolCallContext::default(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !dir.path().join("cancelled-child-survived").exists(),
+            "background child survived future cancellation"
+        );
     }
 }

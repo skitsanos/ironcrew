@@ -10,17 +10,49 @@ use async_trait::async_trait;
 use crate::llm::provider::ToolSchema;
 use crate::mcp::client::McpClient;
 use crate::mcp::config::make_tool_name;
+use crate::mcp::execution_policy::McpCallPolicy;
 use crate::tools::{Tool, ToolCallContext};
 use crate::utils::error::{IronCrewError, Result};
 
 /// Default maximum tool result size (256 KB).
 const DEFAULT_MAX_RESULT_BYTES: usize = 262_144;
+const HARD_MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_CONTENT_ITEMS: usize = 256;
+const HARD_MAX_CONTENT_ITEMS: usize = 4_096;
+const DEFAULT_MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_SCHEMA_BYTES: usize = 64 * 1024;
+const HARD_MAX_DEFINITION_FIELD_BYTES: usize = 1024 * 1024;
 
-fn max_result_bytes() -> usize {
-    std::env::var("IRONCREW_MCP_TOOL_RESULT_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_RESULT_BYTES)
+fn bounded_env(name: &str, default: usize, hard_max: usize) -> Result<usize> {
+    let value = match std::env::var(name) {
+        Ok(raw) => raw.parse::<usize>().map_err(|_| IronCrewError::Mcp {
+            server: String::new(),
+            message: format!("{name} must be an integer from 1 to {hard_max}"),
+        })?,
+        Err(_) => default,
+    };
+    if !(1..=hard_max).contains(&value) {
+        return Err(IronCrewError::Mcp {
+            server: String::new(),
+            message: format!("{name} must be from 1 to {hard_max}"),
+        });
+    }
+    Ok(value)
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn append_bounded(output: &mut String, value: &str, cap: usize) {
+    if output.len() >= cap {
+        return;
+    }
+    output.push_str(utf8_prefix(value, cap - output.len()));
 }
 
 /// A tool registered in IronCrew's registry that proxies calls to an MCP server.
@@ -33,6 +65,10 @@ pub struct McpBridgeTool {
     schema: ToolSchema,
     client: Arc<McpClient>,
     server_label: String,
+    execution_identity_fingerprint: Option<String>,
+    call_policy: McpCallPolicy,
+    result_max_bytes: usize,
+    max_content_items: usize,
 }
 
 impl McpBridgeTool {
@@ -41,6 +77,7 @@ impl McpBridgeTool {
         server_label: &str,
         rmcp_tool: &rmcp::model::Tool,
         client: Arc<McpClient>,
+        execution_identity_fingerprint: Option<String>,
     ) -> Result<Self> {
         let server_tool_name = rmcp_tool.name.to_string();
 
@@ -55,15 +92,54 @@ impl McpBridgeTool {
             .as_deref()
             .unwrap_or("(no description)")
             .to_string();
+        let max_description = bounded_env(
+            "IRONCREW_MCP_MAX_TOOL_DESCRIPTION_BYTES",
+            DEFAULT_MAX_DESCRIPTION_BYTES,
+            HARD_MAX_DEFINITION_FIELD_BYTES,
+        )?;
+        if description.len() > max_description {
+            return Err(IronCrewError::Mcp {
+                server: server_label.to_string(),
+                message: format!("MCP tool description exceeds {max_description} bytes"),
+            });
+        }
 
         // Convert rmcp's input_schema (serde_json::Map) to our ToolSchema parameters
         let parameters = serde_json::Value::Object(rmcp_tool.input_schema.as_ref().clone());
+        let max_schema = bounded_env(
+            "IRONCREW_MCP_MAX_TOOL_SCHEMA_BYTES",
+            DEFAULT_MAX_SCHEMA_BYTES,
+            HARD_MAX_DEFINITION_FIELD_BYTES,
+        )?;
+        let schema_bytes = serde_json::to_vec(&parameters)
+            .map_err(|error| IronCrewError::Mcp {
+                server: server_label.to_string(),
+                message: format!("Failed to encode MCP tool schema: {error}"),
+            })?
+            .len();
+        if schema_bytes > max_schema {
+            return Err(IronCrewError::Mcp {
+                server: server_label.to_string(),
+                message: format!("MCP tool schema exceeds {max_schema} bytes"),
+            });
+        }
 
         let schema = ToolSchema {
             name: ironcrew_name.clone(),
             description: description.clone(),
             parameters,
         };
+        let result_max_bytes = bounded_env(
+            "IRONCREW_MCP_TOOL_RESULT_MAX_BYTES",
+            DEFAULT_MAX_RESULT_BYTES,
+            HARD_MAX_RESULT_BYTES,
+        )?;
+        let max_content_items = bounded_env(
+            "IRONCREW_MCP_MAX_CONTENT_ITEMS",
+            DEFAULT_MAX_CONTENT_ITEMS,
+            HARD_MAX_CONTENT_ITEMS,
+        )?;
+        let call_policy = client.call_policy();
 
         Ok(Self {
             ironcrew_name,
@@ -72,6 +148,10 @@ impl McpBridgeTool {
             schema,
             client,
             server_label: server_label.to_string(),
+            execution_identity_fingerprint,
+            call_policy,
+            result_max_bytes,
+            max_content_items,
         })
     }
 }
@@ -88,6 +168,27 @@ impl Tool for McpBridgeTool {
 
     fn schema(&self) -> ToolSchema {
         self.schema.clone()
+    }
+
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        let identity = self
+            .execution_identity_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                IronCrewError::Validation(format!(
+                    "Persistent conversation tool '{}' requires a non-secret execution_identity for MCP server '{}'",
+                    self.ironcrew_name, self.server_label
+                ))
+            })?;
+        Ok(serde_json::json!({
+            "schema": self.schema,
+            "server_label": self.server_label,
+            "server_tool_name": self.server_tool_name,
+            "execution_identity_fingerprint": identity,
+            "call_policy": self.call_policy.definition(),
+            "result_max_bytes": self.result_max_bytes,
+            "max_content_items": self.max_content_items,
+        }))
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
@@ -107,52 +208,59 @@ impl Tool for McpBridgeTool {
                 }
             })?;
 
-        // Collect text from all Content::Text items
-        let mut parts: Vec<String> = Vec::new();
+        let cap = self.result_max_bytes;
+        let max_items = self.max_content_items;
+        if result.content.len() > max_items {
+            return Err(IronCrewError::Mcp {
+                server: self.server_label.clone(),
+                message: format!(
+                    "MCP tool returned {} content items; limit is {max_items}",
+                    result.content.len()
+                ),
+            });
+        }
+
+        let mut output = String::with_capacity(cap.min(8 * 1024));
+        let mut total_bytes = 0usize;
+        let mut first = true;
         let is_error = result.is_error.unwrap_or(false);
 
         for content in &result.content {
             // rmcp v2 flattened the `Content { raw: RawContent }` wrapper into
             // a `ContentBlock` enum matched directly.
-            match content {
-                rmcp::model::ContentBlock::Text(t) => {
-                    parts.push(t.text.clone());
-                }
-                rmcp::model::ContentBlock::Image(_) => {
-                    parts.push("[image content omitted]".to_string());
-                }
+            let text = match content {
+                rmcp::model::ContentBlock::Text(t) => t.text.as_str(),
+                rmcp::model::ContentBlock::Image(_) => "[image content omitted]",
                 rmcp::model::ContentBlock::Resource(r) => {
                     // Extract embedded text resources
                     if let rmcp::model::ResourceContents::TextResourceContents { text, .. } =
                         &r.resource
                     {
-                        parts.push(text.clone());
+                        text.as_str()
+                    } else {
+                        "[binary resource omitted]"
                     }
                 }
-                rmcp::model::ContentBlock::Audio(_) => {
-                    parts.push("[audio content omitted]".to_string());
-                }
-                rmcp::model::ContentBlock::ResourceLink(_) => {
-                    parts.push("[resource link omitted]".to_string());
-                }
+                rmcp::model::ContentBlock::Audio(_) => "[audio content omitted]",
+                rmcp::model::ContentBlock::ResourceLink(_) => "[resource link omitted]",
                 // ContentBlock is #[non_exhaustive] in rmcp v2 — tolerate any
                 // future content type rather than dropping the tool result.
-                _ => {
-                    parts.push("[unsupported content omitted]".to_string());
-                }
+                _ => "[unsupported content omitted]",
+            };
+            if !first {
+                total_bytes = total_bytes.saturating_add(1);
+                append_bounded(&mut output, "\n", cap);
             }
+            first = false;
+            total_bytes = total_bytes.saturating_add(text.len());
+            append_bounded(&mut output, text, cap);
         }
 
-        let mut output = parts.join("\n");
-
-        // Apply byte cap
-        let cap = max_result_bytes();
-        let byte_len = output.len();
-        if byte_len > cap {
-            // Truncate at a character boundary
-            let mut truncated = output[..cap].to_string();
-            truncated.push_str(&format!("\n[truncated: {} bytes omitted]", byte_len - cap));
-            output = truncated;
+        if total_bytes > cap {
+            let marker = format!("\n[truncated: result exceeded {cap}-byte limit]");
+            let content_cap = cap.saturating_sub(marker.len());
+            output.truncate(utf8_prefix(&output, content_cap).len());
+            append_bounded(&mut output, &marker, cap);
         }
 
         if is_error {
@@ -163,5 +271,26 @@ impl Tool for McpBridgeTool {
         } else {
             Ok(output)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_prefix_never_splits_multibyte_character() {
+        let value = "a🙂b";
+        assert_eq!(utf8_prefix(value, 1), "a");
+        assert_eq!(utf8_prefix(value, 2), "a");
+        assert_eq!(utf8_prefix(value, 5), "a🙂");
+    }
+
+    #[test]
+    fn bounded_append_is_utf8_safe_and_never_exceeds_cap() {
+        let mut output = String::new();
+        append_bounded(&mut output, "🙂🙂", 5);
+        assert_eq!(output, "🙂");
+        assert!(output.len() <= 5);
     }
 }

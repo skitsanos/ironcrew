@@ -1,0 +1,6 @@
+reports/*.json
+reports/*.log
+!reports/.gitignore
+!reports/2026-07-19-local-postgres15-150s.json
+!reports/2026-07-19-local-postgres15-150s.md
+__pycache__/
