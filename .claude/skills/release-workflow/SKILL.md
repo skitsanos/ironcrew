@@ -14,13 +14,33 @@ force-push, rewrite published history, or delete a remote tag.
 - `develop` is the integration branch.
 - `main` is the release branch.
 - The flow is `develop` to a reviewed `main` PR, then an annotated tag on the
-  verified `main` commit. Tags use the stable `vX.Y.Z` form. The tag-triggered
-  workflow checks annotation type, manifest version, and reachability from
-  `main`.
+  verified `main` commit. Tags use the stable `vX.Y.Z` form. A versioned
+  `repository_dispatch` selects the release workflow from default-branch
+  `main`; the workflow separately checks direct annotation-to-commit type,
+  manifest version, and reachability from `main`.
 
-The checked-in guard is defense in depth because GitHub evaluates push
-workflows from the pushed ref. Require protected `v*` tag rules and a protected
-release environment before treating publication as platform-enforced.
+Default-branch dispatch selection and the checked-in guard are defense in depth,
+not the complete platform boundary. Require reviewed default-branch controls
+and a protected `release` environment before treating publication as
+platform-enforced.
+
+The current repository has no ruleset, environment, or `main` protection, and
+its only direct collaborator is the owner. Do not dispatch either workflow
+until an independent environment reviewer exists, self-approval and bypass are
+disabled, Docker credentials have moved from repository secrets into the
+`release` environment, protected `v*` tag rules cover update/deletion and
+creation
+without administrator bypass, immutable releases are enabled, and the
+non-secret controls have been revalidated. Repository dispatch requires
+Contents write, so use a dedicated constrained release authority or lower-
+authority request channel backed by trusted platform actor/event policy; sender
+equality is not an operator allowlist.
+
+Default-branch dispatch does not stop an off-main commit from introducing a
+different tag-push workflow. Require GitHub workflow-execution protections or
+an equivalent platform boundary for untrusted actors/events. Coordinate that
+policy with CI because `ci.yml` still intentionally uses push events on `main`
+and `develop`.
 
 ## Prepare
 
@@ -49,22 +69,64 @@ After approval:
 4. Fast-forward local `main`, create an annotated `vX.Y.Z` on the verified
    release commit, prove it is reachable from `main`, and prove its manifest
    version matches.
-5. Show the evidence and ask before pushing the tag. Monitor release CI. A
-   release created with `GITHUB_TOKEN` does not cascade into a release-event
-   workflow. The tag workflow must create the release once and publish its
-   signed multi-platform OCI archive and strict image receipt without updating
-   existing release assets. Image publication requires a separate, explicitly
-   authorized manual dispatch of `docker-publish.yml` from `main` with the
-   exact tag and latest-reconciliation boolean; it verifies and promotes those
-   tag-owned assets instead of rebuilding source. Before dispatch, require the
-   exact Docker Hub stable-semver immutability rule and IC-015's recorded
-   non-production replay/conflict/concurrent-`latest` acceptance. While IC-015
-   remains in progress, stop before dispatch and keep Docker publication
-   deferred. After authorization, monitor the version digest and final
-   `latest` digest against GitHub's current stable release. Publish crates only
-   with separate authorization too.
+5. Show the evidence and ask before pushing the tag. Pushing the tag does not
+   publish a release. Once the remote controls above exist, separately ask to
+   exercise the protected environment without publication. Replace the tag in
+   this exact request with the pushed stable tag:
+
+   ```bash
+   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
+   {"event_type":"ironcrew_release_v1","client_payload":{"tag":"vX.Y.Z","mode":"validate"}}
+   JSON
+   ```
+
+   Invoke this only through the constrained release authority described above.
+   Confirm independent approval and a successful read-only run with no OIDC,
+   release, Docker-secret, or registry operation. Capture a separately designed
+   denied adversarial canary; `repository_dispatch` always selects the default-
+   branch workflow and cannot be pointed at an off-main ref.
+6. Only after those canaries and separate explicit publication approval, use:
+
+   ```bash
+   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
+   {"event_type":"ironcrew_release_v1","client_payload":{"tag":"vX.Y.Z","mode":"publish"}}
+   JSON
+   ```
+
+   A release created with the workflow's `GITHUB_TOKEN` does not cascade into
+   another release-event workflow; image promotion remains separate.
+   Monitor `release.yml`. Its read-only image job must build the signed multi-
+   platform OCI archive and strict receipt from the exact tag commit. The final
+   protected job must verify those immutable artifacts, sign them, and create
+   the release once without updating existing release assets.
+7. Image promotion through `.github/workflows/docker-publish.yml` requires
+   separate authorization. After the protected environment exists, its non-
+   publishing path can be checked with:
+
+   ```bash
+   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
+   {"event_type":"ironcrew_docker_publish_v1","client_payload":{"tag":"vX.Y.Z","mode":"validate"}}
+   JSON
+   ```
+
+   Before actual promotion, require the exact Docker Hub stable-semver
+   immutability rule and IC-015's recorded non-production replay/conflict/
+   concurrent-`latest` acceptance. While IC-015 remains in progress, keep
+   Docker publication deferred. Once it is resolved and the user separately
+   authorizes production promotion, use:
+
+   ```bash
+   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
+   {"event_type":"ironcrew_docker_publish_v1","client_payload":{"tag":"vX.Y.Z","mode":"publish"}}
+   JSON
+   ```
+
+   It verifies and promotes tag-owned assets instead of rebuilding source.
+   Monitor the version digest and final `latest` digest against GitHub's current
+   stable release. Publish crates only with separate authorization too.
    Do not backfill a legacy release that lacks the signed OCI archive and
-   receipt; promotion begins with the first release produced by this workflow.
+   receipt; promotion begins with the first release produced by the trusted
+   default-branch workflow.
 
 If an unpushed local step is wrong, make a corrective edit or ask for direction.
 After a push, prefer a forward fix. Do not use destructive reset or broad

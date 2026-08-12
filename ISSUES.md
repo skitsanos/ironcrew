@@ -8,7 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-014](docs/issues/IC-014.md) | P1 | Open | Release security | Release publication lacks a platform-enforced trusted control plane |
+| [IC-014](docs/issues/IC-014.md) | P1 | In progress | Release security | Release publication lacks a platform-enforced trusted control plane |
 | [IC-015](docs/issues/IC-015.md) | P1 | In progress | Release automation | Release automation admitted ambiguous tags and non-cascading Docker triggers |
 
 ## Working agreement

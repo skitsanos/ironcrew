@@ -195,7 +195,7 @@ class CommandBackend:
         check_checksum(receipt, directory / f"{receipt_name}.sha256", PromotionError)
         identity = (
             f"https://github.com/{self.repository}/.github/workflows/"
-            f"release.yml@refs/tags/{tag}"
+            "release.yml@refs/heads/main"
         )
         for artifact in (archive, receipt):
             self._run([

@@ -317,6 +317,64 @@ created outside the trusted workflow, or observed before its complete signed
 asset set exists, fails closed; preventing that authority-level event remains
 IC-014's platform boundary.
 
+## Trusted release-control checkpoint — 2026-08-12
+
+The in-progress IC-014 source checkpoint replaces release tag-push and
+branch-selectable manual triggers with versioned `repository_dispatch` events.
+GitHub selects these workflows from the default branch. The request validator
+accepts an exact stable tag and `validate` or `publish` mode, rejects extra or
+ambiguous payload fields, and binds the event to the repository and triggering
+actor. Release selection separately requires a direct annotated tag-to-commit
+reference, matching manifest version, `main` ancestry, and the same resolved
+commit before final publication. The trusted workflow identity is
+`release.yml@refs/heads/main`, while the strict image receipt retains the exact
+tag and commit source binding.
+
+Both release and Docker workflows now have a non-publishing `validate` path
+through an environment named `release`. That path has contents-read permission
+and no release, OIDC-signing, Docker-secret, or registry operation. Image build,
+receipt, and SBOM packaging remain in a contents-read job. The final protected
+release job only independently verifies the expected artifacts, signs them,
+and creates the release once; only the Docker promotion job references Docker
+credentials. These are local workflow and policy-test properties, not proof of
+remote enforcement.
+
+Read-only GitHub API checks on 2026-08-12 found zero repository rulesets, zero
+environments, and no `main` protection object (`404`). The sole direct
+collaborator was owner `skitsanos` with administrator access, so no independent
+release reviewer currently exists. Actions allowed all actions, did not require
+full-SHA pinning, used read as the default workflow permission, and did not
+allow workflows to approve pull-request reviews. `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` remained repository-scoped Actions secrets. Immutable GitHub
+releases were disabled (`enabled: false`, `enforced_by_owner: false`). The new
+preview workflow-execution-policy control was not available as authoritative
+stable-API evidence and its state remains unverified.
+
+Default-branch dispatch selection does not prevent a tag-capable actor from
+placing a separate tag-push workflow in an off-main commit. GitHub's preview
+workflow-execution protections can constrain actors and events before workflow
+execution, but no live policy was verified. Existing CI also uses push events
+on `main` and `develop`, so a blanket push denial would require an agreed CI
+trigger change. Repository dispatch is not itself least privilege: GitHub
+requires Contents write to create it, and sender/actor equality is only a
+consistency check. Closure needs a constrained release App/authority or a lower-
+authority request channel backed by trusted platform controls.
+
+There is also a tag time-of-check/time-of-use boundary: final tag revalidation
+and `gh release create --verify-tag` are not atomic. Active `v*` rules must
+restrict creation and prevent update/deletion without administrator bypass, and
+immutable GitHub releases must be enabled, before the exact tag can be treated
+as stable through publication.
+
+No remote control, collaborator, secret scope, tag, run, release, image, or
+registry state was changed. No denied adversarial canary or successful
+protected-main validation run was attempted. IC-014 remains in progress until
+reviewed default-branch and workflow-execution controls, protected environment,
+immutable tag/release controls, and constrained request authority exist; an
+independent approver and bypass policy are documented; secrets are moved into
+that environment; and both required remote canaries are captured. Release and
+Docker publication remain prohibited in the meantime.
+
 ## Current evidence boundaries
 
 The following remain explicitly unproven, incomplete, or unsupported. Tracked
@@ -336,7 +394,10 @@ gaps retain their issue-registry owners:
   generality beyond IC-009's bounded local GPT-5.6 Luna result;
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
-- a platform-enforced trusted release control plane; and
+- a platform-enforced trusted release control plane; IC-014's local default-
+  branch dispatch and validation paths are implemented, but the remote
+  environment, independent reviewer, rulesets, canaries, and secret scoping are
+  absent; and
 - Docker Hub enforcement and non-production registry acceptance for IC-015's
   locally implemented release-bound promotion protocol. The 2026-08-12 public
   API snapshot found immutable tags disabled and `latest` behind GitHub's
