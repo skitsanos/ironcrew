@@ -71,16 +71,43 @@ pub(super) async fn start_keyed(
     body
 }
 
+async fn peer_readiness_is_healthy(pair: &ProcessPair, context: &str) -> bool {
+    let response = pair
+        .client
+        .get(format!("{}/health/ready", pair.survivor_b.base_url))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("query IC-020 peer readiness during {context}: {error}"));
+    if response.status() == StatusCode::OK {
+        return true;
+    }
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unexpected IC-020 peer readiness status during {context}"
+    );
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("parse IC-020 peer maintenance readiness");
+    assert_eq!(
+        body["status"], "not_ready",
+        "unexpected IC-020 peer readiness body during {context}"
+    );
+    assert_eq!(
+        body["component"], "storage_maintenance",
+        "unexpected IC-020 peer readiness component during {context}"
+    );
+    false
+}
+
 pub(super) async fn wait_draining(pair: &ProcessPair, peer_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let peer = pair
-            .client
-            .get(format!("{}/health/ready", pair.survivor_b.base_url))
-            .send()
-            .await
-            .expect("query IC-020 peer readiness during explicit drain");
-        assert_eq!(peer.status(), StatusCode::OK);
+        // The global run-fence deliberately contends with the peer's bounded
+        // maintenance cycle. Its exact storage-maintenance 503 is truthful;
+        // require recovery before declaring the owner fully drained.
+        let peer_ready = peer_readiness_is_healthy(pair, "explicit drain").await;
         let response = pair
             .client
             .get(format!("{}/health/ready", pair.owner_a.base_url))
@@ -92,7 +119,10 @@ pub(super) async fn wait_draining(pair: &ProcessPair, peer_id: &str) {
                 .json()
                 .await
                 .expect("parse IC-020 draining readiness");
-            if body["component"] == "lifecycle" && body["lifecycle_state"] == "draining" {
+            if peer_ready
+                && body["component"] == "lifecycle"
+                && body["lifecycle_state"] == "draining"
+            {
                 assert_eq!(body["status"], "not_ready");
                 let (receiver, capability) = capabilities(pair, &pair.owner_a.base_url).await;
                 assert_eq!(receiver, pair.owner_a_id);
@@ -112,13 +142,9 @@ pub(super) async fn wait_draining(pair: &ProcessPair, peer_id: &str) {
 pub(super) async fn wait_fencing(pair: &ProcessPair, peer_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let peer = pair
-            .client
-            .get(format!("{}/health/ready", pair.survivor_b.base_url))
-            .send()
-            .await
-            .expect("query IC-020 peer while owner fencing");
-        assert_eq!(peer.status(), StatusCode::OK);
+        // Do not require recovery while the test itself still owns the global
+        // advisory lock; only the exact bounded-maintenance response is valid.
+        let _peer_ready = peer_readiness_is_healthy(pair, "owner fencing").await;
         let owner = pair
             .client
             .get(format!("{}/health/ready", pair.owner_a.base_url))
