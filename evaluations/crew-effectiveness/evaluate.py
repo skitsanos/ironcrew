@@ -36,6 +36,7 @@ from live_provider_environment import live_provider_environment, redaction_canar
 from mock_openai import ContractServer, create_server
 from pairwise_analysis import pairwise_comparisons, summarize_runs
 from pricing_budget import require_approved_budget
+from report_schema_validation import validate_report
 from source_provenance import (
     require_unchanged_provenance,
     safe_binary_path,
@@ -744,35 +745,15 @@ def validate_report_with_ironcrew(
     report_path: Path,
     environment: dict[str, str],
 ) -> str | None:
-    payload = {
-        "schema": schema_path.read_text(encoding="utf-8"),
-        "report": report_path.read_text(encoding="utf-8"),
-    }
-    try:
-        with tempfile.TemporaryDirectory(prefix="ironcrew-eval-schema-") as temporary:
-            isolated_validator = Path(temporary) / "validate-report.lua"
-            shutil.copy2(validator_path, isolated_validator)
-            completed = subprocess.run(
-                [
-                    str(binary),
-                    "run",
-                    str(isolated_validator),
-                    "--input",
-                    json.dumps(payload, separators=(",", ":")),
-                ],
-                cwd=isolated_validator.parent,
-                env=schema_validation_environment(environment),
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-    except (OSError, subprocess.SubprocessError) as error:
-        return f"could not execute report schema validator: {error}"
-    if completed.returncode != 0:
-        detail = redact_error(completed.stderr, environment)
-        return detail or f"report schema validator exited with status {completed.returncode}"
-    return None
+    return validate_report(
+        binary=binary,
+        repo_root=repo_root,
+        validator_path=validator_path,
+        schema_path=schema_path,
+        report_path=report_path,
+        environment=schema_validation_environment(environment),
+        redact_error=lambda detail: redact_error(detail, environment),
+    )
 
 
 def build_parser(base_dir: Path, repo_root: Path) -> argparse.ArgumentParser:
