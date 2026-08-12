@@ -1,0 +1,55 @@
+{
+  "schema_version": "ironcrew.replica-soak-contract.v1",
+  "observation_interval_seconds": 30,
+  "tail_intervals": 20,
+  "journal": {
+    "max_events_per_run": 200,
+    "max_bytes_per_run": 4194304,
+    "max_event_bytes": 262144,
+    "retention_seconds": 600,
+    "max_total_events": 100000,
+    "max_total_bytes": 268435456,
+    "page_max_events": 64,
+    "page_max_bytes": 524288,
+    "poll_interval_ms": 500,
+    "read_timeout_ms": 2000,
+    "write_timeout_ms": 1500,
+    "prune_batch": 128
+  },
+  "ceilings": {
+    "retained_rows": 8192,
+    "retained_bytes": 8388608,
+    "expired_physical_rows": 128,
+    "post_prune_growth_rows": 512,
+    "post_prune_growth_bytes": 1048576,
+    "readiness_failures": 0,
+    "liveness_failures": 0,
+    "rss_peak_bytes_per_replica": 134217728,
+    "tail_rss_growth_bytes_per_replica": 16777216,
+    "tail_run_events_relation_growth_bytes": 8388608,
+    "prefix_relation_bytes": 67108864,
+    "prefix_relation_bytes_per_success": 32768,
+    "wal_bytes": 268435456,
+    "wal_bytes_per_success": 65536,
+    "tail_latency_ms": {
+      "answer_peer": {"p95": 250, "p99": 500, "max": 1000},
+      "health_liveness_probe": {"p95": 250, "p99": 500, "max": 1000},
+      "health_readiness_probe": {"p95": 500, "p99": 1000, "max": 2000},
+      "questions_poll": {"p95": 250, "p99": 500, "max": 1000},
+      "run_read_peer": {"p95": 250, "p99": 500, "max": 1000},
+      "run_start": {"p95": 250, "p99": 500, "max": 1000},
+      "sse_initial": {"p95": 1000, "p99": 2000, "max": 4000},
+      "sse_reconnect": {"p95": 1500, "p99": 3000, "max": 6000}
+    }
+  },
+  "requirements": {
+    "minimum_intervals": 60,
+    "minimum_post_boundary_intervals": 10,
+    "minimum_prune_intervals": 1,
+    "minimum_journal_gap_events": 1,
+    "allowed_journal_gap_reasons": ["retention"],
+    "require_cursor_expired": true,
+    "minimum_workload_seconds": 1800,
+    "require_duration_stop": true
+  }
+}

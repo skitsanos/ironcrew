@@ -90,7 +90,7 @@ curl -sX DELETE http://127.0.0.1:3000/flows/chat-http/conversations/demo \
 | Variable                                 | Default | Purpose                                         |
 | ---------------------------------------- | ------- | ----------------------------------------------- |
 | `OPENAI_API_KEY`                         | —       | OpenAI credential used by the coordinator and sub-crew |
-| `OPENAI_MODEL`                           | `gpt-4.1-mini` | Model used by both flows when allowlisted       |
+| `OPENAI_MODEL`                           | `gpt-5.6-luna` | Model used by both flows when allowlisted       |
 | `IRONCREW_ENV_ALLOWLIST`                 | —       | Include `OPENAI_MODEL` to expose that override to sandboxed Lua |
 | `IRONCREW_API_TOKEN`                     | —       | Bearer token required for the protected routes  |
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS`      | 8       | Simultaneous in-memory session cap              |

@@ -260,6 +260,8 @@ class PairwiseTests(unittest.TestCase):
             mode="live",
             timeout_seconds=1,
             planned_llm_calls=1,
+            task_llm_calls={"final": 1},
+            task_maximum_output_tokens={"final": 800},
             base_environment={},
             mock_server=None,
         )
@@ -297,6 +299,8 @@ class PairwiseTests(unittest.TestCase):
                     mode="live",
                     timeout_seconds=1,
                     planned_llm_calls=1,
+                    task_llm_calls={"final": 1},
+                    task_maximum_output_tokens={"final": 800},
                     base_environment={},
                     mock_server=None,
                 )
@@ -336,6 +340,56 @@ class PairwiseTests(unittest.TestCase):
         self.assertFalse(summaries["single"]["tokens"]["coverage_complete"])
         self.assertFalse(summaries["single"]["latency_ms"]["coverage_complete"])
         self.assertEqual(summaries["dag"]["tokens"]["total"], 20)
+
+
+class ExecutionBoundaryTests(unittest.TestCase):
+    def test_schema_validation_environment_excludes_provider_credentials(self) -> None:
+        minimized = evaluate.schema_validation_environment(
+            {
+                "PATH": "/bin",
+                "SSL_CERT_FILE": "/tmp/cert.pem",
+                "TMPDIR": "/tmp",
+                "IRONCREW_LOG": "error",
+                "OPENAI_API_KEY": "secret-canary",
+                "OPENAI_BASE_URL": "https://api.openai.com/v1",
+                "OPENAI_MODEL": "gpt-5.6-luna",
+                "IRONCREW_PROVIDER_MAX_REQUEST_BYTES": "18000",
+            }
+        )
+        self.assertEqual(
+            minimized,
+            {
+                "PATH": "/bin",
+                "SSL_CERT_FILE": "/tmp/cert.pem",
+                "TMPDIR": "/tmp",
+                "IRONCREW_LOG": "error",
+            },
+        )
+
+    def test_live_controls_force_reviewed_byte_and_pacing_boundaries(self) -> None:
+        environment: dict[str, str] = {}
+        plan = {
+            "limits": {"max_provider_request_body_bytes": 18_000},
+            "rate_limit": {"minimum_provider_start_interval_ms": 3_200},
+        }
+        evaluate.apply_live_provider_controls(environment, plan)
+        self.assertEqual(environment["IRONCREW_PROVIDER_MAX_REQUEST_BYTES"], "18000")
+        self.assertEqual(environment["IRONCREW_RATE_LIMIT_MS"], "3200")
+
+    def test_live_process_pacer_waits_after_success_or_failure_completion(self) -> None:
+        now = [10.0]
+        sleeps: list[float] = []
+        pacer = evaluate.LiveProcessPacer(
+            3_200,
+            clock=lambda: now[0],
+            sleeper=lambda delay: sleeps.append(delay),
+        )
+        pacer.wait_before_start()
+        pacer.record_completion()
+        now[0] = 11.0
+        pacer.wait_before_start()
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 2.2)
 
 
 if __name__ == "__main__":

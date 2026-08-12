@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "exception_budget": 49,
+  "exceptions": [
+    {
+      "path": "src/api/admission.rs",
+      "max_lines": 719,
+      "rationale": "IC-011 baseline: request-class token buckets, principal quotas, admission metrics, and enforcement middleware share one policy boundary; split metrics or configuration before adding another admission class."
+    },
+    {
+      "path": "src/api/audit.rs",
+      "max_lines": 409,
+      "rationale": "IC-011 baseline: HTTP audit identity extraction, bounded metadata normalization, persistence, and their inline security tests form the current audit boundary; extract tests before adding another metadata source."
+    },
+    {
+      "path": "src/api/auth.rs",
+      "max_lines": 556,
+      "rationale": "IC-011 baseline: bearer-token map parsing, validation, constant-time credential matching, principal construction, and middleware are co-located; separate configuration parsing before adding another authentication mode."
+    },
+    {
+      "path": "src/api/conversations.rs",
+      "max_lines": 2312,
+      "rationale": "IC-011 baseline after SSE extraction: conversation start, keyed turns, durable cold rehydration, history, deletion, and lifecycle fencing remain coupled; split idempotency or lifecycle handlers before extending the API."
+    },
+    {
+      "path": "src/api/handlers.rs",
+      "max_lines": 3756,
+      "rationale": "IC-011 baseline: run HTTP handlers currently combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints."
+    },
+    {
+      "path": "src/api/idempotency.rs",
+      "max_lines": 1224,
+      "rationale": "IC-011 baseline: request-key validation, lease heartbeat, owner fencing, cancellation observation, quotas, and recovery responses share the API idempotency boundary; extract heartbeat coordination before new lease behavior."
+    },
+    {
+      "path": "src/cli/commands.rs",
+      "max_lines": 806,
+      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command."
+    },
+    {
+      "path": "src/cli/graph_extract.rs",
+      "max_lines": 682,
+      "rationale": "IC-011 baseline: isolated Lua graph capture, stub-global registration, task normalization, and agent resolution form one extraction pipeline; split capture stubs from graph normalization before expanding either side."
+    },
+    {
+      "path": "src/cli/server.rs",
+      "max_lines": 487,
+      "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy."
+    },
+    {
+      "path": "src/engine/collaborative.rs",
+      "max_lines": 302,
+      "rationale": "IC-011 ratchet after extracting focused tests and usage accounting: bounded collaborative transcript construction and the participant-turn execution loop remain one responsibility; extract prompt construction before adding another collaboration strategy."
+    },
+    {
+      "path": "src/engine/crew.rs",
+      "max_lines": 343,
+      "rationale": "IC-011 baseline: crew and provider configuration models share bounded validation of agents, tasks, tools, goals, and model settings; split provider validation before extending the crew schema."
+    },
+    {
+      "path": "src/engine/eventbus.rs",
+      "max_lines": 1763,
+      "rationale": "IC-011 baseline: event definitions, bounded in-memory replay, live broadcast, durable batching, sequence allocation, flush barriers, and metrics remain coupled; extract the durable writer before new journal behavior."
+    },
+    {
+      "path": "src/engine/executor.rs",
+      "max_lines": 484,
+      "rationale": "IC-011 post-extraction baseline: bounded prompt assembly, task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract prompt construction or provider-round handling before adding another responsibility."
+    },
+    {
+      "path": "src/engine/foreach.rs",
+      "max_lines": 679,
+      "rationale": "IC-011 baseline: bounded item serialization, template substitution, child-task construction, and foreach execution share resource-limit invariants; extract bounded encoding before adding expansion formats."
+    },
+    {
+      "path": "src/engine/human_input.rs",
+      "max_lines": 1213,
+      "rationale": "IC-011 baseline: HITL domain states, validation, shared-key encryption, keyring rotation, durable question and answer encoding, and tests share one security boundary; split cryptography before new mailbox behavior."
+    },
+    {
+      "path": "src/engine/idempotency.rs",
+      "max_lines": 668,
+      "rationale": "IC-011 baseline: idempotency principals, limits, states, records, claims, completions, run fencing signals, and validation define one storage-neutral protocol; split validation before adding protocol states."
+    },
+    {
+      "path": "src/engine/input_bridge.rs",
+      "max_lines": 1811,
+      "rationale": "IC-011 baseline: local and durable HITL registration, bounded pending-question accounting, wait and answer delivery, cancellation, and cleanup remain coordinated here; separate durable mailbox adaptation before new input modes."
+    },
+    {
+      "path": "src/engine/memory.rs",
+      "max_lines": 668,
+      "rationale": "IC-011 baseline: bounded ephemeral and JSON-backed memory items share TTL and revision semantics, context selection, eviction, atomic persistence, and statistics; extract filesystem persistence before adding another backend."
+    },
+    {
+      "path": "src/engine/messagebus.rs",
+      "max_lines": 317,
+      "rationale": "IC-011 baseline: bounded asynchronous topic publication, subscription delivery, and cleanup form one small message-bus lifecycle with inline tests; extract tests before adding delivery semantics."
+    },
+    {
+      "path": "src/engine/orchestrator.rs",
+      "max_lines": 1058,
+      "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode."
+    },
+    {
+      "path": "src/engine/postgres_store.rs",
+      "max_lines": 8892,
+      "rationale": "IC-011 priority debt: one SQLx implementation still contains schema migration and repositories for runs, idempotency, leases, HITL, journals, conversations, and audit; extract table-focused repositories before extending storage."
+    },
+    {
+      "path": "src/engine/run_events.rs",
+      "max_lines": 1304,
+      "rationale": "IC-011 baseline: durable run-event models, cursor parsing, bounded paging, retention gaps, terminal fallback, and store-facing journal rules share one replay contract; split cursor and paging logic before new event semantics."
+    },
+    {
+      "path": "src/engine/run_history.rs",
+      "max_lines": 2608,
+      "rationale": "IC-011 priority debt: the JSON-file StateStore combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family."
+    },
+    {
+      "path": "src/engine/sqlite_store.rs",
+      "max_lines": 3840,
+      "rationale": "IC-011 priority debt: the SQLite StateStore combines migrations and repositories for runs, idempotency, conversations, HITL, journals, audit, and leases; extract table-focused repositories before extending storage."
+    },
+    {
+      "path": "src/engine/store.rs",
+      "max_lines": 777,
+      "rationale": "IC-011 baseline: the StateStore contract owns lease and instance configuration, backend capability defaults, all durable protocol methods, and backend construction; extract lease and factory code before adding another store capability."
+    },
+    {
+      "path": "src/engine/task.rs",
+      "max_lines": 374,
+      "rationale": "IC-011 baseline: task configuration, execution modes, dependency and retry fields, output state, and bounded validation form one domain model; extract validation or tests before expanding the task schema."
+    },
+    {
+      "path": "src/engine/task_runner.rs",
+      "max_lines": 336,
+      "rationale": "IC-011 baseline: task attempt execution, retry and timeout handling, cancellation, tool-finalization, and result construction share one lifecycle; split attempt policy before adding another completion phase."
+    },
+    {
+      "path": "src/llm/anthropic.rs",
+      "max_lines": 978,
+      "rationale": "IC-011 baseline: Anthropic request construction, image and tool translation, streaming and non-stream response parsing, error handling, and tests share one provider adapter; split response decoding before new API features."
+    },
+    {
+      "path": "src/llm/metrics.rs",
+      "max_lines": 410,
+      "rationale": "IC-011 baseline: the provider wrapper owns call counters, latency and token snapshots, cancellation-safe guards, stream observation, and inline tests; extract tests before adding another metric family."
+    },
+    {
+      "path": "src/llm/openai.rs",
+      "max_lines": 649,
+      "rationale": "IC-011 baseline: OpenAI Chat Completions request building, rate limiting, streaming assembly, tool-call normalization, and provider dispatch share one adapter; split stream decoding before adding response modes."
+    },
+    {
+      "path": "src/llm/openai_responses.rs",
+      "max_lines": 868,
+      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, rate limiting, item-state decoding, and provider dispatch share one adapter; extract response parsing before adding server tools."
+    },
+    {
+      "path": "src/llm/provider.rs",
+      "max_lines": 748,
+      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol."
+    },
+    {
+      "path": "src/lua/agent_turn.rs",
+      "max_lines": 644,
+      "rationale": "IC-011 baseline: active-turn cleanup, provider interaction, bounded tool-call rounds, approval, timeout, and transcript updates form one Lua agent-turn lifecycle; extract tool dispatch before adding turn phases."
+    },
+    {
+      "path": "src/lua/api.rs",
+      "max_lines": 783,
+      "rationale": "IC-011 baseline: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields."
+    },
+    {
+      "path": "src/lua/conversation.rs",
+      "max_lines": 964,
+      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features."
+    },
+    {
+      "path": "src/lua/crew_userdata.rs",
+      "max_lines": 1049,
+      "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods."
+    },
+    {
+      "path": "src/lua/dialog.rs",
+      "max_lines": 1626,
+      "rationale": "IC-011 baseline: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes."
+    },
+    {
+      "path": "src/lua/json.rs",
+      "max_lines": 473,
+      "rationale": "IC-011 baseline: cycle-aware Lua table classification and bounded bidirectional JSON conversion share depth, item, and byte-limit enforcement with inline tests; extract tests before adding conversion shapes."
+    },
+    {
+      "path": "src/lua/parsers.rs",
+      "max_lines": 861,
+      "rationale": "IC-011 baseline: Agent, Task, and Tool Lua-table parsing shares bounded field validation plus snapshot-backed source loading; split definition parsers from file loading before extending the DSL."
+    },
+    {
+      "path": "src/lua/sandbox.rs",
+      "max_lines": 1757,
+      "rationale": "IC-011 priority debt: sandbox global registration still combines bounded regex, JSON, Base64, logging, templates, filesystem, HTTP, and schema helpers; extract capability families before adding another global."
+    },
+    {
+      "path": "src/main.rs",
+      "max_lines": 423,
+      "rationale": "IC-011 baseline: the binary entry point still contains Clap command definitions, serve-environment validation, address resolution, command path selection, dispatch, and tests; move CLI definitions before adding commands."
+    },
+    {
+      "path": "src/mcp/client.rs",
+      "max_lines": 475,
+      "rationale": "IC-011 baseline: MCP process environment, process-group cleanup, handshake and listing limits, tool discovery, shutdown, and client state share one transport lifecycle; extract process management before adding transports."
+    },
+    {
+      "path": "src/mcp/config.rs",
+      "max_lines": 733,
+      "rationale": "IC-011 baseline: MCP stdio and HTTP configuration parsing shares bounded maps and lists, command allowlisting, URL policy, namespacing, and validation tests; split transport validators before adding configuration fields."
+    },
+    {
+      "path": "src/tools/approval.rs",
+      "max_lines": 414,
+      "rationale": "IC-011 baseline: approval policy matching, bounded argument redaction, answer interpretation, HITL request dispatch, timeout allowance, and tests form one security gate; extract presentation before adding verdict modes."
+    },
+    {
+      "path": "src/tools/ask_human.rs",
+      "max_lines": 314,
+      "rationale": "IC-011 baseline: the ask_human tool owns schema, bounded timeout and prompt validation, local or durable bridge dispatch, response conversion, and inline tests; extract tests before adding question options."
+    },
+    {
+      "path": "src/tools/project_fs.rs",
+      "max_lines": 374,
+      "rationale": "IC-011 baseline: project path validation, capability-based no-follow reads, bounded UTF-8 and byte reads, atomic writes, syncing, and regular-file collection share one filesystem security boundary."
+    },
+    {
+      "path": "src/tools/shell.rs",
+      "max_lines": 390,
+      "rationale": "IC-011 baseline: shell policy integration, process-group ownership, bounded stdout and stderr draining, timeout termination, tool dispatch, and tests share one cancellation-safe process lifecycle."
+    },
+    {
+      "path": "src/utils/http.rs",
+      "max_lines": 327,
+      "rationale": "IC-011 baseline: bounded HTTP body reads, header collection, limited JSON serialization, UTF-8 truncation, and line buffering share reusable byte-accounting invariants; extract tests before adding helpers."
+    },
+    {
+      "path": "src/utils/network.rs",
+      "max_lines": 437,
+      "rationale": "IC-011 baseline: outbound URL and IP policy, private-range classification, safe DNS resolution, redirect enforcement, secure client construction, and tests form one SSRF-defense boundary."
+    }
+  ]
+}

@@ -2,7 +2,7 @@
   "schema_version": "ironcrew.crew-eval-plan.v1",
   "flow": {
     "path": "crew.lua",
-    "sha256": "db16afe8621b344311076dfe5075edd21ef7978791a8763f3a81722087c0e720",
+    "sha256": "bbbdc021f3be7befbacbe4a5f96b6b9994f39b6f8d96e935ab507bd65ea1bfe8",
     "variants": {
       "single": {
         "planned_llm_calls": 1,

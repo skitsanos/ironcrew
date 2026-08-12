@@ -54,11 +54,14 @@ After approval:
 5. Prove the tag is reachable from `main` and its `Cargo.toml` contains the same
    version. Show the evidence and ask before pushing the tag.
 6. Push the tag and monitor `.github/workflows/release.yml`. A release created
-   with `GITHUB_TOKEN` does not trigger a second release-event workflow, so only
-   after the release succeeds and the user separately authorizes the image,
-   manually dispatch `.github/workflows/docker-publish.yml` from `main` with the
-   exact tag. That workflow always publishes the immutable version alias and
-   moves `latest` only while the tag is still GitHub's current latest release.
+   with `GITHUB_TOKEN` does not trigger a second release-event workflow, so image
+   publication requires a separate, explicitly authorized manual dispatch of
+   `.github/workflows/docker-publish.yml` from `main` with the exact tag. IC-015
+   remains open because a repeated dispatch makes an unconditional version-tag
+   push without a repository-side existing-digest guard, and the `latest`
+   update has a time-of-check/time-of-use race. While IC-015 is open, stop
+   before that dispatch and keep Docker image publication deferred; do not
+   describe its aliases as immutable or rollback-proof.
    Publish a crate only with separate authorization too.
 
 If an unpushed local release step is wrong, make a corrective edit or ask for

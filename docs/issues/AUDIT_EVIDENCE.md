@@ -36,6 +36,39 @@ simpler workflows. Contract mode uses an oracle-backed mock provider and is
 only evidence that orchestration, reporting, and scoring behave as designed.
 IC-009 owns the repeated six-case and representative-domain evidence gap.
 
+On 2026-08-11, the active runtime, scaffold, demos, and IC-009 plan moved to
+`gpt-5.6-luna`; the July GPT-4.1 receipt remains historical rather than being
+rewritten. Bounded real-endpoint text/strict-JSON and image-input probes passed
+after GPT-5 Chat requests adopted `max_completion_tokens` and Luna-backed flows
+removed unsupported explicit temperatures. Those probes establish API/runtime
+compatibility only. They are not a repeated Luna effectiveness result, and the
+full five-repetition synthetic run plus two independently reviewed intended-use
+domain packs remain outstanding under IC-009.
+
+On 2026-08-12, that bounded gap closed. The frozen GPT-5.6 Luna plan completed
+180/180 local live-provider runs across 12 cases, five repetitions, and three
+topologies, with 60 matched pairs per crew candidate and no execution, parse,
+or schema failures. The DAG raised mean grounded correctness from 0.6500 to
+0.7833; its +0.1333 paired delta had a Bonferroni-adjusted 97.5% interval of
+[0.0500, 0.2167], and its 3.2113x token and 4.5645x latency multipliers stayed
+inside the predeclared 6x ceilings. It therefore met every check and was the
+bounded recommendation. The collaborative variant reached 0.7333 but did not
+qualify because its interval crossed zero and its 6.7050x latency multiplier
+exceeded the ceiling. `crew_qualified` means that the DAG qualified for this
+plan; it does not mean every crew topology qualified.
+
+Provider-reported usage was 289,816 prompt, 107,821 completion, zero cached,
+and 397,637 total tokens. The frozen-price observed estimated upper bound was
+$0.2018392, versus a $2.7528 planned bound and $3 approval budget; this is a
+conservative token-derived estimate, not an invoice. The aggregate corpus,
+plan, flow, and release-binary hashes are retained in the dated JSON receipt,
+which also proves the dirty source manifest and binary stayed unchanged during
+the run. The six-case synthetic core and two independently reviewed
+representative synthetic intended-use packs are not production samples. This
+is one operator-declared OpenAI API/GPT-5.6 Luna configuration running locally,
+not multi-model, production-data, deployed-platform, or broad-superiority
+evidence. The July GPT-4.1 receipts remain unchanged historical evidence.
+
 ## Two-process PostgreSQL replica evidence
 
 On 2026-07-19, two independent `ironcrew serve` processes sharing PostgreSQL
@@ -168,7 +201,8 @@ returned to zero, with the namespace baseline restored at
 
 ## Execution and storage metrics closure — 2026-08-11
 
-The reviewed worktree extends the authenticated `/metrics` response with
+The committed, not-yet-released implementation extends the authenticated
+`/metrics` response with
 fixed-cardinality, process-local counters and histograms for run, task, tool,
 provider, provider-token, SSE, lease-loss, reconciliation, terminal-persistence,
 and explicitly instrumented storage outcomes. Closed enums own every label;
@@ -205,6 +239,50 @@ production alert policy exists. IC-010 is resolved on implementation, local
 regression, disposable PostgreSQL, and bounded separate-process evidence; no
 deployed per-pod scraper or release is claimed.
 
+## Retention-boundary replica soak closure — 2026-08-11
+
+IC-018's predeclared provider-free contract passed with two direct release
+processes sharing an isolated PostgreSQL 15.18 database. The 1,800.651-second
+workload completed 2,613/2,613 keyed cross-replica HITL/SSE runs with zero
+readiness, liveness, workload, or deadlock failures. Sixty-one observations
+crossed the configured 600-second journal-retention boundary; 40 were
+post-boundary, and the final 20 intervals covered 602.081 seconds with 7,322
+latency samples and no declared violation.
+
+Maximum retained journal state was 3,696 rows/3,784,704 bytes against
+8,192/8 MiB ceilings. Expired physical rows peaked at 5 against 128, and
+post-prune retained growth was zero rows/bytes against 512/1 MiB. Retention
+state and PostgreSQL delete statistics advanced in 41 and 40 intervals. Prefix
+delete deltas are correlated aggregate evidence rather than per-batch causality.
+Prefix relations peaked at 11,984,896 bytes, WAL reached 69,072,576 bytes,
+replica RSS peaked at 17,924,096/17,989,632 bytes, and tail RSS growth was
+16,384/0 bytes. The required expired cursor, explicit retention gap, incomplete
+synthesized terminal, and zero-row replay anchor all passed.
+
+A separate bounded loopback-mock receipt passed exact provider/tool counts, an
+exact 65,536-byte result, and a two-turn warm-owner/cold-peer committed
+conversation boundary with matching history and the PostgreSQL conversation
+SSE `409`. Paid-provider calls and estimated cost were zero. That receipt
+explicitly records `in_flight_takeover_proven: false`; it is not live-provider
+or arbitrary exactly-once external-effect evidence.
+
+The long-soak and profile JSON receipts hash to
+`sha256:750be5c83ebd4f5df2299c5b3a4b9483b06cdae50a9fc46b18906cdee49eab4e`
+and
+`sha256:2e00f1f7deca155cebbecc5adf65a36d0cec3f21a6cfb7191d49d3066a8e7d83`.
+Both bind revision `fe906f50e37640adb00b37a846be648b3a1178f9`, the same
+release-binary hash, and separately stable dirty-worktree manifests. The serial
+live-PostgreSQL regression gate passed 48/48 store, 2/2 multi-replica HTTP, and
+10/10 process tests against freshly pulled PostgreSQL 15.18 at digest
+`sha256:6eb0add3b77c081df18aa518ce43df58fdcc40f2e6d868a6fd08038dc7acd425`.
+
+The JSON receipts prove clean process exits and exact prefix cleanup to zero.
+Separate fixture evidence confirms that the captured labeled `--rm`
+PostgreSQL container was removed without a broad prune. Raw logs were not
+retained. This closes IC-018's provider-free local-process evidence gap. No
+live-provider, Railway, OpenShift, load-balancer, cgroup/OOM, autoscaling, or
+production-monitoring result is claimed; the dirty artifacts were not published.
+
 ## Current evidence boundaries
 
 The following remain explicitly unproven, incomplete, or unsupported. Tracked
@@ -212,14 +290,21 @@ gaps retain their issue-registry owners:
 
 - execution takeover/checkpoint resume and exactly-once arbitrary external
   provider/tool effects, neither of which follows from replica routing;
-- a retention-boundary steady-state soak with predeclared ceilings;
+- live-provider and Railway/OpenShift retention-boundary resource profiles;
+  IC-018's predeclared provider-free local-process contract is green, but it is
+  not platform or production steady-state proof;
 - an attributed Railway load-balancer canary and a published release for
   arbitrary-routed keyed conversation turns. IC-008's local PostgreSQL and
   OpenShift dirty-artifact results are green, but Railway remains unrun;
   in-flight turn takeover and durable PostgreSQL conversation SSE remain
   unsupported;
-- broader, repeated crew-effectiveness evidence;
+- production-sample, multi-model, and deployed-platform crew-effectiveness
+  generality beyond IC-009's bounded local GPT-5.6 Luna result;
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
-- an honest module-size baseline ratchet for legacy oversized Rust modules; and
-- a platform-enforced trusted release control plane.
+- a platform-enforced trusted release control plane; and
+- repository-enforced immutable, release-bound Docker version publication and
+  rollback-safe `latest` coordination, reopened under IC-015 after the
+  2026-08-11 revalidation found an unconditional version-tag push with no
+  repository-side existing-tag/digest guard. External Docker Hub tag policy
+  was not inspected.

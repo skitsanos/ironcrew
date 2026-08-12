@@ -27,12 +27,14 @@ reconcile files only when the user also asks for changes.
 
 Run these first because they are cheap and fail before Rust compilation:
 
-1. `bun run scripts/validate_skills.ts`
-2. `bun run scripts/issues_registry.ts check`
-3. `bun test scripts/tests/*.test.ts`
-4. `actionlint .github/workflows/*.yml` when available
-5. `bun run scripts/check_worktree.ts`
-6. `git status --short`, followed by explicit review of every tracked and
+1. `python3 -B scripts/check_module_size.py`
+2. `python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'`
+3. `bun run scripts/validate_skills.ts`
+4. `bun run scripts/issues_registry.ts check`
+5. `bun test scripts/tests/*.test.ts`
+6. `actionlint .github/workflows/*.yml` when available
+7. `bun run scripts/check_worktree.ts`
+8. `git status --short`, followed by explicit review of every tracked and
    untracked source, policy, and documentation change
 
 Use Bun's native YAML parser for repository-owned YAML checks. Do not add a

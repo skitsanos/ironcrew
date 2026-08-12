@@ -285,7 +285,7 @@ pub fn register_crew_constructor(
             .unwrap_or_else(|| "openai".into());
         let model = table
             .get::<Option<String>>("model")?
-            .unwrap_or_else(|| "gpt-4.1-mini".into());
+            .unwrap_or_else(|| crate::llm::DEFAULT_OPENAI_MODEL.into());
         let base_url: Option<String> = table.get("base_url")?;
         let api_key: Option<String> = table.get("api_key")?;
         let max_concurrent: Option<usize> = table.get("max_concurrent")?;

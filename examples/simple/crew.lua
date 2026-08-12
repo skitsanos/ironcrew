@@ -8,7 +8,7 @@
 local crew = Crew.new({
     goal = "Answer a simple question about Rust programming",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -16,7 +16,6 @@ crew:add_agent(Agent.new({
     name = "assistant",
     goal = "Answer programming questions clearly and concisely",
     capabilities = {"programming", "explanation"},
-    temperature = 0.5,
 }))
 
 -- Add stream = true to see LLM responses in real-time:
