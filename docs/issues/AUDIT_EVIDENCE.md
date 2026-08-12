@@ -418,6 +418,25 @@ publication remains fail-closed under replay. The request issue is closed after
 the downstream run completes rather than granting the controller Issues-write
 authority.
 
+The live sole-owner controls were then applied. Environment `release`
+(`19770322300`) requires normal approval by `skitsanos`, permits deliberate
+self-review, has administrator bypass disabled in the authenticated UI, and
+admits only `main` through policy `57181717`. No-bypass branch ruleset
+`20762614` protects `main` with PR-only integration, resolved conversations,
+strict current-head enforcement, all nine established CI jobs, zero required
+second-person approvals, deletion protection, and non-fast-forward protection.
+Tag ruleset `20762625` permits only user `skitsanos` to create `v*`; separate
+no-bypass ruleset `20741649` prevents everyone, including the owner, from
+updating or deleting those tags. Label `release-request` is present.
+
+Docker credentials now exist only as environment secrets
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`; the repository secret count is zero.
+The replacement is a 90-day read/write token, and the positively attributed
+legacy `ironcrew-git-publish` token was deleted. A first replacement appeared in
+the automation transcript and was revoked before use or GitHub storage; a
+separate token was transferred without rendering or retaining its value. No
+release, tag, image, registry alias, or dispatch was created.
+
 IC-014 remains in progress until that controller reaches trusted `main`, a
 protected environment with deliberate owner self-approval and main-only
 deployment policy exists, default-branch policy exists, repository-scoped
@@ -450,9 +469,10 @@ gaps retain their issue-registry owners:
   default-branch dispatch and validation paths are implemented, immutable
   releases are enabled for future releases, and an active fail-closed `v*` tag
   ruleset rejected a real creation canary. Under the accepted sole-owner model,
-  the remote environment, owner-only request controller on `main`, protected
-  default-branch policy, final tag-creator policy, successful protected
-  validation runs, and environment-level secret scoping remain incomplete.
+  the remote environment, protected default-branch and tag policies, request
+  label, and environment-level secret scoping are now configured. The owner-
+  only controller is not yet on `main`, and the two successful protected
+  non-publishing validation runs remain outstanding.
 The preview Actions Policies page currently contains zero policies. Under the
 accepted sole-owner boundary that is recorded rather than treated as a closure
 blocker: only the trusted owner may create `v*` tags, owner compromise is out of
