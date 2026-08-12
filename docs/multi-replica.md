@@ -11,8 +11,8 @@ distributed execution engine.** Idempotency-keyed runs can use cross-replica
 cancellation and, with an explicit shared encryption keyring, cross-replica
 Human-in-the-Loop (HITL) question/answer delivery. PostgreSQL also provides a
 bounded cross-replica run-event journal. Live Lua execution, an active
-conversation turn, and each resident handle remain process-owned. The reviewed
-IC-008 worktree implements a narrower property: a PostgreSQL-backed keyed
+conversation turn, and each resident handle remain process-owned. The committed
+IC-008 implementation provides a narrower property: a PostgreSQL-backed keyed
 message can rehydrate a cold handle from a committed durable boundary on either
 replica. Its two-process PostgreSQL 15.18 acceptance and the dated OpenShift
 conversation canary are complete; Railway remains unrun. The OpenShift result
@@ -48,9 +48,9 @@ Status labels on this page are deliberate:
 | Durable cancellation of a PostgreSQL-backed keyed run from another replica | Committed; not released | The keyed-run ledger acts as a cancellation mailbox that the owner observes through its fenced heartbeat. Direct/local race gates, authoritative OpenShift v7 peer/race evidence, and retained Railway route-level delivery evidence pass. The Railway v7 rotation did not repeat cancellation. |
 | Encrypted cross-replica HITL questions/answers for PostgreSQL-backed keyed runs | Committed; not released | With the same readable key set on every replica, any replica can list a pending question and queue the first answer for owner pickup. Local and OpenShift v7 delivery/rotation pass, and Railway v7 passes the literal bidirectional mixed-cohort rotation through new-only. Unkeyed/local-store runs remain process-only. |
 | Bounded PostgreSQL cross-replica run SSE replay | Committed; not released | Any replica can replay/poll the shared journal using `<run_id>:<sequence>` cursors. The local separate-process and authoritative OpenShift v7 gates cover retained replay, malformed/cross-run/ahead/expired cursors, explicit capacity/retention gaps, read deadlines, and incomplete terminal fallback; retained Railway evidence covers numbered reconnect. JSON/SQLite remain process-local, and Railway v7 did not repeat the full cursor matrix. |
-| Explicit replica drain and exact keyed-owner fencing | Implemented; not released | IC-020's local lifecycle/resource gates and temporary Railway/OpenShift drain, scale, and rolling canaries pass. Railway can continue routing to a drained process, so the application mutation fence remains mandatory. The behavior is not yet a published contract. |
-| Keyed PostgreSQL conversation turns and cold rehydration | Implemented; not released | `Idempotency-Key` is required, one incarnation/revision is fenced, and either of two real processes can reconstruct a cold handle. The PostgreSQL 15.18 process gate and affinity-free OpenShift IC-008 canary pass. Railway was not run, and no published artifact contains this worktree yet. |
-| Conversation SSE | Implemented; not released | PostgreSQL returns a truthful `409` and directs recovery to durable history; JSON/SQLite streams remain process-local and reject `Last-Event-ID`. Both local processes and both OpenShift replacement-cohort receivers returned the same boundary. |
+| Explicit replica drain and exact keyed-owner fencing | Committed; not released | IC-020's local lifecycle/resource gates and temporary Railway/OpenShift drain, scale, and rolling canaries pass. Railway can continue routing to a drained process, so the application mutation fence remains mandatory. The behavior is not yet a published contract. |
+| Keyed PostgreSQL conversation turns and cold rehydration | Committed; not released | `Idempotency-Key` is required, one incarnation/revision is fenced, and either of two real processes can reconstruct a cold handle. The PostgreSQL 15.18 process gate and affinity-free OpenShift IC-008 canary pass. Railway was not run, and no published artifact contains this implementation yet. |
+| Conversation SSE | Committed; not released | PostgreSQL returns a truthful `409` and directs recovery to durable history; JSON/SQLite streams remain process-local and reject `Last-Event-ID`. Both local processes and both OpenShift replacement-cohort receivers returned the same boundary. |
 | Cluster-global process admission | Not implemented | Process limits still apply independently per replica. A trusted shared gateway is required for any request/provider limit that must be global. |
 | Execution takeover, checkpoint resume, or provider/tool failover after owner death | Not implemented | A dead owner leaves work to be reconciled as abandoned; another replica does not resume it. |
 
@@ -187,8 +187,8 @@ These responses are truthful diagnostics, not a routing protocol. Clients
 must not assume that an internal pod id is reachable, stable beyond the pod
 lifetime, or safe to expose as a public address.
 
-The implemented worktree conversation contract is resource-based rather than
-owner-routed. For PostgreSQL, every `/messages` request requires an
+The committed, not-yet-released conversation contract is resource-based rather
+than owner-routed. For PostgreSQL, every `/messages` request requires an
 `Idempotency-Key`, claims the exact conversation incarnation and base revision,
 and constructs a cold local handle only after that shared claim is active. The
 transcript and retained replay response commit atomically. A concurrent keyed
@@ -514,10 +514,10 @@ not support sticky sessions](https://docs.railway.com/deployments/scaling).
 Consequently, standard Railway replicas cannot rely on a follow-up unkeyed
 abort/HITL request or conversation SSE reconnect reaching the owner.
 Configured keyed PostgreSQL cancellation/HITL and PostgreSQL run SSE replay do
-not require owner routing. The reviewed worktree gives keyed PostgreSQL
-conversation messages the same routing independence only at committed turn
-boundaries. Its local two-process gate passes, but Railway routing was not run
-for IC-008 and remains a separate release gate.
+not require owner routing. The committed IC-008 implementation gives keyed
+PostgreSQL conversation messages the same routing independence only at
+committed turn boundaries. Its local two-process gate passes, but Railway
+routing was not run for IC-008 and remains a separate release gate.
 
 Until all live-control paths required by an application are shared or brokered:
 
@@ -568,10 +568,11 @@ mechanism:
 The dated IC-008 OpenShift canary passed keyed committed-boundary turns through
 affinity-free Routes, including cold recovery after owner Pod deletion. That
 artifact was dirty, unpublished, and removed, so the checked-in one-replica
-baseline remains until the behavior is released. Keep `replicas: 1` whenever
-the application needs the remaining owner-local surfaces, and use a
-non-overlapping replacement strategy. For two-replica tests, give every pod a
-unique `IRONCREW_INSTANCE_ID` (the pod UID is suitable) and use per-pod test
+baseline remains until a published release contains the behavior. Keep
+`replicas: 1` whenever the application needs the remaining owner-local
+surfaces, and use a non-overlapping replacement strategy. For two-replica
+tests, give every pod a unique `IRONCREW_INSTANCE_ID` (the pod UID is suitable)
+and use per-pod test
 Services or Routes to target A and B deterministically. Do not count
 affinity-assisted success as a passing cross-replica test. Use
 `/health/ready` as the readiness probe and `/health/live` as liveness: a
@@ -653,16 +654,16 @@ replica without affinity and without false success.
 
 ### Phase 3 — conversation ownership and rehydration
 
-- **Implemented and locally validated; not released:** fence one active
+- **Committed; not released:** fence one active
   conversation incarnation/revision across replicas with a required
   idempotency key
-- **Implemented and locally validated; not released:** rehydrate a cold local
+- **Committed; not released:** rehydrate a cold local
   handle deterministically from its persisted transcript and complete
   definition identity
-- **Implemented and locally validated; not released:** return a truthful `409`
+- **Committed; not released:** return a truthful `409`
   unsupported boundary for PostgreSQL conversation SSE; JSON/SQLite remain
   process-local without cursor replay
-- **Implemented and locally validated; not released:** fail closed when Lua source,
+- **Committed; not released:** fail closed when Lua source,
   selected agent/model/system prompt, captured limits and policies, provider
   endpoint/options, or resolved tool graph changed
 

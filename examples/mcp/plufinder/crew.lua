@@ -13,7 +13,7 @@
 local crew = Crew.new({
     goal     = "Look up PLU codes for fresh produce via the PLU Finder MCP server.",
     provider = "openai",
-    model    = env("OPENAI_MODEL") or "gpt-4.1-mini",
+    model    = env("OPENAI_MODEL") or "gpt-5.6-luna",
 
     mcp_servers = {
         plu = {

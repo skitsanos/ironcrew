@@ -93,7 +93,7 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
                 .unwrap_or_else(|_| "openai".into());
             let model: String = table
                 .get::<String>("model")
-                .unwrap_or_else(|_| "gpt-4.1-mini".into());
+                .unwrap_or_else(|_| crate::llm::DEFAULT_OPENAI_MODEL.into());
             let require_approval = table
                 .get::<Option<Table>>("require_approval")
                 .ok()

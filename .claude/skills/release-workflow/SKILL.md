@@ -51,11 +51,14 @@ After approval:
    version matches.
 5. Show the evidence and ask before pushing the tag. Monitor release CI. A
    release created with `GITHUB_TOKEN` does not cascade into a release-event
-   workflow; after success, dispatch `docker-publish.yml` manually from `main`
-   with the exact tag only with separate image-publication authorization. The
-   workflow always publishes the immutable version alias and moves `latest`
-   only if that tag is still GitHub's current latest release. Publish crates
-   only with separate authorization too.
+   workflow, so image publication requires a separate, explicitly authorized
+   manual dispatch of `docker-publish.yml` from `main` with the exact tag.
+   IC-015 remains open because a repeated dispatch makes an unconditional
+   version-tag push without a repository-side existing-digest guard, and the
+   `latest` update has a time-of-check/time-of-use race. While IC-015 is open,
+   stop before that dispatch and keep Docker image publication deferred; do not
+   describe its aliases as immutable or rollback-proof. Publish crates only
+   with separate authorization too.
 
 If an unpushed local step is wrong, make a corrective edit or ask for direction.
 After a push, prefer a forward fix. Do not use destructive reset or broad

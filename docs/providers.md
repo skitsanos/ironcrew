@@ -16,7 +16,7 @@ By default, IronCrew connects to the OpenAI API:
 | -------------------- | --------------------------- | ------------- |
 | `OPENAI_API_KEY`     | (required)                  | API key       |
 | `OPENAI_BASE_URL`    | `https://api.openai.com/v1` | API base URL  |
-| `OPENAI_MODEL`       | `gpt-4.1-mini`              | Default model |
+| `OPENAI_MODEL`       | `gpt-5.6-luna`              | Default model |
 
 Set these in a `.env` file in your project directory or export them in your shell.
 
@@ -32,9 +32,13 @@ No extra configuration needed beyond setting `OPENAI_API_KEY`.
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.6-luna",
 })
 ```
+
+GPT-5.6 Luna accepts only its provider-default temperature. Omit explicit
+`temperature` values when Luna is effective; IronCrew forwards configured
+values and the provider rejects unsupported non-default settings.
 
 ### Google Gemini
 
@@ -140,7 +144,7 @@ is fail-closed, so explicitly add `AZURE_OPENAI_API_KEY` to
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai",
-    model = "gpt-4.1-mini",
+    model = "YOUR-DEPLOYMENT-MODEL",
     base_url = "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/v1",
     api_key = env("AZURE_OPENAI_API_KEY"),
 })
@@ -216,7 +220,7 @@ built-in server-side tools, and cleaner streaming semantics. Also supported by
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-mini",
 })
 ```
 
@@ -226,7 +230,7 @@ local crew = Crew.new({
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-nano",
     reasoning_effort = "medium",      -- "low" | "medium" | "high"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
@@ -241,7 +245,7 @@ Reasoning summaries are streamed dim to stderr and persisted to the run record.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "openai-responses",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.4-mini",
     server_tools = { "web_search", "file_search", "code_interpreter" },
     web_search_context_size = "medium",           -- "low" | "medium" | "high"
     file_search_vector_store_ids = { "vs_abc" },  -- required for file_search
@@ -329,11 +333,11 @@ the same crew, optimizing cost and performance.
 local crew = Crew.new({
     goal = "Cost-optimized crew",
     provider = "openai",
-    model = "gpt-4.1-mini",           -- default fallback
+    model = "gpt-5.6-luna",           -- default fallback
     models = {
-        task_execution = "gpt-4.1-mini",
-        collaboration = "gpt-4.1-mini",
-        collaboration_synthesis = "gpt-4.1",
+        task_execution = "gpt-5.6-luna",
+        collaboration = "gpt-5.6-luna",
+        collaboration_synthesis = "gpt-5.6-terra",
     },
 })
 ```
@@ -372,7 +376,7 @@ when `prompt_cache_key` is set on the crew.
 
 ## Tips
 
-- Use `gpt-4.1-mini`, `gemini-2.5-flash`, or `claude-haiku-4-5` for simple
+- Use `gpt-5.6-luna`, `gemini-2.5-flash`, or `claude-haiku-4-5` for simple
   tasks. Reserve stronger models for tasks requiring deep reasoning.
 - Set model overrides at the task level when a single task needs more capability
   than the rest of the crew.
@@ -387,9 +391,10 @@ when `prompt_cache_key` is set on the crew.
   actual connection addresses, and redirects, and ignore environment proxy
   settings. Private endpoints (including local Ollama) require the explicit
   `IRONCREW_ALLOW_PRIVATE_IPS=1` trust override.
-- Non-streaming responses default to a 16 MiB cap, raw SSE streams to 32 MiB,
-  accumulated output to 16 MiB, and error bodies to 256 KiB. Tune these with
-  the `IRONCREW_PROVIDER_MAX_*` variables in
+- Serialized JSON requests default to a 32 MiB cap and are rejected before any
+  network send when oversized. Non-streaming responses default to a 16 MiB cap,
+  raw SSE streams to 32 MiB, accumulated output to 16 MiB, and error bodies to
+  256 KiB. Tune these with the `IRONCREW_PROVIDER_MAX_*` variables in
   [CLI](cli.md#environment-variables).
 
 ## See also: MCP servers

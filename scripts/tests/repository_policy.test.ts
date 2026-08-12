@@ -29,7 +29,7 @@ describe("repository integration policy", () => {
     expect(workflow.permissions).toEqual({ contents: "read" });
   });
 
-  test("CI runs the Bun repository policy and workflow lint", async () => {
+  test("CI runs the repository policy and workflow lint", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
     const workflow = Bun.YAML.parse(source) as {
       jobs: Record<string, {
@@ -61,6 +61,10 @@ describe("repository integration policy", () => {
       "${{ github.event.pull_request.base.sha || github.event.before }}",
     );
     const commands = policy.steps.map((step) => step.run ?? "").join("\n");
+    expect(commands).toContain("python3 -B scripts/check_module_size.py");
+    expect(commands).toContain(
+      "python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'",
+    );
     expect(commands).toContain("bun run scripts/validate_skills.ts");
     expect(commands).toContain("bun run scripts/issues_registry.ts check");
     expect(commands).toContain("bun test scripts/tests/*.test.ts");

@@ -5,8 +5,7 @@
 //! exposes reasoning items, built-in server-side tools (web_search,
 //! file_search, code_interpreter, MCP), and cleaner streaming semantics.
 //!
-//! This provider treats every task as stateless — it does not chain
-//! `previous_response_id`. Full message history is always sent via `input`.
+//! Tasks are stateless: full message history is sent without `previous_response_id`.
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -101,6 +100,16 @@ impl OpenAiResponsesProvider {
             config,
             execution_policy,
         }
+    }
+
+    fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
+        if self.api_key.trim().is_empty() {
+            return Err(IronCrewError::Validation(
+                "API key is required for OpenAI Responses provider".into(),
+            ));
+        }
+        self.execution_policy
+            .serialize_request("OpenAI Responses", body)
     }
 
     /// Detect if the base_url points to xAI/Grok (which doesn't support `instructions` param).
@@ -301,11 +310,7 @@ impl OpenAiResponsesProvider {
     }
 
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "API key is required for OpenAI Responses provider".into(),
-            ));
-        }
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
@@ -320,7 +325,7 @@ impl OpenAiResponsesProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;
@@ -367,17 +372,12 @@ impl OpenAiResponsesProvider {
         mut body: Value,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "API key is required for OpenAI Responses provider".into(),
-            ));
-        }
+        body["stream"] = json!(true);
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
         }
-
-        body["stream"] = json!(true);
 
         let url = format!("{}/v1/responses", self.base_url);
         crate::utils::network::validate_url_not_private(&url)
@@ -388,7 +388,7 @@ impl OpenAiResponsesProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;

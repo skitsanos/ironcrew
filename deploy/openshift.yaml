@@ -5,11 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/name: ironcrew
 spec:
-  # Conservative general-purpose baseline: PostgreSQL run SSE and keyed
-  # cancellation/HITL are shared, but execution and conversations remain
-  # process-owned. Stop the old pod before creating its replacement. Keep this
-  # Recreate shape for the first drain-aware/mixed-version rollout; the bounded
-  # two-replica RollingUpdate overlay and surge arithmetic are documented in
+  # Conservative general-purpose baseline: PostgreSQL run SSE, keyed
+  # cancellation/HITL, and keyed PostgreSQL conversation rehydration at
+  # committed turn boundaries are shared. Active Lua/provider/tool turns remain
+  # process-owned, and PostgreSQL conversation SSE remains unsupported. Stop the
+  # old pod before creating its replacement. Keep this Recreate shape for the
+  # first drain-aware/mixed-version rollout; the bounded two-replica
+  # RollingUpdate overlay and surge arithmetic are documented in
   # docs/cloud-deployment.md.
   replicas: 1
   strategy:

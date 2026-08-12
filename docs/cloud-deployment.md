@@ -232,6 +232,7 @@ per-flow read grants.
 | `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |
 | `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Final serialized `http_request` result cap. |
+| `IRONCREW_PROVIDER_MAX_REQUEST_BYTES` | `33554432` (32 MiB) | Serialized provider JSON request cap, enforced before network send (hard ceiling 256 MiB). |
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Non-streaming model response cap. |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | `33554432` (32 MiB) | Raw model SSE stream cap. |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Accumulated model output/reasoning cap. |
@@ -435,15 +436,16 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 **Kubernetes/OpenShift:** use PostgreSQL for production durability. With a
 shared HITL keyring, idempotency-keyed runs support cross-replica cancellation
 and question listing/answer delivery. PostgreSQL's bounded run-event journal
-also supports cross-replica run SSE replay. The reviewed IC-008 worktree
-implements cold rehydration of a keyed PostgreSQL conversation message on
+also supports cross-replica run SSE replay. The committed IC-008 implementation
+provides cold rehydration of a keyed PostgreSQL conversation message on
 either replica from the last committed incarnation/revision, but does not move
 an in-flight turn. Its local two-process PostgreSQL gate and affinity-free
 OpenShift IC-008 canary pass; Railway remains unrun, and the tested dirty
 artifact was unpublished and removed. Shared-store conversation SSE returns
 `409` unsupported. JSON/SQLite run and conversation SSE remain owner-local.
-Keep `replicas: 1` until the behavior is released, or whenever clients require
-the remaining owner-local surfaces through arbitrary Service routing.
+Keep `replicas: 1` until a published release contains the behavior, or whenever
+clients require the remaining owner-local surfaces through arbitrary Service
+routing.
 JSON/SQLite require a writable persistent volume if their records must survive
 replacement.
 
@@ -457,8 +459,9 @@ does support a bounded multi-replica slice: any replica can accept new keyed
 runs and durable reads, stream retained run journal events, replay keyed
 acceptance, request keyed cancellation,
 and—when the shared HITL keyring is configured—list or answer that keyed run's
-pending questions. The reviewed IC-008 worktree also reconstructs a required-key
-`/messages` request on either replica from a committed conversation boundary.
+pending questions. The committed IC-008 implementation also reconstructs a
+required-key `/messages` request on either replica from a committed
+conversation boundary.
 The local process gate and OpenShift canary pass; Railway routing remains
 unrun, the artifact is unpublished, in-flight takeover is unsupported, and
 conversation SSE remains unsupported. Routing affinity is not a correctness
@@ -1054,9 +1057,10 @@ For small flow sets, mount `crew.lua` / `config.lua` via ConfigMap. For larger s
 Do not configure session affinity as a substitute for this restriction.
 Affinity can improve routing but cannot transfer run execution or an in-flight
 conversation handle between processes. Configured PostgreSQL run SSE, a keyed
-HITL mailbox, and the current worktree's keyed PostgreSQL conversation messages
-work without affinity at committed turn boundaries, but none can transfer a Lua
-VM or suspended coroutine. IC-008's affinity-free OpenShift canary passed this
+HITL mailbox, and keyed PostgreSQL conversation messages from the committed
+IC-008 implementation work without affinity at committed turn boundaries, but
+none can transfer a Lua VM or suspended coroutine. IC-008's affinity-free
+OpenShift canary passed this
 committed-boundary slice, but its dirty artifact was unpublished and Railway
 remains unrun. PostgreSQL conversation SSE is unsupported; JSON/SQLite
 conversation and run SSE remain process-local.
@@ -1466,10 +1470,11 @@ Railway may use `SIGKILL` and the run later reconciles as `abandoned`.
 
 `overlapSeconds: 0` prevents extra overlap after the candidate becomes active;
 it does not make owner-local live controls distributed. Multiple replicas can
-use PostgreSQL run SSE and the keyed cancellation/HITL slice. The current
-worktree also supports arbitrary routing of keyed PostgreSQL messages between
-committed conversation turns. Its local and OpenShift gates pass, but Railway
-has not run the IC-008 canary and no published artifact contains the worktree.
+use PostgreSQL run SSE and the keyed cancellation/HITL slice. The committed
+IC-008 implementation also supports arbitrary routing of keyed PostgreSQL
+messages between committed conversation turns. Its local and OpenShift gates
+pass, but Railway has not run the IC-008 canary and no published release
+contains this implementation.
 Keep the service at one when clients require conversation SSE, in-flight turn
 takeover, unkeyed live controls, or any other owner-local surface.
 
@@ -1600,9 +1605,10 @@ RUN cargo build --release --locked --no-default-features --features postgres
       and later `abandoned` reconciliation
 - [ ] Replica count matches the
   [multi-replica live-control contract](multi-replica.md); use exactly one
-      until the IC-008 behavior is released, on Railway until its attributed
-      canary passes, or whenever clients require conversation SSE, in-flight
-      conversation takeover, or unkeyed controls; PostgreSQL run SSE and keyed
+      until a published release contains the IC-008 behavior, on Railway until
+      its attributed canary passes, or whenever clients require conversation
+      SSE, in-flight conversation takeover, or unkeyed controls; PostgreSQL run
+      SSE and keyed
       conversation messages have separate bounded contracts
 - [ ] First drain-aware rollout avoids mixed old/new drain semantics; later
       rolling deployments verify every routable replica exposes
