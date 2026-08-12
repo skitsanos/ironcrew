@@ -272,6 +272,7 @@ describe("repository integration policy", () => {
     ).text();
     const workflow = Bun.YAML.parse(source) as {
       permissions: Record<string, string>;
+      concurrency: { group: string; "cancel-in-progress": boolean };
       jobs: Record<string, {
         needs?: string;
         permissions?: Record<string, string>;
@@ -283,6 +284,10 @@ describe("repository integration policy", () => {
       .join("\n");
 
     expect(workflow.permissions).toEqual({});
+    expect(workflow.concurrency).toEqual({
+      group: "release-publication",
+      "cancel-in-progress": false,
+    });
     expect(workflow.jobs.guard.permissions).toEqual({ contents: "read" });
     expect(workflow.jobs.build.permissions).toEqual({ contents: "read" });
     expect(workflow.jobs.release.permissions).toEqual({
@@ -294,6 +299,13 @@ describe("repository integration policy", () => {
     expect(guardCommands).toContain(
       "./scripts/verify_release_source.sh \"$TAG_NAME\" refs/remotes/origin/main",
     );
+    const immutableAssets = workflow.jobs.release.steps.find(
+      (step) => step.name === "Refuse release-asset replacement",
+    );
+    expect(immutableAssets?.run).toContain(
+      'scripts/verify_release_absent.py --repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME"',
+    );
+    expect(source).not.toContain("Create or update release");
 
     const notes = workflow.jobs.release.steps.find(
       (step) => step.name === "Write release notes from tag annotation",
@@ -306,9 +318,12 @@ describe("repository integration policy", () => {
     );
     expect(notes?.run).toContain("--certificate-identity '$CERTIFICATE_IDENTITY'");
     const publisher = workflow.jobs.release.steps.find(
-      (step) => step.uses === "softprops/action-gh-release@v3",
+      (step) => step.name === "Create release once",
     );
-    expect(publisher?.with?.body_path).toBe("${{ runner.temp }}/ironcrew-release-body.md");
+    expect(publisher?.run).toContain('gh release create "$GITHUB_REF_NAME"');
+    expect(publisher?.run).toContain('--notes-file "$RUNNER_TEMP/ironcrew-release-body.md"');
+    expect(publisher?.run).toContain("--verify-tag");
+    expect(source).not.toContain("softprops/action-gh-release");
   });
 
   test("release source verification rejects lightweight, version-drift, and off-main tags", async () => {
@@ -371,7 +386,7 @@ describe("repository integration policy", () => {
     }
   });
 
-  test("Docker publication is manual, default-branch-only, and validates safe input", async () => {
+  test("Docker publication promotes signed receipts with immutable version and bounded latest policy", async () => {
     const source = await Bun.file(
       join(repository, ".github/workflows/docker-publish.yml"),
     ).text();
@@ -397,43 +412,68 @@ describe("repository integration policy", () => {
 
     expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
     expect(workflow.on.workflow_dispatch.inputs.tag).toEqual({
-      description: "Exact stable release tag to publish (for example v2.24.0).",
+      description: "Exact stable release tag to promote (for example v2.24.0).",
       required: true,
       type: "string",
     });
+    expect(workflow.on.workflow_dispatch.inputs.authorize_latest_reconciliation).toEqual({
+      description:
+        "Authorize exact version promotion and bounded reconciliation of latest to GitHub's current signed stable release.",
+      required: true,
+      type: "boolean",
+      default: false,
+    });
     expect(workflow.permissions).toEqual({});
     expect(workflow.concurrency).toEqual({
-      group: "docker-publish",
+      group: "release-publication",
       "cancel-in-progress": false,
     });
     expect(workflow.jobs.publish.if).toBe(
-      "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+      "github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.authorize_latest_reconciliation == true",
     );
     expect(workflow.jobs.publish.permissions).toEqual({
       contents: "read",
-      "id-token": "write",
     });
 
-    const validation = workflow.jobs.publish.steps.find(
-      (step) => step.name === "Validate release tag",
+    const promotion = workflow.jobs.publish.steps.find(
+      (step) => step.name === "Promote signed release image and reconcile latest",
     );
-    expect(validation?.env?.RELEASE_TAG_INPUT).toBe("${{ inputs.tag }}");
-    expect(validation?.run).not.toContain("${{ inputs.tag }}");
-    expect(validation?.run).not.toContain("github.event.inputs.tag");
-    expect(validation?.run).toContain("Release tag must match stable tag form vX.Y.Z");
-    expect(validation?.run).toContain("--json tagName,isDraft,isPrerelease");
+    expect(promotion?.env?.RELEASE_TAG_INPUT).toBe("${{ inputs.tag }}");
+    expect(promotion?.run).not.toContain("${{ inputs.tag }}");
+    expect(promotion?.run).not.toContain("github.event.inputs.tag");
+    expect(promotion?.run).toContain("scripts/promote_release_image.py");
+    expect(promotion?.run).toContain("--authorize-latest-reconciliation");
+    expect(promotion?.run).toContain("--max-latest-attempts 3");
+    expect(promotion?.env?.DOCKERHUB_USERNAME).toBe(
+      "${{ secrets.DOCKERHUB_USERNAME }}",
+    );
+    expect(promotion?.env?.DOCKERHUB_TOKEN).toBe("${{ secrets.DOCKERHUB_TOKEN }}");
+    expect(promotion?.env?.GH_TOKEN).toBe("${{ github.token }}");
 
-    const build = workflow.jobs.publish.steps.find(
-      (step) => step.name === "Build & push multi-arch image",
-    );
-    expect(build?.with?.tags).toContain("${{ env.IMAGE }}:${{ steps.tag.outputs.version }}");
-    expect(build?.with?.tags).not.toContain(":latest");
-    const latest = workflow.jobs.publish.steps.find(
-      (step) => step.name === "Move latest alias only for the current GitHub release",
-    );
-    expect(latest?.run).toContain("releases/latest");
-    expect(latest?.run).toContain('current_tag" != "$RELEASE_TAG');
-    expect(latest?.run).toContain("docker buildx imagetools create");
+    expect(source).not.toContain("docker/build-push-action");
+    expect(source).not.toContain("docker buildx");
+    expect(source).not.toContain("docker build ");
+    expect(source).not.toContain("docker/runtime.Dockerfile");
+
+    const helper = await Bun.file(
+      join(repository, "scripts/promote_release_image.py"),
+    ).text();
+    const protocol = await Bun.file(
+      join(repository, "scripts/release_promotion_protocol.py"),
+    ).text();
+    const immutability = await Bun.file(
+      join(repository, "scripts/dockerhub_immutability.py"),
+    ).text();
+    expect(helper).toContain("ironcrew-{tag}-linux-oci.tar");
+    expect(helper).toContain("ironcrew-{tag}-image-receipt.v1.json");
+    expect(helper).toContain("cosign\", \"verify-blob");
+    expect(helper).toContain("release.yml@refs/tags/{tag}");
+    expect(helper).toContain("verify_release_image.py");
+    expect(helper).toContain('"--preserve-digests"');
+    expect(protocol).toContain("immutable version tag points to a different digest");
+    expect(protocol).toContain("bounded reconciliation loop");
+    expect(immutability).toContain("immutable_tags_settings");
+    expect(immutability).toContain("SEMVER_IMMUTABILITY_RULE");
   });
 
   test("release guidance preserves approval and manual publication boundaries", async () => {

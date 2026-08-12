@@ -54,15 +54,22 @@ After approval:
 5. Prove the tag is reachable from `main` and its `Cargo.toml` contains the same
    version. Show the evidence and ask before pushing the tag.
 6. Push the tag and monitor `.github/workflows/release.yml`. A release created
-   with `GITHUB_TOKEN` does not trigger a second release-event workflow, so image
-   publication requires a separate, explicitly authorized manual dispatch of
-   `.github/workflows/docker-publish.yml` from `main` with the exact tag. IC-015
-   remains open because a repeated dispatch makes an unconditional version-tag
-   push without a repository-side existing-digest guard, and the `latest`
-   update has a time-of-check/time-of-use race. While IC-015 is open, stop
-   before that dispatch and keep Docker image publication deferred; do not
-   describe its aliases as immutable or rollback-proof.
-   Publish a crate only with separate authorization too.
+   with `GITHUB_TOKEN` does not trigger a second release-event workflow. The
+   release workflow must create the release once and publish the signed OCI
+   archive plus strict image receipt; it must not update an existing release or
+   replace its assets. Image publication is a separate, explicitly authorized
+   manual dispatch of `.github/workflows/docker-publish.yml` from `main` with
+   the exact tag and latest-reconciliation boolean. It verifies and promotes
+   the tag-owned signed archive rather than rebuilding source. Before dispatch,
+   require the exact Docker Hub stable-semver immutability rule and IC-015's
+   recorded non-production replay/conflict/concurrent-`latest` acceptance. While
+   IC-015 remains in progress, stop before dispatch and keep Docker publication
+   deferred. After authorization, monitor the version digest and final `latest`
+   digest against GitHub's current stable release. Publish a crate only with
+   separate authorization too.
+   Do not use this path to backfill a legacy release without the signed OCI
+   archive and receipt; promotion begins with the first release produced by the
+   new tag workflow.
 
 If an unpushed local release step is wrong, make a corrective edit or ask for
 direction. Once anything is pushed, use a forward fix unless the user explicitly
