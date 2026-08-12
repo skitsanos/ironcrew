@@ -21,8 +21,7 @@
 local crew = Crew.new({
     goal     = "Run a small multi-agent research team on demand",
     provider = "openai",
-    model    = env("GEMINI_MODEL") or "gemini-2.5-flash",
-    base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
+    model    = env("OPENAI_MODEL") or "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

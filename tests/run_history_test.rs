@@ -1,9 +1,10 @@
 use ironcrew::engine::run_history::{
-    JsonFileStore, ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus,
+    JsonFileStore, ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunTransition,
 };
-use ironcrew::engine::store::StateStore;
+use ironcrew::engine::store::{RunLeaseConfig, StateStore};
 use ironcrew::engine::task::TaskResult;
 use ironcrew::utils::error::IronCrewError;
+use std::time::Duration;
 
 /// Test helper: write a Running intent + immediately update to
 /// terminal state. Mirrors the pre-Task 8 `save_run` call shape so
@@ -36,6 +37,7 @@ async fn save_completed_run(
             },
         )
         .await
+        .map(|_| ())
 }
 
 fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) -> RunRecord {
@@ -53,6 +55,8 @@ fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) ->
         total_tokens: 0,
         cached_tokens: 0,
         tags,
+        owner_instance_id: String::new(),
+        lease_expires_at: String::new(),
     }
 }
 
@@ -83,6 +87,8 @@ async fn test_save_and_load_run() {
         total_tokens: 0,
         cached_tokens: 0,
         tags: vec![],
+        owner_instance_id: String::new(),
+        lease_expires_at: String::new(),
     };
 
     save_completed_run(&history, &record).await.unwrap();
@@ -91,6 +97,22 @@ async fn test_save_and_load_run() {
     assert_eq!(loaded.run_id, "test-run-123");
     assert_eq!(loaded.status, RunStatus::Success);
     assert_eq!(loaded.task_results.len(), 1);
+}
+
+#[tokio::test]
+async fn json_store_rejects_oversized_record_without_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+    let path = dir.path().join("runs/oversized.json");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+
+    let error = history.get_run("oversized").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("IRONCREW_JSON_STORE_RECORD_MAX_BYTES")
+    );
 }
 
 #[tokio::test]
@@ -112,6 +134,8 @@ async fn test_delete_run() {
         total_tokens: 0,
         cached_tokens: 0,
         tags: vec![],
+        owner_instance_id: String::new(),
+        lease_expires_at: String::new(),
     };
     save_completed_run(&history, &record).await.unwrap();
 
@@ -383,7 +407,7 @@ async fn json_store_reconcile_abandoned_selectivity() {
     .unwrap();
 
     let count = store
-        .reconcile_abandoned_runs("2026-04-23T10:05:00Z")
+        .reconcile_abandoned_runs("9999-04-23T10:05:00Z")
         .await
         .unwrap();
     assert_eq!(count, 2);
@@ -394,7 +418,7 @@ async fn json_store_reconcile_abandoned_selectivity() {
     );
     assert_eq!(
         store.get_run("r1").await.unwrap().finished_at,
-        "2026-04-23T10:05:00Z"
+        "9999-04-23T10:05:00Z"
     );
     assert_eq!(
         store.get_run("r2").await.unwrap().status,
@@ -408,10 +432,175 @@ async fn json_store_reconcile_abandoned_selectivity() {
 
     // Idempotency: a second call finds nothing.
     let second = store
-        .reconcile_abandoned_runs("2026-04-23T10:06:00Z")
+        .reconcile_abandoned_runs("9999-04-23T10:06:00Z")
         .await
         .unwrap();
     assert_eq!(second, 0);
+}
+
+#[tokio::test]
+async fn json_store_owner_lease_and_exactly_once_terminal_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_a = JsonFileStore::new_with_lease_config(
+        dir.path().to_path_buf(),
+        RunLeaseConfig::new("owner-a", Duration::from_secs(60)).unwrap(),
+    )
+    .unwrap();
+    let owner_b = JsonFileStore::new_with_lease_config(
+        dir.path().to_path_buf(),
+        RunLeaseConfig::new("owner-b", Duration::from_secs(60)).unwrap(),
+    )
+    .unwrap();
+    owner_a
+        .save_run_intent(RunIntent {
+            suggested_id: Some("leased-json".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-07-18T10:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(owner_a.heartbeat_owned_runs().await.unwrap(), 1);
+    owner_a.health_check().await.unwrap();
+
+    let record = owner_a.get_run("leased-json").await.unwrap();
+    assert_eq!(record.owner_instance_id, "owner-a");
+    let deadline = chrono::DateTime::parse_from_rfc3339(&record.lease_expires_at).unwrap();
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&(deadline - chrono::Duration::seconds(1)).to_rfc3339())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        owner_b
+            .reconcile_abandoned_runs(&(deadline + chrono::Duration::seconds(1)).to_rfc3339())
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = owner_a
+        .update_run_completion(
+            "leased-json",
+            RunCompletion {
+                status: RunStatus::TimedOut,
+                finished_at: "9999-01-01T00:00:02Z".into(),
+                duration_ms: 1,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, RunTransition::AlreadyTerminal(RunStatus::Abandoned));
+}
+
+#[test]
+fn explicit_cancellation_statuses_round_trip() {
+    for (status, stored) in [
+        (RunStatus::Aborted, "aborted"),
+        (RunStatus::TimedOut, "timed_out"),
+    ] {
+        assert_eq!(status.to_string(), stored);
+        assert_eq!(stored.parse::<RunStatus>().unwrap(), status);
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(serde_json::from_str::<RunStatus>(&json).unwrap(), status);
+    }
+}
+
+#[tokio::test]
+async fn json_store_persists_abort_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+    store
+        .save_run_intent(RunIntent {
+            suggested_id: Some("abort-json".into()),
+            flow_name: "f".into(),
+            flow: "f".into(),
+            started_at: "2026-07-18T10:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let transition = store
+        .update_run_completion(
+            "abort-json",
+            RunCompletion {
+                status: RunStatus::Aborted,
+                finished_at: "2026-07-18T10:00:01Z".into(),
+                duration_ms: 1_000,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(transition, RunTransition::Applied);
+    assert_eq!(
+        store.get_run("abort-json").await.unwrap().status,
+        RunStatus::Aborted
+    );
+    let loser = store
+        .update_run_completion(
+            "abort-json",
+            RunCompletion {
+                status: RunStatus::TimedOut,
+                finished_at: "2026-07-18T10:00:02Z".into(),
+                duration_ms: 2_000,
+                task_results: vec![],
+                total_tokens: 0,
+                cached_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(loser, RunTransition::AlreadyTerminal(RunStatus::Aborted));
+}
+
+#[tokio::test]
+async fn json_store_reads_and_reconciles_legacy_unleased_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(dir.path().to_path_buf()).unwrap();
+    let legacy = serde_json::json!({
+        "run_id": "legacy-json",
+        "flow_name": "legacy",
+        "flow": "",
+        "status": "Running",
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "",
+        "duration_ms": 0,
+        "task_results": [],
+        "agent_count": 1,
+        "task_count": 1,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "tags": []
+    });
+    std::fs::write(
+        dir.path().join("runs/legacy-json.json"),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let record = store.get_run("legacy-json").await.unwrap();
+    assert_eq!(record.owner_instance_id, "");
+    assert_eq!(record.lease_expires_at, "");
+    assert_eq!(
+        store
+            .reconcile_abandoned_runs("2026-01-01T00:01:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_run("legacy-json").await.unwrap().status,
+        RunStatus::Abandoned
+    );
 }
 
 #[test]

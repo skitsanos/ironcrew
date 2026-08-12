@@ -36,10 +36,28 @@ async fn spawn_test_server() -> SocketAddr {
 
     let state = Arc::new(AppState {
         flows_dir: std::path::PathBuf::from("examples"),
+        runtime_identity: ironcrew::api::deployment::RuntimeIdentity::disabled(),
+        auth: Arc::new(ironcrew::api::auth::AuthConfig::disabled()),
+        admission: Arc::new(ironcrew::api::admission::AdmissionController::default()),
+        lifecycle: ironcrew::api::lifecycle::LifecycleController::new(),
         active_runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        conversation_lifecycles: Arc::new(
+            ironcrew::api::conversation_lifecycle::ConversationLifecycleRegistry::new(
+                ironcrew::api::conversation_lifecycle::max_active_conversation_lifecycles(),
+            ),
+        ),
         max_active_conversations: 100,
+        conversation_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_active_runs: 100,
+        run_permits: Arc::new(tokio::sync::Semaphore::new(100)),
+        max_sse_connections: 100,
+        sse_permits: Arc::new(tokio::sync::Semaphore::new(100)),
+        max_run_lifetime: std::time::Duration::from_secs(30 * 60),
+        terminal_persistence_failures: std::sync::atomic::AtomicUsize::new(0),
+        store_maintenance_healthy: std::sync::atomic::AtomicBool::new(true),
+        readiness_cache: tokio::sync::Mutex::new(None),
+        idempotency: Default::default(),
         store,
     });
 

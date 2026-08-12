@@ -8,7 +8,7 @@ local topic = (input and input.topic) or "general programming"
 local crew = Crew.new({
     goal = "Analyze " .. topic,
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -16,7 +16,6 @@ crew:add_agent(Agent.new({
     name = "expert",
     goal = "Provide expert analysis on technical topics",
     capabilities = {"analysis", "expertise"},
-    temperature = 0.3,
 }))
 
 crew:add_task({

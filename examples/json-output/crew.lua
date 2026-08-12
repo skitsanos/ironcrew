@@ -11,9 +11,12 @@
 local crew = Crew.new({
     goal = "Extract structured company data and save as JSON",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
+
+-- Give this report run a correlation id using the sandboxed UUID helper.
+local report_id = uuid4()
 
 -- Task 1: Extract structured data using JSON Schema response format
 -- The extractor agent has response_format = json_schema configured,
@@ -71,4 +74,5 @@ for _, result in ipairs(results) do
 end
 
 -- Print metadata
+print("Report ID: " .. report_id)
 print("Run completed at: " .. now_rfc3339())

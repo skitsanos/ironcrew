@@ -4,7 +4,6 @@ return {
     system_prompt = "You are a data extraction specialist. You always return valid JSON matching the requested schema.",
     capabilities = { "extraction", "analysis", "json" },
     tools = { "file_write" },
-    temperature = 0.1,
     response_format = {
         type = "json_schema",
         name = "company_analysis",

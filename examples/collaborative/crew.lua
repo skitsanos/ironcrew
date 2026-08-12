@@ -10,7 +10,7 @@
 local crew = Crew.new({
     goal = "Demonstrate agent collaboration and messaging",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -18,21 +18,18 @@ crew:add_agent(Agent.new({
     name = "optimist",
     goal = "See the positive side of things and advocate for opportunities",
     capabilities = {"analysis", "advocacy"},
-    temperature = 0.8,
 }))
 
 crew:add_agent(Agent.new({
     name = "critic",
     goal = "Identify risks, weaknesses, and potential problems",
     capabilities = {"analysis", "risk-assessment"},
-    temperature = 0.3,
 }))
 
 crew:add_agent(Agent.new({
     name = "pragmatist",
     goal = "Find practical, balanced solutions",
     capabilities = {"synthesis", "planning"},
-    temperature = 0.5,
 }))
 
 -- Phase 1: Individual research (runs in parallel)
@@ -57,6 +54,21 @@ crew:add_collaborative_task({
     depends_on = {"research_benefits", "research_risks"},
 })
 
+-- Seed the MessageBus before execution. Targeted messages and broadcasts are
+-- delivered to each agent with its next task prompt, then consumed.
+crew:message_send(
+    "facilitator",
+    "*",
+    "Ground every claim in a concrete software-team practice.",
+    "broadcast"
+)
+crew:message_send(
+    "critic",
+    "pragmatist",
+    "In the synthesis, pair every recommendation with a risk control.",
+    "request"
+)
+
 local results = crew:run()
 
 for _, result in ipairs(results) do
@@ -68,3 +80,22 @@ for _, result in ipairs(results) do
     end
     print()
 end
+
+-- MessageBus is also available directly to Lua for explicit coordination.
+-- This targeted follow-up is consumed from the recipient's queue, while the
+-- history remains available for observability.
+crew:message_send(
+    "pragmatist",
+    "optimist",
+    "Please carry the agreed risk controls into the next planning cycle.",
+    "request"
+)
+
+print("=== MessageBus follow-up inbox ===")
+for _, message in ipairs(crew:message_read("optimist")) do
+    print(string.format("%s -> %s [%s]: %s",
+        message.from, message.to, message.type, message.content))
+end
+
+local history = crew:message_history()
+print(string.format("MessageBus history retained %d message(s).", #history))

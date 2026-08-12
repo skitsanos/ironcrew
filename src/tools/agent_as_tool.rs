@@ -104,6 +104,21 @@ impl Tool for AgentAsTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<Value> {
+        Ok(serde_json::json!({
+            "schema": self.schema(),
+            "agent": self.agent,
+            "resolved_model": self.resolved_model,
+            "max_tool_rounds": self.max_tool_rounds,
+            "max_history": self.max_history,
+            "provider_execution_fingerprint": self.provider.execution_fingerprint()?,
+        }))
+    }
+
+    fn conversation_dependencies(&self) -> Vec<String> {
+        self.agent.tools.clone()
+    }
+
     async fn execute(&self, args: Value, ctx: &ToolCallContext) -> Result<String> {
         // 1. Parse `prompt` — return a user-visible error string (not an
         //    `Err`) so the caller LLM sees the validation failure as a
@@ -113,8 +128,15 @@ impl Tool for AgentAsTool {
             _ => return Ok("error: `prompt` is required (a non-empty string)".into()),
         };
 
-        // 2. Shared depth cap with `run_flow`.
-        let cap = crate::lua::subflow::max_flow_depth();
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            IronCrewError::Validation("Agent-as-tool: parent Runtime has been dropped".into())
+        })?;
+
+        // 2. Shared, runtime-captured depth cap with `run_flow`.
+        let cap = ctx.tool_registry.as_ref().map_or_else(
+            || runtime.tool_registry.max_flow_depth(),
+            |registry| registry.max_flow_depth(),
+        );
         if ctx.depth >= cap {
             return Ok(format!(
                 "error: Agent delegation depth exceeded ({}). Simplify the pipeline \
@@ -125,9 +147,6 @@ impl Tool for AgentAsTool {
 
         // 3. Prefer the caller's augmented registry (built-ins + MCP +
         //    sibling agent-tools); fall back to the runtime's default.
-        let runtime = self.runtime.upgrade().ok_or_else(|| {
-            IronCrewError::Validation("Agent-as-tool: parent Runtime has been dropped".into())
-        })?;
         let augmented_registry = ctx
             .tool_registry
             .clone()

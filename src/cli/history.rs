@@ -45,6 +45,8 @@ pub async fn cmd_runs(
             RunStatus::Running => "running",
             RunStatus::WaitingForInput => "waiting",
             RunStatus::Abandoned => "abandoned",
+            RunStatus::Aborted => "aborted",
+            RunStatus::TimedOut => "timed_out",
             RunStatus::Success => "success",
             RunStatus::PartialFailure => "partial",
             RunStatus::Failed => "failed",

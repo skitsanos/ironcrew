@@ -450,10 +450,9 @@ async fn test_05_unknown_agent_reference_cached_error() {
     let runtime = build_runtime(project.path());
 
     // The Crew.new factory hits the OpenAI provider path when api_key is
-    // set, but we keep the default (openai/gpt-4.1-mini/no api_key) so
-    // `custom_provider` is None and the runtime's provider (noop) is
-    // used. finalize_agent_tools never calls a provider — it only walks
-    // tools lists — so this is safe.
+    // set, but we leave api_key unset so `custom_provider` is None and the
+    // runtime's provider (noop) is used. finalize_agent_tools never calls a
+    // provider — it only walks tools lists — so this is safe.
     let lua = create_crew_lua().expect("create_crew_lua");
     register_agent_constructor(&lua).expect("register_agent_constructor");
     register_crew_constructor(
@@ -606,7 +605,7 @@ async fn test_09_bracket_events_fire_on_invocation() {
     let project = tempfile::tempdir().unwrap();
     let runtime = build_runtime(project.path());
     let bus = EventBus::new(256);
-    let mut rx = bus.subscribe();
+    let (_, mut rx) = bus.subscribe_with_replay();
 
     let researcher = Agent {
         name: "researcher".into(),
@@ -722,7 +721,7 @@ async fn test_10_inner_tool_events_fire() {
     let project = tempfile::tempdir().unwrap();
     let runtime = build_runtime(project.path());
     let bus = EventBus::new(256);
-    let mut rx = bus.subscribe();
+    let (_, mut rx) = bus.subscribe_with_replay();
 
     let provider = CannedProvider::with_tool_call_then("done", "stub_tool");
     let researcher = Agent {
@@ -793,7 +792,7 @@ async fn test_11_no_conversation_pollution() {
     let project = tempfile::tempdir().unwrap();
     let runtime = build_runtime(project.path());
     let bus = EventBus::new(256);
-    let mut rx = bus.subscribe();
+    let (_, mut rx) = bus.subscribe_with_replay();
 
     let researcher = Agent {
         name: "researcher".into(),

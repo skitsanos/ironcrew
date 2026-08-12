@@ -98,13 +98,14 @@ fn test_interpolate_no_patterns() {
 fn test_interpolate_env_var() {
     let results = HashMap::new();
     unsafe {
-        std::env::set_var("TEST_IRONCREW_INTERP", "hello_world");
+        std::env::set_var("TEST_IRONCREW_INTERP_UNLISTED_SECRET", "must_not_escape");
     }
-    let template = "Env: ${env.TEST_IRONCREW_INTERP}";
+    let template = "Env: ${env.TEST_IRONCREW_INTERP_UNLISTED_SECRET}";
     let result = interpolate(template, &results);
-    assert_eq!(result, "Env: hello_world");
+    assert_eq!(result, "Env: ");
+    assert!(!result.contains("must_not_escape"));
     unsafe {
-        std::env::remove_var("TEST_IRONCREW_INTERP");
+        std::env::remove_var("TEST_IRONCREW_INTERP_UNLISTED_SECRET");
     }
 }
 

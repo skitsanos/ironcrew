@@ -19,7 +19,8 @@ pub struct AuditEvent {
 
     /// Dotted action label. Currently one of:
     ///   "flow.run.start", "flow.run.abort", "flow.run.delete",
-    ///   "conversation.start", "conversation.delete".
+    ///   "conversation.start", "conversation.message",
+    ///   "conversation.delete".
     pub action: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

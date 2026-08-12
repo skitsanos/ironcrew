@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal     = "Use an HTTP MCP server to perform a task",
     provider = "openai",
-    model    = "gpt-4.1-mini",
+    model    = "gpt-5.6-luna",
 
     mcp_servers = {
         myapi = {
@@ -33,6 +33,7 @@ crew:add_agent({
 })
 
 crew:add_task({
+    name            = "call_increment",
     description     = "Call the increment tool on the MCP server and report what it returned.",
     agent           = "api_agent",
     expected_output = "The result of calling the increment tool.",

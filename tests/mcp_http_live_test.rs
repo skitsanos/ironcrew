@@ -28,6 +28,7 @@ fn cfg(url: &str) -> McpServerConfig {
             url: url.to_string(),
             headers: HashMap::new(),
         },
+        execution_identity_fingerprint: None,
         inherit_env: false,
     }
 }

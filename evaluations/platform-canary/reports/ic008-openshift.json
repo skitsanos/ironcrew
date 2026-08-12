@@ -1,0 +1,541 @@
+{
+  "schema": "ironcrew-ic008-openshift-canary-v1",
+  "generated_at": "2026-08-11T08:05:56Z",
+  "status": "passed",
+  "platform": {
+    "name": "openshift",
+    "namespace": "gedankrayze-dev",
+    "run_label": "ic008-conversation-20260811",
+    "user": "gedankrayze",
+    "openshift_version": "4.21.21",
+    "kubernetes_version": "1.34.8"
+  },
+  "artifact": {
+    "base_commit": "c4799a3c3b8a2441243ad512436d1cb649275cf4",
+    "dirty_build_inputs": true,
+    "build_input_count": 373,
+    "build_manifest": "sha256:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+    "binary": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+    "flow_tree": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+    "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+    "config_field_count": 113,
+    "empty_hitl_keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+    "deployment_revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+    "oci_manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+    "oci_config": "sha256:5f227b981026bdee84fbec487f6f8f3aad5b311f3f7e7d0e56c532665cd2a0e2",
+    "platform": "linux/amd64",
+    "image_size_bytes": 54044299,
+    "assembly_file_count": 9,
+    "scanner": {
+      "name": "Docker Scout",
+      "version": "1.24.0",
+      "packages": 130,
+      "critical_unfixed": ["CVE-2026-12087", "CVE-2026-13221"],
+      "high_unfixed": ["CVE-2026-48959", "CVE-2026-48962"],
+      "critical_high_fixed_count": 0,
+      "scope": "Debian 13 base package perl 5.40.1-6"
+    },
+    "retained_assets": {
+      "build_attestation": {
+        "path": "evaluations/platform-canary/reports/ic008-openshift-build-attestation.json",
+        "sha256": "sha256:73594576aa289e97d3c960e294575ea61d6a65ce03d369c43740d569640c9f44"
+      },
+      "assembly_context": {
+        "path": "evaluations/platform-canary/reports/ic008-openshift-assembly-context.json",
+        "sha256": "sha256:4fa1e0325d93050247b929db29a9712b67b95e0b62553b33857735d24b7432e5"
+      },
+      "effective_config": {
+        "path": "evaluations/platform-canary/reports/ic008-openshift-effective-config.json",
+        "sha256": "sha256:bf32a287f4f49cd8338e9d13aea8b66ef533b707f5cd03f4645a9525ba2f30d9"
+      },
+      "template": {
+        "path": "evaluations/platform-canary/ic008-openshift-template.yaml",
+        "sha256": "sha256:9a2088e215165dac421efd6c514fe02783247e4ccf1289d6885ba0075dcdcf60"
+      },
+      "functional_receipt": {
+        "path": "evaluations/platform-canary/reports/ic008-openshift-functional.json",
+        "sha256": "sha256:5e9353dc9ef3c620ebfc6ff8ca306678208c0c2500324ea40eb99bba5af9b517"
+      },
+      "cold_recovery_receipt": {
+        "path": "evaluations/platform-canary/reports/ic008-openshift-cold-recovery.json",
+        "sha256": "sha256:a824f9106b7adff35b4c336d6afa9afdf012b064619d41eb61028f39e9f2c641"
+      },
+      "conversation_contract_helper": {
+        "path": "evaluations/platform-canary/conversation_contract.py",
+        "sha256": "sha256:5f10331ccb6000bcf53e7854b34d177946d36f3c6003c45407000723d2572adb"
+      },
+      "conversation_http_helper": {
+        "path": "evaluations/platform-canary/conversation_http.py",
+        "sha256": "sha256:d71b1675faf26ba0a2b4fdf6db4626a31885cf9f9cdeff930373809a496195b4"
+      },
+      "conversation_receipt_helper": {
+        "path": "evaluations/platform-canary/conversation_receipt.py",
+        "sha256": "sha256:3ae51b3332e66c1e3b523a65b24260130513904440c3c58447d4d5c606ecb96a"
+      }
+    },
+    "collector_boundary": "The bounded HTTP and receipt helpers are content-addressed above. The platform orchestration wrapper was executed inline and its exact wrapper bytes were not retained; this is an explicit ad-hoc controller boundary rather than a released harness claim. Both retained receipts round-trip exactly through the retained sanitizer."
+  },
+  "processes": [
+    {
+      "role": "initial-a",
+      "pod": "ic008-conv-20260811-a",
+      "pod_uid": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+      "instance_id": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+      "process_start_id": "e1119896-86a3-4c5e-b59d-d7ed3e7c65a9",
+      "restart_count": 0,
+      "image_manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+      "attestation": "passed",
+      "final_state": "force_deleted_between_committed_turns"
+    },
+    {
+      "role": "b",
+      "pod": "ic008-conv-20260811-b",
+      "pod_uid": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51",
+      "restart_count": 0,
+      "image_manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+      "attestation": "passed",
+      "final_state": "force_deleted_after_the_supplemental_cold_recovery_owner_turn",
+      "rss_kib_before_deletion": 18432,
+      "file_descriptors_before_deletion": 13
+    },
+    {
+      "role": "replacement-c",
+      "pod": "ic008-conv-20260811-c",
+      "pod_uid": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70",
+      "restart_count": 0,
+      "image_manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+      "attestation": "passed",
+      "rss_kib_final": 18304,
+      "file_descriptors_final": 13,
+      "final_state": "deleted_during_scoped_cleanup"
+    }
+  ],
+  "process_attestations": [
+    {
+      "role": "initial-a",
+      "pod_uid": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+      "direct_route": "ic008-conv-20260811-a",
+      "receiver_header": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+      "capabilities_instance_id": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+      "capabilities_process_start_id": "e1119896-86a3-4c5e-b59d-d7ed3e7c65a9",
+      "advertised": {
+        "deployment_revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155"
+      },
+      "independently_observed": {
+        "binary": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "config_fields": 113,
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+        "build_manifest": "sha256:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact_manifest_helper": "sha256:7a1d47ae60d4d271bc8743585f68accbaca586cd704db700fdab397175e89e29",
+        "config_contract_helper": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+        "fingerprints_helper": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+        "mock_provider_helper": "sha256:beaed78a5676eb17687edf7cee6693240b2952ea26a4001d62253ff231b7c58e",
+        "mock_state_helper": "sha256:e49e8630ff3dd6985ea508092eef285ff86cdc371008a4f8dddb11e5473c87be"
+      }
+    },
+    {
+      "role": "b",
+      "pod_uid": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "direct_route": "ic008-conv-20260811-b",
+      "receiver_header": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "capabilities_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "capabilities_process_start_id": "339c03dd-597c-4df7-b99c-023af8c86f51",
+      "advertised": {
+        "deployment_revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155"
+      },
+      "independently_observed": {
+        "binary": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "config_fields": 113,
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+        "build_manifest": "sha256:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact_manifest_helper": "sha256:7a1d47ae60d4d271bc8743585f68accbaca586cd704db700fdab397175e89e29",
+        "config_contract_helper": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+        "fingerprints_helper": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+        "mock_provider_helper": "sha256:beaed78a5676eb17687edf7cee6693240b2952ea26a4001d62253ff231b7c58e",
+        "mock_state_helper": "sha256:e49e8630ff3dd6985ea508092eef285ff86cdc371008a4f8dddb11e5473c87be"
+      }
+    },
+    {
+      "role": "replacement-c",
+      "pod_uid": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "direct_route": "ic008-conv-20260811-a",
+      "receiver_header": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "capabilities_instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "capabilities_process_start_id": "1dd972c2-73f3-4eeb-b963-7b49a639fc70",
+      "advertised": {
+        "deployment_revision": "git:c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155"
+      },
+      "independently_observed": {
+        "binary": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+        "flow": "sha256:4f0f32aba78d2b571d4052a962ff5798c10a6f65f389a211946381c0958aa7de",
+        "config": "sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12",
+        "config_fields": 113,
+        "keyring": "sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155",
+        "build_manifest": "sha256:fdf9b1813eaf914f03089931c1016134983c9c1c7ce622e85bbd32ae6eb2414e",
+        "artifact_manifest_helper": "sha256:7a1d47ae60d4d271bc8743585f68accbaca586cd704db700fdab397175e89e29",
+        "config_contract_helper": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+        "fingerprints_helper": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+        "mock_provider_helper": "sha256:beaed78a5676eb17687edf7cee6693240b2952ea26a4001d62253ff231b7c58e",
+        "mock_state_helper": "sha256:e49e8630ff3dd6985ea508092eef285ff86cdc371008a4f8dddb11e5473c87be"
+      }
+    }
+  ],
+  "backend_workloads": [
+    {
+      "role": "mock",
+      "pod": "ic008-conv-20260811-mock",
+      "pod_uid": "1c862b6f-1a61-4cc4-8cf1-802479495e7b",
+      "spec_image": "image-registry.openshift-image-registry.svc:5000/gedankrayze-dev/ic008-conv-20260811@sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+      "runtime_image_id": "image-registry.openshift-image-registry.svc:5000/gedankrayze-dev/ic008-conv-20260811@sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+      "restart_count": 0,
+      "ready_at_attestation": true,
+      "final_state": "deleted_during_scoped_cleanup",
+      "provider_helper": "sha256:beaed78a5676eb17687edf7cee6693240b2952ea26a4001d62253ff231b7c58e",
+      "state_helper": "sha256:e49e8630ff3dd6985ea508092eef285ff86cdc371008a4f8dddb11e5473c87be"
+    },
+    {
+      "role": "postgres",
+      "pod": "ic008-conv-20260811-postgres",
+      "pod_uid": "c076f572-dc4a-4227-8b4d-d6b3b2777e45",
+      "spec_image": "quay.io/sclorg/postgresql-15-c9s@sha256:68bdb875e869aabc8e8cd1a62bf9a7ff0e46142342ce81c5a80156f3fead7263",
+      "runtime_image_id": "quay.io/sclorg/postgresql-15-c9s@sha256:68bdb875e869aabc8e8cd1a62bf9a7ff0e46142342ce81c5a80156f3fead7263",
+      "resolved_linux_amd64_manifest": "sha256:d675aee51ccd1a4b7f557848336cf5b7e624d040c934fcb8e68234114729f091",
+      "server_version": "15.12",
+      "restart_count": 0,
+      "ready_at_attestation": true,
+      "final_state": "deleted_during_scoped_cleanup"
+    }
+  ],
+  "attestation": {
+    "each_process": {
+      "capabilities_receiver_matches_pod_uid": true,
+      "pid1_executable": "/usr/local/bin/ironcrew",
+      "pid1_binary_matches": true,
+      "flow_matches": true,
+      "config_matches": true,
+      "config_fields": 113,
+      "keyring_matches": true,
+      "build_manifest_matches": true,
+      "five_helper_hashes_match": true,
+      "api_token_present": true,
+      "database_url_present": true,
+      "hitl_keys_absent": true,
+      "openai_key_absent": true,
+      "port": 8080
+    },
+    "shared_route_initial": {
+      "samples": 64,
+      "failures": 0,
+      "distribution": {
+        "a49fb7cf-ec09-4555-8776-6bdd70284727": 32,
+        "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7": 32
+      }
+    },
+    "shared_route_replacement": {
+      "samples": 32,
+      "failures": 0,
+      "distribution": {
+        "91bc1795-4b26-4d45-8d32-8dc0daaadf4e": 16,
+        "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7": 16
+      }
+    }
+  },
+  "conversation": {
+    "flow": "ic008",
+    "agent": "coordinator",
+    "max_history": 20,
+    "conversation_id": "ic008-ocp-20260811",
+    "original_incarnation_id": "19d8b40e-0480-41d3-be54-fadc2fba6c7b",
+    "recreated_incarnation_id": "020fa409-2e48-4682-a773-539907dc881e",
+    "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+    "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+    "cases": {
+      "start_on_a_and_peer_b": {
+        "status": 200,
+        "byte_equivalent": true,
+        "revision": 1,
+        "provider_counts": [0, 0, 0, 0]
+      },
+      "missing_key": {
+        "status": 400,
+        "provider_counts": [0, 0, 0, 0]
+      },
+      "first_turn_and_replay": {
+        "executor": "b",
+        "first_status": 200,
+        "replay_status": 200,
+        "replay_header": true,
+        "byte_equivalent": true,
+        "message_body_sha256": "sha256:199c893c4cc314578d80d6e2b21f36999672ba8ce94f3468ee39b14cc308bb58",
+        "history_body_sha256": "sha256:09d395b9bf820b4d2d40bcdbd04e05ebb8809e84db40751c3c4cbb4dd5bbad78",
+        "provider_counts": [2, 1, 1, 1]
+      },
+      "route_replay_and_sse_boundary": {
+        "replay_reached_both_initial_processes": true,
+        "replay_byte_equivalent": true,
+        "sse_status": 409,
+        "sse_error": "Conversation SSE replay is unavailable with shared-store coordination; use durable history for recovery",
+        "sse_reached_both_initial_processes": true
+      },
+      "between_turn_owner_loss": {
+        "deleted_pod_uid": "a49fb7cf-ec09-4555-8776-6bdd70284727",
+        "endpoint_withdrawn": true,
+        "b_only_route_samples": 16,
+        "b_only_route_failures": 0,
+        "recovery_revision": 3,
+        "recovery_body_sha256": "sha256:5261d9fa066d3488e6bf3794f0ef436bb6911b99b689a54e4ad936e1136c52c2",
+        "provider_counts": [4, 2, 2, 2]
+      },
+      "replacement_rehydration": {
+        "replacement_uid_differs": true,
+        "replacement_process_start_differs": true,
+        "history_revision": 3,
+        "history_body_sha256": "sha256:3f740ba77d88ae4e059028b410b002a047a07e5f0cead56f92bdaf8fa1211245",
+        "k2_replay_reached_b_and_c": true,
+        "sse_409_on_b_and_c": true,
+        "provider_counts": [4, 2, 2, 2]
+      },
+      "concurrent_same_key_and_active_delete": {
+        "active_row": "1|conversation.message|claimed|ic008-ocp-20260811|ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7|3|64|36",
+        "duplicate_status": 409,
+        "same_process_delete": {
+          "status": 409,
+          "elapsed_ms": 378,
+          "error": "Conversation is busy; retry after the active operation completes"
+        },
+        "peer_delete": {
+          "status": 409,
+          "elapsed_ms": 412,
+          "error": "Conflict: Conversation 'ic008-ocp-20260811' has an active idempotent message operation"
+        },
+        "blocked_counts": [5, 2, 2, 2],
+        "released_requests": 1,
+        "completed_revision": 4,
+        "message_body_sha256": "sha256:4907d7b5706d9ab6cd4c732de942b95d7a18faa4e9da88dc9fcd0d08433f45cc",
+        "peer_replay_byte_equivalent": true,
+        "provider_counts": [6, 3, 3, 3]
+      },
+      "delete_recreate_fence": {
+        "delete_through_c_status": 200,
+        "new_incarnation": true,
+        "source_and_definition_stable": true,
+        "old_key_status": 409,
+        "final_delete_through_b_status": 200,
+        "provider_counts": [6, 3, 3, 3]
+      },
+      "sanitized_receiver_receipt": {
+        "conversation_id": "ic008-receipt-20260811",
+        "incarnation_id": "59c1d66f-44a7-4389-a457-89286ad179e6",
+        "record_count": 17,
+        "route_samples": 8,
+        "route_distribution": {
+          "91bc1795-4b26-4d45-8d32-8dc0daaadf4e": 4,
+          "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7": 4
+        },
+        "start_sanitized_response_equivalent_on_b_and_c": true,
+        "message_first_receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "message_replay_receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "message_replay_sanitized_response_equivalent_and_response_bytes_equal": true,
+        "history_sanitized_response_equivalent_and_response_bytes_equal_on_b_and_c": true,
+        "sse_409_on_b_and_c": true,
+        "delete_through_c": true,
+        "provider_counts_before": [6, 3, 3, 3],
+        "provider_counts_after": [8, 4, 4, 4]
+      },
+      "cold_keyed_recovery_after_owner_loss": {
+        "conversation_id": "ic008-cold-recovery-20260811",
+        "incarnation_id": "a4c8f02c-4313-42a8-b144-7ccbb78307a6",
+        "bootstrap_receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "bootstrap_revision": 1,
+        "first_turn_receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "first_turn_revision": 2,
+        "deleted_owner_pod_uid": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+        "owner_pod_absent": true,
+        "owner_endpoint_withdrawn": true,
+        "cold_receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+        "cold_receiver_active_conversations_before": 0,
+        "cold_receiver_prior_operations_for_this_id": 0,
+        "cold_recovery_revision": 3,
+        "incarnation_source_definition_stable": true,
+        "mock_counts_before": [8, 4, 4, 4],
+        "mock_counts_after_first_turn": [10, 5, 5, 5],
+        "mock_counts_after_cold_recovery": [12, 6, 6, 6],
+        "cold_recovery_delta": [2, 1, 1, 1],
+        "history_through_c_revision": 3,
+        "delete_through_c_status": 200,
+        "cold_receiver_active_conversations_after_delete": 0,
+        "record_count": 5
+      }
+    }
+  },
+  "database": {
+    "server_version": "15.12",
+    "table_prefix": "ic008c_20260811_",
+    "tables": 10,
+    "indexes": 18,
+    "functions": 2,
+    "final_conversations": 0,
+    "message_ledger_rows": 6,
+    "message_ledger_completed_200": 6,
+    "active_ledger_rows": 0,
+    "distinct_key_hashes": 6,
+    "key_hash_bytes": 64,
+    "attempt_id_bytes": 36,
+    "message_rows": [
+      {"resource_id": "ic008-cold-recovery-20260811", "base_revision": 1, "state": "completed", "response_status": 200, "response_body_bytes": 311, "owner_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false},
+      {"resource_id": "ic008-cold-recovery-20260811", "base_revision": 2, "state": "completed", "response_status": 200, "response_body_bytes": 314, "owner_instance_id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false},
+      {"resource_id": "ic008-ocp-20260811", "base_revision": 1, "state": "completed", "response_status": 200, "response_body_bytes": 277, "owner_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false},
+      {"resource_id": "ic008-ocp-20260811", "base_revision": 2, "state": "completed", "response_status": 200, "response_body_bytes": 282, "owner_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false},
+      {"resource_id": "ic008-ocp-20260811", "base_revision": 3, "state": "completed", "response_status": 200, "response_body_bytes": 270, "owner_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false},
+      {"resource_id": "ic008-receipt-20260811", "base_revision": 1, "state": "completed", "response_status": 200, "response_body_bytes": 308, "owner_instance_id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7", "completed_at_present": true, "expires_at_present": true, "lease_expires_at_null": false}
+    ]
+  },
+  "security": {
+    "scc": "restricted-v2",
+    "run_as_user": 1004800000,
+    "run_as_group": 0,
+    "seccomp": "RuntimeDefault",
+    "read_only_root": true,
+    "allow_privilege_escalation": false,
+    "capabilities_dropped": ["ALL"],
+    "service_account_token_mounted": false,
+    "root_write_succeeded": false,
+    "tmp_write_succeeded": true,
+    "log_scope": "pre-supplemental B/C/mock/PostgreSQL plus post-supplemental surviving C/mock/PostgreSQL before cleanup",
+    "scoped_log_errors": 0,
+    "scoped_log_warnings": 0,
+    "secret_scan": {
+      "patterns": 3,
+      "pre_supplemental_b_c_mock_postgres_log_bytes": 20182,
+      "post_supplemental_surviving_log_bytes": 11329,
+      "deleted_pod_final_log_tails_retained": false,
+      "database_dump_bytes": 38494,
+      "resource_manifest_bytes": 92326,
+      "image_config_history_bytes": 8968,
+      "assembly_context_bytes": 26127702,
+      "retained_platform_files_scanned": true,
+      "retained_platform_file_secret_matches": 0,
+      "scanned_matches": 0,
+      "boundary": "Initial A and B were deleted before their final log tails could be rescanned. No secret-clean claim is made for those unavailable tail bytes."
+    },
+    "network_boundary": "Canary policies express intended app-to-PostgreSQL/mock access, but the namespace allow-same-namespace policy is additive; exclusive ingress isolation is not claimed."
+  },
+  "resources": {
+    "peak_pods": 4,
+    "peak_cpu_requests": "400m",
+    "peak_memory_requests": "512Mi",
+    "peak_cpu_limits": "4",
+    "peak_memory_limits": "2Gi",
+    "persistent_volume_claims": 0,
+    "service_session_affinity": "None",
+    "route_balance": "roundrobin",
+    "route_cookies_disabled": true
+  },
+  "counted_phase_attribution": {
+    "mock_controls_authenticated": false,
+    "mock_public_route_present": false,
+    "non_test_pods": 0,
+    "non_test_deployments_statefulsets_daemonsets_jobs_cronjobs": 0,
+    "basis": "Every counted provider phase observed zero non-test workload pods and zero workload controllers. The only Pods were the exact labeled app, mock, and PostgreSQL inventory, so the mock deltas are attributed to the bounded canary workload set, not to exclusive NetworkPolicy ingress."
+  },
+  "preflight_baseline": {
+    "workloads": {
+      "pods": [],
+      "deployments": [],
+      "statefulsets": [],
+      "daemonsets": [],
+      "jobs": [],
+      "cronjobs": [],
+      "routes": [],
+      "persistent_volume_claims": [],
+      "image_streams": []
+    },
+    "services": ["modelmesh-serving"],
+    "configmaps": ["config-service-cabundle", "config-trusted-cabundle", "devworkspace-ssh-askpass", "kube-root-ca.crt", "odh-kserve-custom-ca-bundle", "odh-trusted-ca-bundle", "openshift-service-ca.crt"],
+    "secrets": ["builder-dockercfg-4nkgb", "default-dockercfg-7lm7p", "deployer-dockercfg-d8p2t", "model-serving-proxy-tls", "pipeline-dockercfg-l6qb9", "workspace52e65f3af1824bcc-sa-dockercfg-gffj4"],
+    "network_policies": ["allow-from-codeready-workspaces-operator", "allow-from-console-namespaces", "allow-from-dev-sandbox-managed-ns", "allow-from-olm-namespaces", "allow-from-openshift-ingress", "allow-from-openshift-monitoring", "allow-from-openshift-virtualization-namespaces", "allow-from-redhat-ods-app-to-mariadb", "allow-from-redhat-ods-app-to-mm", "allow-same-namespace"],
+    "service_accounts": ["builder", "default", "deployer", "pipeline", "workspace52e65f3af1824bcc-sa"],
+    "resource_quota_used": {
+      "compute-build": {"limits.cpu": "0", "limits.memory": "0", "requests.cpu": "0", "requests.memory": "0", "requests.nvidia.com/gpu": "0"},
+      "compute-deploy": {"limits.cpu": "0", "limits.memory": "0", "requests.cpu": "0", "requests.memory": "0", "requests.nvidia.com/gpu": "0"},
+      "compute-spacerequests": {"count/spacerequests.toolchain.dev.openshift.com": "0"},
+      "storage": {"count/persistentvolumeclaims": "0", "limits.ephemeral-storage": "0", "requests.ephemeral-storage": "0", "requests.storage": "0"}
+    }
+  },
+  "preflight_baseline_sha256": "sha256:ce9697dfb8eb519641338240dcbb0ab328952ebc8b07c9500a511101d774d4dd",
+  "excluded_fixture_attempts": [
+    {
+      "stage": "postgres_initial_mount",
+      "classification": "manifest_fixture_error",
+      "result": "SCL image required writable /var/lib/pgsql rather than only /var/lib/pgsql/data; failed before functional traffic"
+    },
+    {
+      "stage": "initial_parallel_app_start",
+      "classification": "startup_order_fixture_error",
+      "result": "A and B exhausted the startup probe while PostgreSQL was unavailable; both were deleted and recreated serially before functional traffic"
+    },
+    {
+      "stage": "in_container_pid1_sigkill",
+      "classification": "platform_injection_no_op",
+      "result": "Namespace-init protection left the exact process unchanged; the accepted owner-loss proof used exact OpenShift pod force deletion"
+    }
+  ],
+  "boundaries": {
+    "railway_repeated": false,
+    "openshift_route_tested": true,
+    "in_flight_vm_takeover": false,
+    "conversation_sse_shared_replay": false,
+    "general_exactly_once_external_effects": false,
+    "published_release_artifact": false,
+    "bit_reproducible_artifact": false,
+    "exclusive_network_isolation": false,
+    "owner_loss_scope": "between committed turns"
+  },
+  "cleanup": {
+    "status": "complete",
+    "completed_at": "2026-08-11T08:04:28Z",
+    "database_prefix_relations_remaining": 0,
+    "database_prefix_functions_remaining": 0,
+    "database_idle_sessions_terminated_after_bounded_wait": 4,
+    "database_sessions_remaining_before_postgres_delete": 0,
+    "drop_used_cascade": false,
+    "labeled_cluster_objects_remaining": 0,
+    "namespace_workloads_routes_pvcs_imagestreams_remaining": 0,
+    "namespace_baseline_matches_preflight": true,
+    "post_cleanup_baseline_sha256": "sha256:ce9697dfb8eb519641338240dcbb0ab328952ebc8b07c9500a511101d774d4dd",
+    "resource_quota_matches_preflight_zero": true,
+    "namespace_and_project_preserved": true,
+    "image_stream_removed": true,
+    "registry_blob_garbage_collection_claimed": false,
+    "local_staging_directories_remaining": 0,
+    "local_python_cache_directories_remaining": 0,
+    "local_python_bytecode_files_remaining": 0,
+    "local_attributable_docker_containers_remaining": 0,
+    "local_attributable_docker_images_remaining": 0,
+    "exact_canary_binary_or_oci_copy_retained": false,
+    "postgres_15_image_retained": true,
+    "postgres_15_image_digest": "sha256:6eb0add3b77c081df18aa518ce43df58fdcc40f2e6d868a6fd08038dc7acd425",
+    "broad_delete_or_prune_used": false,
+    "openshift_authentication_retained": true
+  }
+}

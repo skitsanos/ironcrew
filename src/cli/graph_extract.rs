@@ -11,6 +11,7 @@ use crate::lua::api::{
     agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files,
     register_agent_constructor, task_from_lua_table,
 };
+use crate::lua::limits::LuaExecutionGuard;
 use crate::lua::sandbox::create_crew_lua;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -25,6 +26,8 @@ struct CapturedCrew {
     model: String,
     inline_agents: Vec<Agent>,
     tasks: Vec<Task>,
+    require_approval: Vec<String>,
+    human_inputs: Vec<GraphHumanInput>,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,13 +93,20 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
                 .unwrap_or_else(|_| "openai".into());
             let model: String = table
                 .get::<String>("model")
-                .unwrap_or_else(|_| "gpt-4.1-mini".into());
+                .unwrap_or_else(|_| crate::llm::DEFAULT_OPENAI_MODEL.into());
+            let require_approval = table
+                .get::<Option<Table>>("require_approval")
+                .ok()
+                .flatten()
+                .map(capture_string_sequence)
+                .unwrap_or_default();
 
             {
                 let mut cap = capture_for_crew.lock().unwrap();
                 cap.goal = goal;
                 cap.provider = provider;
                 cap.model = model;
+                cap.require_approval = require_approval;
             }
 
             // Build a crew proxy table that captures add_agent / add_task calls.
@@ -138,6 +148,44 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
                 Ok(t)
             })?;
             crew_proxy.set("run", run_fn)?;
+
+            // ask_human() records fixed flow checkpoints and returns the
+            // configured default. This lets capture continue through the
+            // complete flow without prompting or waiting for an HTTP answer.
+            let cap_ask_human = capture_for_crew.clone();
+            let ask_human_fn =
+                lua.create_function(move |_, (_self, options): (mlua::Value, Table)| {
+                    let prompt = options.get::<String>("prompt").unwrap_or_default();
+                    let choices = options
+                        .get::<Option<Table>>("choices")
+                        .ok()
+                        .flatten()
+                        .map(capture_string_sequence)
+                        .unwrap_or_default();
+                    let timeout_s = options.get::<Option<u64>>("timeout_s").unwrap_or(None);
+                    let default_value = options
+                        .get::<mlua::Value>("default")
+                        .unwrap_or(mlua::Value::Nil);
+                    let default = match &default_value {
+                        mlua::Value::String(value) => value.to_str().ok().map(|s| s.to_string()),
+                        mlua::Value::Integer(value) => Some(value.to_string()),
+                        mlua::Value::Number(value) => Some(value.to_string()),
+                        mlua::Value::Boolean(value) => Some(value.to_string()),
+                        _ => None,
+                    };
+                    cap_ask_human
+                        .lock()
+                        .unwrap()
+                        .human_inputs
+                        .push(GraphHumanInput {
+                            prompt,
+                            choices,
+                            timeout_s,
+                            default,
+                        });
+                    Ok(default_value)
+                })?;
+            crew_proxy.set("ask_human", ask_human_fn)?;
 
             // conversation() returns a stub with send/ask/history/reset/length methods.
             let conv_fn = lua.create_function(|lua, _args: mlua::MultiValue| {
@@ -240,6 +288,10 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
             // memory() returns nil (key-value lookup returns nothing).
             let mem_fn = lua.create_function(|_, _args: mlua::MultiValue| Ok(mlua::Value::Nil))?;
             crew_proxy.set("memory", mem_fn)?;
+            crew_proxy.set(
+                "memory_set",
+                lua.create_function(|_, _args: mlua::MultiValue| Ok(()))?,
+            )?;
 
             // Set __index so method calls work on the proxy table.
             let mt = lua.create_table()?;
@@ -262,12 +314,15 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
 
-    let source = std::fs::read_to_string(entrypoint).map_err(IronCrewError::Io)?;
+    let source = crate::lua::source::read_lua_source(entrypoint)?;
 
     // First pass: try executing the full script. Errors are caught by
     // wrapping in pcall so the Lua VM stays alive.
     let wrapped = format!("local __ok, __err = pcall(function()\n{}\nend)\n", source);
-    match lua.load(&wrapped).exec() {
+    let first_pass = LuaExecutionGuard::begin(&lua)
+        .map_err(IronCrewError::Lua)
+        .and_then(|_execution| lua.load(&wrapped).exec().map_err(IronCrewError::Lua));
+    match first_pass {
         Ok(_) => {}
         Err(e) => {
             tracing::debug!("graph_extract: crew.lua execution stopped: {}", e);
@@ -300,7 +355,10 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
                     "{}\nlocal __ok, __err = pcall(function()\nlocal crew = {}\nend)\n",
                     locals, crew_portion
                 );
-                match lua.load(&fallback).exec() {
+                let fallback_pass = LuaExecutionGuard::begin(&lua)
+                    .map_err(IronCrewError::Lua)
+                    .and_then(|_execution| lua.load(&fallback).exec().map_err(IronCrewError::Lua));
+                match fallback_pass {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::debug!("graph_extract: fallback also stopped: {}", e);
@@ -420,6 +478,17 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
         agents: graph_agents,
         tools: graph_tools,
         tasks: graph_tasks,
+        require_approval: captured.require_approval.clone(),
+        human_inputs: captured
+            .human_inputs
+            .iter()
+            .map(|input| GraphHumanInput {
+                prompt: input.prompt.clone(),
+                choices: input.choices.clone(),
+                timeout_s: input.timeout_s,
+                default: input.default.clone(),
+            })
+            .collect(),
         ..Default::default()
     })
 }
@@ -427,6 +496,13 @@ pub fn extract_graph_data(path: &Path) -> Result<GraphData> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn capture_string_sequence(table: Table) -> Vec<String> {
+    table
+        .sequence_values::<String>()
+        .filter_map(std::result::Result::ok)
+        .collect()
+}
 
 /// Derive a display task_type string from Task flags.
 fn derive_task_type(task: &Task) -> String {

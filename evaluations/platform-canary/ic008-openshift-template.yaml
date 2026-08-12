@@ -1,0 +1,776 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: ic008-conversation-canary
+  annotations:
+    description: >-
+      Scoped IC-008 OpenShift conversation canary. Processing this template is
+      intentionally separate from applying it. Every generated object is bound
+      to ironcrew.io/test-run=ic008-conversation-20260811.
+  labels:
+    ironcrew.io/test-run: ic008-conversation-20260811
+parameters:
+  - name: NAME_PREFIX
+    description: DNS-safe prefix for every generated object.
+    value: ic008-conv-20260811
+    required: true
+  - name: APP_IMAGE
+    description: >-
+      Exact attested IronCrew canary image pinned by digest. The image must
+      contain the immutable IC-008 flow at /flows/ic008/crew.lua.
+    required: true
+  - name: MOCK_IMAGE
+    description: >-
+      Exact private IC-008 mock-provider image pinned by digest. It must contain
+      MOCK_SCRIPT and expose the bounded control/count API on port 8081.
+    required: true
+  - name: MOCK_SCRIPT
+    description: Absolute IC-008 mock-provider entrypoint inside MOCK_IMAGE.
+    value: /opt/ironcrew-canary/ic008_mock_provider.py
+    required: true
+  - name: BLOCKING_CONTENT
+    description: >-
+      Non-secret, single-line user content that makes the mock hold one turn
+      until the canary calls its private /release control endpoint.
+    value: block-delete
+    required: true
+  - name: POSTGRES_IMAGE
+    description: >-
+      OpenShift arbitrary-UID-compatible PostgreSQL 15 image pinned to the
+      audited multi-architecture digest.
+    value: quay.io/sclorg/postgresql-15-c9s@sha256:68bdb875e869aabc8e8cd1a62bf9a7ff0e46142342ce81c5a80156f3fead7263
+    required: true
+  - name: SECRET_NAME
+    description: >-
+      Name of a separately provisioned Secret. Required keys are database-url,
+      api-token, postgres-database, postgres-user, and postgres-password. This
+      template never creates or embeds secret values.
+    value: ic008-conv-20260811-secrets
+    required: true
+  - name: TABLE_PREFIX
+    description: Dedicated lowercase PostgreSQL table prefix ending in underscore.
+    value: ic008c_20260811_
+    required: true
+  - name: DEPLOYMENT_REVISION
+    description: Exact source/build-manifest revision, at most 128 safe ASCII bytes.
+    required: true
+  - name: ARTIFACT_FINGERPRINT
+    description: Canonical sha256 fingerprint of the running IronCrew binary.
+    required: true
+  - name: FLOW_FINGERPRINT
+    description: Canonical sha256 fingerprint of the mounted flow tree.
+    required: true
+  - name: CONFIG_FINGERPRINT
+    description: >-
+      Canonical config_contract.py fingerprint. The default is exact for the
+      default table prefix, private mock URL, and secret-presence profile; it
+      must be recomputed when any effective input changes.
+    value: sha256:5d7411e95639c5cbcf9cc6cfe5005895f8ebd19fd794415619d5f2d54e295d12
+    required: true
+  - name: HITL_KEYRING_FINGERPRINT
+    description: >-
+      Canonical sha256 fingerprint of the independently computed empty-keyring
+      manifest used by this HITL-disabled canary.
+    value: sha256:9bc1cc42c4690cde8d2f666c9e572f81cd20c2341ff20cc1bac4d0744601e155
+    required: true
+objects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${NAME_PREFIX}-config
+      labels:
+        app.kubernetes.io/name: ironcrew
+        app.kubernetes.io/component: canary-config
+        ironcrew.io/test-run: ic008-conversation-20260811
+    immutable: true
+    data:
+      HOME: /tmp
+      IRONCREW_HOST: 0.0.0.0
+      IRONCREW_PORT: "8080"
+      IRONCREW_ADMISSION_CONTROL_BURST: "20"
+      IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE: "120"
+      IRONCREW_ADMISSION_OBSERVATION_BURST: "20"
+      IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE: "600"
+      IRONCREW_ADMISSION_WORK_BURST: "10"
+      IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE: "60"
+      IRONCREW_ALLOW_PRIVATE_IPS: "true"
+      IRONCREW_ALLOW_UNAUTHENTICATED: "false"
+      IRONCREW_API_CONVERSATION_MAX_HISTORY: "50"
+      IRONCREW_API_MESSAGE_MAX_BYTES: "262144"
+      IRONCREW_API_PRINCIPAL: platform-canary
+      IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES: "16384"
+      IRONCREW_ASK_HUMAN_MAX_CHOICES: "16"
+      IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES: "16384"
+      IRONCREW_ASK_HUMAN_MAX_PENDING: "8"
+      IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES: "262144"
+      IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES: "16384"
+      IRONCREW_ASK_HUMAN_MAX_TIMEOUT: "300"
+      IRONCREW_ASK_HUMAN_TIMEOUT: "120"
+      IRONCREW_CHAT_HISTORY_MAX_BYTES: "33554432"
+      IRONCREW_CHAT_SESSION_IDLE_SECS: "1800"
+      IRONCREW_CONVERSATION_MAX_HISTORY: "50"
+      IRONCREW_CREW_GOAL_MAX_BYTES: "65536"
+      IRONCREW_DB_CONNECT_BACKOFF_MS: "1000"
+      IRONCREW_DB_CONNECT_RETRIES: "10"
+      IRONCREW_DB_CONNECT_TIMEOUT_SECS: "30"
+      IRONCREW_DB_POOL_SIZE: "2"
+      IRONCREW_ENV_ALLOWLIST: PLATFORM_CANARY_PROVIDER_BASE_URL
+      IRONCREW_EVENT_CHANNEL_CAPACITY: "8"
+      IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES: "16777216"
+      IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS: "2000"
+      IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES: "131072"
+      IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS: "250"
+      IRONCREW_EVENT_JOURNAL_PRUNE_BATCH: "100"
+      IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS: "2000"
+      IRONCREW_EVENT_JOURNAL_RETENTION_SECS: "600"
+      IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS: "5000"
+      IRONCREW_EVENT_MAX_BYTES: "65536"
+      IRONCREW_EVENT_REPLAY_MAX_BYTES: "1048576"
+      IRONCREW_FILE_WRITE_MAX_BYTES: "262144"
+      IRONCREW_FILE_WRITE_ROOT: /data/outputs
+      IRONCREW_HITL_PG_MAX_CONCURRENT_READS: "1"
+      IRONCREW_HITL_POLL_INTERVAL_MS: "250"
+      IRONCREW_HITL_READ_TIMEOUT_MS: "2000"
+      IRONCREW_HTTP_MAX_HEADER_BYTES: "32768"
+      IRONCREW_HTTP_MAX_JSON_BYTES: "262144"
+      IRONCREW_HTTP_MAX_OUTPUT_BYTES: "524288"
+      IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES: "262144"
+      IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES: "32768"
+      IRONCREW_HTTP_MAX_RESPONSE_BYTES: "262144"
+      IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL: "8"
+      IRONCREW_IDEMPOTENCY_MAX_RECORDS: "1000"
+      IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL: "250"
+      IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES: "1048576"
+      IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES: "16777216"
+      IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL: "4194304"
+      IRONCREW_IDEMPOTENCY_PRUNE_BATCH: "100"
+      IRONCREW_IDEMPOTENCY_TTL_SECONDS: "7200"
+      IRONCREW_LOG: info
+      IRONCREW_LUA_FS_MAX_READ_BYTES: "1048576"
+      IRONCREW_LUA_FS_MAX_WRITE_BYTES: "1048576"
+      IRONCREW_LUA_JSON_MAX_DEPTH: "64"
+      IRONCREW_LUA_JSON_MAX_NODES: "100000"
+      IRONCREW_LUA_JSON_MAX_OUTPUT_BYTES: "16777216"
+      IRONCREW_LUA_JSON_MAX_STRING_BYTES: "8388608"
+      IRONCREW_LUA_MAX_EXECUTION_SECONDS: "60"
+      IRONCREW_LUA_MAX_INSTRUCTIONS: "10000000"
+      IRONCREW_LUA_MAX_MEMORY_BYTES: "16777216"
+      IRONCREW_LUA_MAX_SOURCE_BYTES: "1048576"
+      IRONCREW_MAX_BODY_SIZE: "10485760"
+      IRONCREW_MAX_ACTIVE_CONVERSATIONS: "2"
+      IRONCREW_MAX_ACTIVE_RUNS: "2"
+      IRONCREW_MAX_AGENTS: "64"
+      IRONCREW_MAX_CONCURRENT_TASKS: "2"
+      IRONCREW_MAX_CONVERSATION_LIFECYCLES: "32"
+      IRONCREW_MAX_CONVERSATION_TURN_SECS: "300"
+      IRONCREW_MAX_EVENTS: "256"
+      IRONCREW_MAX_PROMPT_CHARS: "16384"
+      IRONCREW_MAX_REASONING_BYTES: "1048576"
+      IRONCREW_MAX_RUN_LIFETIME: "300"
+      IRONCREW_MAX_SSE_CONNECTIONS: "8"
+      IRONCREW_MAX_TASKS: "8"
+      IRONCREW_MAX_TASK_RETRIES: "10"
+      IRONCREW_MAX_TASK_TIMEOUT_SECS: "86400"
+      IRONCREW_MCP_ALLOWED_COMMANDS: __disabled__
+      IRONCREW_MCP_ALLOWED_HTTP_HOSTS: __disabled__
+      IRONCREW_MCP_ALLOW_LOCALHOST: "false"
+      IRONCREW_MCP_TOOL_RESULT_MAX_BYTES: "262144"
+      IRONCREW_PG_TABLE_PREFIX: ${TABLE_PREFIX}
+      IRONCREW_PROVIDER_MAX_ERROR_BYTES: "65536"
+      IRONCREW_PROVIDER_MAX_OUTPUT_BYTES: "1048576"
+      IRONCREW_PROVIDER_MAX_RESPONSE_BYTES: "1048576"
+      IRONCREW_PROVIDER_MAX_STREAM_BYTES: "2097152"
+      IRONCREW_READINESS_CACHE_MS: "500"
+      IRONCREW_REQUIRE_IDEMPOTENCY_KEY: "true"
+      IRONCREW_RUN_LEASE_TTL_SECONDS: "60"
+      IRONCREW_RUN_RESULTS_MAX_BYTES: "4194304"
+      IRONCREW_RUN_SSE_RETENTION_SECS: "5"
+      IRONCREW_SHUTDOWN_DRAIN_MS: "1000"
+      IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS: "5"
+      IRONCREW_SHUTDOWN_TIMEOUT_SECS: "15"
+      IRONCREW_STORE: postgres
+      IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES: "1048576"
+      IRONCREW_TASK_RESULT_MAX_REASONING_BYTES: "524288"
+      IRONCREW_TOOL_TIMEOUT: "60"
+      IRONCREW_TRUST_PROXY: "false"
+      PLATFORM_CANARY_PROVIDER_BASE_URL: http://${NAME_PREFIX}-mock:8081/v1
+      IRONCREW_DEPLOYMENT_REVISION: ${DEPLOYMENT_REVISION}
+      IRONCREW_ARTIFACT_FINGERPRINT: ${ARTIFACT_FINGERPRINT}
+      IRONCREW_FLOW_FINGERPRINT: ${FLOW_FINGERPRINT}
+      IRONCREW_CONFIG_FINGERPRINT: ${CONFIG_FINGERPRINT}
+      IRONCREW_HITL_KEYRING_FINGERPRINT: ${HITL_KEYRING_FINGERPRINT}
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: ${NAME_PREFIX}-a
+      labels:
+        app.kubernetes.io/name: ironcrew
+        app.kubernetes.io/component: app
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: app
+        ironcrew.io/replica: a
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ironcrew
+          image: ${APP_IMAGE}
+          imagePullPolicy: Always
+          args: ["serve", "--flows-dir", "/flows"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: ${NAME_PREFIX}-config
+          env:
+            - name: IRONCREW_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: database-url
+            - name: IRONCREW_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: api-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: outputs
+          emptyDir:
+            sizeLimit: 256Mi
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: ${NAME_PREFIX}-b
+      labels:
+        app.kubernetes.io/name: ironcrew
+        app.kubernetes.io/component: app
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: app
+        ironcrew.io/replica: b
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ironcrew
+          image: ${APP_IMAGE}
+          imagePullPolicy: Always
+          args: ["serve", "--flows-dir", "/flows"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: ${NAME_PREFIX}-config
+          env:
+            - name: IRONCREW_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: database-url
+            - name: IRONCREW_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: api-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: outputs
+          emptyDir:
+            sizeLimit: 256Mi
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: ${NAME_PREFIX}-postgres
+      labels:
+        app.kubernetes.io/name: ${NAME_PREFIX}-postgres
+        app.kubernetes.io/component: database
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: postgres
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: ${POSTGRES_IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: postgres-database
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: postgres-user
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${SECRET_NAME}
+                  key: postgres-password
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: pg-data
+              mountPath: /var/lib/pgsql
+            - name: pg-run
+              mountPath: /var/run/postgresql
+            - name: pg-tmp
+              mountPath: /tmp
+            - name: pg-shm
+              mountPath: /dev/shm
+      volumes:
+        - name: pg-data
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: pg-run
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: pg-tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: pg-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: ${NAME_PREFIX}-mock
+      labels:
+        app.kubernetes.io/name: ${NAME_PREFIX}-mock
+        app.kubernetes.io/component: mock-provider
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: mock
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-provider
+          image: ${MOCK_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "${MOCK_SCRIPT}"]
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8081"
+            - --effect-url
+            - http://${NAME_PREFIX}-mock:8081/effect
+            - --blocking-content
+            - ${BLOCKING_CONTENT}
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /counts
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /counts
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME_PREFIX}-a
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+    spec:
+      type: ClusterIP
+      sessionAffinity: None
+      selector:
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: app
+        ironcrew.io/replica: a
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME_PREFIX}-b
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+    spec:
+      type: ClusterIP
+      sessionAffinity: None
+      selector:
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: app
+        ironcrew.io/replica: b
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME_PREFIX}-app
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+    spec:
+      type: ClusterIP
+      sessionAffinity: None
+      selector:
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: app
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME_PREFIX}-postgres
+      labels:
+        app.kubernetes.io/name: ${NAME_PREFIX}-postgres
+        ironcrew.io/test-run: ic008-conversation-20260811
+    spec:
+      type: ClusterIP
+      selector:
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: postgres
+      ports:
+        - name: postgres
+          port: 5432
+          targetPort: postgres
+          protocol: TCP
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME_PREFIX}-mock
+      labels:
+        app.kubernetes.io/name: ${NAME_PREFIX}-mock
+        ironcrew.io/test-run: ic008-conversation-20260811
+    spec:
+      type: ClusterIP
+      selector:
+        ironcrew.io/test-run: ic008-conversation-20260811
+        ironcrew.io/role: mock
+      ports:
+        - name: http
+          port: 8081
+          targetPort: http
+          protocol: TCP
+  - apiVersion: route.openshift.io/v1
+    kind: Route
+    metadata:
+      name: ${NAME_PREFIX}-a
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+      annotations:
+        haproxy.router.openshift.io/balance: roundrobin
+        haproxy.router.openshift.io/disable_cookies: "true"
+    spec:
+      to:
+        kind: Service
+        name: ${NAME_PREFIX}-a
+        weight: 100
+      port:
+        targetPort: http
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+      wildcardPolicy: None
+  - apiVersion: route.openshift.io/v1
+    kind: Route
+    metadata:
+      name: ${NAME_PREFIX}-b
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+      annotations:
+        haproxy.router.openshift.io/balance: roundrobin
+        haproxy.router.openshift.io/disable_cookies: "true"
+    spec:
+      to:
+        kind: Service
+        name: ${NAME_PREFIX}-b
+        weight: 100
+      port:
+        targetPort: http
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+      wildcardPolicy: None
+  - apiVersion: route.openshift.io/v1
+    kind: Route
+    metadata:
+      name: ${NAME_PREFIX}-app
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+      annotations:
+        haproxy.router.openshift.io/balance: roundrobin
+        haproxy.router.openshift.io/disable_cookies: "true"
+    spec:
+      to:
+        kind: Service
+        name: ${NAME_PREFIX}-app
+        weight: 100
+      port:
+        targetPort: http
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+      wildcardPolicy: None
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME_PREFIX}-app-egress
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+      annotations:
+        ironcrew.io/evidence-boundary: additive-baseline-ingress-not-exclusive
+    spec:
+      podSelector:
+        matchLabels:
+          ironcrew.io/test-run: ic008-conversation-20260811
+          ironcrew.io/role: app
+      policyTypes: ["Egress"]
+      egress:
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: openshift-dns
+          ports:
+            - protocol: UDP
+              port: 53
+            - protocol: TCP
+              port: 53
+            - protocol: UDP
+              port: 5353
+            - protocol: TCP
+              port: 5353
+        - to:
+            - podSelector:
+                matchLabels:
+                  ironcrew.io/test-run: ic008-conversation-20260811
+                  ironcrew.io/role: postgres
+          ports:
+            - protocol: TCP
+              port: 5432
+        - to:
+            - podSelector:
+                matchLabels:
+                  ironcrew.io/test-run: ic008-conversation-20260811
+                  ironcrew.io/role: mock
+          ports:
+            - protocol: TCP
+              port: 8081
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME_PREFIX}-backend-boundary
+      labels:
+        app.kubernetes.io/name: ironcrew
+        ironcrew.io/test-run: ic008-conversation-20260811
+      annotations:
+        ironcrew.io/evidence-boundary: additive-baseline-ingress-not-exclusive
+    spec:
+      podSelector:
+        matchExpressions:
+          - key: ironcrew.io/test-run
+            operator: In
+            values: ["ic008-conversation-20260811"]
+          - key: ironcrew.io/role
+            operator: In
+            values: ["postgres", "mock"]
+      policyTypes: ["Ingress", "Egress"]
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels:
+                  ironcrew.io/test-run: ic008-conversation-20260811
+                  ironcrew.io/role: app
+          ports:
+            - protocol: TCP
+              port: 5432
+            - protocol: TCP
+              port: 8081

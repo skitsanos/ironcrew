@@ -25,11 +25,54 @@ use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::sessions::{DialogStateRecord, validate_session_id};
 use crate::engine::store::StateStore;
 use crate::llm::provider::{
-    ChatMessage, ChatRequest, ChatResponse, LlmProvider, StreamChunk, ToolCallRequest,
+    ChatMessage, ChatRequest, ChatResponse, HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider,
+    StreamChunk, ToolCallRequest, append_text_bounded, chat_history_estimated_bytes,
+    chat_history_max_bytes, max_reasoning_bytes, validate_chat_history,
 };
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
+
+const DEFAULT_DIALOG_MAX_HISTORY: usize = 100;
+const HARD_DIALOG_MAX_HISTORY: usize = HARD_CHAT_HISTORY_MAX_MESSAGES - 1;
+const DEFAULT_DIALOG_MAX_TURNS: usize = 1_000;
+const HARD_DIALOG_MAX_TURNS: usize = 10_000;
+const DEFAULT_DIALOG_MAX_PARTICIPANTS: usize = 16;
+const HARD_DIALOG_MAX_PARTICIPANTS: usize = 64;
+const MAX_DIALOG_STOP_REASON_BYTES: usize = 4 * 1024;
+
+fn positive_bounded_env(name: &str, default: usize, hard_max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(hard_max))
+        .unwrap_or(default)
+}
+
+fn configured_dialog_max_turns() -> usize {
+    positive_bounded_env(
+        "IRONCREW_DIALOG_MAX_TURNS",
+        DEFAULT_DIALOG_MAX_TURNS,
+        HARD_DIALOG_MAX_TURNS,
+    )
+}
+
+fn configured_dialog_max_participants() -> usize {
+    positive_bounded_env(
+        "IRONCREW_DIALOG_MAX_PARTICIPANTS",
+        DEFAULT_DIALOG_MAX_PARTICIPANTS,
+        HARD_DIALOG_MAX_PARTICIPANTS,
+    )
+}
+
+fn default_dialog_max_history() -> usize {
+    positive_bounded_env(
+        "IRONCREW_DIALOG_MAX_HISTORY",
+        DEFAULT_DIALOG_MAX_HISTORY,
+        HARD_DIALOG_MAX_HISTORY,
+    )
+}
 
 /// Convert a 0-based agent index into a stable positional label
 /// (`"a"`, `"b"`, ..., `"z"`). Used in SSE events for backward compatibility.
@@ -54,6 +97,130 @@ pub struct DialogTurn {
     pub reasoning: Option<String>,
 }
 
+impl DialogTurn {
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.agent_name.capacity())
+            .saturating_add(self.content.capacity())
+            .saturating_add(self.reasoning.as_ref().map_or(0, String::capacity))
+    }
+}
+
+fn transcript_estimated_bytes(transcript: &VecDeque<DialogTurn>) -> usize {
+    transcript.iter().fold(
+        std::mem::size_of::<VecDeque<DialogTurn>>(),
+        |total, turn| total.saturating_add(turn.estimated_bytes()),
+    )
+}
+
+fn validate_transcript(
+    transcript: &VecDeque<DialogTurn>,
+    agents: &[Agent],
+    max_history: usize,
+    max_turns: usize,
+    max_bytes: usize,
+    next_index: usize,
+) -> Result<(), IronCrewError> {
+    if transcript.len() > max_history {
+        return Err(IronCrewError::Validation(format!(
+            "dialog transcript contains {} turns, exceeding max_history {max_history}",
+            transcript.len()
+        )));
+    }
+    let estimated_bytes = transcript_estimated_bytes(transcript);
+    if estimated_bytes > max_bytes {
+        return Err(IronCrewError::Validation(format!(
+            "dialog transcript estimated footprint is {estimated_bytes} bytes, exceeding {max_bytes} bytes"
+        )));
+    }
+    if next_index > max_turns {
+        return Err(IronCrewError::Validation(format!(
+            "dialog resume index {next_index} exceeds max_turns {max_turns}"
+        )));
+    }
+    if transcript.is_empty() {
+        if next_index != 0 {
+            return Err(IronCrewError::Validation(format!(
+                "empty dialog transcript has non-zero resume index {next_index}"
+            )));
+        }
+        return Ok(());
+    }
+
+    let expected_first = next_index.saturating_sub(transcript.len());
+    for (offset, turn) in transcript.iter().enumerate() {
+        let expected_index = expected_first.saturating_add(offset);
+        if turn.index != expected_index {
+            return Err(IronCrewError::Validation(format!(
+                "dialog transcript turn index {} is not the expected {expected_index}",
+                turn.index
+            )));
+        }
+        let Some(agent) = agents.get(turn.speaker_index) else {
+            return Err(IronCrewError::Validation(format!(
+                "dialog transcript turn {} references invalid speaker index {}",
+                turn.index, turn.speaker_index
+            )));
+        };
+        if turn.agent_name != agent.name {
+            return Err(IronCrewError::Validation(format!(
+                "dialog transcript turn {} names agent '{}' but speaker index {} is '{}'",
+                turn.index, turn.agent_name, turn.speaker_index, agent.name
+            )));
+        }
+        if turn
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| reasoning.len() > max_reasoning_bytes())
+        {
+            return Err(IronCrewError::Validation(format!(
+                "dialog transcript turn {} reasoning exceeds the configured limit",
+                turn.index
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_dialog_working_history(
+    messages: &mut Vec<ChatMessage>,
+    mut active_start: usize,
+    max_bytes: usize,
+) -> Result<usize, IronCrewError> {
+    if messages.len() < 2 || active_start < 2 || active_start > messages.len() {
+        return Err(IronCrewError::Validation(
+            "Dialog provider history has invalid protected boundaries".into(),
+        ));
+    }
+
+    let protected_count = 1usize.saturating_add(messages.len().saturating_sub(active_start));
+    let protected_bytes = messages[..2]
+        .iter()
+        .chain(messages[active_start..].iter())
+        .fold(std::mem::size_of::<Vec<ChatMessage>>(), |total, message| {
+            total.saturating_add(message.estimated_bytes())
+        });
+    if protected_count > HARD_CHAT_HISTORY_MAX_MESSAGES || protected_bytes > max_bytes {
+        return Err(IronCrewError::Validation(format!(
+            "Current dialog tool-call turn exceeds the configured history budget of {max_bytes} bytes"
+        )));
+    }
+
+    while messages.len().saturating_sub(1) > HARD_CHAT_HISTORY_MAX_MESSAGES
+        || chat_history_estimated_bytes(messages) > max_bytes
+    {
+        if active_start <= 2 {
+            return Err(IronCrewError::Validation(
+                "Current dialog tool-call turn exceeds the configured history budget".into(),
+            ));
+        }
+        messages.remove(2);
+        active_start -= 1;
+    }
+    validate_chat_history(messages, HARD_CHAT_HISTORY_MAX_MESSAGES, max_bytes, false)?;
+    Ok(active_start)
+}
+
 /// State of an N-agent dialog (N >= 2). Agents take turns in round-robin
 /// order starting from `starting_speaker`.
 pub struct AgentDialog {
@@ -72,6 +239,8 @@ pub struct AgentDialog {
 
     pub max_turns: usize,
     pub max_history: Option<usize>,
+    /// Aggregate estimated footprint cap for prompt/transcript history.
+    pub history_max_bytes: usize,
     pub stream: bool,
     pub max_tool_rounds: usize,
     /// 0-based index into `agents` of the agent who speaks first.
@@ -140,6 +309,9 @@ pub struct AgentDialog {
 
     /// RFC3339 timestamp of the original creation, preserved across resumes.
     pub created_at: String,
+
+    /// Revision expected by the next durable save.
+    pub revision: Mutex<u64>,
 }
 
 impl AgentDialog {
@@ -174,6 +346,47 @@ impl AgentDialog {
         autosave: bool,
     ) -> Result<Self, IronCrewError> {
         let now = chrono::Utc::now().to_rfc3339();
+        let participant_limit = configured_dialog_max_participants();
+        if !(2..=participant_limit).contains(&agents.len()) {
+            return Err(IronCrewError::Validation(format!(
+                "Dialog participant count must be between 2 and {participant_limit}, got {}",
+                agents.len()
+            )));
+        }
+        let turn_limit = configured_dialog_max_turns();
+        if max_turns == 0 || max_turns > turn_limit {
+            return Err(IronCrewError::Validation(format!(
+                "Dialog max_turns must be between 1 and {turn_limit}, got {max_turns}"
+            )));
+        }
+        let max_history = match max_history {
+            Some(value) if (1..=HARD_DIALOG_MAX_HISTORY).contains(&value) => value,
+            Some(value) => {
+                return Err(IronCrewError::Validation(format!(
+                    "Dialog max_history must be between 1 and {HARD_DIALOG_MAX_HISTORY}, got {value}"
+                )));
+            }
+            None => default_dialog_max_history(),
+        };
+        if starting_speaker >= agents.len() {
+            return Err(IronCrewError::Validation(format!(
+                "Dialog starting speaker index {starting_speaker} is out of range"
+            )));
+        }
+        let history_max_bytes = chat_history_max_bytes();
+        for agent in &agents {
+            let system = agent
+                .system_prompt
+                .clone()
+                .unwrap_or_else(|| format!("You are {}. Your goal: {}", agent.name, agent.goal));
+            let base_messages = [ChatMessage::system(&system), ChatMessage::user(&starter)];
+            if chat_history_estimated_bytes(&base_messages) > history_max_bytes {
+                return Err(IronCrewError::Validation(format!(
+                    "Dialog starter and system prompt for '{}' exceed the configured history budget of {history_max_bytes} bytes",
+                    agent.name
+                )));
+            }
+        }
 
         let (id, persistent) = match id {
             Some(s) => {
@@ -189,6 +402,7 @@ impl AgentDialog {
         let mut stopped = false;
         let mut stop_reason: Option<String> = None;
         let mut created_at = now.clone();
+        let mut revision = 0;
 
         if persistent
             && let Some(ref store) = store
@@ -204,11 +418,38 @@ impl AgentDialog {
                     id, record.agent_names, current_names
                 )));
             }
+            if record.starter != starter {
+                return Err(IronCrewError::Validation(format!(
+                    "Dialog '{id}' was saved with a different starter message"
+                )));
+            }
+            revision = record.revision;
             transcript = record.transcript.into();
             next_index = record.next_index;
             stopped = record.stopped;
             stop_reason = record.stop_reason;
             created_at = record.created_at;
+            if stop_reason
+                .as_ref()
+                .is_some_and(|reason| reason.len() > MAX_DIALOG_STOP_REASON_BYTES)
+            {
+                return Err(IronCrewError::Validation(format!(
+                    "Dialog '{id}' has an oversized persisted stop reason"
+                )));
+            }
+            validate_transcript(
+                &transcript,
+                &agents,
+                max_history,
+                max_turns,
+                history_max_bytes,
+                next_index,
+            )
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "Dialog '{id}' has invalid persisted history: {error}"
+                ))
+            })?;
             tracing::info!(
                 "Resumed dialog '{}' at turn {} ({} prior turns)",
                 id,
@@ -216,6 +457,15 @@ impl AgentDialog {
                 transcript.len()
             );
         }
+
+        validate_transcript(
+            &transcript,
+            &agents,
+            max_history,
+            max_turns,
+            history_max_bytes,
+            next_index,
+        )?;
 
         eventbus.emit(CrewEvent::DialogStarted {
             dialog_id: id.clone(),
@@ -231,7 +481,8 @@ impl AgentDialog {
             model,
             starter,
             max_turns,
-            max_history,
+            max_history: Some(max_history),
+            history_max_bytes,
             stream,
             max_tool_rounds,
             starting_speaker,
@@ -249,6 +500,7 @@ impl AgentDialog {
             flow_path,
             autosave,
             created_at,
+            revision: Mutex::new(revision),
         })
     }
 
@@ -261,8 +513,19 @@ impl AgentDialog {
         if !self.persistent {
             return Ok(());
         }
-        let transcript: Vec<DialogTurn> = self.transcript.lock().await.iter().cloned().collect();
+        let mut revision = self.revision.lock().await;
         let next_index = *self.next_index.lock().await;
+        let transcript_guard = self.transcript.lock().await;
+        validate_transcript(
+            &transcript_guard,
+            &self.agents,
+            self.max_history.unwrap_or(DEFAULT_DIALOG_MAX_HISTORY),
+            self.max_turns,
+            self.history_max_bytes,
+            next_index,
+        )?;
+        let transcript: Vec<DialogTurn> = transcript_guard.iter().cloned().collect();
+        drop(transcript_guard);
         let stopped = *self.stopped.lock().await;
         let stop_reason = self.stop_reason.lock().await.clone();
         let record = DialogStateRecord {
@@ -277,8 +540,10 @@ impl AgentDialog {
             stop_reason,
             created_at: self.created_at.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
+            revision: *revision,
         };
-        store.save_dialog_state(&record).await
+        *revision = store.save_dialog_state(&record).await?;
+        Ok(())
     }
 
     /// Returns `true` if the dialog has not reached `max_turns` yet AND no
@@ -310,6 +575,11 @@ impl AgentDialog {
                     .to_str()
                     .map(|s| s.to_string())
                     .map_err(|e| IronCrewError::Validation(format!("should_stop reason: {}", e)))?;
+                if owned.len() > MAX_DIALOG_STOP_REASON_BYTES {
+                    return Err(IronCrewError::Validation(format!(
+                        "should_stop reason exceeds {MAX_DIALOG_STOP_REASON_BYTES} bytes"
+                    )));
+                }
                 if owned.is_empty() {
                     Ok(Some("custom_stop".into()))
                 } else {
@@ -480,7 +750,10 @@ impl AgentDialog {
     /// - System: that agent's system prompt
     /// - Starter as user
     /// - Their own past turns as assistant, others' as user with `[name]:` prefix
-    async fn build_messages(&self, speaker_index: usize) -> Vec<ChatMessage> {
+    async fn build_messages(
+        &self,
+        speaker_index: usize,
+    ) -> Result<Vec<ChatMessage>, IronCrewError> {
         let agent = &self.agents[speaker_index];
 
         let system_content = agent
@@ -493,28 +766,49 @@ impl AgentDialog {
         // The starter is always a user message
         messages.push(ChatMessage::user(&self.starter));
 
-        // Walk transcript and assign roles based on perspective
+        let mut estimated_bytes = chat_history_estimated_bytes(&messages);
+        if estimated_bytes > self.history_max_bytes {
+            return Err(IronCrewError::Validation(format!(
+                "Dialog system prompt and starter exceed the configured history budget of {} bytes",
+                self.history_max_bytes
+            )));
+        }
+
+        // Select a bounded suffix before cloning content into provider
+        // messages. Each transcript entry is a complete dialog turn, so
+        // dropping an older entry cannot split a provider tool-call group.
         let transcript = self.transcript.lock().await;
-        for turn in transcript.iter() {
-            if turn.speaker_index == speaker_index {
-                messages.push(ChatMessage::assistant(Some(turn.content.clone()), None));
+        let max_history = self.max_history.unwrap_or(DEFAULT_DIALOG_MAX_HISTORY);
+        let mut selected = VecDeque::new();
+        for turn in transcript.iter().rev().take(max_history) {
+            let candidate = if turn.speaker_index == speaker_index {
+                ChatMessage::assistant(Some(turn.content.clone()), None)
             } else {
                 let prefixed = format!("[{}]: {}", turn.agent_name, turn.content);
-                messages.push(ChatMessage::user(&prefixed));
+                ChatMessage::user(&prefixed)
+            };
+            let candidate_bytes = candidate.estimated_bytes();
+            if estimated_bytes.saturating_add(candidate_bytes) > self.history_max_bytes {
+                if selected.is_empty() {
+                    return Err(IronCrewError::Validation(format!(
+                        "Current dialog turn exceeds the configured history budget of {} bytes",
+                        self.history_max_bytes
+                    )));
+                }
+                break;
             }
+            estimated_bytes = estimated_bytes.saturating_add(candidate_bytes);
+            selected.push_front(candidate);
         }
+        drop(transcript);
+        messages.extend(selected);
 
-        // Apply history cap (keep system + starter + last N turns)
-        if let Some(cap) = self.max_history {
-            // System (1) + starter (1) = 2 always preserved at start
-            let limit = cap + 2;
-            if messages.len() > limit {
-                let excess = messages.len() - limit;
-                messages.drain(2..2 + excess);
-            }
+        if messages.len().saturating_sub(1) > HARD_CHAT_HISTORY_MAX_MESSAGES {
+            return Err(IronCrewError::Validation(
+                "Dialog prompt exceeds the hard chat message ceiling".into(),
+            ));
         }
-
-        messages
+        Ok(messages)
     }
 
     /// Run a single turn with automatic speaker selection (round-robin or callback).
@@ -527,7 +821,7 @@ impl AgentDialog {
         let speaker_index = self.select_speaker(lua).await?;
         let turn = self.execute_turn(speaker_index).await?;
         self.maybe_stop_after_turn(lua, &turn).await?;
-        self.autosave_if_enabled().await;
+        self.autosave_if_enabled().await?;
         Ok(Some(turn))
     }
 
@@ -545,27 +839,25 @@ impl AgentDialog {
         let speaker_index = self.agent_index(agent_name)?;
         let turn = self.execute_turn(speaker_index).await?;
         self.maybe_stop_after_turn(lua, &turn).await?;
-        self.autosave_if_enabled().await;
+        self.autosave_if_enabled().await?;
         Ok(Some(turn))
     }
 
-    /// Persist the dialog state after a turn, if autosave is enabled and
-    /// the session is persistent. Errors are logged but not propagated so
-    /// a transient store failure doesn't kill an in-progress dialog.
-    async fn autosave_if_enabled(&self) {
+    /// Persist the dialog state after a turn, if autosave is enabled and the
+    /// session is persistent. Callers must observe failures rather than
+    /// reporting a turn as durably successful while storage lags behind.
+    async fn autosave_if_enabled(&self) -> Result<(), IronCrewError> {
         if !self.autosave || !self.persistent {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.persist().await {
-            tracing::warn!("Autosave failed for dialog '{}': {}", self.id, e);
-        }
+        self.persist().await
     }
 
     /// Execute a turn for the agent at `speaker_index`. Increments the turn
     /// counter and emits SSE events.
     async fn execute_turn(&self, speaker_index: usize) -> Result<DialogTurn, IronCrewError> {
         let agent = self.agents[speaker_index].clone();
-        let messages = self.build_messages(speaker_index).await;
+        let messages = self.build_messages(speaker_index).await?;
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
         let has_tools = !tool_schemas.is_empty();
 
@@ -584,11 +876,26 @@ impl AgentDialog {
 
         // Tool-call loop (mirrors LuaConversation::run_turn)
         let mut accumulated_reasoning = String::new();
+        let reasoning_limit = max_reasoning_bytes();
+        let mut reasoning_truncated = false;
         let accumulated_content;
         let mut working_messages = messages;
+        validate_chat_history(
+            &working_messages,
+            HARD_CHAT_HISTORY_MAX_MESSAGES,
+            self.history_max_bytes,
+            true,
+        )?;
+        let mut active_tool_start: Option<usize> = None;
         let mut rounds = 0usize;
 
         loop {
+            validate_chat_history(
+                &working_messages,
+                HARD_CHAT_HISTORY_MAX_MESSAGES,
+                self.history_max_bytes,
+                true,
+            )?;
             let request = ChatRequest {
                 messages: working_messages.clone(),
                 model: self.model.clone(),
@@ -611,9 +918,11 @@ impl AgentDialog {
 
             if let Some(ref r) = response.reasoning {
                 if !accumulated_reasoning.is_empty() {
-                    accumulated_reasoning.push('\n');
+                    reasoning_truncated |=
+                        append_text_bounded(&mut accumulated_reasoning, "\n", reasoning_limit);
                 }
-                accumulated_reasoning.push_str(r);
+                reasoning_truncated |=
+                    append_text_bounded(&mut accumulated_reasoning, r, reasoning_limit);
             }
 
             if response.tool_calls.is_empty() {
@@ -634,53 +943,89 @@ impl AgentDialog {
 
             // Append assistant tool-call request to working messages, carrying
             // the provider's reasoning blocks for replay (extended thinking).
+            let active_start = *active_tool_start.get_or_insert(working_messages.len());
             working_messages.push(ChatMessage::assistant_with_blocks(
                 response.content.clone(),
                 Some(response.tool_calls.clone()),
                 response.raw_blocks.clone(),
             ));
+            active_tool_start = Some(enforce_dialog_working_history(
+                &mut working_messages,
+                active_start,
+                self.history_max_bytes,
+            )?);
 
             for tool_call in &response.tool_calls {
                 let result_text = self
                     .execute_tool_call(tool_call, &agent.name, turn_idx)
                     .await;
                 working_messages.push(ChatMessage::tool(&tool_call.id, &result_text));
+                active_tool_start = Some(enforce_dialog_working_history(
+                    &mut working_messages,
+                    active_tool_start.expect("tool-call active boundary is set"),
+                    self.history_max_bytes,
+                )?);
             }
         }
 
-        let next_index = {
-            let mut idx = self.next_index.lock().await;
-            let current = *idx;
-            *idx = current + 1;
-            current
-        };
-
         let turn = DialogTurn {
-            index: next_index,
+            index: turn_idx,
             speaker_index,
             agent_name: agent.name.clone(),
             content: accumulated_content,
             reasoning: if accumulated_reasoning.is_empty() {
                 None
             } else {
+                if reasoning_truncated {
+                    tracing::warn!(
+                        dialog = %self.id,
+                        agent = %agent.name,
+                        limit = reasoning_limit,
+                        "Reasoning text was truncated to the configured byte limit"
+                    );
+                }
                 Some(accumulated_reasoning)
             },
         };
 
+        if std::mem::size_of::<VecDeque<DialogTurn>>().saturating_add(turn.estimated_bytes())
+            > self.history_max_bytes
+        {
+            return Err(IronCrewError::Validation(format!(
+                "Current dialog turn exceeds the configured history budget of {} bytes",
+                self.history_max_bytes
+            )));
+        }
+
+        let mut next_index_guard = self.next_index.lock().await;
+        if *next_index_guard != turn_idx {
+            return Err(IronCrewError::Validation(
+                "Dialog turn index changed during execution".into(),
+            ));
+        }
         {
             let mut transcript = self.transcript.lock().await;
             transcript.push_back(turn.clone());
-            // Trim the stored transcript if a cap is configured. This keeps
-            // the stored transcript bounded in the same way `build_messages`
-            // already bounds the ephemeral prompt message list.
-            if let Some(cap) = self.max_history
-                && cap > 0
+            let cap = self.max_history.unwrap_or(DEFAULT_DIALOG_MAX_HISTORY);
+            while transcript.len() > cap
+                || transcript_estimated_bytes(&transcript) > self.history_max_bytes
             {
-                while transcript.len() > cap {
-                    transcript.pop_front();
-                }
+                transcript.pop_front();
+            }
+            if let Err(error) = validate_transcript(
+                &transcript,
+                &self.agents,
+                cap,
+                self.max_turns,
+                self.history_max_bytes,
+                turn_idx.saturating_add(1),
+            ) {
+                transcript.pop_back();
+                return Err(error);
             }
         }
+        *next_index_guard = turn_idx.saturating_add(1);
+        drop(next_index_guard);
 
         // Emit SSE events for this turn
         let speaker_str = speaker_label(speaker_index);
@@ -711,13 +1056,13 @@ impl AgentDialog {
         // natural max-turns path. Early `should_stop` termination is handled
         // in `maybe_stop_after_turn`, and `completed_emitted` guarantees only
         // one of the two paths actually fires the event.
-        if next_index + 1 >= self.max_turns {
+        if turn_idx + 1 >= self.max_turns {
             let mut emitted = self.completed_emitted.lock().await;
             if !*emitted {
                 *emitted = true;
                 self.eventbus.emit(CrewEvent::DialogCompleted {
                     dialog_id: self.id.clone(),
-                    total_turns: next_index + 1,
+                    total_turns: turn_idx + 1,
                     stop_reason: None,
                 });
             }
@@ -767,14 +1112,7 @@ impl AgentDialog {
         let tool_timeout = self
             .tool_registry
             .dispatch_timeout(&tool_call.function.name, &args)
-            .unwrap_or_else(|| {
-                Duration::from_secs(
-                    std::env::var("IRONCREW_TOOL_TIMEOUT")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(60),
-                )
-            });
+            .unwrap_or_else(|| Duration::from_secs(crate::lua::agent_turn::tool_timeout_secs()));
 
         // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
         // tools can see them on their sandbox VMs (needed for sandbox-level
@@ -1006,6 +1344,13 @@ pub async fn build_dialog(
             "Dialog requires at least 2 agents".into(),
         )));
     }
+    let participant_limit = configured_dialog_max_participants();
+    if dialog_agents.len() > participant_limit {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Dialog supports at most {participant_limit} participants, got {}",
+            dialog_agents.len()
+        ))));
+    }
 
     // Reject duplicate names — each agent must be distinct
     {
@@ -1029,23 +1374,24 @@ pub async fn build_dialog(
     let max_turns: usize = table
         .get::<usize>("max_turns")
         .unwrap_or(dialog_agents.len() * 2);
+    let turn_limit = configured_dialog_max_turns();
+    if max_turns == 0 || max_turns > turn_limit {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Dialog max_turns must be between 1 and {turn_limit}, got {max_turns}"
+        ))));
+    }
     // max_history resolution order (same pattern as LuaConversation):
-    //   1. Explicit value in the Lua table (0 → unbounded opt-in)
+    //   1. Explicit positive value in the Lua table
     //   2. IRONCREW_DIALOG_MAX_HISTORY env var
     //   3. Safe default of 100 turns
     let max_history: Option<usize> = match table.get::<usize>("max_history") {
-        Ok(0) => None,
-        Ok(n) => Some(n),
-        Err(_) => {
-            let env_default = std::env::var("IRONCREW_DIALOG_MAX_HISTORY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
-            match env_default {
-                Some(0) => None,
-                Some(n) => Some(n),
-                None => Some(100),
-            }
+        Ok(n) if (1..=HARD_DIALOG_MAX_HISTORY).contains(&n) => Some(n),
+        Ok(n) => {
+            return Err(mlua::Error::external(IronCrewError::Validation(format!(
+                "Dialog max_history must be between 1 and {HARD_DIALOG_MAX_HISTORY}, got {n}"
+            ))));
         }
+        Err(_) => Some(default_dialog_max_history()),
     };
     let stream: bool = table.get::<bool>("stream").unwrap_or(false);
 
@@ -1160,6 +1506,7 @@ fn resolve_agent(value: Value, agents: &[Agent], field: &str) -> mlua::Result<Ag
 #[cfg(test)]
 mod interpret_stop_tests {
     use super::*;
+    use crate::llm::provider::{ToolCallFunction, ToolCallRequest};
 
     fn lua() -> mlua::Lua {
         mlua::Lua::new()
@@ -1217,5 +1564,63 @@ mod interpret_stop_tests {
         let t = lua.create_table().unwrap();
         let result = AgentDialog::interpret_stop_value(mlua::Value::Table(t));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dialog_tool_history_evicts_only_prior_transcript_messages() {
+        let tool_call = ToolCallRequest {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: ToolCallFunction {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let protected = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("starter"),
+            ChatMessage::assistant(None, Some(vec![tool_call.clone()])),
+            ChatMessage::tool("call-1", "result"),
+        ];
+        let max_bytes = chat_history_estimated_bytes(&protected);
+        let mut working = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("starter"),
+            ChatMessage::user(&"old".repeat(1_000)),
+            ChatMessage::assistant(None, Some(vec![tool_call])),
+            ChatMessage::tool("call-1", "result"),
+        ];
+
+        let active = enforce_dialog_working_history(&mut working, 3, max_bytes).unwrap();
+
+        assert_eq!(active, 2);
+        assert_eq!(working.len(), 4);
+        assert_eq!(working[2].role, "assistant");
+        assert_eq!(working[3].role, "tool");
+    }
+
+    #[test]
+    fn resumed_dialog_indices_must_match_retained_window() {
+        let agents = vec![
+            Agent {
+                name: "a".into(),
+                ..Default::default()
+            },
+            Agent {
+                name: "b".into(),
+                ..Default::default()
+            },
+        ];
+        let transcript = VecDeque::from([DialogTurn {
+            index: 7,
+            speaker_index: 0,
+            agent_name: "a".into(),
+            content: "hello".into(),
+            reasoning: None,
+        }]);
+
+        let error = validate_transcript(&transcript, &agents, 10, 10, 1024 * 1024, 7)
+            .expect_err("turn index must precede next_index");
+        assert!(error.to_string().contains("expected"));
     }
 }

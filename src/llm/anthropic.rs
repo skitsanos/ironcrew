@@ -55,20 +55,20 @@ pub struct AnthropicProvider {
     api_key: String,
     rate_limit: Option<RateLimiter>,
     config: AnthropicConfig,
+    execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
 impl AnthropicProvider {
     pub fn new(api_key: String, base_url: Option<String>, config: AnthropicConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("Failed to build HTTP client");
+        let client = crate::utils::network::secure_client_builder(
+            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
+        )
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("Failed to build HTTP client");
 
-        let rate_limit = std::env::var("IRONCREW_RATE_LIMIT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(RateLimiter::new);
+        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
             client,
@@ -76,7 +76,17 @@ impl AnthropicProvider {
             api_key,
             rate_limit,
             config,
+            execution_policy,
         }
+    }
+
+    fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
+        if self.api_key.trim().is_empty() {
+            return Err(IronCrewError::Validation(
+                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
+            ));
+        }
+        self.execution_policy.serialize_request("Anthropic", body)
     }
 
     /// Build the Anthropic Messages API request body from a ChatRequest.
@@ -267,17 +277,15 @@ impl AnthropicProvider {
 
     /// Send a non-streaming request to the Anthropic Messages API.
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
-            ));
-        }
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
         }
 
         let url = format!("{}/v1/messages", self.base_url);
+        crate::utils::network::validate_url_not_private(&url)
+            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
 
         let resp = self
             .client
@@ -285,15 +293,29 @@ impl AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
-        let resp_text = resp.text().await.map_err(IronCrewError::Http)?;
+        let response_limit = if status.is_success() {
+            self.execution_policy.response_bytes()
+        } else {
+            self.execution_policy.error_bytes()
+        };
+        let bytes =
+            crate::utils::http::read_response_bytes(resp, response_limit, "Anthropic response")
+                .await
+                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        let resp_text = String::from_utf8(bytes).map_err(|_| {
+            IronCrewError::Provider("Anthropic response was not valid UTF-8".into())
+        })?;
         let resp_body: Value = serde_json::from_str(&resp_text).map_err(|e| {
-            tracing::debug!("Raw response: {}", &resp_text[..resp_text.len().min(500)]);
+            tracing::debug!(
+                "Raw response: {}",
+                crate::utils::http::utf8_prefix(&resp_text, 500)
+            );
             IronCrewError::Provider(format!("Invalid JSON from Anthropic: {}", e))
         })?;
 
@@ -316,19 +338,16 @@ impl AnthropicProvider {
         mut body: Value,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
-            ));
-        }
+        body["stream"] = json!(true);
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
         }
 
-        body["stream"] = json!(true);
-
         let url = format!("{}/v1/messages", self.base_url);
+        crate::utils::network::validate_url_not_private(&url)
+            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
 
         let resp = self
             .client
@@ -336,17 +355,26 @@ impl AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let error_body: Value = resp.json().await.map_err(IronCrewError::Http)?;
+            let limit = self.execution_policy.error_bytes();
+            let bytes =
+                crate::utils::http::read_response_bytes(resp, limit, "Anthropic error response")
+                    .await
+                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let error_msg = error_body["error"]["message"]
                 .as_str()
-                .unwrap_or("Unknown Anthropic API error");
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let raw = String::from_utf8_lossy(&bytes);
+                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
+                });
             return Err(IronCrewError::Provider(format!(
                 "HTTP {}: {}",
                 status, error_msg
@@ -355,6 +383,8 @@ impl AnthropicProvider {
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
+        let output_limit = self.execution_policy.output_bytes();
+        let mut stored_output_bytes = 0_usize;
         let mut block_states: HashMap<usize, BlockState> = HashMap::new();
         let mut input_tokens: u32 = 0;
         let mut output_tokens: u32 = 0;
@@ -363,7 +393,9 @@ impl AnthropicProvider {
         // Read SSE stream — Anthropic uses `event: <type>\ndata: <json>` format
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        let mut buffer = String::new();
+        let stream_limit = self.execution_policy.stream_bytes();
+        let mut buffer =
+            crate::utils::http::BoundedLineBuffer::new(stream_limit, "Anthropic stream");
         let mut current_event_type = String::new();
         // Track terminal delivery so a mid-stream `error` event (e.g.
         // `overloaded_error`) or a connection dropped before `message_stop`
@@ -373,12 +405,12 @@ impl AnthropicProvider {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(IronCrewError::Http)?;
-            let text = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&text);
+            let lines = buffer
+                .push(&chunk)
+                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+            for raw_line in lines {
+                let line = raw_line.trim();
 
                 if line.is_empty() {
                     continue;
@@ -449,10 +481,26 @@ impl AnthropicProvider {
                         match delta_type {
                             "text_delta" => {
                                 if let Some(text) = delta["text"].as_str() {
-                                    full_content.push_str(text);
+                                    crate::utils::http::bounded_push_str(
+                                        &mut full_content,
+                                        text,
+                                        &mut stored_output_bytes,
+                                        output_limit,
+                                        "Anthropic accumulated output",
+                                    )
+                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
                                     let _ = tx.send(StreamChunk::Text(text.to_string())).await;
                                     if let Some(state) = block_states.get_mut(&index) {
-                                        state.text.push_str(text);
+                                        crate::utils::http::bounded_push_str(
+                                            &mut state.text,
+                                            text,
+                                            &mut stored_output_bytes,
+                                            output_limit,
+                                            "Anthropic accumulated output",
+                                        )
+                                        .map_err(
+                                            |error| IronCrewError::Provider(error.to_string()),
+                                        )?;
                                     }
                                 }
                             }
@@ -460,7 +508,14 @@ impl AnthropicProvider {
                                 if let Some(partial) = delta["partial_json"].as_str()
                                     && let Some(state) = block_states.get_mut(&index)
                                 {
-                                    state.text.push_str(partial);
+                                    crate::utils::http::bounded_push_str(
+                                        &mut state.text,
+                                        partial,
+                                        &mut stored_output_bytes,
+                                        output_limit,
+                                        "Anthropic accumulated output",
+                                    )
+                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
                                     let _ = tx
                                         .send(StreamChunk::ToolCallDelta {
                                             id: state.id.clone(),
@@ -471,7 +526,14 @@ impl AnthropicProvider {
                             }
                             "thinking_delta" => {
                                 if let Some(text) = delta["thinking"].as_str() {
-                                    full_reasoning.push_str(text);
+                                    crate::utils::http::bounded_push_str(
+                                        &mut full_reasoning,
+                                        text,
+                                        &mut stored_output_bytes,
+                                        output_limit,
+                                        "Anthropic accumulated output",
+                                    )
+                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
                                     let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
                                 }
                             }
@@ -731,14 +793,56 @@ fn merge_consecutive_roles(messages: Vec<Value>) -> Vec<Value> {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn metrics_family(&self) -> crate::metrics::ProviderFamily {
+        crate::metrics::ProviderFamily::Anthropic
+    }
+
+    fn execution_fingerprint(&self) -> Result<String> {
+        let server_tools = self
+            .config
+            .server_tools
+            .iter()
+            .map(|tool| match tool {
+                ServerTool::WebSearch { max_uses } => {
+                    json!({"type": "web_search", "max_uses": max_uses})
+                }
+                ServerTool::CodeExecution => json!({"type": "code_execution"}),
+            })
+            .collect::<Vec<_>>();
+        crate::engine::conversation_provider::provider_execution_fingerprint(
+            "anthropic",
+            &self.base_url,
+            &json!({
+                "thinking_budget": self.config.thinking_budget,
+                "server_tools": server_tools,
+                "execution_policy": self.execution_policy.definition(),
+            }),
+        )
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let body = self.build_body(&request, None);
         tracing::debug!(
-            "Anthropic request: {}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
+            provider = "anthropic",
+            model = %request.model,
+            messages = request.messages.len(),
+            estimated_message_bytes = chat_history_estimated_bytes(&request.messages),
+            tools = 0,
+            "LLM request metadata"
         );
+        let body = self.build_body(&request, None);
         let response = self.send_request(body).await?;
-        tracing::debug!("Anthropic response: {:?}", response);
+        tracing::debug!(
+            provider = "anthropic",
+            content_bytes = response.content.as_ref().map_or(0, String::len),
+            reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
+            tool_calls = response.tool_calls.len(),
+            raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
+            total_tokens = response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| usage.total_tokens),
+            "LLM response metadata"
+        );
         Ok(response)
     }
 
@@ -747,13 +851,28 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         tools: &[ToolSchema],
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&request, Some(tools));
         tracing::debug!(
-            "Anthropic request (with tools): {}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
+            provider = "anthropic",
+            model = %request.model,
+            messages = request.messages.len(),
+            estimated_message_bytes = chat_history_estimated_bytes(&request.messages),
+            tools = tools.len(),
+            "LLM request metadata"
         );
+        let body = self.build_body(&request, Some(tools));
         let response = self.send_request(body).await?;
-        tracing::debug!("Anthropic response: {:?}", response);
+        tracing::debug!(
+            provider = "anthropic",
+            content_bytes = response.content.as_ref().map_or(0, String::len),
+            reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
+            tool_calls = response.tool_calls.len(),
+            raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
+            total_tokens = response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| usage.total_tokens),
+            "LLM response metadata"
+        );
         Ok(response)
     }
 

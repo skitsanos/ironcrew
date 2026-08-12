@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::engine::eventbus::CrewEvent;
 use crate::engine::input_bridge::AskOutcome;
-use crate::engine::run_history::RunStatus;
 use crate::tools::ToolCallContext;
 use crate::utils::error::Result;
 
@@ -48,6 +47,9 @@ fn args_max_chars() -> usize {
 pub struct ApprovalPolicy {
     /// Exact tool names and `prefix*` globs (entry ending in `*`).
     rules: Arc<Vec<String>>,
+    /// Exact non-secret operator limits captured with this policy.
+    timeout_secs: u64,
+    args_max_chars: usize,
     /// Tool names granted "always" this flow execution.
     granted: Arc<Mutex<HashSet<String>>>,
 }
@@ -70,6 +72,14 @@ impl ApprovalPolicy {
                     .filter(|r| !r.is_empty()),
             );
         }
+        Self::from_effective_rules(rules, approval_timeout_secs(), args_max_chars())
+    }
+
+    fn from_effective_rules(
+        mut rules: Vec<String>,
+        timeout_secs: u64,
+        args_max_chars: usize,
+    ) -> Option<Self> {
         if rules.is_empty() {
             return None;
         }
@@ -77,7 +87,26 @@ impl ApprovalPolicy {
         rules.dedup();
         Some(Self {
             rules: Arc::new(rules),
+            timeout_secs,
+            args_max_chars,
             granted: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(
+        rules: &[String],
+        timeout_secs: u64,
+        args_max_chars: usize,
+    ) -> Option<Self> {
+        Self::from_effective_rules(rules.to_vec(), timeout_secs, args_max_chars)
+    }
+
+    pub(crate) fn conversation_definition(&self) -> serde_json::Value {
+        serde_json::json!({
+            "required": true,
+            "timeout_secs": self.timeout_secs,
+            "args_max_chars": self.args_max_chars,
         })
     }
 
@@ -152,9 +181,8 @@ fn redact(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Serialized, redacted, length-capped args for the approval prompt.
-fn describe_args(args: &serde_json::Value) -> String {
+fn describe_args(args: &serde_json::Value, cap: usize) -> String {
     let mut text = redact(args).to_string();
-    let cap = args_max_chars();
     if text.len() > cap {
         let mut boundary = cap;
         while boundary > 0 && !text.is_char_boundary(boundary) {
@@ -212,47 +240,46 @@ pub async fn request(
         "[approval] Agent '{}' wants to call {}({}). Allow?",
         agent,
         tool,
-        describe_args(args)
+        describe_args(args, policy.args_max_chars)
     );
     let choices = vec![
         "allow".to_string(),
         "always".to_string(),
         "deny".to_string(),
     ];
-    let timeout_s = approval_timeout_secs();
+    let timeout_s = policy.timeout_secs;
 
     let eventbus = ask.eventbus.clone().or_else(|| ctx.eventbus.clone());
     let store = ask.store.clone().or_else(|| ctx.store.clone());
     let question_id = uuid::Uuid::new_v4().to_string();
 
-    if let Some(bus) = &eventbus {
-        bus.emit(CrewEvent::HumanInputRequested {
-            question_id: question_id.clone(),
-            prompt: prompt.clone(),
-            choices: choices.clone(),
-            timeout_s,
-            kind: "approval".into(),
-        });
-    }
-    if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-        && let Err(e) = store
-            .update_run_status(run_id, RunStatus::WaitingForInput)
-            .await
-    {
-        tracing::debug!("approval gate: run status not updated: {}", e);
-    }
-
+    let requested_event = CrewEvent::HumanInputRequested {
+        question_id: question_id.clone(),
+        prompt: prompt.clone(),
+        choices: choices.clone(),
+        timeout_s,
+        kind: "approval".into(),
+    };
+    let requested_eventbus = eventbus.clone();
     let outcome = ask
         .bridge
-        .ask(&question_id, &prompt, &choices, timeout_s, "approval")
+        .with_run_wait_status(
+            store.clone(),
+            ask.run_id.as_deref(),
+            ask.bridge.ask_when_ready(
+                &question_id,
+                &prompt,
+                &choices,
+                timeout_s,
+                "approval",
+                move || {
+                    if let Some(bus) = requested_eventbus {
+                        bus.emit(requested_event);
+                    }
+                },
+            ),
+        )
         .await?;
-
-    if let (Some(store), Some(run_id)) = (&store, &ask.run_id)
-        && ask.bridge.pending_count() == 0
-        && let Err(e) = store.update_run_status(run_id, RunStatus::Running).await
-    {
-        tracing::debug!("approval gate: run status not restored: {}", e);
-    }
 
     let (verdict, outcome_str) = match outcome {
         AskOutcome::Answered(value) => (parse_answer(tool, &value, policy), "answered"),
@@ -281,7 +308,7 @@ pub(crate) fn gate_dispatch_allowance(
 ) -> Option<std::time::Duration> {
     if policy.requires(tool) && !policy.is_granted(tool) {
         Some(std::time::Duration::from_secs(
-            approval_timeout_secs() + DISPATCH_MARGIN_SECS,
+            policy.timeout_secs + DISPATCH_MARGIN_SECS,
         ))
     } else {
         None
@@ -380,7 +407,7 @@ mod tests {
     #[test]
     fn describe_args_caps_length() {
         let big = serde_json::json!({ "data": "x".repeat(5000) });
-        let text = describe_args(&big);
+        let text = describe_args(&big, 600);
         assert!(text.len() < 5000);
         assert!(text.ends_with("… [truncated]"));
     }

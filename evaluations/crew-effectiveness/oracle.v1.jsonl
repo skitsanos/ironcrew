@@ -1,0 +1,6 @@
+{"case_id":"incident-rollback","answers":[{"question_id":"Q1","correct_option_ids":["rollback_r17"],"citation_sets":[["E2","E4"]]},{"question_id":"Q2","correct_option_ids":["database"],"citation_sets":[["E2","E3","E4"]]}]}
+{"case_id":"pod-capacity","answers":[{"question_id":"Q1","correct_option_ids":["five_pods"],"citation_sets":[["E1","E2","E3"]]},{"question_id":"Q2","correct_option_ids":["ten_gib"],"citation_sets":[["E1","E2"]]}]}
+{"case_id":"approval-policy","answers":[{"question_id":"Q1","correct_option_ids":["not_compliant"],"citation_sets":[["E1","E2","E3","E4"]]},{"question_id":"Q2","correct_option_ids":["block_deployment"],"citation_sets":[["E1","E2","E3","E4"]]}]}
+{"case_id":"conflicting-cache-state","answers":[{"question_id":"Q1","correct_option_ids":["insufficient_evidence"],"citation_sets":[["E1","E2","E3"]]},{"question_id":"Q2","correct_option_ids":["conflicting_evidence"],"citation_sets":[["E1","E2","E3"]]}]}
+{"case_id":"deployment-chronology","answers":[{"question_id":"Q1","correct_option_ids":["latency_alert"],"citation_sets":[["E1"]]},{"question_id":"Q2","correct_option_ids":["five_minutes"],"citation_sets":[["E2","E3"]]}]}
+{"case_id":"ownership-join","answers":[{"question_id":"Q1","correct_option_ids":["team_orion"],"citation_sets":[["E1","E2"]]},{"question_id":"Q2","correct_option_ids":["mara"],"citation_sets":[["E1","E2","E3"]]}]}

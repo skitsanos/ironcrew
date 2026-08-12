@@ -3,14 +3,34 @@ use std::collections::HashMap;
 
 use crate::engine::task::TaskResult;
 use crate::lua::json::json_value_to_lua;
+use crate::lua::limits::{LuaExecutionGuard, LuaLimits, install_lua_limits};
 
 // Thread-local Lua VM reused for condition evaluation.
 thread_local! {
-    static CONDITION_LUA: RefCell<mlua::Lua> = RefCell::new(mlua::Lua::new());
+    static CONDITION_LUA: RefCell<Option<std::result::Result<mlua::Lua, String>>> =
+        const { RefCell::new(None) };
 }
 
 pub fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>) -> bool {
-    CONDITION_LUA.with(|cell| evaluate_condition_inner(&cell.borrow(), condition, results))
+    CONDITION_LUA.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let initialized = slot.get_or_insert_with(|| {
+            let lua = mlua::Lua::new();
+            install_lua_limits(
+                &lua,
+                LuaLimits::from_env().map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(lua)
+        });
+        match initialized {
+            Ok(lua) => evaluate_condition_inner(lua, condition, results),
+            Err(error) => {
+                tracing::error!(%error, "Condition Lua VM could not be initialized");
+                false
+            }
+        }
+    })
 }
 
 fn evaluate_condition_inner(
@@ -18,6 +38,13 @@ fn evaluate_condition_inner(
     condition: &str,
     results: &HashMap<String, TaskResult>,
 ) -> bool {
+    let _execution = match LuaExecutionGuard::begin(lua) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "Condition Lua execution could not start");
+            return false;
+        }
+    };
     let Ok(ctx) = lua.create_table() else {
         return false;
     };

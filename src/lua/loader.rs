@@ -10,6 +10,29 @@ pub struct ProjectLoader {
 }
 
 impl ProjectLoader {
+    /// Build loader metadata from an immutable conversation snapshot without
+    /// consulting the live flow tree again.
+    pub fn from_conversation_snapshot(
+        snapshot: &crate::engine::conversation_definition::FlowSourceSnapshot,
+    ) -> Result<Self> {
+        let roles = snapshot.roles()?;
+        let project_dir = snapshot.root().to_path_buf();
+        Ok(Self {
+            agent_files: roles
+                .agents
+                .iter()
+                .map(|source| project_dir.join(source.relative_path()))
+                .collect(),
+            tool_files: roles
+                .tools
+                .iter()
+                .map(|source| project_dir.join(source.relative_path()))
+                .collect(),
+            entrypoint: Some(project_dir.join(roles.entrypoint.relative_path())),
+            project_dir,
+        })
+    }
+
     pub fn from_directory(path: &Path) -> Result<Self> {
         let project_dir = path.to_path_buf();
 

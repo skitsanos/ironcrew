@@ -220,7 +220,7 @@ crew:add_foreach_task({
 
 Concurrency is **bounded**: at most `max_concurrent` items run at once (the
 crew's `max_concurrent` setting, else `IRONCREW_DEFAULT_MAX_CONCURRENT`, else
-10). A foreach over a large array therefore won't fire one LLM request per item
+4). A foreach over a large array therefore won't fire one LLM request per item
 simultaneously — items beyond the cap queue and start as slots free up, while
 result order is preserved.
 

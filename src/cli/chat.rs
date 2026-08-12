@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::lua::api::{CHAT_CREW_REGISTRY_KEY, ChatMode, set_ironcrew_mode};
 use crate::lua::conversation::{LuaConversation, LuaConversationInner};
+use crate::lua::limits::LuaExecutionGuard;
 use crate::utils::error::{IronCrewError, Result};
 
 use super::project::{load_project, setup_crew_runtime};
@@ -34,15 +35,18 @@ pub async fn cmd_chat(path: &Path, agent: Option<String>, id: Option<String>) ->
     let entrypoint = loader
         .entrypoint()
         .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = std::fs::read_to_string(entrypoint)?;
+    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
     // Execute the entrypoint. The user's crew.lua is expected to build a
     // Crew and add at least one agent. With ChatMode set, the Crew
     // constructor will park the userdata in the registry.
-    lua.load(&script)
-        .exec_async()
-        .await
-        .map_err(IronCrewError::Lua)?;
+    {
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&script)
+            .exec_async()
+            .await
+            .map_err(IronCrewError::Lua)?;
+    }
 
     let agent_name = agent.ok_or_else(|| {
         IronCrewError::Validation(
@@ -78,11 +82,13 @@ pub async fn cmd_chat(path: &Path, agent: Option<String>, id: Option<String>) ->
             )
         })?;
 
-    let conv_ud: AnyUserData = lua
-        .load(&snippet)
-        .call_async::<AnyUserData>(crew_ud)
-        .await
-        .map_err(IronCrewError::Lua)?;
+    let conv_ud: AnyUserData = {
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+        lua.load(&snippet)
+            .call_async::<AnyUserData>(crew_ud)
+            .await
+            .map_err(IronCrewError::Lua)?
+    };
 
     // Grab the Arc out of the LuaConversation wrapper.
     let conv: Arc<LuaConversationInner> = {

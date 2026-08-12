@@ -1,0 +1,577 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ironcrew
+  labels:
+    app.kubernetes.io/name: ironcrew
+spec:
+  # Conservative general-purpose baseline: PostgreSQL run SSE, keyed
+  # cancellation/HITL, and keyed PostgreSQL conversation rehydration at
+  # committed turn boundaries are shared. Active Lua/provider/tool turns remain
+  # process-owned, and PostgreSQL conversation SSE remains unsupported. Stop the
+  # old pod before creating its replacement. Keep this Recreate shape for the
+  # first drain-aware/mixed-version rollout; the bounded two-replica
+  # RollingUpdate overlay and surge arithmetic are documented in
+  # docs/cloud-deployment.md.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ironcrew
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ironcrew
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ironcrew
+          # Bootstrap template only: after publishing, replace this tag with
+          # docker.io/skitsanos/ironcrew@sha256:<signed-release-digest> before
+          # applying the production manifest. The publish workflow signs that
+          # immutable digest and emits provenance/SBOM attestations.
+          image: docker.io/skitsanos/ironcrew:2.22.0
+          imagePullPolicy: Always
+          args: ["serve", "--flows-dir", "/flows"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: IRONCREW_HOST
+              value: "0.0.0.0"
+            - name: IRONCREW_PORT
+              value: "8080"
+            - name: IRONCREW_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: IRONCREW_LOG
+              value: "info"
+            - name: IRONCREW_STORE
+              value: "postgres"
+            - name: IRONCREW_FILE_WRITE_ROOT
+              value: "/tmp/ironcrew-outputs"
+            - name: IRONCREW_DB_POOL_SIZE
+              value: "2"
+            - name: IRONCREW_DB_CONNECT_TIMEOUT_SECS
+              value: "30"
+            - name: IRONCREW_MAX_ACTIVE_RUNS
+              value: "2"
+            - name: IRONCREW_MAX_ACTIVE_CONVERSATIONS
+              value: "4"
+            # Bound lifecycle lock cardinality independently from resident
+            # conversations so random IDs cannot grow process memory.
+            - name: IRONCREW_MAX_CONVERSATION_LIFECYCLES
+              value: "256"
+            - name: IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE
+              value: "60"
+            - name: IRONCREW_ADMISSION_WORK_BURST
+              value: "10"
+            - name: IRONCREW_ADMISSION_CONTROL_RATE_PER_MINUTE
+              value: "120"
+            - name: IRONCREW_ADMISSION_CONTROL_BURST
+              value: "20"
+            - name: IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE
+              value: "600"
+            - name: IRONCREW_ADMISSION_OBSERVATION_BURST
+              value: "20"
+            - name: IRONCREW_MAX_CONVERSATION_TURN_SECS
+              value: "300"
+            - name: IRONCREW_MAX_SSE_CONNECTIONS
+              value: "16"
+            - name: IRONCREW_READINESS_CACHE_MS
+              value: "1000"
+            - name: IRONCREW_CHAT_SESSION_IDLE_SECS
+              value: "600"
+            - name: IRONCREW_API_CONVERSATION_MAX_HISTORY
+              value: "20"
+            - name: IRONCREW_CONVERSATION_MAX_HISTORY
+              value: "20"
+            - name: IRONCREW_DIALOG_MAX_HISTORY
+              value: "50"
+            - name: IRONCREW_DIALOG_MAX_TURNS
+              value: "100"
+            - name: IRONCREW_DIALOG_MAX_PARTICIPANTS
+              value: "8"
+            - name: IRONCREW_API_MESSAGE_MAX_BYTES
+              value: "131072"
+            - name: IRONCREW_API_MAX_TAGS
+              value: "16"
+            - name: IRONCREW_API_MAX_TAG_BYTES
+              value: "128"
+            - name: IRONCREW_API_MAX_TAGS_BYTES
+              value: "2048"
+            - name: IRONCREW_API_MAX_IMAGES_PER_MESSAGE
+              value: "2"
+            - name: IRONCREW_API_MAX_IMAGES_PER_CONVERSATION
+              value: "8"
+            - name: IRONCREW_API_MAX_IMAGE_BYTES_PER_MESSAGE
+              value: "5242880"
+            - name: IRONCREW_API_MAX_IMAGE_BYTES_PER_CONVERSATION
+              value: "8388608"
+            - name: IRONCREW_ASK_HUMAN_MAX_PENDING
+              value: "8"
+            - name: IRONCREW_ASK_HUMAN_MAX_PENDING_BYTES
+              value: "524288"
+            - name: IRONCREW_ASK_HUMAN_MAX_TIMEOUT
+              value: "900"
+            - name: IRONCREW_ASK_HUMAN_MAX_PROMPT_BYTES
+              value: "32768"
+            - name: IRONCREW_ASK_HUMAN_MAX_CHOICES
+              value: "20"
+            - name: IRONCREW_ASK_HUMAN_MAX_CHOICES_BYTES
+              value: "32768"
+            - name: IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES
+              value: "32768"
+            - name: IRONCREW_HITL_POLL_INTERVAL_MS
+              value: "1000"
+            - name: IRONCREW_HITL_READ_TIMEOUT_MS
+              value: "2000"
+            # Match durable question-list/answer-auth concurrency to this pod's
+            # small PostgreSQL pool; owner answer polling is separately bounded.
+            - name: IRONCREW_HITL_PG_MAX_CONCURRENT_READS
+              value: "2"
+            - name: IRONCREW_TOOL_TIMEOUT
+              value: "60"
+            - name: IRONCREW_DEFAULT_MAX_CONCURRENT
+              value: "2"
+            - name: IRONCREW_MAX_CONCURRENT_TASKS
+              value: "4"
+            - name: IRONCREW_MAX_AGENTS
+              value: "32"
+            - name: IRONCREW_MAX_TASKS
+              value: "128"
+            - name: IRONCREW_CREW_GOAL_MAX_BYTES
+              value: "65536"
+            - name: IRONCREW_MAX_APPROVAL_PATTERNS
+              value: "64"
+            - name: IRONCREW_MAX_MEMORY_ITEMS
+              value: "2000"
+            - name: IRONCREW_MAX_MEMORY_TOKENS
+              value: "200000"
+            - name: IRONCREW_MAX_SERVER_TOOLS
+              value: "8"
+            - name: IRONCREW_MAX_VECTOR_STORE_IDS
+              value: "16"
+            - name: IRONCREW_MAX_MODEL_ROUTES
+              value: "32"
+            - name: IRONCREW_MAX_RUN_LIFETIME
+              value: "900"
+            - name: IRONCREW_RUN_LEASE_TTL_SECONDS
+              value: "60"
+            # Require retry-safe mutation requests in production. Clients must
+            # reuse one key only for an identical run/message request.
+            - name: IRONCREW_REQUIRE_IDEMPOTENCY_KEY
+              value: "true"
+            - name: IRONCREW_IDEMPOTENCY_TTL_SECONDS
+              value: "86400"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RECORDS
+              value: "10000"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL
+              value: "2500"
+            - name: IRONCREW_IDEMPOTENCY_MAX_IN_FLIGHT_PER_PRINCIPAL
+              value: "16"
+            - name: IRONCREW_IDEMPOTENCY_PRUNE_BATCH
+              value: "1000"
+            - name: IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES
+              value: "4194304"
+            - name: IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES
+              value: "67108864"
+            - name: IRONCREW_IDEMPOTENCY_MAX_TOTAL_RESPONSE_BYTES_PER_PRINCIPAL
+              value: "16777216"
+            - name: IRONCREW_MAX_TASK_TIMEOUT_SECS
+              value: "900"
+            - name: IRONCREW_MAX_TASK_RETRIES
+              value: "3"
+            - name: IRONCREW_MAX_RETRY_BACKOFF_SECS
+              value: "60"
+            - name: IRONCREW_MAX_COLLABORATIVE_TURNS
+              value: "20"
+            - name: IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES
+              value: "4194304"
+            - name: IRONCREW_COLLABORATION_MAX_TURN_BYTES
+              value: "524288"
+            - name: IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS
+              value: "32"
+            - name: IRONCREW_FOREACH_MAX_ITEMS
+              value: "50"
+            - name: IRONCREW_FOREACH_MAX_OUTPUT_BYTES
+              value: "4194304"
+            - name: IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES
+              value: "4194304"
+            - name: IRONCREW_TASK_RESULT_MAX_REASONING_BYTES
+              value: "2097152"
+            - name: IRONCREW_RUN_RESULTS_MAX_BYTES
+              value: "16777216"
+            - name: IRONCREW_MAX_PROMPT_CHARS
+              value: "65536"
+            - name: IRONCREW_LUA_MAX_MEMORY_BYTES
+              value: "25165824"
+            - name: IRONCREW_LUA_MAX_INSTRUCTIONS
+              value: "50000000"
+            - name: IRONCREW_LUA_MAX_EXECUTION_SECONDS
+              value: "900"
+            - name: IRONCREW_LUA_MAX_SOURCE_BYTES
+              value: "1048576"
+            - name: IRONCREW_LUA_JSON_MAX_DEPTH
+              value: "32"
+            - name: IRONCREW_LUA_JSON_MAX_NODES
+              value: "50000"
+            - name: IRONCREW_LUA_JSON_MAX_STRING_BYTES
+              value: "2097152"
+            - name: IRONCREW_LUA_JSON_MAX_OUTPUT_BYTES
+              value: "4194304"
+            - name: IRONCREW_LUA_FS_MAX_READ_BYTES
+              value: "1048576"
+            - name: IRONCREW_LUA_FS_MAX_WRITE_BYTES
+              value: "1048576"
+            - name: IRONCREW_MAX_BODY_SIZE
+              value: "8388608"
+            - name: IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES
+              value: "65536"
+            - name: IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES
+              value: "4194304"
+            - name: IRONCREW_HTTP_MAX_RESPONSE_BYTES
+              value: "4194304"
+            - name: IRONCREW_HTTP_MAX_HEADER_BYTES
+              value: "65536"
+            - name: IRONCREW_HTTP_MAX_OUTPUT_BYTES
+              value: "8388608"
+            - name: IRONCREW_HTTP_MAX_JSON_BYTES
+              value: "1048576"
+            - name: IRONCREW_WEB_SCRAPE_MAX_BYTES
+              value: "2097152"
+            - name: IRONCREW_MAX_IMAGE_BYTES
+              value: "5242880"
+            - name: IRONCREW_PROVIDER_MAX_RESPONSE_BYTES
+              value: "4194304"
+            - name: IRONCREW_PROVIDER_MAX_ERROR_BYTES
+              value: "131072"
+            - name: IRONCREW_PROVIDER_MAX_STREAM_BYTES
+              value: "8388608"
+            - name: IRONCREW_PROVIDER_MAX_OUTPUT_BYTES
+              value: "4194304"
+            - name: IRONCREW_CHAT_HISTORY_MAX_BYTES
+              value: "8388608"
+            - name: IRONCREW_MAX_REASONING_BYTES
+              value: "524288"
+            - name: IRONCREW_FILE_READ_MAX_BYTES
+              value: "4194304"
+            - name: IRONCREW_FILE_WRITE_MAX_BYTES
+              value: "4194304"
+            - name: IRONCREW_GLOB_MAX_FILES
+              value: "100"
+            - name: IRONCREW_GLOB_MAX_BYTES
+              value: "8388608"
+            - name: IRONCREW_GLOB_MAX_OUTPUT_BYTES
+              value: "16777216"
+            - name: IRONCREW_GLOB_MAX_ENTRIES
+              value: "2000"
+            - name: IRONCREW_EVENT_MAX_BYTES
+              value: "131072"
+            - name: IRONCREW_MAX_EVENTS
+              value: "200"
+            - name: IRONCREW_EVENT_REPLAY_MAX_BYTES
+              value: "1048576"
+            - name: IRONCREW_EVENT_CHANNEL_CAPACITY
+              value: "8"
+            # These are logical PostgreSQL journal caps, not physical disk/WAL
+            # quotas. The page size stays above the 128 KiB event maximum.
+            - name: IRONCREW_EVENT_JOURNAL_RETENTION_SECS
+              value: "3600"
+            - name: IRONCREW_EVENT_JOURNAL_MAX_TOTAL_EVENTS
+              value: "10000"
+            - name: IRONCREW_EVENT_JOURNAL_MAX_TOTAL_BYTES
+              value: "67108864"
+            - name: IRONCREW_EVENT_JOURNAL_PAGE_MAX_BYTES
+              value: "262144"
+            - name: IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS
+              value: "1000"
+            - name: IRONCREW_EVENT_JOURNAL_READ_TIMEOUT_MS
+              value: "2000"
+            # Managed PostgreSQL may briefly contend during a rollout. This is
+            # the outer bound for one append attempt; PostgreSQL statements use
+            # a derived 4-second transaction-local timeout.
+            - name: IRONCREW_EVENT_JOURNAL_WRITE_TIMEOUT_MS
+              value: "5000"
+            - name: IRONCREW_EVENT_JOURNAL_PRUNE_BATCH
+              value: "500"
+            - name: IRONCREW_MESSAGEBUS_MESSAGE_MAX_BYTES
+              value: "32768"
+            - name: IRONCREW_MESSAGEBUS_QUEUE_DEPTH
+              value: "200"
+            - name: IRONCREW_MESSAGEBUS_QUEUE_MAX_BYTES
+              value: "1048576"
+            - name: IRONCREW_MESSAGEBUS_HISTORY_DEPTH
+              value: "200"
+            - name: IRONCREW_MESSAGEBUS_HISTORY_MAX_BYTES
+              value: "1048576"
+            - name: IRONCREW_MESSAGEBUS_PENDING_CAP
+              value: "100"
+            - name: IRONCREW_MESSAGEBUS_PENDING_MAX_BYTES
+              value: "1048576"
+            - name: IRONCREW_MEMORY_MAX_VALUE_BYTES
+              value: "262144"
+            - name: IRONCREW_MEMORY_PERSIST_MAX_BYTES
+              value: "8388608"
+            - name: IRONCREW_MEMORY_CONTEXT_MAX_BYTES
+              value: "32768"
+            - name: IRONCREW_MEMORY_QUERY_MAX_BYTES
+              value: "8192"
+            - name: IRONCREW_MCP_MAX_TOOLS
+              value: "64"
+            # Deny stdio MCP commands until an operator replaces this with an
+            # explicit comma-separated allowlist of binaries in the image.
+            - name: IRONCREW_MCP_ALLOWED_COMMANDS
+              value: "__disabled__"
+            # rmcp currently materializes transport frames before IronCrew's
+            # post-decode caps. Only exact operator-trusted hosts may opt in.
+            - name: IRONCREW_MCP_ALLOWED_HTTP_HOSTS
+              value: "__disabled__"
+            - name: IRONCREW_MCP_MAX_LIST_PAGES
+              value: "16"
+            - name: IRONCREW_MCP_MAX_TOOL_DEFINITION_BYTES
+              value: "65536"
+            - name: IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES
+              value: "131072"
+            - name: IRONCREW_MCP_MAX_CONTENT_ITEMS
+              value: "128"
+            - name: IRONCREW_MCP_TOOL_RESULT_MAX_BYTES
+              value: "131072"
+            - name: IRONCREW_JSON_SCHEMA_MAX_BYTES
+              value: "131072"
+            # 5s routing grace + 30s stopping deadline + 1s cleanup + 5s
+            # operator margin = 41s inside terminationGracePeriodSeconds=45.
+            # Keep the container stop signal as SIGTERM: SIGUSR1 drains but
+            # intentionally does not exit.
+            - name: IRONCREW_SHUTDOWN_ROUTING_GRACE_SECS
+              value: "5"
+            - name: IRONCREW_SHUTDOWN_TIMEOUT_SECS
+              value: "30"
+            - name: IRONCREW_SHUTDOWN_DRAIN_MS
+              value: "1000"
+            - name: IRONCREW_CORS_ORIGINS
+              value: "https://app.example.com"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: database-url
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: openai-api-key
+            - name: IRONCREW_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: api-token
+            # Optional as a pair. If either key is supplied, both must exist.
+            # Secret-backed env values are read only when this process starts;
+            # each rotation phase needs an explicit rollout/restart. Every
+            # replica must have the expanded keyring before active ids differ.
+            - name: IRONCREW_HITL_ENCRYPTION_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: hitl-encryption-keys
+                  optional: true
+            - name: IRONCREW_HITL_ACTIVE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ironcrew-secrets
+                  key: hitl-active-key-id
+                  optional: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: flows
+              mountPath: /flows
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: flows
+          configMap:
+            name: ironcrew-flows
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ironcrew
+  labels:
+    app.kubernetes.io/name: ironcrew
+spec:
+  selector:
+    app.kubernetes.io/name: ironcrew
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ironcrew
+  labels:
+    app.kubernetes.io/name: ironcrew
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ironcrew
+  policyTypes:
+    - Ingress
+    - Egress
+  # Only OpenShift ingress-controller namespaces may reach the HTTP port.
+  # Node-originated kubelet probes remain governed by the cluster CNI's normal
+  # node-to-pod handling; validate this policy against the installed CNI.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # OpenShift DNS. OVN-Kubernetes can translate the Service destination to
+    # the DNS pods' 5353 target port before NetworkPolicy evaluation, so allow
+    # both the Service port and target port. TCP is required for large answers
+    # and retry fallback.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+    # Compatibility for clusters that retain CoreDNS in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The baseline assumes PostgreSQL runs in the same namespace. Narrow this
+    # peer with a database pod label when the operator provides a stable one.
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Public provider/tool HTTPS only. Private, loopback, link-local,
+    # benchmarking, multicast, and reserved IPv4 destinations stay denied.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+    # On dual-stack clusters, permit public IPv6 HTTPS while excluding native
+    # local, private, documentation, and multicast destinations. OpenShift
+    # rejects the IPv4-mapped exclusion; native IPv4 traffic is governed by
+    # the separate IPv4 ipBlock above, while application SSRF policy remains
+    # the boundary for mapped-address interpretation.
+    - to:
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::/128"
+              - "::1/128"
+              # OpenShift validates IPv6 exclusions as strict `::/0` subsets
+              # and rejects the IPv4-mapped range. Native IPv4 traffic is
+              # already governed by the separate IPv4 ipBlock above.
+              - "2001:db8::/32"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "ff00::/8"
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ironcrew
+  labels:
+    app.kubernetes.io/name: ironcrew
+spec:
+  to:
+    kind: Service
+    name: ironcrew
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

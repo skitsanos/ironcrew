@@ -9,7 +9,7 @@
 local crew = Crew.new({
     goal = "Demonstrate streaming output",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
     stream = true,  -- enable streaming for all tasks
 })
@@ -18,7 +18,6 @@ crew:add_agent(Agent.new({
     name = "storyteller",
     goal = "Tell short, engaging stories",
     capabilities = {"writing", "creativity"},
-    temperature = 0.9,
 }))
 
 crew:add_task({

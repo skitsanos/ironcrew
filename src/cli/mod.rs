@@ -5,8 +5,10 @@ pub mod graph_bundle;
 pub mod graph_extract;
 pub mod graph_types;
 pub mod history;
+mod init;
 pub mod project;
 pub mod server;
+mod server_shutdown;
 
 /// Escape a string for safe embedding as a Lua literal. Used by the chat
 /// CLI and the HTTP conversation start handler to drive `crew:conversation`

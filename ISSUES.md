@@ -1,0 +1,32 @@
+# IronCrew engineering issues
+
+The canonical engineering ledger is maintained in
+[`docs/issues/README.md`](docs/issues/README.md). Individual findings use
+stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
+
+## Active findings
+
+| ID | Priority | Status | Area | Summary |
+|---|---:|---|---|---|
+| [IC-014](docs/issues/IC-014.md) | P1 | In progress | Release security | Release publication lacks a platform-enforced trusted control plane |
+
+## Working agreement
+
+1. Select one issue, or one tightly coupled pair, from the highest-priority
+   active group and set its frontmatter status to `in-progress`.
+2. Confirm the live code still supports the finding, then add focused
+   regression coverage for the original defect or missing contract.
+3. Align implementation, current documentation, Lua examples, evaluations,
+   and deployment guidance affected by the issue.
+4. Run focused tests while iterating and the required all-target Rust gates
+   before completion. Use live PostgreSQL only when the contract requires it.
+5. Set an issue to `resolved` only after its acceptance criteria pass. Record
+   the outcome, boundary, exact validation evidence, ISO completion date, and
+   commit or PR when applicable.
+6. Allocate the next never-reused ID and advance `docs/issues/HIGH_WATER_MARK`
+   when adding a finding. Never lower the marker or delete a historical page.
+7. Regenerate the indexes and run `bun run scripts/issues_registry.ts check`.
+
+Historical audit baselines and cross-issue evidence are retained in
+[`docs/issues/AUDIT_EVIDENCE.md`](docs/issues/AUDIT_EVIDENCE.md). Other plans
+and product roadmaps are not engineering-status evidence.

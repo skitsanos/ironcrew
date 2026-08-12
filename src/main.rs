@@ -5,12 +5,14 @@ mod llm;
 mod lua;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod metrics;
 mod tools;
 mod utils;
 
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use clap::{Parser, Subcommand};
+use utils::error::{IronCrewError, Result};
 
 #[derive(Parser)]
 #[command(
@@ -86,12 +88,13 @@ enum Commands {
     },
     /// Start the REST API server
     Serve {
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port to bind to
-        #[arg(long, default_value = "3000")]
-        port: u16,
+        /// Host to bind to (IRONCREW_HOST; defaults to 0.0.0.0 when PORT is set,
+        /// otherwise 127.0.0.1)
+        #[arg(long)]
+        host: Option<String>,
+        /// Port to bind to (IRONCREW_PORT, then platform PORT, then 3000)
+        #[arg(long)]
+        port: Option<u16>,
         /// Directory containing crew flows
         #[arg(long, default_value = ".")]
         flows_dir: PathBuf,
@@ -140,7 +143,8 @@ enum Commands {
     },
     /// List past runs
     Runs {
-        /// Filter by status: success, partial_failure, failed
+        /// Filter by status: success, partial_failure, failed, aborted,
+        /// timed_out, running, waiting_for_input, abandoned
         #[arg(short, long)]
         status: Option<String>,
         /// Filter by tag
@@ -159,6 +163,89 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ServeEnvironment {
+    host: Option<String>,
+    ironcrew_port: Option<String>,
+    platform_port: Option<String>,
+}
+
+impl ServeEnvironment {
+    fn from_process() -> Result<Self> {
+        Ok(Self {
+            host: read_optional_env("IRONCREW_HOST")?,
+            ironcrew_port: read_optional_env("IRONCREW_PORT")?,
+            platform_port: read_optional_env("PORT")?,
+        })
+    }
+}
+
+fn read_optional_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(IronCrewError::Validation(format!(
+            "{name} must contain valid UTF-8"
+        ))),
+    }
+}
+
+fn parse_port(name: &str, value: &str) -> Result<u16> {
+    let port = value.parse::<u16>().map_err(|_| {
+        IronCrewError::Validation(format!(
+            "{name} must be an integer between 1 and 65535, got {value:?}"
+        ))
+    })?;
+    if port == 0 {
+        return Err(IronCrewError::Validation(format!(
+            "{name} must be between 1 and 65535, got 0"
+        )));
+    }
+    Ok(port)
+}
+
+/// Resolve server binding without making container-only defaults leak into the
+/// local CLI. Explicit flags take precedence over IronCrew-specific variables,
+/// which take precedence over Railway's conventional `PORT` variable.
+fn resolve_serve_address(
+    cli_host: Option<String>,
+    cli_port: Option<u16>,
+    environment: ServeEnvironment,
+) -> Result<(String, u16)> {
+    let platform_port_is_set = environment.platform_port.is_some();
+
+    let host = cli_host.or(environment.host).unwrap_or_else(|| {
+        if platform_port_is_set {
+            "0.0.0.0".to_owned()
+        } else {
+            "127.0.0.1".to_owned()
+        }
+    });
+    if host.trim().is_empty() {
+        return Err(IronCrewError::Validation(
+            "server host must not be empty".into(),
+        ));
+    }
+
+    let port = match cli_port {
+        Some(0) => {
+            return Err(IronCrewError::Validation(
+                "--port must be between 1 and 65535, got 0".into(),
+            ));
+        }
+        Some(port) => port,
+        None => match environment.ironcrew_port {
+            Some(value) => parse_port("IRONCREW_PORT", &value)?,
+            None => match environment.platform_port {
+                Some(value) => parse_port("PORT", &value)?,
+                None => 3000,
+            },
+        },
+    };
+
+    Ok((host, port))
 }
 
 /// The project/CWD path a command operates on, used to locate its `.env`.
@@ -219,7 +306,11 @@ fn main() {
                 host,
                 port,
                 flows_dir,
-            } => cli::server::cmd_serve(&host, port, &flows_dir).await,
+            } => {
+                let (host, port) =
+                    resolve_serve_address(host, port, ServeEnvironment::from_process()?)?;
+                cli::server::cmd_serve(&host, port, &flows_dir).await
+            }
             Commands::Fmt { path } => cli::commands::cmd_fmt(&path),
             Commands::Doctor { path } => cli::commands::cmd_doctor(&path),
             Commands::Export { path, output } => {
@@ -251,5 +342,82 @@ fn main() {
     if let Err(e) = result {
         tracing::error!("{}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServeEnvironment, resolve_serve_address};
+
+    fn environment(
+        host: Option<&str>,
+        ironcrew_port: Option<&str>,
+        platform_port: Option<&str>,
+    ) -> ServeEnvironment {
+        ServeEnvironment {
+            host: host.map(str::to_owned),
+            ironcrew_port: ironcrew_port.map(str::to_owned),
+            platform_port: platform_port.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn serve_defaults_remain_local() {
+        let address = resolve_serve_address(None, None, environment(None, None, None)).unwrap();
+        assert_eq!(address, ("127.0.0.1".to_owned(), 3000));
+    }
+
+    #[test]
+    fn railway_port_binds_all_interfaces() {
+        let address =
+            resolve_serve_address(None, None, environment(None, None, Some("48123"))).unwrap();
+        assert_eq!(address, ("0.0.0.0".to_owned(), 48123));
+    }
+
+    #[test]
+    fn ironcrew_environment_takes_precedence_over_platform_port() {
+        let address = resolve_serve_address(
+            None,
+            None,
+            environment(Some("::"), Some("4100"), Some("48123")),
+        )
+        .unwrap();
+        assert_eq!(address, ("::".to_owned(), 4100));
+    }
+
+    #[test]
+    fn explicit_arguments_take_precedence_over_environment() {
+        let address = resolve_serve_address(
+            Some("127.0.0.2".to_owned()),
+            Some(4200),
+            environment(Some("::"), Some("4100"), Some("48123")),
+        )
+        .unwrap();
+        assert_eq!(address, ("127.0.0.2".to_owned(), 4200));
+    }
+
+    #[test]
+    fn invalid_ironcrew_port_fails_loudly() {
+        let error = resolve_serve_address(
+            None,
+            None,
+            environment(None, Some("not-a-port"), Some("48123")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("IRONCREW_PORT"));
+    }
+
+    #[test]
+    fn invalid_platform_port_fails_loudly() {
+        let error =
+            resolve_serve_address(None, None, environment(None, None, Some("70000"))).unwrap_err();
+        assert!(error.to_string().contains("PORT"));
+    }
+
+    #[test]
+    fn zero_port_is_rejected() {
+        let error =
+            resolve_serve_address(None, Some(0), environment(None, None, None)).unwrap_err();
+        assert!(error.to_string().contains("--port"));
     }
 }

@@ -1,0 +1,76 @@
+{
+  "file_count": 9,
+  "files": [
+    {
+      "path": "Dockerfile",
+      "sha256": "sha256:4a728b53d06c7e262399035ab159d48adc5a5e7a6fc410ce22d92c06676bdbc1",
+      "size": 992
+    },
+    {
+      "path": "build-attestation.json",
+      "sha256": "sha256:73594576aa289e97d3c960e294575ea61d6a65ce03d369c43740d569640c9f44",
+      "size": 52419
+    },
+    {
+      "path": "flows/ic008/crew.lua",
+      "sha256": "sha256:9cdfff6717ba5c37c382470a75de249ffc7f807ee0e90a07dda0481e493619d3",
+      "size": 849
+    },
+    {
+      "path": "ironcrew",
+      "sha256": "sha256:1cb77b4f712381a8aa2226fd1963f576bccb54d350329cf88e420806d4e0c4f3",
+      "size": 26031888
+    },
+    {
+      "path": "opt/ironcrew-canary/artifact_manifest.py",
+      "sha256": "sha256:7a1d47ae60d4d271bc8743585f68accbaca586cd704db700fdab397175e89e29",
+      "size": 11737
+    },
+    {
+      "path": "opt/ironcrew-canary/config_contract.py",
+      "sha256": "sha256:4b01880cc5628d366975a4a55d45c04111be1b05d94b1631bceef7622915cd49",
+      "size": 6111
+    },
+    {
+      "path": "opt/ironcrew-canary/fingerprints.py",
+      "sha256": "sha256:72dffcb8149886339b538a13c28447a6f9c3a894497a3afe1d39eabcb0c8feb6",
+      "size": 10697
+    },
+    {
+      "path": "opt/ironcrew-canary/ic008_mock_provider.py",
+      "sha256": "sha256:beaed78a5676eb17687edf7cee6693240b2952ea26a4001d62253ff231b7c58e",
+      "size": 10757
+    },
+    {
+      "path": "opt/ironcrew-canary/ic008_mock_state.py",
+      "sha256": "sha256:e49e8630ff3dd6985ea508092eef285ff86cdc371008a4f8dddb11e5473c87be",
+      "size": 2252
+    }
+  ],
+  "local_image": {
+    "config": "sha256:5f227b981026bdee84fbec487f6f8f3aad5b311f3f7e7d0e56c532665cd2a0e2",
+    "manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a",
+    "platform": "linux/amd64",
+    "size_bytes": 54044299
+  },
+  "registry_image": {
+    "image_stream": "ic008-conv-20260811",
+    "manifest": "sha256:ad413aff04e3eae80c5c3b82e3b03e9387c5a15809e24a94992804f14e4ac29a"
+  },
+  "scan": {
+    "base_image_findings": true,
+    "critical_high_fixed_count": 0,
+    "critical_unfixed": [
+      "CVE-2026-12087",
+      "CVE-2026-13221"
+    ],
+    "high_unfixed": [
+      "CVE-2026-48959",
+      "CVE-2026-48962"
+    ],
+    "package": "perl 5.40.1-6",
+    "packages": 130,
+    "scanner": "Docker Scout 1.24.0"
+  },
+  "schema": "ironcrew-ic008-openshift-assembly-v1"
+}

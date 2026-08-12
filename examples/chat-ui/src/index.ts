@@ -19,7 +19,7 @@ const uiPort = Number(process.env.PORT ?? 5173);
 const runtime = {
   ironCrewBaseUrl: process.env.IRONCREW_BASE_URL ?? "http://127.0.0.1:3000",
   ironCrewFlow: process.env.IRONCREW_FLOW ?? "chat-http",
-  ironCrewAgent: process.env.IRONCREW_AGENT ?? "concierge",
+  ironCrewAgent: process.env.IRONCREW_AGENT ?? "coordinator",
 };
 
 // Guard against a misconfiguration where IRONCREW_BASE_URL points at

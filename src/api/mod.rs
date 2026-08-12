@@ -1,7 +1,19 @@
+pub mod admission;
 pub mod audit;
 pub mod auth;
+pub mod conversation_lifecycle;
 pub mod conversations;
+pub mod deployment;
 pub mod handlers;
+pub mod idempotency;
+pub mod lifecycle;
+mod metrics;
+mod resource_metrics;
+mod sse;
+mod state;
+
+#[allow(unused_imports)] // public compatibility re-export; binary module tree is private
+pub use state::{ActiveConversationsMap, ActiveRun, AppState, CachedReadiness};
 
 use axum::{
     Router,
@@ -10,53 +22,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-
-use crate::engine::eventbus::EventBus;
-use crate::engine::input_bridge::InputBridge;
-use crate::engine::store::StateStore;
-
-/// A running crew: its event bus and an abort handle to cancel it.
-pub struct ActiveRun {
-    pub eventbus: EventBus,
-    pub abort_handle: tokio::task::AbortHandle,
-    /// Flow slug this run belongs to, so `abort_run` can reject a request that
-    /// targets another flow's run without a store round-trip.
-    pub flow: String,
-    /// Per-run human-input transport for `crew:ask_human()` — the questions
-    /// and answer endpoints reach the suspended flow through this. Dropped
-    /// with the entry, so pending oneshots die when the run is cleaned up.
-    pub input_bridge: Arc<InputBridge>,
-}
-
-/// Map of live chat sessions keyed by `(flow_slug, conversation_id)`.
-/// Flow slug is the last path segment of the resolved flow dir — the same
-/// value stored in `ConversationRecord.flow_path`, so the map is implicitly
-/// namespaced by flow.
-pub type ActiveConversationsMap =
-    Arc<RwLock<HashMap<(String, String), Arc<conversations::ConversationHandle>>>>;
-
-/// Shared application state
-pub struct AppState {
-    pub flows_dir: PathBuf,
-    pub active_runs: Arc<RwLock<HashMap<String, ActiveRun>>>,
-    pub active_conversations: ActiveConversationsMap,
-    /// Hard cap on `active_conversations.len()` — reads
-    /// `IRONCREW_MAX_ACTIVE_CONVERSATIONS` once at boot.
-    pub max_active_conversations: usize,
-    /// Hard cap on `active_runs.len()` — reads `IRONCREW_MAX_ACTIVE_RUNS`
-    /// once at boot. Backpressure against unbounded concurrent runs.
-    pub max_active_runs: usize,
-    /// Server-wide persistence singleton. Bootstrapped once at
-    /// `cmd_serve` startup and reused across every handler so Postgres
-    /// migrations / table checks don't re-run per request, and so every
-    /// caller shares the same connection pool instead of spinning a new
-    /// one per conversation start.
-    pub store: Arc<dyn StateStore>,
-}
 
 /// Response from running a crew
 #[derive(Serialize)]
@@ -103,13 +70,28 @@ pub struct ListRunsResponse {
 }
 
 /// Error response
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
 
 pub fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ErrorResponse>) {
     (status, Json(ErrorResponse { error: message }))
+}
+
+/// Run-event and human-input payloads (including validation errors) can carry
+/// sensitive metadata. Apply this at the route boundary so extractor-generated
+/// 4xx responses receive the same cache policy as successful handlers.
+async fn sensitive_response_no_store(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Resolve a flow path with traversal prevention.
@@ -164,22 +146,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     use handlers::*;
 
     // Public routes (no auth required)
-    let public = Router::new().route("/health", get(health));
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness));
 
-    // Protected routes (auth required when IRONCREW_API_TOKEN is set)
-    let protected = Router::new()
-        .route("/flows/{flow}/run", post(run_flow))
-        .route("/flows/{flow}/abort/{run_id}", post(abort_run))
-        .route("/flows/{flow}/runs", get(list_runs))
-        .route("/flows/{flow}/runs/{id}", get(get_run))
-        .route("/flows/{flow}/runs/{id}", delete(delete_run))
-        .route("/flows/{flow}/validate", get(validate_flow))
-        .route("/flows/{flow}/agents", get(list_agents))
+    let sensitive_run_control = Router::new()
         .route("/flows/{flow}/events/{run_id}", get(flow_events))
-        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints
         .route("/flows/{flow}/questions/{run_id}", get(list_questions))
         .route("/flows/{flow}/answer/{run_id}", post(answer_question))
-        // Phase-1 Human-in-the-Loop conversation endpoints
+        .layer(axum::middleware::from_fn(sensitive_response_no_store));
+
+    let sensitive_conversation_control = Router::new()
         .route(
             "/flows/{flow}/conversations",
             get(conversations::list_conversations),
@@ -197,16 +175,52 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(conversations::get_history),
         )
         .route(
-            "/flows/{flow}/conversations/{id}/events",
-            get(conversations::conversation_events),
-        )
-        .route(
             "/flows/{flow}/conversations/{id}",
             delete(conversations::delete_conversation),
         )
+        .route(
+            "/flows/{flow}/conversations/{id}/events",
+            get(conversations::conversation_events),
+        )
+        .layer(axum::middleware::from_fn(sensitive_response_no_store));
+
+    // Protected routes (auth required when either token source is configured).
+    // Authentication is the outer layer: admission sees only server-issued
+    // principal extensions, never X-Audit-Actor or source-IP guesses.
+    let protected = Router::new()
+        .route("/capabilities", get(capabilities))
+        .route("/flows/{flow}/run", post(run_flow))
+        .route("/flows/{flow}/abort/{run_id}", post(abort_run))
+        .route("/flows/{flow}/runs", get(list_runs))
+        .route("/flows/{flow}/runs/{id}", get(get_run))
+        .route("/flows/{flow}/runs/{id}", delete(delete_run))
+        .route("/flows/{flow}/validate", get(validate_flow))
+        .route("/flows/{flow}/agents", get(list_agents))
+        // Mid-run Human-in-the-Loop (crew:ask_human) endpoints. Their route
+        // layer also marks extractor-generated errors as non-cacheable.
+        .merge(sensitive_run_control)
+        // Conversation payloads and all extractor/error responses are
+        // non-cacheable because transcripts and model output are sensitive.
+        .merge(sensitive_conversation_control)
         .route("/audit", get(handlers::list_audit))
+        .route("/metrics", get(metrics::metrics))
         .route("/nodes", get(list_nodes))
-        .layer(axum::middleware::from_fn(auth::bearer_auth));
+        .layer(axum::middleware::from_fn_with_state(
+            state.admission.clone(),
+            admission::enforce_mutation_admission,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            lifecycle::enforce_mutation_lifecycle,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            lifecycle::attach_instance_id,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::bearer_auth,
+        ));
 
     public.merge(protected).with_state(state)
 }

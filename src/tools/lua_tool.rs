@@ -1,21 +1,26 @@
 use async_trait::async_trait;
-use mlua::{Function, Value};
+use mlua::Function;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 use super::{Tool, ToolCallContext};
+use crate::engine::conversation_definition::ConversationSourceContext;
 use crate::engine::runtime::Runtime;
 use crate::llm::provider::ToolSchema;
-use crate::lua::sandbox::create_tool_lua_with_base_dir;
+use crate::lua::limits::LuaExecutionGuard;
+use crate::lua::sandbox::create_tool_lua_with_execution_policy;
 use crate::lua::subflow::SubflowDepth;
+use crate::tools::runtime_policy::LuaVmPolicy;
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct LuaScriptTool {
     pub tool_name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    pub source: String,
-    pub base_dir: Option<PathBuf>,
+    pub source: Arc<str>,
+    policy: super::execution_policy::LuaToolPolicy,
+    vm_policy: LuaVmPolicy,
+    conversation_source: Option<ConversationSourceContext>,
     /// Weak ref to the owning `Runtime`. Populated by `Runtime::set_self_ref`
     /// after the `Arc<Runtime>` is constructed so sub-flows can re-enter the
     /// same tool registry without a reference cycle.
@@ -26,19 +31,61 @@ pub struct LuaScriptTool {
 }
 
 impl LuaScriptTool {
-    pub fn new(
+    pub(crate) fn new(
         tool_name: String,
         description: String,
         parameters: serde_json::Value,
-        source: String,
-        base_dir: Option<PathBuf>,
+        source: Arc<str>,
+        fs_roots: (Option<PathBuf>, Option<PathBuf>),
+        vm_policy: LuaVmPolicy,
+        conversation_source: Option<ConversationSourceContext>,
     ) -> Self {
+        let (read_base_dir, write_base_dir) = fs_roots;
+        let policy = super::execution_policy::LuaToolPolicy::capture(
+            read_base_dir.clone(),
+            write_base_dir.clone(),
+        );
         Self {
             tool_name,
             description,
             parameters,
             source,
-            base_dir,
+            policy,
+            vm_policy,
+            conversation_source,
+            runtime: Mutex::new(None),
+            project_dir_arc: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_fs_policy_for_test(
+        tool_name: String,
+        description: String,
+        parameters: serde_json::Value,
+        source: Arc<str>,
+        read_base_dir: Option<PathBuf>,
+        write_base_dir: Option<PathBuf>,
+        read_limit: usize,
+        write_limit: usize,
+        http_marker: usize,
+        allow_private: bool,
+    ) -> Self {
+        let policy = super::execution_policy::LuaToolPolicy::with_limits_for_test(
+            read_base_dir,
+            write_base_dir,
+            read_limit,
+            write_limit,
+        );
+        Self {
+            tool_name,
+            description,
+            parameters,
+            source,
+            policy,
+            vm_policy: LuaVmPolicy::for_test(http_marker, allow_private),
+            conversation_source: None,
             runtime: Mutex::new(None),
             project_dir_arc: Mutex::new(None),
         }
@@ -79,9 +126,41 @@ impl Tool for LuaScriptTool {
         }
     }
 
+    fn conversation_definition(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "schema": self.schema(),
+            "source_fingerprint": super::execution_policy::bytes_fingerprint(
+                "lua-tool-source",
+                self.source.as_bytes(),
+            ),
+            "policy": self.policy.definition()?,
+            "vm_policy": self.vm_policy.definition(),
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCallContext) -> Result<String> {
-        let lua =
-            create_tool_lua_with_base_dir(self.base_dir.clone()).map_err(IronCrewError::Lua)?;
+        let (read_root, write_root) =
+            self.policy
+                .roots()
+                .map_err(|message| IronCrewError::ToolExecution {
+                    tool: self.tool_name.clone(),
+                    message,
+                })?;
+        let (read_limit, write_limit) =
+            self.policy
+                .limits()
+                .map_err(|message| IronCrewError::ToolExecution {
+                    tool: self.tool_name.clone(),
+                    message,
+                })?;
+        let lua = create_tool_lua_with_execution_policy(
+            read_root,
+            write_root,
+            read_limit,
+            write_limit,
+            self.vm_policy.clone(),
+        )
+        .map_err(IronCrewError::Lua)?;
 
         // Seed app-data on the sandbox VM so sandbox-level primitives (like
         // `run_flow`) can reach the runtime + project dir + current subflow
@@ -98,6 +177,9 @@ impl Tool for LuaScriptTool {
         {
             lua.set_app_data(project_dir.clone());
         }
+        if let Some(context) = &self.conversation_source {
+            lua.set_app_data(context.clone());
+        }
         lua.set_app_data(SubflowDepth(ctx.depth));
         if let Some(ref eventbus) = ctx.eventbus {
             lua.set_app_data(eventbus.clone());
@@ -106,8 +188,15 @@ impl Tool for LuaScriptTool {
             lua.set_app_data(store.clone());
         }
 
+        // Loading the definition executes its top-level Lua, so the same
+        // budget must cover both definition evaluation and the tool call.
+        let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+
         // Load the tool definition
-        let table: mlua::Table = lua.load(&self.source).eval().map_err(IronCrewError::Lua)?;
+        let table: mlua::Table = lua
+            .load(self.source.as_ref())
+            .eval()
+            .map_err(IronCrewError::Lua)?;
 
         // Get the execute function
         let execute_fn: Function =
@@ -119,9 +208,11 @@ impl Tool for LuaScriptTool {
                 })?;
 
         // Convert JSON args to Lua table
-        let args_value = json_to_lua_value(&lua, &args).map_err(IronCrewError::Lua)?;
+        let json_limits = self.vm_policy.json_limits();
+        let args_value = crate::lua::json::json_value_to_lua_with_limits(&lua, &args, json_limits)
+            .map_err(IronCrewError::Lua)?;
         let args_table = match args_value {
-            Value::Table(table) => table,
+            mlua::Value::Table(table) => table,
             other => {
                 let table = lua.create_table().map_err(IronCrewError::Lua)?;
                 table.set("value", other).map_err(IronCrewError::Lua)?;
@@ -132,7 +223,7 @@ impl Tool for LuaScriptTool {
         // Call the function. Use `call_async` so any `run_flow` (or other
         // async primitives) nested inside the Lua execute block can await
         // cleanly instead of blocking the Tokio worker.
-        let result: Value =
+        let result: mlua::Value =
             execute_fn
                 .call_async(args_table)
                 .await
@@ -141,43 +232,19 @@ impl Tool for LuaScriptTool {
                     message: format!("Lua execute error: {}", e),
                 })?;
 
+        let result = crate::lua::json::lua_value_to_json_with_limits(result, json_limits).map_err(
+            |error| IronCrewError::ToolExecution {
+                tool: self.tool_name.clone(),
+                message: format!("Lua result conversion failed: {error}"),
+            },
+        )?;
         match result {
-            Value::String(s) => Ok(s.to_str()?.to_string()),
-            Value::Nil => Ok(String::new()),
-            other => Ok(format!("{:?}", other)),
-        }
-    }
-}
-
-fn json_to_lua_value(lua: &mlua::Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value> {
-    match value {
-        serde_json::Value::Null => Ok(mlua::Value::Nil),
-        serde_json::Value::Bool(boolean) => Ok(mlua::Value::Boolean(*boolean)),
-        serde_json::Value::Number(number) => {
-            if let Some(integer) = number.as_i64() {
-                Ok(mlua::Value::Integer(integer))
-            } else if let Some(float) = number.as_f64() {
-                Ok(mlua::Value::Number(float))
-            } else {
-                Ok(mlua::Value::Nil)
-            }
-        }
-        serde_json::Value::String(string) => {
-            Ok(mlua::Value::String(lua.create_string(string.as_str())?))
-        }
-        serde_json::Value::Array(array) => {
-            let table = lua.create_table()?;
-            for (index, item) in array.iter().enumerate() {
-                table.set(index + 1, json_to_lua_value(lua, item)?)?;
-            }
-            Ok(mlua::Value::Table(table))
-        }
-        serde_json::Value::Object(map) => {
-            let table = lua.create_table()?;
-            for (key, item) in map {
-                table.set(key.as_str(), json_to_lua_value(lua, item)?)?;
-            }
-            Ok(mlua::Value::Table(table))
+            serde_json::Value::String(string) => Ok(string),
+            serde_json::Value::Null => Ok(String::new()),
+            other => serde_json::to_string(&other).map_err(|error| IronCrewError::ToolExecution {
+                tool: self.tool_name.clone(),
+                message: format!("Lua result serialization failed: {error}"),
+            }),
         }
     }
 }

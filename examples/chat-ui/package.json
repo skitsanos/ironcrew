@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "IRONCREW_API_TOKEN=dev-token bun --hot src/index.ts",
+    "dev": "bun --hot src/index.ts",
     "start": "NODE_ENV=production bun src/index.ts"
   },
   "dependencies": {

@@ -102,7 +102,7 @@ async fn run_single_agent_turn_does_not_emit_conversation_events() {
         ..Default::default()
     };
     let bus = EventBus::new(64);
-    let mut rx = bus.subscribe();
+    let (_, mut rx) = bus.subscribe_with_replay();
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
     let ctx = ToolCallContext {
         eventbus: Some(bus),

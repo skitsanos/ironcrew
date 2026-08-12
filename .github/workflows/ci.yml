@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, develop]
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref (e.g. rapid pushes to a PR)
 # so we don't burn CI minutes on stale commits.
 concurrency:
@@ -17,64 +20,175 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  check:
-    name: Check
+  repository-policy:
+    name: Repository policy
     runs-on: ubuntu-latest
+    env:
+      IRONCREW_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Check Rust module size policy
+        run: python3 -B scripts/check_module_size.py
+      - name: Test Rust module size policy checker
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
+      - run: bun run scripts/validate_skills.ts
+      - name: Validate issue registry against trusted history
+        run: bun run scripts/issues_registry.ts check
+      - run: bun test scripts/tests/*.test.ts
+      - run: bun run scripts/check_worktree.ts
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint workflows
+        run: '"$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml'
 
-  fmt:
-    name: Format
+  rust-default:
+    name: Format, Clippy, and tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
-          components: rustfmt
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo test --doc
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          cache-targets: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
 
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  test-macos:
+    name: Tests (macOS)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+
+  postgres-integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Exercise the minimum PostgreSQL major version IronCrew supports.
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ironcrew_ci_admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IRONCREW_TEST_PG_URL: postgres://ironcrew_ci:ironcrew_ci_password@localhost:5432/ironcrew_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Create isolated test database
+        env:
+          PGPASSWORD: ironcrew_ci_admin
+        run: |
+          psql --host localhost --username postgres --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE ironcrew_ci LOGIN PASSWORD 'ironcrew_ci_password'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
+          CREATE DATABASE ironcrew_test OWNER ironcrew_ci;
+          \connect ironcrew_test
+          GRANT USAGE, CREATE ON SCHEMA public TO ironcrew_ci;
+          SQL
+      - name: Run PostgreSQL integration tests
+        run: >-
+          cargo test --locked --all-features
+          --test postgres_store_test
+          --test multi_replica_http_test
+          --test two_process_replica_acceptance_test
+          -- --test-threads=1
+      - name: Run replica soak contract smoke
+        run: |
+          python3 -m unittest discover \
+            -s evaluations/replica-soak \
+            -p 'test_*.py'
+          DATABASE_URL="$IRONCREW_TEST_PG_URL" \
+          python3 evaluations/replica-soak/soak.py \
+            --binary target/debug/ironcrew \
+            --runs 2 \
+            --duration-seconds 30 \
+            --concurrency 1 \
+            --report /tmp/ironcrew-replica-soak-ci/result.json
+      - name: Upload replica soak contract evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-soak-contract
+          path: /tmp/ironcrew-replica-soak-ci
+          if-no-files-found: ignore
+
+  windows-check:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  lua-examples:
+    name: Lua examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin ironcrew
+      - run: ./scripts/check-lua-examples.sh
+
+  crew-effectiveness-contract:
+    name: Crew effectiveness contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin ironcrew
+      - name: Test evaluator and orchestration contract
+        run: |
+          python3 -m unittest discover \
+            -s evaluations/crew-effectiveness \
+            -p 'test_*.py'
+          python3 evaluations/crew-effectiveness/evaluate.py \
+            --mode contract \
+            --binary target/debug/ironcrew \
+            --report /tmp/ironcrew-crew-effectiveness-contract.json
 
   release-build:
     name: Release Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+      - run: cargo build --release --locked
       - name: Binary size
         run: ls -lh target/release/ironcrew

@@ -11,6 +11,7 @@ the browser **directly to IronCrew**, which keeps SSE streaming clean
 
 - explicit conversation start, resume, and delete
 - sending messages to `chat-http`
+- attaching a fresh `Idempotency-Key` to each logical message mutation
 - reading stored history
 - listing stored sessions for the flow
 - subscribing to `/events` via native `EventSource`
@@ -43,7 +44,7 @@ The Bun server reads:
 |---|---|---|
 | `IRONCREW_BASE_URL` | `http://127.0.0.1:3000` | Base URL of the IronCrew server |
 | `IRONCREW_FLOW` | `chat-http` | Flow name to target |
-| `IRONCREW_AGENT` | `concierge` | Default agent shown in the UI |
+| `IRONCREW_AGENT` | `coordinator` | Default agent exposed by the paired `chat-http` flow |
 | `PORT` | `5173` | UI server port. Must differ from IronCrew's port. |
 
 ## Install
@@ -57,7 +58,7 @@ bun install
 ```bash
 IRONCREW_BASE_URL=http://127.0.0.1:3000 \
 IRONCREW_FLOW=chat-http \
-IRONCREW_AGENT=concierge \
+IRONCREW_AGENT=coordinator \
 bun dev
 ```
 
@@ -70,7 +71,7 @@ bun run build
 
 IRONCREW_BASE_URL=http://127.0.0.1:3000 \
 IRONCREW_FLOW=chat-http \
-IRONCREW_AGENT=concierge \
+IRONCREW_AGENT=coordinator \
 bun start
 ```
 
@@ -84,6 +85,11 @@ bun start
 | `POST` | `/flows/{flow}/conversations/{id}/messages` |
 | `GET` | `/flows/{flow}/conversations/{id}/events` (SSE) |
 | `DELETE` | `/flows/{flow}/conversations/{id}` |
+
+The message request includes `Idempotency-Key`, so this UI also works when the
+IronCrew service sets `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true`. A production UI
+that automatically retries a timed-out fetch must retain and reuse that same
+key until the logical message receives a definitive response.
 
 The Bun server itself only serves:
 

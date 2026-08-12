@@ -2,7 +2,6 @@
 -- Model: kimi-k2.5
 -- Requires: MOONSHOT_API_KEY
 
--- API key is auto-resolved from MOONSHOT_API_KEY env var based on base_url.
 local crew = Crew.new({
     goal = "Verify Kimi K2.5 via Moonshot OpenAI compat",
     provider = "openai",

@@ -7,17 +7,114 @@ use axum::http::{HeaderName, HeaderValue};
 use futures::future::BoxFuture;
 use rmcp::{
     Peer, RoleClient, ServiceExt,
-    model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation},
+    model::{
+        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
+        PaginatedRequestParams,
+    },
     service::RunningService,
     transport::streamable_http_client::StreamableHttpClientTransportConfig,
     transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
 };
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::mcp::config::{McpServerConfig, McpTransportConfig};
+use crate::mcp::execution_policy::{McpCallPolicy, ensure_serialized_size};
 use crate::utils::error::{IronCrewError, Result};
+use crate::utils::network::{OutboundNetworkPolicy, secure_no_redirect_client};
+
+const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_LIST_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+const MAX_TIMEOUT_SECS: u64 = 3_600;
+
+const DEFAULT_MAX_TOOLS: usize = 128;
+const HARD_MAX_TOOLS: usize = 4_096;
+const DEFAULT_MAX_LIST_PAGES: usize = 32;
+const HARD_MAX_LIST_PAGES: usize = 256;
+const DEFAULT_MAX_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
+const HARD_MAX_TOOL_DEFINITION_BYTES: usize = 1024 * 1024;
+const HARD_MAX_TOOL_NAME_BYTES: usize = 256;
+
+fn mcp_error(message: impl Into<String>) -> IronCrewError {
+    IronCrewError::Mcp {
+        server: String::new(),
+        message: message.into(),
+    }
+}
+
+fn bounded_env_u64(name: &str, default: u64, max: u64) -> Result<u64> {
+    let value = match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| mcp_error(format!("{name} must be an integer from 1 to {max}")))?,
+        Err(_) => default,
+    };
+    if !(1..=max).contains(&value) {
+        return Err(mcp_error(format!("{name} must be from 1 to {max}")));
+    }
+    Ok(value)
+}
+
+fn bounded_env_usize(name: &str, default: usize, max: usize) -> Result<usize> {
+    let value = match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| mcp_error(format!("{name} must be an integer from 1 to {max}")))?,
+        Err(_) => default,
+    };
+    if !(1..=max).contains(&value) {
+        return Err(mcp_error(format!("{name} must be from 1 to {max}")));
+    }
+    Ok(value)
+}
+
+fn configured_timeout(name: &str, default: u64) -> Result<Duration> {
+    Ok(Duration::from_secs(bounded_env_u64(
+        name,
+        default,
+        MAX_TIMEOUT_SECS,
+    )?))
+}
+
+fn localhost_override_enabled() -> bool {
+    std::env::var("IRONCREW_MCP_ALLOW_LOCALHOST")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Kill the entire MCP stdio process group when a connection is cancelled,
+/// times out, or is dropped. rmcp already reaps the direct child; this guard
+/// covers grandchildren spawned by the MCP server.
+struct McpProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl McpProcessGroupGuard {
+    fn new(process_id: Option<u32>) -> Self {
+        #[cfg(not(unix))]
+        let _ = process_id;
+        Self {
+            #[cfg(unix)]
+            pgid: process_id.and_then(|id| i32::try_from(id).ok()),
+        }
+    }
+}
+
+impl Drop for McpProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
 
 // ── safe-env helpers ──────────────────────────────────────────────────────────
 
@@ -62,10 +159,15 @@ type ShutdownFn = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + Sync>;
 pub struct McpClient {
     peer: Peer<RoleClient>,
     shutdown: Mutex<Option<ShutdownFn>>,
+    call_policy: McpCallPolicy,
 }
 
 impl McpClient {
-    fn from_service<S>(service: RunningService<RoleClient, S>) -> Self
+    fn from_service<S>(
+        service: RunningService<RoleClient, S>,
+        process_group: Option<McpProcessGroupGuard>,
+        call_policy: McpCallPolicy,
+    ) -> Self
     where
         S: rmcp::Service<RoleClient> + 'static,
     {
@@ -78,16 +180,23 @@ impl McpClient {
                 if let Err(e) = service.cancel().await {
                     tracing::debug!(error = %e, "MCP service cancel returned error");
                 }
+                drop(process_group);
             })
         });
         McpClient {
             peer,
             shutdown: Mutex::new(Some(shutdown)),
+            call_policy,
         }
     }
 
     /// Connect using a `McpServerConfig`, respecting all security constraints.
     pub async fn connect(cfg: &McpServerConfig) -> Result<Self> {
+        let call_policy = McpCallPolicy::capture()?;
+        let handshake_timeout = configured_timeout(
+            "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS",
+            DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        )?;
         match &cfg.transport {
             McpTransportConfig::Stdio { command, args, env } => {
                 let child_env = build_child_env(env, cfg.inherit_env);
@@ -100,6 +209,9 @@ impl McpClient {
                     for (k, v) in &child_env {
                         cmd.env(k, v);
                     }
+                    cmd.kill_on_drop(true);
+                    #[cfg(unix)]
+                    cmd.process_group(0);
                     cmd.configure(|_| {})
                 })
                 .map_err(|e| IronCrewError::Mcp {
@@ -107,13 +219,27 @@ impl McpClient {
                     message: format!("Failed to create stdio transport: {}", e),
                 })?;
 
+                let process_group = McpProcessGroupGuard::new(transport.id());
                 let service: RunningService<RoleClient, ()> =
-                    ().serve(transport).await.map_err(|e| IronCrewError::Mcp {
-                        server: cfg.label.clone(),
-                        message: format!("Handshake failed: {}", e),
-                    })?;
+                    tokio::time::timeout(handshake_timeout, ().serve(transport))
+                        .await
+                        .map_err(|_| IronCrewError::Mcp {
+                            server: cfg.label.clone(),
+                            message: format!(
+                                "Handshake timed out after {} seconds",
+                                handshake_timeout.as_secs()
+                            ),
+                        })?
+                        .map_err(|e| IronCrewError::Mcp {
+                            server: cfg.label.clone(),
+                            message: format!("Handshake failed: {}", e),
+                        })?;
 
-                Ok(Self::from_service(service))
+                Ok(Self::from_service(
+                    service,
+                    Some(process_group),
+                    call_policy,
+                ))
             }
             McpTransportConfig::Http { url, headers } => {
                 let config = if headers.is_empty() {
@@ -137,36 +263,103 @@ impl McpClient {
                         .custom_headers(header_map)
                 };
 
-                let transport = StreamableHttpClientTransport::from_config(config);
+                let policy = if localhost_override_enabled() {
+                    OutboundNetworkPolicy::AllowLoopback
+                } else {
+                    OutboundNetworkPolicy::PublicOnly
+                };
+                let http_client =
+                    secure_no_redirect_client(policy).map_err(|e| IronCrewError::Mcp {
+                        server: cfg.label.clone(),
+                        message: format!("Failed to build safe HTTP client: {e}"),
+                    })?;
+                let transport = StreamableHttpClientTransport::with_client(http_client, config);
 
                 let client_info = ClientInfo::new(
                     ClientCapabilities::default(),
                     Implementation::new("ironcrew", env!("CARGO_PKG_VERSION")),
                 );
 
-                let service =
-                    client_info
-                        .serve(transport)
-                        .await
-                        .map_err(|e| IronCrewError::Mcp {
-                            server: cfg.label.clone(),
-                            message: format!("HTTP handshake failed: {}", e),
-                        })?;
+                let service = tokio::time::timeout(handshake_timeout, client_info.serve(transport))
+                    .await
+                    .map_err(|_| IronCrewError::Mcp {
+                        server: cfg.label.clone(),
+                        message: format!(
+                            "HTTP handshake timed out after {} seconds",
+                            handshake_timeout.as_secs()
+                        ),
+                    })?
+                    .map_err(|e| IronCrewError::Mcp {
+                        server: cfg.label.clone(),
+                        message: format!("HTTP handshake failed: {}", e),
+                    })?;
 
-                Ok(Self::from_service(service))
+                Ok(Self::from_service(service, None, call_policy))
             }
         }
     }
 
     /// List all tools using paginated `list_all_tools()`.
     pub async fn list_all_tools(&self) -> Result<Vec<rmcp::model::Tool>> {
-        self.peer
-            .list_all_tools()
-            .await
-            .map_err(|e| IronCrewError::Mcp {
-                server: String::new(),
-                message: format!("list_all_tools failed: {}", e),
-            })
+        let timeout =
+            configured_timeout("IRONCREW_MCP_LIST_TIMEOUT_SECS", DEFAULT_LIST_TIMEOUT_SECS)?;
+        let max_tools =
+            bounded_env_usize("IRONCREW_MCP_MAX_TOOLS", DEFAULT_MAX_TOOLS, HARD_MAX_TOOLS)?;
+        let max_pages = bounded_env_usize(
+            "IRONCREW_MCP_MAX_LIST_PAGES",
+            DEFAULT_MAX_LIST_PAGES,
+            HARD_MAX_LIST_PAGES,
+        )?;
+        let max_definition_bytes = bounded_env_usize(
+            "IRONCREW_MCP_MAX_TOOL_DEFINITION_BYTES",
+            DEFAULT_MAX_TOOL_DEFINITION_BYTES,
+            HARD_MAX_TOOL_DEFINITION_BYTES,
+        )?;
+
+        let list = async {
+            let mut tools = Vec::new();
+            let mut cursor = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+
+            for _ in 0..max_pages {
+                let result = self
+                    .peer
+                    .list_tools(Some(
+                        PaginatedRequestParams::default().with_cursor(cursor.clone()),
+                    ))
+                    .await
+                    .map_err(|e| mcp_error(format!("list_tools failed: {e}")))?;
+
+                if tools.len().saturating_add(result.tools.len()) > max_tools {
+                    return Err(mcp_error(format!(
+                        "MCP server advertised more than {max_tools} tools"
+                    )));
+                }
+                for tool in &result.tools {
+                    ensure_serialized_size(tool, max_definition_bytes, "MCP tool definition")?;
+                }
+                tools.extend(result.tools);
+
+                let Some(next) = result.next_cursor else {
+                    return Ok(tools);
+                };
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(mcp_error("MCP tool pagination repeated a cursor"));
+                }
+                cursor = Some(next);
+            }
+
+            Err(mcp_error(format!(
+                "MCP tool discovery exceeded {max_pages} pages"
+            )))
+        };
+
+        tokio::time::timeout(timeout, list).await.map_err(|_| {
+            mcp_error(format!(
+                "MCP tool discovery timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        })?
     }
 
     /// Call a tool by its server-local name (not the prefixed IronCrew name).
@@ -175,19 +368,36 @@ impl McpClient {
         name: &str,
         args: serde_json::Value,
     ) -> Result<rmcp::model::CallToolResult> {
-        let params = if let Some(obj) = args.as_object() {
-            CallToolRequestParams::new(name.to_string()).with_arguments(obj.clone())
-        } else {
-            CallToolRequestParams::new(name.to_string())
+        if name.is_empty() || name.len() > HARD_MAX_TOOL_NAME_BYTES {
+            return Err(mcp_error(format!(
+                "MCP tool name must contain 1..={HARD_MAX_TOOL_NAME_BYTES} bytes"
+            )));
+        }
+        self.call_policy.validate_arguments(&args)?;
+
+        let params = match args {
+            serde_json::Value::Object(arguments) => {
+                CallToolRequestParams::new(name.to_string()).with_arguments(arguments)
+            }
+            serde_json::Value::Null => CallToolRequestParams::new(name.to_string()),
+            _ => return Err(mcp_error("MCP tool arguments must be a JSON object")),
         };
 
-        self.peer
-            .call_tool(params)
+        let timeout = self.call_policy.timeout();
+        tokio::time::timeout(timeout, self.peer.call_tool(params))
             .await
-            .map_err(|e| IronCrewError::Mcp {
-                server: String::new(),
-                message: format!("call_tool '{}' failed: {}", name, e),
-            })
+            .map_err(|_| {
+                mcp_error(format!(
+                    "call_tool '{}' timed out after {} seconds",
+                    name,
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| mcp_error(format!("call_tool '{name}' failed: {e}")))
+    }
+
+    pub(super) fn call_policy(&self) -> McpCallPolicy {
+        self.call_policy
     }
 
     /// Graceful async shutdown — awaits the service loop's exit and drops
@@ -197,7 +407,20 @@ impl McpClient {
     pub async fn shutdown(&self) {
         let f = self.shutdown.lock().await.take();
         if let Some(f) = f {
-            f().await;
+            let timeout = configured_timeout(
+                "IRONCREW_MCP_SHUTDOWN_TIMEOUT_SECS",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "Invalid MCP shutdown timeout; using default");
+                Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS)
+            });
+            if tokio::time::timeout(timeout, f()).await.is_err() {
+                tracing::warn!(
+                    timeout_seconds = timeout.as_secs(),
+                    "MCP shutdown timed out; dropping transport"
+                );
+            }
         }
     }
 
@@ -216,7 +439,14 @@ impl McpClient {
         let Some(f) = f else { return };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move { f().await });
+                handle.spawn(async move {
+                    let timeout = configured_timeout(
+                        "IRONCREW_MCP_SHUTDOWN_TIMEOUT_SECS",
+                        DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                    )
+                    .unwrap_or(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS));
+                    let _ = tokio::time::timeout(timeout, f()).await;
+                });
             }
             Err(_) => {
                 // No runtime — drop the owned service on this thread.

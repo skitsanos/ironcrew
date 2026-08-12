@@ -1,0 +1,113 @@
+{
+  "record_count": 5,
+  "records": [
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_start",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-cold-recovery-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "events_url": "/flows/ic008/conversations/ic008-cold-recovery-20260811/events",
+        "flow": "ic008",
+        "incarnation_id": "a4c8f02c-4313-42a8-b144-7ccbb78307a6",
+        "revision": 1,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "turn_count": 0
+      },
+      "response_bytes": 494,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7"
+      },
+      "operation": "conversation_message",
+      "receiver": "ff0a6ebc-066a-4293-9f1e-0295a0ca5ae7",
+      "response": {
+        "conversation_id": "ic008-cold-recovery-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "incarnation_id": "a4c8f02c-4313-42a8-b144-7ccbb78307a6",
+        "revision": 2,
+        "turn_count": 1,
+        "turn_index": 0
+      },
+      "response_bytes": 311,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_message",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "conversation_id": "ic008-cold-recovery-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "incarnation_id": "a4c8f02c-4313-42a8-b144-7ccbb78307a6",
+        "revision": 3,
+        "turn_count": 2,
+        "turn_index": 1
+      },
+      "response_bytes": 314,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_history",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "agent": "coordinator",
+        "conversation_id": "ic008-cold-recovery-20260811",
+        "definition_fingerprint": "sha256:c4311818560bf5b3882654e7da62ce142dc1de63e2b733181a934ffd712c5920",
+        "flow": "ic008",
+        "incarnation_id": "a4c8f02c-4313-42a8-b144-7ccbb78307a6",
+        "messages": [
+          {"role": "system"},
+          {"role": "user"},
+          {"role": "assistant"},
+          {"role": "tool"},
+          {"role": "assistant"},
+          {"role": "user"},
+          {"role": "assistant"},
+          {"role": "tool"},
+          {"role": "assistant"}
+        ],
+        "revision": 3,
+        "source_fingerprint": "sha256:f88689b58f330ecfe624c8e69c430df860c41aa4e65c8b94153d30042122b207",
+        "truncated": false,
+        "turn_count": 2
+      },
+      "response_bytes": 1789,
+      "status": 200
+    },
+    {
+      "headers": {
+        "cache-control": "no-store",
+        "content-type": "application/json",
+        "x-ironcrew-instance-id": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e"
+      },
+      "operation": "conversation_delete",
+      "receiver": "91bc1795-4b26-4d45-8d32-8dc0daaadf4e",
+      "response": {
+        "deleted": "ic008-cold-recovery-20260811"
+      },
+      "response_bytes": 42,
+      "status": 200
+    }
+  ],
+  "schema": "ironcrew-ic008-platform-canary-v1"
+}

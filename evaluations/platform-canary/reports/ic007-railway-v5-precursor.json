@@ -1,0 +1,181 @@
+{
+  "schema": "ironcrew-platform-canary-receipt-v1",
+  "status": "precursor_superseded_before_closure",
+  "platform": "railway",
+  "project_id": "d0eda4bf-f0ed-4258-bdb6-5b76cfdb8761",
+  "environment_id": "4ef85b76-84c6-470f-8a18-825c4d32222a",
+  "test_run": "ic007-final-20260810",
+  "evidence_window": {
+    "date": "2026-08-10",
+    "kind": "bounded temporary canary",
+    "not_claimed": [
+      "release artifact",
+      "production monitoring",
+      "soak",
+      "exactly-once external effects",
+      "complete IC-007 matrix"
+    ]
+  },
+  "supersession": {
+    "reason": "The deployed v5 artifact lost every durable run-event batch under Railway latency because each append attempt had a fixed 1500 ms outer deadline without a shorter PostgreSQL statement deadline.",
+    "v5_result_use": "negative and precursor evidence only",
+    "closure_requires": "homogeneous v6 rollout and repeated source-binding matrix"
+  },
+  "artifact": {
+    "tag": "ironcrew:ic007-platform-final-v5-20260810",
+    "oci_index_sha256": "32c6d4ecd0e93f2e76f3f8080dc1fa91b66b1b46ed7a81df23e6a0b79d5c3864",
+    "linux_amd64_manifest_sha256": "a2cb1eff1b4029d1dfbe3d097bf771509135563c98f07871cad3b6777630f2a7",
+    "oci_config_sha256": "d908632dbc812f45542d8b66cb46b11bddad89262e7e9bda79cf98c0f4224556",
+    "binary_sha256": "1fc1b963d743426b62c1c80705ea0e7b33dc28e299c777795107133b062a3078",
+    "flow_tree_sha256": "7a66cd31b503994bdf2338c6a599d0e1762a96bfaebad47d295d10e267fa4256",
+    "canonical_build_manifest_sha256": "7d637f0b2d33c58ebc0200ea09e74dd6d6cf709d513d1f496f7b90a735abbf48",
+    "build_attestation_file_sha256": "5b98f29676a32cdac242c96584c573543df53c5230f61e176f73f271c4a159c8",
+    "assembly_dockerfile_sha256": "6de0d031b6d5bc6078996bc13b8ca89ab22486c6b73065a047937b7c8e6f9723",
+    "deployment_revision": "develop-c4799a3c3b8a2441243ad512436d1cb649275cf4+manifest-7d637f0b2d33c58ebc0200ea09e74dd6d6cf709d513d1f496f7b90a735abbf48+ttl60"
+  },
+  "retained_artifacts": {
+    "assembly_dockerfile": "ic007-openshift-v5-assembly.Dockerfile",
+    "build_attestation": "ic007-openshift-v5-build-attestation.json",
+    "build_manifest": "ic007-openshift-v5-build-manifest.json",
+    "shared_artifact_with_openshift": true,
+    "effective_config": "ic007-railway-effective-config.json"
+  },
+  "deployment": {
+    "service_id": "4bc87da5-72cc-451f-8f54-7c382c4fd1bf",
+    "deployment_id": "f49232b9-67b0-4a89-ac43-ef3e4591852f",
+    "status": "SUCCESS",
+    "created_at": "2026-08-10T14:54:15.037Z",
+    "promoted_at": "2026-08-10T14:56:10.016Z",
+    "promotion_seconds": 114.979,
+    "instances": [
+      {
+        "instance_id": "59547c1b-02fc-4153-b9cd-9e9055f97b01",
+        "process_start_id": "8f400c9a-b4b7-4f9e-b5fc-6eb316ebd741"
+      },
+      {
+        "instance_id": "d06f6a2a-10a4-4187-a562-6823819ba3e7",
+        "process_start_id": "514ad671-f86a-4d8d-a073-44e96039bdba"
+      }
+    ]
+  },
+  "parity": {
+    "route_samples": 64,
+    "statuses_200": 64,
+    "identity_distribution": {
+      "59547c1b-02fc-4153-b9cd-9e9055f97b01": 28,
+      "d06f6a2a-10a4-4187-a562-6823819ba3e7": 36
+    },
+    "header_body_attribution_exact": true,
+    "artifact_flow_config_keyring_tuple_count": 1,
+    "independent_instance_binary_flow_config_keyring_verification": true,
+    "config_fingerprint": "sha256:8f9c479725f9d65c4e35e5bb1f99ed8b44ed236ae5b166973a90ac0d3ba8af47",
+    "keyring_fingerprint": "sha256:845d8ed531aba2109a986eaa66d5250624ce5982bae9a6ee036ab0b95b469613"
+  },
+  "functional_evidence": [
+    {
+      "case": "idempotent_provider_effect",
+      "outcome": "passed_before_journal_mismatch",
+      "run_id": "57b4f1c6-203a-4094-b526-796067d06715",
+      "evidence": "cross-peer replay returned the original Success run, changed-body reuse returned 409, and mock counts stayed chat=2 effect=1 final=1 tool=1"
+    },
+    {
+      "case": "encrypted_shared_hitl",
+      "outcome": "passed_before_journal_mismatch",
+      "run_id": "a5dd61a7-e3d7-444c-a48b-66dcb9a97ae9",
+      "evidence": "peer observed and answered both questions; question and answer ciphertext excluded their plaintext; duplicate answer returned 404; mailbox drained to zero; run completed Success"
+    },
+    {
+      "case": "cursor_validation",
+      "outcome": "partial_boundary_only",
+      "run_id": "a5dd61a7-e3d7-444c-a48b-66dcb9a97ae9",
+      "evidence": "malformed, cross-run, and ahead cursors returned 400, 400, and 409 with no-store; retained replay and expiry could not count because no numbered events persisted"
+    },
+    {
+      "case": "retained_sse",
+      "outcome": "failed",
+      "run_ids": [
+        "57b4f1c6-203a-4094-b526-796067d06715",
+        "a5dd61a7-e3d7-444c-a48b-66dcb9a97ae9"
+      ],
+      "evidence": "both terminal reads returned only an unnumbered synthesized run_complete with journal_complete=false; SQL retained zero event and state rows"
+    }
+  ],
+  "journal_failure": {
+    "source_outer_attempt_timeout_ms": 1500,
+    "source_max_attempts": 3,
+    "provider_attempt_timestamps_utc": [
+      "2026-08-10T14:57:43.254851Z",
+      "2026-08-10T14:57:44.807193Z",
+      "2026-08-10T14:57:46.410777Z",
+      "2026-08-10T14:57:47.911969Z",
+      "2026-08-10T14:57:49.464144Z",
+      "2026-08-10T14:57:51.066430Z",
+      "2026-08-10T14:57:53.177243Z",
+      "2026-08-10T14:57:54.730794Z",
+      "2026-08-10T14:57:56.333049Z"
+    ],
+    "hitl_attempt_timestamps_utc": [
+      "2026-08-10T14:58:24.713072Z",
+      "2026-08-10T14:58:26.265700Z",
+      "2026-08-10T14:58:27.867698Z",
+      "2026-08-10T14:58:43.910609Z",
+      "2026-08-10T14:58:45.462106Z",
+      "2026-08-10T14:58:47.065020Z",
+      "2026-08-10T14:58:48.566546Z",
+      "2026-08-10T14:58:50.119206Z",
+      "2026-08-10T14:58:51.720932Z",
+      "2026-08-10T14:59:01.142412Z",
+      "2026-08-10T14:59:02.694087Z",
+      "2026-08-10T14:59:04.295995Z",
+      "2026-08-10T14:59:08.779724Z",
+      "2026-08-10T14:59:10.332801Z",
+      "2026-08-10T14:59:11.935114Z"
+    ],
+    "postgres_maintenance_lock_timeouts_utc": [
+      "2026-08-10T14:57:47.111Z",
+      "2026-08-10T14:58:27.066Z",
+      "2026-08-10T14:58:48.138Z",
+      "2026-08-10T14:59:02.571Z"
+    ],
+    "postgres_timeout_statement": "SELECT retained_events, retained_bytes FROM <prefix>run_event_usage WHERE singleton = TRUE FOR UPDATE",
+    "historical_blocker_pid_attribution": "not recoverable without a new run",
+    "post_failure_sql": {
+      "run_rows": 2,
+      "success_rows": 2,
+      "run_event_rows": 0,
+      "run_event_state_rows": 0,
+      "global_retained_events": 0,
+      "global_retained_bytes": 0
+    }
+  },
+  "post_failure_health": {
+    "liveness": "both targeted instances returned 200",
+    "readiness": "both targeted instances exceeded 5 seconds; a later public probe recovered to 200 in 8.105 seconds",
+    "pool_samples": [
+      "open=2 in_use=1 limit=2",
+      "open=2 in_use=2 limit=2"
+    ],
+    "postgres_snapshot": "four app connections, two per replica, all idle ClientRead; no blocking PIDs or ungranted locks",
+    "interpretation": "transient checked-out client connections and readiness degradation are observed; an extant server-side blocker is not claimed"
+  },
+  "matrix_stop": {
+    "reason": "new contract mismatch",
+    "not_run_on_v5": [
+      "attributed cancellation and cancellation race",
+      "expired retained cursor",
+      "local admission and shared quota phases",
+      "owner-local negative boundaries",
+      "exact-owner SIGKILL and replacement",
+      "three-revision HITL rotation",
+      "IC-020 scale, drain, and rolling lifecycle",
+      "final security, resource, log, and database scans"
+    ]
+  },
+  "cleanup": {
+    "status": "deferred_for_v6",
+    "resources_held_for_replacement": true,
+    "project_and_environment_preserved": true,
+    "preexisting_volume_tombstones_preserved": 2,
+    "active_canary_volumes": 0
+  }
+}
