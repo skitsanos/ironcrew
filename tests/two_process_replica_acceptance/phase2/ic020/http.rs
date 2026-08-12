@@ -101,6 +101,20 @@ async fn peer_readiness_is_healthy(pair: &ProcessPair, context: &str) -> bool {
     false
 }
 
+pub(super) async fn wait_peer_ready(pair: &ProcessPair, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if peer_readiness_is_healthy(pair, context).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "IC-020 peer did not recover readiness during {context}\n{}",
+        pair.survivor_b.logs()
+    );
+}
+
 pub(super) async fn wait_draining(pair: &ProcessPair, peer_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {

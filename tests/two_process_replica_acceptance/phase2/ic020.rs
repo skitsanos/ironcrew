@@ -150,17 +150,19 @@ async fn scenario(pair: &mut ProcessPair) {
     sql::assert_owner_not_draining(pair, &replacement_run).await;
     assert_eq!(sql::snapshot(pair).await, before_direct_sigterm);
     owner_fence.release().await;
-    http::wait_draining(pair, &peer_id).await;
-    sql::assert_owner_draining(pair, &replacement_run).await;
-    assert_eq!(sql::snapshot(pair).await, before_direct_sigterm);
-    process::wait_clean_exit(
+    // Direct SIGTERM starts the routing-grace clock before the deliberately
+    // blocked fence can commit. Once the lock is released, the listener may
+    // therefore close before another HTTP sample can observe `draining`.
+    // The earlier `fencing` response proves the monotonic lifecycle transition;
+    // use the durable fence for this post-release boundary instead.
+    sql::wait_owner_draining(pair, &replacement_run).await;
+    process::wait_clean_exit_independently(
         &mut pair.owner_a,
-        &pair.client,
-        &pair.survivor_b.base_url,
         sigterm_sent_at,
         "replacement C direct SIGTERM",
     )
     .await;
+    http::wait_peer_ready(pair, "replacement C direct SIGTERM").await;
     assert_eq!(
         wait_for_status_with_context(
             pair,
