@@ -29,25 +29,30 @@ selection is still only repository-level defense in depth. Require reviewed
 default-branch controls and a protected `release` environment before treating
 publication as platform-enforced.
 
-The current repository has no ruleset, environment, or `main` protection, and
-its only direct collaborator is the owner. Do not dispatch either workflow
-until an independent environment reviewer exists, self-approval and bypass are
-disabled, Docker credentials have moved from repository secrets into the
-`release` environment, protected `v*` tag rules prevent update/deletion and
-restrict creation without administrator bypass, immutable releases are enabled,
-and the documented non-secret controls have been revalidated. Because creating
-a repository dispatch requires Contents write, use only a dedicated constrained
-release authority or a lower-authority request channel backed by a trusted
-controller and platform actor/event policy; do not call sender/actor equality an
-operator allowlist. `validate` mode is non-publishing, but it still must wait for
-those controls because its purpose is to prove their enforcement.
+IronCrew currently uses an explicit sole-owner authority model: `skitsanos` is
+the trusted root and may approve `develop` to `main`, create a stable release
+tag, request a release, approve the protected deployment, and rerun it. A
+malicious or compromised repository owner is outside this model. Do not dispatch
+either workflow until `main` requires a PR and green CI, the protected `release`
+environment requires deliberate owner self-approval with administrator bypass
+disabled, Docker credentials have moved from repository secrets into that
+environment, only the owner may create protected `v*` tags, tag updates and
+deletions remain prohibited, immutable releases are enabled, and the documented
+non-secret controls have been revalidated.
+
+The owner-only Issues controller is the request channel. It validates an exact
+issue and uses its run-scoped `GITHUB_TOKEN` to create the fixed repository
+dispatch, avoiding a standing Contents-write personal token. `validate` mode is
+non-publishing, but it still waits for the protected environment because its
+purpose is to prove that enforcement.
 
 Default-branch dispatch does not prevent a tag-capable actor from adding a
-different tag-push workflow to an off-main commit. Require GitHub workflow-
-execution protections, or an equivalent platform boundary, that denies such
-untrusted actors/events. Coordinate this with CI: `.github/workflows/ci.yml`
-still intentionally uses `push` for `main` and `develop`, so do not blanket-
-disable push events without an agreed CI-trigger replacement.
+different tag-push workflow to an off-main commit. Under the sole-owner model,
+only the trusted owner may create `v*` tags and owner compromise is out of
+scope. Record the workflow-execution-policy state, but do not enable a broad
+event restriction that breaks CI's intentional `push` and `pull_request`
+coverage or the Issues request controller without a separately validated
+policy design.
 
 ## Verify and propose
 
@@ -69,8 +74,8 @@ After approval:
    root package entry in `Cargo.lock`, and read both back.
 2. Rerun the complete gate. Stage only explicit release paths and commit/push
    only when authorized.
-3. Open or update the `develop` to `main` release PR. Wait for green CI and the
-   required review, then merge only with user authorization.
+3. Open or update the `develop` to `main` release PR. Wait for green CI, then
+   merge only with explicit sole-owner authorization.
 4. Fast-forward local `main` from `origin/main`. Create an annotated `vX.Y.Z`
    tag only on the verified release commit.
 5. Prove the tag is reachable from `main` and its `Cargo.toml` contains the same
@@ -81,26 +86,29 @@ After approval:
    in this exact request with the pushed stable tag:
 
    ```bash
-   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
-   {"event_type":"ironcrew_release_v1","client_payload":{"tag":"vX.Y.Z","mode":"validate"}}
-   JSON
+   request=$(gh issue create --repo skitsanos/ironcrew \
+     --title 'IronCrew release request' \
+     --body '{"target":"release","tag":"vX.Y.Z","mode":"validate"}')
+   gh issue edit "$request" --add-label release-request
    ```
 
-   The payload must contain exactly `event_type` plus `client_payload`, and the
-   client payload must contain exactly `tag` and `mode`. Invoke it only with the
-   constrained release authority described above. Confirm that the
-   protected `release` environment required independent approval and that the
+   The issue must be open, owner-authored, have the exact title and only the
+   `release-request` label, and contain the canonical single-line JSON body
+   shown above. Confirm that the protected `release` environment required
+   deliberate owner approval and that the
    run completed without contents-write, OIDC signing, a GitHub release, or
-   registry access. Capture a separately designed denied adversarial canary;
-   `repository_dispatch` itself always selects the default-branch workflow and
-   cannot be pointed at an off-main ref.
+   registry access. Close the request issue after the downstream run completes.
+   Capture a separately designed denied adversarial canary; the controller's
+   `repository_dispatch` always selects the default-branch workflow and cannot
+   be pointed at an off-main ref.
 7. Only after those canaries and a separate explicit publication approval,
    dispatch the exact release request:
 
    ```bash
-   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
-   {"event_type":"ironcrew_release_v1","client_payload":{"tag":"vX.Y.Z","mode":"publish"}}
-   JSON
+   request=$(gh issue create --repo skitsanos/ironcrew \
+     --title 'IronCrew release request' \
+     --body '{"target":"release","tag":"vX.Y.Z","mode":"publish"}')
+   gh issue edit "$request" --add-label release-request
    ```
 
    A release created with the workflow's `GITHUB_TOKEN` does not cascade into
@@ -119,19 +127,22 @@ After approval:
    request; it must not read Docker credentials or touch the registry:
 
    ```bash
-   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
-   {"event_type":"ironcrew_docker_publish_v1","client_payload":{"tag":"vX.Y.Z","mode":"validate"}}
-   JSON
+   request=$(gh issue create --repo skitsanos/ironcrew \
+     --title 'IronCrew release request' \
+     --body '{"target":"docker","tag":"vX.Y.Z","mode":"validate"}')
+   gh issue edit "$request" --add-label release-request
    ```
 
-   While IC-015 remains in progress, keep actual Docker publication deferred.
-   Once IC-015 is resolved and the user separately authorizes production
-   promotion, use this exact request:
+   IC-015's non-production registry acceptance is resolved, but actual Docker
+   publication remains deferred until this IC-014 control plane is complete and
+   the user separately authorizes production promotion. Then use this exact
+   request:
 
    ```bash
-   gh api --method POST repos/skitsanos/ironcrew/dispatches --input - <<'JSON'
-   {"event_type":"ironcrew_docker_publish_v1","client_payload":{"tag":"vX.Y.Z","mode":"publish"}}
-   JSON
+   request=$(gh issue create --repo skitsanos/ironcrew \
+     --title 'IronCrew release request' \
+     --body '{"target":"docker","tag":"vX.Y.Z","mode":"publish"}')
+   gh issue edit "$request" --add-label release-request
    ```
 
    Monitor the version digest and final `latest` digest against GitHub's current

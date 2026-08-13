@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,17 +69,16 @@ class CommandBackend:
 
     def inspect(self, tag: str) -> str | None:
         result = self._run(
-            ["skopeo", "inspect", "--format", "{{.Digest}}", f"docker://{self.image}:{tag}"],
+            ["skopeo", "inspect", "--raw", f"docker://{self.image}:{tag}"],
             allow_failure=True,
         )
         if result.returncode:
             if any(marker in result.stderr.lower() for marker in NOT_FOUND_MARKERS):
                 return None
             raise PromotionError("registry digest inspection failed")
-        digest = result.stdout.strip()
-        if not DIGEST_RE.fullmatch(digest):
-            raise PromotionError("registry returned an invalid digest")
-        return digest
+        if not result.stdout:
+            raise PromotionError("registry returned an empty manifest")
+        return "sha256:" + hashlib.sha256(result.stdout.encode()).hexdigest()
 
     def copy(self, image: ReleaseImage, tag: str) -> bool:
         result = self._run(

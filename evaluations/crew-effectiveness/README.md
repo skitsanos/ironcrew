@@ -59,6 +59,8 @@ persistence, token accounting, structured output parsing, and scoring remain
 wired together. They must never be cited as evidence that crews outperform a
 single agent. Before succeeding, `evaluate.py` also runs the generated document
 through IronCrew's own JSON Schema validator using `report-v3.schema.json`.
+Schema and report documents are each limited to 2 MiB and cross the process
+boundary through bounded modules rather than command-line arguments.
 The v1 and v2 schemas and dated GPT-4.1 receipts remain unchanged historical
 evidence; they are not rewritten into the current contract.
 
