@@ -1521,15 +1521,67 @@ archive; it does not rebuild a historical release from the current default
 branch. The release image retains the source image's permissions, numeric user,
 environment, and command contract.
 
-This promotion protocol is still in progress under
-[IC-015](issues/IC-015.md). As of the 2026-08-12 read-only check, Docker Hub
-immutable tags were disabled and its public `latest` still matched `2.20.0`,
-while GitHub's current stable release was `v2.22.0`. Production Docker
-publication remains deferred until the immutable semantic-version rule and a
-non-production replay/conflict/concurrent-`latest` acceptance run are recorded.
+This promotion protocol is resolved under [IC-015](issues/IC-015.md). On
+2026-08-12, Docker Hub's production repository was changed to the exact
+stable-semver-only immutability rule while leaving `latest` mutable. A
+disposable repository passed the real
+replay/conflict/concurrent-`latest` protocol and was then removed exactly; the
+retained machine receipt is linked from IC-015. No production image or tag was
+published or moved. The exact harness/evidence commit passed all platform CI
+jobs. Production Docker publication remains deferred under IC-014's
+release-control gate and the user's release-last sequence.
 The protocol starts with the first release produced by the new tag workflow;
 it does not retroactively rebuild or promote legacy releases that lack the
 signed OCI archive and receipt.
+
+The non-production IC-015 registry gate is
+[`scripts/dockerhub_promotion_acceptance.py`](../scripts/dockerhub_promotion_acceptance.py).
+It derives the only permitted target as
+`<namespace>/ironcrew-ic015-acceptance-<run-id>`; callers cannot pass the
+production repository. Its `prepare` phase creates that exact public disposable
+repository, installs the canonical semantic-version immutability rule, and
+records its name, description, registration timestamp, and fingerprint. The
+`run` phase requires that bound receipt, an empty tag inventory, two distinct
+public source images pinned by digest, an authenticated `skopeo` session, and
+explicit promotion authorization. It exercises initial and identical version
+promotion, protocol conflict refusal, a direct registry overwrite rejection,
+a same-archive mutable-tag positive control, a second version, and deterministic `latest` repair when the injected stable
+release changes between reads. It revalidates the external immutability rule
+after the rejected overwrite and requires the exact final tag set.
+
+Use a unique ID and new evidence paths; the helper refuses to overwrite an
+existing receipt:
+
+```bash
+python3 -B scripts/dockerhub_promotion_acceptance.py prepare \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --authorize-create --evidence /secure/path/ic015-prepare.json
+python3 -B scripts/dockerhub_promotion_acceptance.py run \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --input-evidence /secure/path/ic015-prepare.json \
+  --source-a docker://example/image@sha256:<64-lowercase-hex> \
+  --source-b docker://example/other@sha256:<64-lowercase-hex> \
+  --authorize-promotion --evidence /secure/path/ic015-run.json
+```
+
+Supply `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` through the environment and
+authenticate `skopeo` without placing the token in command history. After the
+receipt passes, delete only the exact disposable repository in Docker Hub's
+authenticated UI, then bind absence evidence to the run receipt:
+
+```bash
+python3 -B scripts/dockerhub_promotion_acceptance.py verify-cleanup \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --input-evidence /secure/path/ic015-run.json \
+  --evidence /secure/path/ic015-cleanup.json
+```
+
+Repository deletion is destructive and removes its images permanently. The
+cleanup phase is read-only: it passes only after the authenticated API reports
+that exact bound repository absent and `skopeo` cannot resolve any of its three
+acceptance tags. The dated IC-015 receipt records one completed run of this
+procedure. Production publication remains deferred under IC-014's separate
+release-control gate and the user's release-last sequence.
 
 ### Excluding MCP
 

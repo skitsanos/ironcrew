@@ -1,0 +1,97 @@
+{
+  "schema": "ironcrew.ic015.dockerhub-acceptance-report.v1",
+  "recorded_at": "2026-08-12T12:05:52.478470+00:00",
+  "source": {
+    "base_revision": "b266f32217f75d7c7607fa465bc685aa6fe82b97",
+    "dirty_worktree": true,
+    "files": {
+      "scripts/dockerhub_acceptance_api.py": "sha256:ef90f7b392e7c27f8bf57351c5a458e51add84d698ddbf7cd4a62a19fbde3dd7",
+      "scripts/dockerhub_immutability.py": "sha256:058ddbfa6c0f8d1918b0cd4a19a0d38416adef6ab257b44818ebe81837dc8f6f",
+      "scripts/dockerhub_promotion_acceptance.py": "sha256:830bf90534341f0591a3f42887f862c87a9a63c14a14283fa4efe2b19bf39a28",
+      "scripts/promote_release_image.py": "sha256:aa6d80488369036582c19192ef3cc1280a5bc3e20c3633286020358e98095dd1",
+      "scripts/release_promotion_protocol.py": "sha256:cd11afa5e821f548b4573133f691b21ab35b91425efaf3f954d535d76486dd1a",
+      "scripts/tests/test_dockerhub_promotion_acceptance.py": "sha256:706ed36fab65066128d96c197c8f6416c89bf0e1c01cfba7209b37db562b7afc"
+    }
+  },
+  "tools": {
+    "skopeo": "1.24.0",
+    "transport": "Docker Hub registry and authenticated repository API"
+  },
+  "sources": [
+    {
+      "reference": "docker.io/library/busybox",
+      "index_digest": "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+      "acceptance_tag": "0.0.1"
+    },
+    {
+      "reference": "docker.io/library/alpine",
+      "index_digest": "sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a",
+      "acceptance_tag": "0.0.2"
+    }
+  ],
+  "disposable_repository": {
+    "name": "skitsanos/ironcrew-ic015-acceptance-20260812t115900z-5fd204be",
+    "run_id": "20260812t115900z-5fd204be",
+    "fingerprint": "f65c6aeff0065813d4f46e0a82b3c3dd784e1720de15bf0b4296eec33f80e943",
+    "public": true,
+    "created_at": "2026-08-12T11:59:11.405433+00:00",
+    "deleted_at": "2026-08-12T12:05:52.478470+00:00",
+    "repository_absent_after_cleanup": true,
+    "tags_absent_after_cleanup": [
+      "0.0.1",
+      "0.0.2",
+      "latest"
+    ]
+  },
+  "immutable_tag_policy": {
+    "rule": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+    "disposable_repository_verified_before_and_after_conflict": true,
+    "production_repository_verified_after_acceptance": true,
+    "latest_remains_mutable": true
+  },
+  "acceptance": {
+    "status": "passed",
+    "initial_version_promotion": "published",
+    "identical_replay": "no-op",
+    "conflicting_replay": "protocol-refused",
+    "direct_registry_overwrite": "semver-only-rejected-with-mutable-control",
+    "mutable_tag_write_and_restore_control": true,
+    "newer_version_promotion": "published",
+    "latest_reconciled_to": "v0.0.2",
+    "latest_attempts": 2,
+    "final_tags_before_cleanup": [
+      "0.0.1",
+      "0.0.2",
+      "latest"
+    ]
+  },
+  "production_repository": {
+    "name": "skitsanos/ironcrew",
+    "policy_only_change": true,
+    "image_or_tag_write_performed": false,
+    "tag_snapshot_after_policy_change": {
+      "latest": "sha256:fa336f85a0347001438d576f2e945136eb40485f7a6a0355a77ea0dbf38230c6",
+      "2.20.0": "sha256:fa336f85a0347001438d576f2e945136eb40485f7a6a0355a77ea0dbf38230c6",
+      "2.21.0": null,
+      "2.22.0": null
+    }
+  },
+  "phase_receipts": {
+    "prepare": "sha256:cfdb3c6b74795bcdb257baa474929a62439cd6c5cddc4da765b29aa592a43123",
+    "run": "sha256:784711fa4a0fae1ba66388daba5954c5cd13c62a627703829458f63b3a8f1999",
+    "cleanup": "sha256:5a98e4e52374a2b54593c8ab54788e06c866e4c8a17fb5be8373f37b6345e8af"
+  },
+  "preliminary_attempt": {
+    "run_id": "20260812t113700z-4b9f2a10",
+    "status": "failed-closed",
+    "retained": false,
+    "reason": "Docker Hub returned a zero count with three tag rows",
+    "repository_cleanup_verified": true
+  },
+  "boundaries": {
+    "github_release_asset_download_exercised": false,
+    "production_release_exercised": false,
+    "production_image_publication_exercised": false,
+    "legacy_release_backfill_proven": false
+  }
+}

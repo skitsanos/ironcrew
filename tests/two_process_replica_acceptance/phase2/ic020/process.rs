@@ -67,12 +67,7 @@ pub(super) async fn wait_clean_exit(
             .try_wait()
             .expect("inspect IC-020 draining replica")
         {
-            assert!(
-                status.success(),
-                "{label} did not shut down cleanly with SIGTERM: {status}\n{}",
-                process.logs()
-            );
-            assert!(sigterm_sent_at.elapsed() < Duration::from_secs(8));
+            assert_clean_exit(process, status, sigterm_sent_at, label);
             return;
         }
         if Instant::now() >= deadline {
@@ -82,6 +77,51 @@ pub(super) async fn wait_clean_exit(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+pub(super) async fn wait_clean_exit_independently(
+    process: &mut ReplicaProcess,
+    sigterm_sent_at: Instant,
+    label: &str,
+) {
+    let deadline = sigterm_sent_at + Duration::from_secs(8);
+    loop {
+        if let Some(status) = process
+            .child
+            .try_wait()
+            .expect("inspect IC-020 draining replica")
+        {
+            assert_clean_exit(process, status, sigterm_sent_at, label);
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+            panic!("{label} exceeded the bounded IC-020 shutdown window");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn assert_clean_exit(
+    process: &ReplicaProcess,
+    status: std::process::ExitStatus,
+    sigterm_sent_at: Instant,
+    label: &str,
+) {
+    assert!(
+        status.success(),
+        "{label} did not shut down cleanly with SIGTERM: {status}\n{}",
+        process.logs()
+    );
+    assert!(
+        !process
+            .logs()
+            .contains("Graceful shutdown exceeded its teardown deadline"),
+        "{label} exited through the teardown-timeout fallback\n{}",
+        process.logs()
+    );
+    assert!(sigterm_sent_at.elapsed() < Duration::from_secs(8));
 }
 
 pub(super) async fn replace_owner(pair: &mut ProcessPair, extra_env: &[(&str, &str)]) -> String {

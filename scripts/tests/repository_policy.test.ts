@@ -278,6 +278,121 @@ describe("repository integration policy", () => {
     expect(cliGuide).toContain("flush/terminal acknowledgement is bounded by `3W + 650 ms`");
   });
 
+  test("sole-owner issue requests dispatch only fixed trusted workflows", async () => {
+    const source = await Bun.file(
+      join(repository, ".github/workflows/release-request.yml"),
+    ).text();
+    const workflow = Bun.YAML.parse(source) as {
+      on: { issues: { types: string[] } };
+      permissions: Record<string, string>;
+      concurrency: { group: string; "cancel-in-progress": boolean };
+      jobs: Record<string, {
+        if?: string;
+        needs?: string;
+        "timeout-minutes"?: number;
+        env?: Record<string, string>;
+        outputs?: Record<string, string>;
+        permissions?: Record<string, string>;
+        steps: Array<{
+          name?: string;
+          if?: string;
+          uses?: string;
+          run?: string;
+          env?: Record<string, string>;
+          with?: Record<string, string | boolean>;
+        }>;
+      }>;
+    };
+
+    expect(Object.keys(workflow.on)).toEqual(["issues"]);
+    expect(workflow.on.issues.types).toEqual(["labeled"]);
+    expect(workflow.permissions).toEqual({});
+    expect(workflow.concurrency).toEqual({
+      group: "release-request-${{ github.event.issue.number }}",
+      "cancel-in-progress": false,
+    });
+    expect(workflow.jobs.guard.permissions).toEqual({
+      contents: "read",
+      issues: "read",
+    });
+    expect(workflow.jobs.guard["timeout-minutes"]).toBe(5);
+    expect(workflow.jobs.guard.outputs).toEqual({
+      relevant: "${{ steps.request.outputs.relevant }}",
+      target: "${{ steps.request.outputs.target }}",
+      tag: "${{ steps.request.outputs.tag }}",
+      mode: "${{ steps.request.outputs.mode }}",
+    });
+    expect(workflow.jobs.guard.steps[0]?.env).toEqual({
+      EVENT_ACTION: "${{ github.event.action }}",
+      DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
+    });
+    const guardCommands = workflow.jobs.guard.steps
+      .map((step) => step.run ?? "")
+      .join("\n");
+    expect(guardCommands).toContain('test "$GITHUB_EVENT_NAME" = issues');
+    expect(guardCommands).toContain('test "$EVENT_ACTION" = labeled');
+    expect(guardCommands).toContain('test "$DEFAULT_BRANCH" = main');
+    expect(guardCommands).toContain('test "$GITHUB_REF" = refs/heads/main');
+    expect(guardCommands).toContain(
+      "$GITHUB_REPOSITORY/.github/workflows/release-request.yml@refs/heads/main",
+    );
+    expect(guardCommands).toContain('test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"');
+    expect(guardCommands).toContain("scripts/validate_release_request.py");
+    expect(guardCommands).toContain('--actor "$GITHUB_ACTOR"');
+    expect(guardCommands).toContain('--triggering-actor "$TRIGGERING_ACTOR"');
+    expect(guardCommands).toContain("--owner skitsanos");
+    const requestStep = workflow.jobs.guard.steps.find(
+      (step) => step.name === "Validate exact issue request",
+    );
+    expect(requestStep?.env).toEqual({
+      TRIGGERING_ACTOR: "${{ github.triggering_actor }}",
+    });
+    const checkout = workflow.jobs.guard.steps.find((step) => step.uses);
+    expect(checkout?.uses).toBe(
+      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    );
+    expect(checkout?.with).toEqual({
+      "persist-credentials": false,
+      ref: "${{ github.sha }}",
+    });
+
+    const dispatch = workflow.jobs.dispatch;
+    expect(dispatch.needs).toBe("guard");
+    expect(dispatch.if).toBe("needs.guard.outputs.relevant == 'true'");
+    expect(dispatch["timeout-minutes"]).toBe(5);
+    expect(dispatch.permissions).toEqual({ contents: "write" });
+    expect(dispatch.env).toEqual({
+      RELEASE_TAG: "${{ needs.guard.outputs.tag }}",
+      RELEASE_MODE: "${{ needs.guard.outputs.mode }}",
+    });
+    expect(dispatch.steps).toHaveLength(2);
+    expect(dispatch.steps.every((step) => !step.uses)).toBeTrue();
+    expect(dispatch.steps.every((step) => step.env?.GH_TOKEN === "${{ github.token }}"))
+      .toBeTrue();
+    const release = dispatch.steps[0];
+    expect(release?.if).toBe("needs.guard.outputs.target == 'release'");
+    expect(release?.run?.trim()).toBe(
+      'gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \\\n' +
+        "  -f event_type=ironcrew_release_v1 \\\n" +
+        '  -f "client_payload[tag]=${RELEASE_TAG}" \\\n' +
+        '  -f "client_payload[mode]=${RELEASE_MODE}"',
+    );
+    const docker = dispatch.steps[1];
+    expect(docker?.if).toBe("needs.guard.outputs.target == 'docker'");
+    expect(docker?.run?.trim()).toBe(
+      'gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \\\n' +
+        "  -f event_type=ironcrew_docker_publish_v1 \\\n" +
+        '  -f "client_payload[tag]=${RELEASE_TAG}" \\\n' +
+        '  -f "client_payload[mode]=${RELEASE_MODE}"',
+    );
+    expect(source).not.toContain("secrets.");
+    expect(source).not.toContain("issues: write");
+    expect(source).not.toContain("workflow_dispatch");
+    expect(source).not.toContain("gh release");
+    expect(source).not.toContain("docker build");
+    expect(source).not.toContain("docker push");
+  });
+
   test("release workflow gates builds and scopes publication authority", async () => {
     const source = await Bun.file(
       join(repository, ".github/workflows/release.yml"),
@@ -677,7 +792,7 @@ describe("repository integration policy", () => {
       expect(source).not.toContain("git push --force");
       expect(source).toContain("GITHUB_TOKEN");
       expect(source).toContain("docker-publish.yml");
-      expect(source).toContain("protected `v*` tag rules");
+      expect(source).toMatch(/owner may create (?:protected )?`v\*` tags/);
     }
   });
 });
