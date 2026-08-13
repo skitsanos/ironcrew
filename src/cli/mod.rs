@@ -5,6 +5,7 @@ pub mod graph_bundle;
 pub mod graph_extract;
 pub mod graph_types;
 pub mod history;
+mod init;
 pub mod project;
 pub mod server;
 mod server_shutdown;

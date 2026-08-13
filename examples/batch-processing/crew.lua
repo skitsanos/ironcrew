@@ -11,7 +11,7 @@
 local crew = Crew.new({
     goal = "Process and analyze a batch of product data files",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -20,14 +20,12 @@ crew:add_agent(Agent.new({
     goal = "Read and validate batch data files",
     capabilities = {"processing", "validation"},
     tools = {"file_read_glob"},
-    temperature = 0.1,
 }))
 
 crew:add_agent(Agent.new({
     name = "analyst",
     goal = "Analyze product data and provide insights",
     capabilities = {"analysis", "summarization"},
-    temperature = 0.5,
 }))
 
 -- Step 1: Read all JSON files from input/

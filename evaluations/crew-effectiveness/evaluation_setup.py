@@ -2,24 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-from pathlib import Path
 from typing import Any
-
-from decision_policy import load_plan, preflight
 
 
 CONTRACT_PROVIDER_ID = "synthetic-oracle-backed-mock"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+REQUIRED_LIVE_MODEL = "gpt-5.6-luna"
+REQUIRED_LIVE_PROVIDER_ID = "openai-api"
 
 
 def validate_run_request(
@@ -27,6 +17,8 @@ def validate_run_request(
 ) -> tuple[int, str]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model):
         raise ValueError("--model must be a non-empty, non-secret provider model identifier")
+    if model != REQUIRED_LIVE_MODEL:
+        raise ValueError(f"IC-009 requires --model {REQUIRED_LIVE_MODEL}")
     if repetitions is None:
         if mode == "live":
             raise ValueError("--repetitions is required in live mode")
@@ -40,6 +32,10 @@ def validate_run_request(
             raise ValueError(
                 "--provider-id is required in live mode and must be a non-secret lowercase slug"
             )
+        if provider_id != REQUIRED_LIVE_PROVIDER_ID:
+            raise ValueError(
+                f"live IC-009 requires --provider-id {REQUIRED_LIVE_PROVIDER_ID}"
+            )
         return repetitions, provider_id
     return repetitions, CONTRACT_PROVIDER_ID
 
@@ -49,49 +45,3 @@ def serialized_case_input_bytes(cases: list[dict[str, Any]]) -> int:
         len(json.dumps(case, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         for case in cases
     )
-
-
-def prepare_plan(
-    *,
-    base_dir: Path,
-    plan_path: Path,
-    cases: list[dict[str, Any]],
-    repetitions: int,
-    mode: str,
-    variants: tuple[str, ...],
-) -> tuple[dict[str, Any], dict[str, int], dict[str, int], dict[str, int]]:
-    plan = load_plan(plan_path)
-    flow_path = base_dir / plan["flow"]["path"]
-    if _sha256_file(flow_path) != plan["flow"]["sha256"]:
-        raise ValueError(
-            "evaluation plan rejected before provider execution: "
-            f"{flow_path.name} SHA-256 does not match the reviewed plan"
-        )
-    planned_calls = {
-        name: plan["flow"]["variants"][name]["planned_llm_calls"] for name in variants
-    }
-    planned_output_tokens = {
-        name: plan["flow"]["variants"][name]["maximum_output_tokens"] for name in variants
-    }
-    planned_work = preflight(
-        plan=plan,
-        case_input_bytes=serialized_case_input_bytes(cases),
-        case_count=len(cases),
-        repetitions=repetitions,
-        variants=variants,
-        calls_per_run=planned_calls,
-        output_tokens_per_run=planned_output_tokens,
-        require_decision_grade=mode == "live",
-    )
-    return plan, planned_work, planned_calls, planned_output_tokens
-
-
-def plan_receipt(
-    *, plan: dict[str, Any], plan_path: Path, planned_work: dict[str, int]
-) -> dict[str, Any]:
-    return {
-        **plan,
-        "path": str(plan_path),
-        "sha256": _sha256_file(plan_path),
-        "planned_work": planned_work,
-    }

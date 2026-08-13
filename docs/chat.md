@@ -29,7 +29,7 @@ the crew is always declared, but any one-shot `crew:run()` only fires in
 run mode:
 
 ```lua
-local crew = Crew.new({ goal = "...", provider = "openai", model = "gpt-4.1-mini" })
+local crew = Crew.new({ goal = "...", provider = "openai", model = "gpt-5.6-luna" })
 crew:add_agent(Agent.new({ name = "tutor", goal = "..." }))
 
 if IRONCREW_MODE ~= "chat" then

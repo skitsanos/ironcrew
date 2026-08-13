@@ -9,7 +9,7 @@ memory, and messaging into a single runnable workflow defined in Lua.
 local crew = Crew.new({
     goal            = "Analyze customer feedback and produce a report",
     provider        = "openai",               -- "openai" | "anthropic" | "openai-responses"
-    model           = "gpt-4.1-mini",          -- default model for all tasks
+    model           = "gpt-5.6-luna",          -- default model for all tasks
     base_url        = "https://api.openai.com/v1",  -- optional, overrides OPENAI_BASE_URL
     api_key         = env("OPENAI_API_KEY"),  -- optional, overrides OPENAI_API_KEY
     stream          = false,                  -- enable streaming output (default false)
@@ -23,10 +23,10 @@ local crew = Crew.new({
     -- Model router (see below)
     models = {
         task_execution         = "gpt-4o",
-        tool_synthesis         = "gpt-4.1-mini",
+        tool_synthesis         = "gpt-5.6-luna",
         final_response         = "gpt-4o",
         collaboration          = "gpt-4o",
-        collaboration_synthesis = "gpt-4.1-mini",
+        collaboration_synthesis = "gpt-5.6-luna",
     },
 })
 ```
@@ -45,7 +45,7 @@ local crew = Crew.new({
 | `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
 | `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results; `1..=1000` |
-| `model`                  | string   | `"gpt-4.1-mini"`    | Non-empty default model for task execution; maximum 1024 bytes |
+| `model`                  | string   | `"gpt-5.6-luna"`    | Non-empty default model for task execution; maximum 1024 bytes |
 | `base_url`               | string   | env `OPENAI_BASE_URL` | HTTP(S) API endpoint, maximum 4096 bytes; userinfo, query strings, and fragments are rejected |
 | `api_key`                | string   | env `OPENAI_API_KEY`  | API key, maximum 16 KiB; padding/control characters are rejected |
 | `stream`                 | bool     | `false`            | Stream LLM responses token-by-token |
@@ -922,13 +922,13 @@ without changing agent or task definitions.
 ```lua
 local crew = Crew.new({
     goal  = "Multi-model workflow",
-    model = "gpt-4.1-mini",         -- fallback for unrouted purposes
+    model = "gpt-5.6-luna",         -- fallback for unrouted purposes
     models = {
         task_execution          = "gpt-4o",
-        tool_synthesis          = "gpt-4.1-mini",
+        tool_synthesis          = "gpt-5.6-luna",
         final_response          = "gpt-4o",
         collaboration           = "gpt-4o",
-        collaboration_synthesis = "gpt-4.1-mini",
+        collaboration_synthesis = "gpt-5.6-luna",
     },
 })
 ```
@@ -1073,7 +1073,7 @@ MCP is enabled by default (Cargo feature `mcp`). Build without it via `--no-defa
 local crew = Crew.new({
     goal = "Summarise recent Git activity",
     provider = "openai",
-    model    = "gpt-4.1-mini",
+    model    = "gpt-5.6-luna",
 
     mcp_servers = {
         -- Label must match ^[a-z][a-z0-9_-]{0,15}$

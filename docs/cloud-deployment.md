@@ -3,10 +3,10 @@
 How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**, **Railway**, and similar platforms. This doc covers graceful shutdown, resource limits, security posture, and platform-specific recipes.
 
 IronCrew is distributed as a single Rust executable. The default Linux release
-and container image use the GNU target and are dynamically linked against
-glibc; the Debian runtime image supplies that runtime environment. IronCrew
-runs in `serve` mode as a long-lived HTTP server, or in `run` mode as a
-one-shot job.
+uses the GNU target and is dynamically linked against glibc. The source-build
+container uses Debian; the tag-owned release-image recipe uses a pinned Wolfi
+base index with the required glibc, OpenSSL, and CA runtime. IronCrew runs in
+`serve` mode as a long-lived HTTP server, or in `run` mode as a one-shot job.
 
 For HTTP-specific capacity planning, active conversation sizing, SSE tuning,
 and RAM limits, see [HTTP Scaling](http-scaling.md). For the exact shared-state
@@ -25,7 +25,8 @@ image contains those capabilities.
 
 - Single application executable; default Linux artifacts require a compatible glibc runtime.
 - Release build strips symbols and enables LTO — typical size is 15–25 MB.
-- Source and release container images use `debian:13-slim` plus CA certificates.
+- The source container uses `debian:13-slim`; the release-image recipe uses a
+  content-addressed Wolfi base index and performs no moving package install.
 - The image defaults to numeric UID `10001` and group `0`; writable directories are group-writable so OpenShift can substitute its namespace-assigned UID.
 - The image has a runnable `CMD` (`ironcrew serve --flows-dir /flows`) and listens on port `3000` unless an environment port overrides it.
 - No systemd, no daemonization — runs in the foreground; logs to stderr.
@@ -232,6 +233,7 @@ per-flow read grants.
 | `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |
 | `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Final serialized `http_request` result cap. |
+| `IRONCREW_PROVIDER_MAX_REQUEST_BYTES` | `33554432` (32 MiB) | Serialized provider JSON request cap, enforced before network send (hard ceiling 256 MiB). |
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Non-streaming model response cap. |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | `33554432` (32 MiB) | Raw model SSE stream cap. |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Accumulated model output/reasoning cap. |
@@ -435,15 +437,16 @@ IronCrew can store run records in three backends. **Choose based on your platfor
 **Kubernetes/OpenShift:** use PostgreSQL for production durability. With a
 shared HITL keyring, idempotency-keyed runs support cross-replica cancellation
 and question listing/answer delivery. PostgreSQL's bounded run-event journal
-also supports cross-replica run SSE replay. The reviewed IC-008 worktree
-implements cold rehydration of a keyed PostgreSQL conversation message on
+also supports cross-replica run SSE replay. The committed IC-008 implementation
+provides cold rehydration of a keyed PostgreSQL conversation message on
 either replica from the last committed incarnation/revision, but does not move
 an in-flight turn. Its local two-process PostgreSQL gate and affinity-free
 OpenShift IC-008 canary pass; Railway remains unrun, and the tested dirty
 artifact was unpublished and removed. Shared-store conversation SSE returns
 `409` unsupported. JSON/SQLite run and conversation SSE remain owner-local.
-Keep `replicas: 1` until the behavior is released, or whenever clients require
-the remaining owner-local surfaces through arbitrary Service routing.
+Keep `replicas: 1` until a published release contains the behavior, or whenever
+clients require the remaining owner-local surfaces through arbitrary Service
+routing.
 JSON/SQLite require a writable persistent volume if their records must survive
 replacement.
 
@@ -457,8 +460,9 @@ does support a bounded multi-replica slice: any replica can accept new keyed
 runs and durable reads, stream retained run journal events, replay keyed
 acceptance, request keyed cancellation,
 and—when the shared HITL keyring is configured—list or answer that keyed run's
-pending questions. The reviewed IC-008 worktree also reconstructs a required-key
-`/messages` request on either replica from a committed conversation boundary.
+pending questions. The committed IC-008 implementation also reconstructs a
+required-key `/messages` request on either replica from a committed
+conversation boundary.
 The local process gate and OpenShift canary pass; Railway routing remains
 unrun, the artifact is unpublished, in-flight takeover is unsupported, and
 conversation SSE remains unsupported. Routing affinity is not a correctness
@@ -1054,9 +1058,10 @@ For small flow sets, mount `crew.lua` / `config.lua` via ConfigMap. For larger s
 Do not configure session affinity as a substitute for this restriction.
 Affinity can improve routing but cannot transfer run execution or an in-flight
 conversation handle between processes. Configured PostgreSQL run SSE, a keyed
-HITL mailbox, and the current worktree's keyed PostgreSQL conversation messages
-work without affinity at committed turn boundaries, but none can transfer a Lua
-VM or suspended coroutine. IC-008's affinity-free OpenShift canary passed this
+HITL mailbox, and keyed PostgreSQL conversation messages from the committed
+IC-008 implementation work without affinity at committed turn boundaries, but
+none can transfer a Lua VM or suspended coroutine. IC-008's affinity-free
+OpenShift canary passed this
 committed-boundary slice, but its dirty artifact was unpublished and Railway
 remains unrun. PostgreSQL conversation SSE is unsupported; JSON/SQLite
 conversation and run SSE remain process-local.
@@ -1466,10 +1471,11 @@ Railway may use `SIGKILL` and the run later reconciles as `abandoned`.
 
 `overlapSeconds: 0` prevents extra overlap after the candidate becomes active;
 it does not make owner-local live controls distributed. Multiple replicas can
-use PostgreSQL run SSE and the keyed cancellation/HITL slice. The current
-worktree also supports arbitrary routing of keyed PostgreSQL messages between
-committed conversation turns. Its local and OpenShift gates pass, but Railway
-has not run the IC-008 canary and no published artifact contains the worktree.
+use PostgreSQL run SSE and the keyed cancellation/HITL slice. The committed
+IC-008 implementation also supports arbitrary routing of keyed PostgreSQL
+messages between committed conversation turns. Its local and OpenShift gates
+pass, but Railway has not run the IC-008 canary and no published release
+contains this implementation.
 Keep the service at one when clients require conversation SSE, in-flight turn
 takeover, unkeyed live controls, or any other owner-local surface.
 
@@ -1507,8 +1513,75 @@ The runtime stage:
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
 with GNU/Linux artifacts built by the release workflow using Rust `1.96.0` and
-`--locked`. It has the same Debian, permissions, user, environment, and command
-contract as the source image.
+`--locked`. The exact tag workflow assembles one `linux/amd64` plus
+`linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
+source and OCI object hashes in a signed receipt, and publishes both as release
+assets. The separately authorized Docker workflow verifies and promotes that
+archive; it does not rebuild a historical release from the current default
+branch. The release image retains the source image's permissions, numeric user,
+environment, and command contract.
+
+This promotion protocol is resolved under [IC-015](issues/IC-015.md). On
+2026-08-12, Docker Hub's production repository was changed to the exact
+stable-semver-only immutability rule while leaving `latest` mutable. A
+disposable repository passed the real
+replay/conflict/concurrent-`latest` protocol and was then removed exactly; the
+retained machine receipt is linked from IC-015. No production image or tag was
+published or moved. The exact harness/evidence commit passed all platform CI
+jobs. Production Docker publication remains deferred under IC-014's
+release-control gate and the user's release-last sequence.
+The protocol starts with the first release produced by the new tag workflow;
+it does not retroactively rebuild or promote legacy releases that lack the
+signed OCI archive and receipt.
+
+The non-production IC-015 registry gate is
+[`scripts/dockerhub_promotion_acceptance.py`](../scripts/dockerhub_promotion_acceptance.py).
+It derives the only permitted target as
+`<namespace>/ironcrew-ic015-acceptance-<run-id>`; callers cannot pass the
+production repository. Its `prepare` phase creates that exact public disposable
+repository, installs the canonical semantic-version immutability rule, and
+records its name, description, registration timestamp, and fingerprint. The
+`run` phase requires that bound receipt, an empty tag inventory, two distinct
+public source images pinned by digest, an authenticated `skopeo` session, and
+explicit promotion authorization. It exercises initial and identical version
+promotion, protocol conflict refusal, a direct registry overwrite rejection,
+a same-archive mutable-tag positive control, a second version, and deterministic `latest` repair when the injected stable
+release changes between reads. It revalidates the external immutability rule
+after the rejected overwrite and requires the exact final tag set.
+
+Use a unique ID and new evidence paths; the helper refuses to overwrite an
+existing receipt:
+
+```bash
+python3 -B scripts/dockerhub_promotion_acceptance.py prepare \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --authorize-create --evidence /secure/path/ic015-prepare.json
+python3 -B scripts/dockerhub_promotion_acceptance.py run \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --input-evidence /secure/path/ic015-prepare.json \
+  --source-a docker://example/image@sha256:<64-lowercase-hex> \
+  --source-b docker://example/other@sha256:<64-lowercase-hex> \
+  --authorize-promotion --evidence /secure/path/ic015-run.json
+```
+
+Supply `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` through the environment and
+authenticate `skopeo` without placing the token in command history. After the
+receipt passes, delete only the exact disposable repository in Docker Hub's
+authenticated UI, then bind absence evidence to the run receipt:
+
+```bash
+python3 -B scripts/dockerhub_promotion_acceptance.py verify-cleanup \
+  --namespace skitsanos --run-id 20260812t120000z-deadbeef \
+  --input-evidence /secure/path/ic015-run.json \
+  --evidence /secure/path/ic015-cleanup.json
+```
+
+Repository deletion is destructive and removes its images permanently. The
+cleanup phase is read-only: it passes only after the authenticated API reports
+that exact bound repository absent and `skopeo` cannot resolve any of its three
+acceptance tags. The dated IC-015 receipt records one completed run of this
+procedure. Production publication remains deferred under IC-014's separate
+release-control gate and the user's release-last sequence.
 
 ### Excluding MCP
 
@@ -1600,9 +1673,10 @@ RUN cargo build --release --locked --no-default-features --features postgres
       and later `abandoned` reconciliation
 - [ ] Replica count matches the
   [multi-replica live-control contract](multi-replica.md); use exactly one
-      until the IC-008 behavior is released, on Railway until its attributed
-      canary passes, or whenever clients require conversation SSE, in-flight
-      conversation takeover, or unkeyed controls; PostgreSQL run SSE and keyed
+      until a published release contains the IC-008 behavior, on Railway until
+      its attributed canary passes, or whenever clients require conversation
+      SSE, in-flight conversation takeover, or unkeyed controls; PostgreSQL run
+      SSE and keyed
       conversation messages have separate bounded contracts
 - [ ] First drain-aware rollout avoids mixed old/new drain semantics; later
       rolling deployments verify every routable replica exposes

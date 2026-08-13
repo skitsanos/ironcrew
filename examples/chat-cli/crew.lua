@@ -9,7 +9,7 @@
 local crew = Crew.new({
     goal = "Teach Rust one step at a time",
     provider = "openai",
-    model = "gpt-4.1-mini",
+    model = "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

@@ -8,6 +8,10 @@ use crate::engine::task::{TaskResult, TaskTokenUsage};
 use crate::llm::provider::*;
 use crate::utils::error::{IronCrewError, Result};
 
+mod usage;
+
+use usage::UsageAccumulator;
+
 const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const HARD_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_TURN_MAX_BYTES: usize = 1024 * 1024;
@@ -155,7 +159,7 @@ pub async fn execute_collaborative_task(
     .min(transcript_limit);
     let prompt_limit = prompt_char_limit();
 
-    let mut total_usage = TaskTokenUsage::default();
+    let mut total_usage = UsageAccumulator::default();
 
     // Build conversation history shared across all agents
     let mut conversation = Transcript::new(transcript_limit);
@@ -218,12 +222,7 @@ pub async fn execute_collaborative_task(
             };
 
             let response = provider.chat(request).await?;
-            if let Some(usage) = &response.usage {
-                total_usage.prompt_tokens += usage.prompt_tokens;
-                total_usage.completion_tokens += usage.completion_tokens;
-                total_usage.total_tokens += usage.total_tokens;
-                total_usage.cached_tokens += usage.cached_tokens;
-            }
+            total_usage.observe(response.usage.as_ref());
             let content = response.content.unwrap_or_default();
             if content.len() > turn_limit {
                 return Err(IronCrewError::Task {
@@ -292,42 +291,12 @@ pub async fn execute_collaborative_task(
     validate_chat_history(&request.messages, 1, chat_history_max_bytes(), true)?;
 
     let response = provider.chat(request).await?;
-    if let Some(usage) = &response.usage {
-        total_usage.prompt_tokens += usage.prompt_tokens;
-        total_usage.completion_tokens += usage.completion_tokens;
-        total_usage.total_tokens += usage.total_tokens;
-        total_usage.cached_tokens += usage.cached_tokens;
-    }
-    let has_usage = total_usage.total_tokens > 0;
+    total_usage.observe(response.usage.as_ref());
     response
         .content
-        .map(|c| (c, if has_usage { Some(total_usage) } else { None }))
+        .map(|content| (content, total_usage.finish()))
         .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transcript_rejects_growth_before_allocating_an_oversized_entry() {
-        let mut transcript = Transcript::new(32);
-        transcript.push("task", "Task: ", "small").unwrap();
-        let error = transcript
-            .push("task", "[agent]: ", &"x".repeat(64))
-            .expect_err("oversized turn must fail");
-        assert!(error.to_string().contains("transcript exceeds"));
-        assert_eq!(transcript.entries.len(), 1);
-        assert!(transcript.bytes <= 32);
-    }
-
-    #[test]
-    fn prompt_builder_stops_at_character_budget_without_splitting_utf8() {
-        let mut transcript = Transcript::new(1024);
-        transcript.push("task", "", &"é".repeat(100)).unwrap();
-        let (prompt, truncated) = build_bounded_prompt("", &transcript, 17);
-        assert!(truncated);
-        assert_eq!(prompt.chars().count(), 17);
-        assert_eq!(prompt.len(), 34);
-    }
-}
+mod tests;
