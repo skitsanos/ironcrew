@@ -9,10 +9,10 @@
 //! local crew = Crew.new({
 //!     goal = "...",
 //!     mcp_servers = {
-//!         git = {
+//!         local = {
 //!             transport = "stdio",
-//!             command   = "uvx",
-//!             args      = {"mcp-server-git"},
+//!             command   = "python3",
+//!             args      = {"examples/mcp/stdio-tools/server.py"},
 //!         },
 //!     },
 //! })
@@ -21,9 +21,11 @@
 //! MCP tools are available under `mcp__<server>__<tool>` in agents' `tools` list.
 
 pub mod bridge;
+mod call;
 pub mod client;
 pub mod config;
 mod execution_policy;
+mod lifecycle;
 pub mod manager;
 
 pub use config::{McpConfig, parse_mcp_config};

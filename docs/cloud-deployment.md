@@ -170,6 +170,9 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_ALLOWED_COMMANDS` | comma-separated allowlist | If using MCP stdio, whitelist only exact commands you trust (e.g. `uvx,npx`). Unset = development allow-all; present-but-empty refuses all. |
 | `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` | `__disabled__` or exact hosts | HTTP MCP frames are not bounded before rmcp decodes them. Keep disabled in production unless every exact host is operator-trusted. Public binds require this policy. |
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | **unset** | Only enable if MCP servers run as sidecars. |
+| `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` | `10` | Deadline for strict MCP `2026-07-28` `server/discover`; legacy initialize/SSE endpoints are not supported. |
+| `IRONCREW_MCP_MAX_MRTR_ROUNDS` | `10` or lower | Total wire-attempt cap for state-only MRTR tool calls; hard ceiling `32`. |
+| `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` or lower | Byte cap on opaque state echoed during MRTR; hard ceiling `1048576`. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical in steady state | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. During the controlled rotation overlap, every process must contain both keys even while active ids temporarily differ. Store only in Railway/OpenShift secrets; never bake it into the image. |
@@ -218,6 +221,14 @@ per-flow read grants.
 - Mount them as environment variables via `Secret` (Kubernetes), `Environment Variables` (Railway), or equivalent.
 - Lua `env()` and `${env.NAME}` interpolation share the fail-closed `IRONCREW_ENV_ALLOWLIST`, so process secrets are unreadable unless explicitly opted in.
 - MCP stdio children do **not** inherit the parent environment by default — only `PATH`, `HOME`, `USER`, `LANG`, `LC_*`. Secrets are therefore isolated from spawned MCP servers unless you explicitly list them in `env = {...}` or set `inherit_env = true`.
+- MCP servers must implement the `2026-07-28` `server/discover` lifecycle.
+  Streamable HTTP configuration must name the POST endpoint (normally `/mcp`),
+  not a legacy `/sse` endpoint. IronCrew sends self-contained protocol/client
+  metadata without creating an MCP session and never falls back to
+  `initialize`.
+- MCP tool calls support bounded, state-only MRTR. Non-empty `inputRequests`
+  and Tasks-extension results fail closed because IronCrew advertises neither
+  capability. The overall call timeout covers every retry and backoff.
 
 ---
 
@@ -253,6 +264,8 @@ per-flow read grants.
 | `IRONCREW_RUN_RESULTS_MAX_BYTES` | `33554432` (32 MiB) | Aggregate serialized task results retained for one run (hard ceiling 48 MiB). |
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | `1048576` | Shell stdout/stderr cap. |
 | `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` | Cap on each MCP tool result. |
+| `IRONCREW_MCP_MAX_MRTR_ROUNDS` | `10` | Total wire attempts for one state-only MCP multi-round tool call. |
+| `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` | UTF-8 byte cap for opaque MCP `requestState`. |
 | `IRONCREW_DEFAULT_MAX_CONCURRENT` | `4` | Default task semaphore per execution phase; also bounds `foreach_parallel` fan-out unless the crew overrides `max_concurrent`. |
 | `IRONCREW_MAX_CONCURRENT_TASKS` | `32` | Process policy ceiling for any crew's task semaphore. |
 | `IRONCREW_MAX_AGENTS` | `64` | Maximum agents registered in one crew. |
