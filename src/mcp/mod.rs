@@ -39,6 +39,7 @@ mod lifecycle;
 pub mod manager;
 mod protocol;
 mod sse_stream;
+mod stdio_abort;
 mod stdio_transport;
 
 pub use config::{McpConfig, parse_mcp_config};
