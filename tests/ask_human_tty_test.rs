@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
+#[path = "support/scripted_hitl_provider.rs"]
+mod scripted_hitl_provider;
+
 /// `portable-pty` launches through `forkpty` on macOS. Starting several of
 /// those children concurrently from Rust's multithreaded test harness is
 /// inherently unsafe and can leave a child stalled before `exec`. Keep the
@@ -35,14 +38,23 @@ struct PtyRun {
 
 impl PtyRun {
     fn spawn(script: &str, max_answer_bytes: Option<usize>) -> Self {
-        Self::spawn_with_mode(script, max_answer_bytes, false)
+        Self::spawn_with_mode(script, max_answer_bytes, false, None)
     }
 
     fn spawn_noncanonical(script: &str, max_answer_bytes: Option<usize>) -> Self {
-        Self::spawn_with_mode(script, max_answer_bytes, true)
+        Self::spawn_with_mode(script, max_answer_bytes, true, None)
     }
 
-    fn spawn_with_mode(script: &str, max_answer_bytes: Option<usize>, noncanonical: bool) -> Self {
+    fn spawn_agent_flow(script: &str, provider_url: &str) -> Self {
+        Self::spawn_with_mode(script, None, false, Some(provider_url))
+    }
+
+    fn spawn_with_mode(
+        script: &str,
+        max_answer_bytes: Option<usize>,
+        noncanonical: bool,
+        provider_url: Option<&str>,
+    ) -> Self {
         let project = tempfile::tempdir().expect("create flow directory");
         let script = format!(
             r#"
@@ -85,6 +97,11 @@ impl PtyRun {
         command.env("IRONCREW_STORE", "json");
         if let Some(limit) = max_answer_bytes {
             command.env("IRONCREW_ASK_HUMAN_MAX_ANSWER_BYTES", limit.to_string());
+        }
+        if let Some(url) = provider_url {
+            command.env("IRONCREW_ALLOW_PRIVATE_IPS", "1");
+            command.env("IRONCREW_ENV_ALLOWLIST", "HITL_PROVIDER_BASE_URL");
+            command.env("HITL_PROVIDER_BASE_URL", url);
         }
 
         let child = pair
@@ -363,4 +380,30 @@ fn oversized_noncanonical_terminal_still_honors_the_question_deadline() {
         "output:\n{}",
         run.output()
     );
+}
+
+#[test]
+fn two_named_agents_can_talk_to_the_human_through_the_real_cli() {
+    use scripted_hitl_provider::{
+        ANALYST_ANSWER, ANALYST_PROMPT, REVIEWER_ANSWER, REVIEWER_PROMPT, ScriptedHitlProvider,
+    };
+
+    let _process_guard = pty_process_guard();
+    let provider = ScriptedHitlProvider::start();
+    let probe = provider.probe();
+    let fixture = include_str!("fixtures/two_process_replica/hitl_agents_crew.lua");
+    let mut run = PtyRun::spawn_agent_flow(fixture, &probe.base_url);
+
+    run.wait_for_text(ANALYST_PROMPT, Duration::from_secs(10));
+    run.send(format!("{ANALYST_ANSWER}\r").as_bytes());
+    run.wait_for_text(REVIEWER_PROMPT, Duration::from_secs(10));
+    run.send(format!("{REVIEWER_ANSWER}\r").as_bytes());
+    run.wait_for_text(
+        "HITL_AGENT_RESULTS=FINAL:dataset-alpha:FINAL:approved",
+        Duration::from_secs(10),
+    );
+
+    let status = run.wait_for_exit(Duration::from_secs(5));
+    assert!(status.success(), "output:\n{}", run.output());
+    probe.assert_complete();
 }

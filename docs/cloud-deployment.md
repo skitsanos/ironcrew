@@ -15,9 +15,8 @@ multi-replica roadmap, see the
 [Multi-Replica Deployment Contract](multi-replica.md).
 
 The PostgreSQL cross-replica HITL mailbox and run-event journal described here
-are committed but not yet in a published release. Until the next release,
-deploy a verified source commit rather than assuming the published `2.22.0`
-image contains those capabilities.
+require IronCrew v3.0.0 or newer. The legacy `2.22.0` image does not contain
+those capabilities.
 
 ---
 
@@ -994,7 +993,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: docker.io/skitsanos/ironcrew:2.22.0
+        image: docker.io/skitsanos/ironcrew:3.0.0
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080

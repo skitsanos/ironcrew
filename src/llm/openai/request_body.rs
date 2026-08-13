@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::llm::provider::ToolSchema;
+
 /// Adds the Chat Completions output-token limit using the field supported by
 /// the selected model.
 ///
@@ -24,13 +26,46 @@ pub(super) fn insert_completion_token_limit(
     body[field] = json!(max_tokens);
 }
 
+/// Keeps Luna's Chat Completions tool calls on its supported execution path.
+/// Luna defaults to reasoning when the field is omitted, but the API rejects
+/// function tools unless reasoning effort is explicitly disabled.
+pub(super) fn insert_tool_reasoning_compatibility(body: &mut Value, model: &str, has_tools: bool) {
+    let is_luna = model == "gpt-5.6-luna" || model.starts_with("gpt-5.6-luna-");
+    if has_tools && is_luna {
+        body["reasoning_effort"] = json!("none");
+    }
+}
+
+pub(super) fn insert_tools(body: &mut Value, model: &str, tools: Option<&[ToolSchema]>) {
+    if let Some(schemas) = tools {
+        body["tools"] = json!(
+            schemas
+                .iter()
+                .map(|tool| json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    insert_tool_reasoning_compatibility(
+        body,
+        model,
+        tools.is_some_and(|schemas| !schemas.is_empty()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
 
     use serde_json::json;
 
-    use super::insert_completion_token_limit;
+    use super::{insert_completion_token_limit, insert_tool_reasoning_compatibility};
     use crate::llm::execution_policy::ProviderExecutionPolicy;
     use crate::llm::openai::OpenAiProvider;
     use crate::llm::provider::LlmProvider;
@@ -87,6 +122,32 @@ mod tests {
 
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn luna_function_tools_explicitly_disable_reasoning() {
+        for model in ["gpt-5.6-luna", "gpt-5.6-luna-2026-08-01"] {
+            let mut body = json!({});
+
+            insert_tool_reasoning_compatibility(&mut body, model, true);
+
+            assert_eq!(body["reasoning_effort"], "none", "model: {model}");
+        }
+    }
+
+    #[test]
+    fn tool_free_luna_and_other_models_keep_provider_defaults() {
+        for (model, has_tools) in [
+            ("gpt-5.6-luna", false),
+            ("gpt-5.6-lunatic", true),
+            ("gpt-5.6-terra", true),
+        ] {
+            let mut body = json!({});
+
+            insert_tool_reasoning_compatibility(&mut body, model, has_tools);
+
+            assert!(body.get("reasoning_effort").is_none(), "model: {model}");
+        }
     }
 
     #[tokio::test]

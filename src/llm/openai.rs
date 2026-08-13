@@ -144,22 +144,7 @@ impl OpenAiProvider {
             }
         }
 
-        if let Some(tool_schemas) = tools {
-            let tools_json: Vec<Value> = tool_schemas
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = json!(tools_json);
-        }
+        request_body::insert_tools(&mut body, &request.model, tools);
 
         if let Some(ref key) = request.prompt_cache_key {
             body["prompt_cache_key"] = json!(key);

@@ -181,6 +181,13 @@ When `gpt-5.6-luna` is effective, omit explicit `temperature` values. Luna
 accepts only its provider default, and IronCrew forwards configured values
 rather than silently discarding an unsupported non-default setting.
 
+When Luna uses Chat Completions with function tools (including agent-facing
+`ask_human`), IronCrew explicitly sends `reasoning_effort = "none"`. Luna's
+default reasoning mode rejects function tools on that endpoint. Use the
+`openai-responses` provider when the task needs both explicit reasoning and
+server-side tools; do not work around the endpoint contract by hiding tool
+failures or retrying without the requested tool.
+
 **Streaming.** Enable `stream = true` on the crew or individual tasks to get
 LLM output as it arrives. When reasoning-capable providers are used
 (Anthropic thinking, OpenAI Responses reasoning, DeepSeek/Kimi reasoning), the

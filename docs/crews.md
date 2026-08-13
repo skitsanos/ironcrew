@@ -819,6 +819,10 @@ crew:add_agent({
 When the model calls the tool, the task suspends on the same per-run
 transport — same SSE events, same `questions`/`answer` endpoints, same
 terminal prompt in CLI mode. The human sees who's asking (`[analyst] …`).
+Every named agent gets its own attributed question, so one crew may pause for
+sequential or concurrent conversations with several agents. Answers are bound
+to `question_id`; clients must never infer the recipient from prompt text or
+submission order.
 Two behaviors are specific to the agent path:
 
 - **Human-wait time is excluded from the task timeout.** A task suspended on
@@ -831,6 +835,14 @@ Two behaviors are specific to the agent path:
 
 Delegated agents (`agent__<name>`) inherit the transport, so a sub-agent can
 also pause to ask.
+
+The v3 release gate executes this contract three ways: a real terminal-backed
+`ironcrew run` with two named agents, a real `ironcrew serve` question/list/
+answer/SSE round trip, and two independent server processes sharing disposable
+PostgreSQL 15 storage and one HITL keyring. In the replica case the run remains
+owned by one process while the other process lists and answers both agents'
+questions; PostgreSQL coordinates encrypted delivery but does not migrate the
+Lua execution.
 
 ### Approval gates (`require_approval`)
 
