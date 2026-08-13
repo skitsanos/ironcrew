@@ -33,7 +33,7 @@ dotenvy = "0.15.7"
 uuid = { version = "1.24.0", features = ["v4"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.23.1"
-bytes = { version = "1.11.1", optional = true }
+bytes = { version = "1.12.1", optional = true }
 thiserror = "2.0.20"
 async-trait = "0.1.92"
 url = "2.5.8"
@@ -50,7 +50,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
 tower-http = { version = "0.7.0", features = ["cors"] }
 rmcp = { version = "3.1.2", optional = true, default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "tower"] }
-sse-stream = { version = "0.2.4", optional = true }
+sse-stream = { version = "0.2.5", optional = true }
 ring = "0.17.14"
 zeroize = "1.9.0"
 cap-std = "4.0.2"
