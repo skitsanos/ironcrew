@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exception_budget": 49,
+  "exception_budget": 48,
   "exceptions": [
     {
       "path": "src/api/admission.rs",
@@ -206,11 +206,6 @@
       "path": "src/main.rs",
       "max_lines": 423,
       "rationale": "IC-011 baseline: the binary entry point still contains Clap command definitions, serve-environment validation, address resolution, command path selection, dispatch, and tests; move CLI definitions before adding commands."
-    },
-    {
-      "path": "src/mcp/client.rs",
-      "max_lines": 475,
-      "rationale": "IC-011 baseline: MCP process environment, process-group cleanup, handshake and listing limits, tool discovery, shutdown, and client state share one transport lifecycle; extract process management before adding transports."
     },
     {
       "path": "src/mcp/config.rs",
