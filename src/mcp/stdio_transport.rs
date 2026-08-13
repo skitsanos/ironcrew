@@ -1,88 +1,30 @@
 //! Strict MCP stdio transport with an assembled-line cap before JSON decode.
 
-use std::{
-    io,
-    process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-    },
-    time::Duration,
-};
-
+#[cfg(unix)]
 use rmcp::{
     RoleClient,
     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
+#[cfg(unix)]
+use std::{io, process::Stdio, sync::Arc, time::Duration};
+#[cfg(unix)]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout, Command},
-    sync::{Mutex, watch},
+    sync::Mutex,
 };
 
+pub(super) use crate::mcp::stdio_abort::StdioAbortHandle;
+#[cfg(unix)]
 use crate::mcp::{connection::PoisonWatch, protocol::inbound_is_allowed};
 
+#[cfg(unix)]
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Synchronous process-group poison used by timeout and cancelled caller paths.
-#[derive(Clone, Debug)]
-pub(super) struct StdioAbortHandle {
-    pgid: Arc<AtomicI32>,
-    abort: watch::Sender<bool>,
-    reaped: watch::Receiver<bool>,
-}
-
-impl StdioAbortHandle {
-    fn new(process_id: Option<u32>) -> (Self, watch::Receiver<bool>, watch::Sender<bool>) {
-        let pgid = process_id
-            .and_then(|id| i32::try_from(id).ok())
-            .unwrap_or_default();
-        let (abort, abort_rx) = watch::channel(false);
-        let (reaped_tx, reaped) = watch::channel(false);
-        (
-            Self {
-                pgid: Arc::new(AtomicI32::new(pgid)),
-                abort,
-                reaped,
-            },
-            abort_rx,
-            reaped_tx,
-        )
-    }
-
-    pub(super) fn abort(&self) {
-        let pgid = self.pgid.swap(0, Ordering::AcqRel);
-        #[cfg(unix)]
-        if pgid > 0 {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pgid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        #[cfg(not(unix))]
-        let _ = pgid;
-        self.abort.send_replace(true);
-    }
-
-    pub(super) async fn wait_reaped(&self) -> io::Result<()> {
-        let mut reaped = self.reaped.clone();
-        loop {
-            if *reaped.borrow() {
-                return Ok(());
-            }
-            reaped.changed().await.map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "MCP reaper exited before confirming process-group cleanup",
-                )
-            })?;
-        }
-    }
-}
-
 /// A child-process transport that never buffers more than one configured frame.
+#[cfg(unix)]
 pub(super) struct StrictStdioTransport {
     reader: BufReader<ChildStdout>,
     writer: Arc<Mutex<Option<ChildStdin>>>,
@@ -92,6 +34,7 @@ pub(super) struct StrictStdioTransport {
     poison: PoisonWatch,
 }
 
+#[cfg(unix)]
 impl StrictStdioTransport {
     pub(super) fn spawn(
         command: &mut Command,
@@ -210,6 +153,7 @@ impl StrictStdioTransport {
     }
 }
 
+#[cfg(unix)]
 impl Transport<RoleClient> for StrictStdioTransport {
     type Error = io::Error;
 
@@ -292,6 +236,7 @@ impl Transport<RoleClient> for StrictStdioTransport {
     }
 }
 
+#[cfg(unix)]
 impl Drop for StrictStdioTransport {
     fn drop(&mut self) {
         self.abort.abort();
