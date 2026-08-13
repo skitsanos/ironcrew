@@ -65,6 +65,11 @@ not need to call `crew:add_agent()` for file-based agents.
 > model. IronCrew forwards explicit values; it does not silently discard them,
 > so a non-default value is rejected by the provider.
 
+> **GPT-5.6 Luna tools:** Chat Completions rejects Luna function tools while
+> reasoning is enabled. When an agent has tools, IronCrew explicitly sends
+> `reasoning_effort = "none"`; use `openai-responses` for an explicitly
+> reasoning-oriented OpenAI task.
+
 ## Response Format
 
 The `response_format` field controls how the LLM structures its output.

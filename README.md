@@ -43,7 +43,7 @@ local results = crew:run()
 - **Lua scripting** — agents, tasks, tools, and orchestration defined in Lua
 - **Project defaults via `config.lua`** — set provider, model, limits, and routing once per project; `crew.lua` stays focused on workflow logic
 - **Conversation & Dialog modes** — stateful multi-turn chat with one agent (`crew:conversation({})`) or perspective-flipped multi-agent dialogs (`crew:dialog({})`) for two-agent debates or N-agent roundtables
-- **Mid-run Human-in-the-Loop** — `crew:ask_human({})` suspends a flow until a human answers (terminal prompt in CLI, `questions`/`answer` endpoints + SSE in server mode); timeouts with defaults keep unattended runs from hanging
+- **Mid-run Human-in-the-Loop** — `crew:ask_human({})` suspends a flow, while the built-in `ask_human` tool lets one or several named agents talk to the operator; answers arrive through a terminal prompt in CLI mode or `questions`/`answer` endpoints plus SSE in server mode, with encrypted cross-replica delivery on PostgreSQL
 - **Tool approval gates** — `require_approval = {"http_request", "mcp__git__*"}` (or `IRONCREW_REQUIRE_APPROVAL`) pauses gated tool calls for a human allow/always/deny, with redacted args and fail-closed timeouts
 - **Parallel execution** — independent tasks run concurrently within topological phases
 - **Three provider types** — OpenAI Chat Completions, Anthropic native Messages API, OpenAI Responses API (also works with Gemini, Groq, Kimi, DeepSeek, xAI, Ollama via OpenAI compat)

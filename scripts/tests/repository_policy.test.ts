@@ -204,6 +204,32 @@ describe("repository integration policy", () => {
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
   });
 
+  test("the release documents one strict current MCP revision", async () => {
+    const lifecycle = await Bun.file(join(repository, "src/mcp/lifecycle.rs")).text();
+    const tools = await Bun.file(join(repository, "docs/tools.md")).text();
+    const releaseSkill = await Bun.file(
+      join(repository, ".agents/skills/release-ironcrew/SKILL.md"),
+    ).text();
+
+    expect(lifecycle).toContain("ProtocolVersion::V_2026_07_28");
+    expect(tools).toMatch(/latest published MCP\s+specification/);
+    expect(releaseSkill).toContain("official MCP specification index");
+    expect(releaseSkill).toContain("supports only that revision");
+  });
+
+  test("public release examples follow the Cargo package version", async () => {
+    const manifest = await Bun.file(join(repository, "Cargo.toml")).text();
+    const version = manifest.match(/^version = "([^"]+)"$/m)?.[1];
+    expect(version).toBeDefined();
+
+    const rest = await Bun.file(join(repository, "docs/rest-api.md")).text();
+    const cloud = await Bun.file(join(repository, "docs/cloud-deployment.md")).text();
+    const openshift = await Bun.file(join(repository, "deploy/openshift.yaml")).text();
+    expect(rest.match(new RegExp(`"version": "${version}"`, "g"))).toHaveLength(3);
+    expect(cloud).toContain(`docker.io/skitsanos/ironcrew:${version}`);
+    expect(openshift).toContain(`docker.io/skitsanos/ironcrew:${version}`);
+  });
+
   test("PostgreSQL 15 process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
     const renovate = await Bun.file(join(repository, "renovate.json")).json() as {

@@ -469,8 +469,11 @@ remote tool execution and side effects remain untrusted. See
 the complete environment table in
 [CLI](cli.md#environment-variables).
 
-**Protocol and MRTR boundary.** IronCrew accepts only MCP `2026-07-28`, uses
-`server/discover`, and never falls back to legacy initialization. It advertises
+**Protocol and MRTR boundary.** IronCrew tracks only the latest published MCP
+specification at release time. For v3.0.0 that revision is `2026-07-28`.
+IronCrew uses `server/discover` and never falls back to legacy initialization;
+when a newer specification is published, the next release advances the strict
+pin and removes the superseded revision rather than adding compatibility. It advertises
 no optional client capabilities or extensions, and refuses a server that does
 not declare its `tools` capability before any `tools/list` request. Strict stdio
 transport is Unix-only because its cancellation contract requires owned process

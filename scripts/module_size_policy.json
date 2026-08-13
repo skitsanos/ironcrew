@@ -149,8 +149,8 @@
     },
     {
       "path": "src/llm/openai.rs",
-      "max_lines": 649,
-      "rationale": "IC-011 baseline: OpenAI Chat Completions request building, rate limiting, streaming assembly, tool-call normalization, and provider dispatch share one adapter; split stream decoding before adding response modes."
+      "max_lines": 634,
+      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions rate limiting, streaming assembly, tool-call normalization, and provider dispatch share one adapter; split stream decoding before adding response modes."
     },
     {
       "path": "src/llm/openai_responses.rs",

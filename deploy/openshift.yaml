@@ -35,7 +35,7 @@ spec:
           # docker.io/skitsanos/ironcrew@sha256:<signed-release-digest> before
           # applying the production manifest. The publish workflow signs that
           # immutable digest and emits provenance/SBOM attestations.
-          image: docker.io/skitsanos/ironcrew:2.22.0
+          image: docker.io/skitsanos/ironcrew:3.0.0
           imagePullPolicy: Always
           args: ["serve", "--flows-dir", "/flows"]
           ports:

@@ -38,6 +38,15 @@
   `.env` may be consumed by tests, but never print or commit its values.
 - Avoid new dependencies when the standard library or an existing dependency
   is sufficient. Do not weaken the dependency audit without a documented review.
+- Before cutting a release, verify every direct Cargo dependency against the
+  current registry, include incompatible updates in the review, and refresh the
+  lockfile to the newest graph allowed by those current direct dependencies.
+  An older transitive crate is acceptable only when a current upstream pins it;
+  record that constraint instead of forcing an incoherent lockfile update.
+- IronCrew releases target only the latest published MCP specification. At each
+  release, check the official specification index, advance the strict source,
+  tests, examples, and docs together when it changes, and remove the superseded
+  revision rather than adding a compatibility fallback.
 
 ## Multi-replica and deployment boundaries
 
