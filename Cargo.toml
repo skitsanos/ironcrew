@@ -33,6 +33,7 @@ dotenvy = "0.15.7"
 uuid = { version = "1.24.0", features = ["v4"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.23.1"
+bytes = { version = "1.11.1", optional = true }
 thiserror = "2.0.20"
 async-trait = "0.1.92"
 url = "2.5.8"
@@ -48,7 +49,8 @@ axum = "0.8.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
 tower-http = { version = "0.7.0", features = ["cors"] }
-rmcp = { version = "2.2.0", optional = true, default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "tower"] }
+rmcp = { version = "3.1.2", optional = true, default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "tower"] }
+sse-stream = { version = "0.2.4", optional = true }
 ring = "0.17.14"
 zeroize = "1.9.0"
 cap-std = "4.0.2"
@@ -62,7 +64,7 @@ crossterm = { version = "0.29.0", default-features = false, features = ["event-s
 [features]
 default = ["postgres", "mcp"]
 postgres = ["sqlx"]
-mcp = ["dep:rmcp"]
+mcp = ["dep:bytes", "dep:rmcp", "dep:sse-stream"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

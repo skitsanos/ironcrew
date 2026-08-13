@@ -347,11 +347,11 @@ pub fn validate_mcp_http_url(url: &str) -> Result<(), String> {
 /// Expected shape:
 /// ```lua
 /// mcp_servers = {
-///   git = {
+///   local = {
 ///     transport = "stdio",
-///     execution_identity = "mcp-server-git@2026-08",
-///     command   = "uvx",
-///     args      = {"mcp-server-git"},
+///     execution_identity = "local-mcp-2026-07-28-v1",
+///     command   = "python3",
+///     args      = {"examples/mcp/stdio-tools/server.py"},
 ///     env       = { MY_VAR = "value" },
 ///     inherit_env = false,
 ///   },

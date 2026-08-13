@@ -1,7 +1,7 @@
 -- examples/mcp/http-tools/crew.lua
 --
--- Demonstrates MCP HTTP Streamable transport.
--- Replace the URL with your actual MCP server endpoint.
+-- Demonstrates strict MCP 2026-07-28 Streamable HTTP transport.
+-- Replace the URL with your server/discover-capable Streamable HTTP POST endpoint.
 -- Run: ironcrew run examples/mcp/http-tools/
 
 local crew = Crew.new({
@@ -12,6 +12,7 @@ local crew = Crew.new({
     mcp_servers = {
         myapi = {
             transport = "http",
+            execution_identity = "replace-with-your-server-revision",
             url       = env("MCP_SERVER_URL") or "https://mcp.example.com/mcp",
             -- Optional: extra HTTP headers (authorization values are redacted in logs)
             headers   = {
