@@ -15,6 +15,14 @@
   "prHourlyLimit": 2,
   "packageRules": [
     {
+      "description": "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+      "matchManagers": ["github-actions"],
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["postgres"],
+      "matchFileNames": [".github/workflows/ci.yml"],
+      "enabled": false
+    },
+    {
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "non-major updates"
     },
