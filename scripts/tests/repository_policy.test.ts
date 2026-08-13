@@ -206,6 +206,9 @@ describe("repository integration policy", () => {
 
   test("PostgreSQL 15 process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
+      packageRules: Array<Record<string, unknown>>;
+    };
     const agents = await Bun.file(join(repository, "AGENTS.md")).text();
     const soakGuide = await Bun.file(
       join(repository, "evaluations/replica-soak/README.md"),
@@ -221,6 +224,16 @@ describe("repository integration policy", () => {
     };
     const postgres = workflow.jobs["postgres-integration"];
     expect(postgres.services?.postgres.image).toBe("postgres:15");
+    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([
+      {
+        description: "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+        matchManagers: ["github-actions"],
+        matchDatasources: ["docker"],
+        matchPackageNames: ["postgres"],
+        matchFileNames: [".github/workflows/ci.yml"],
+        enabled: false,
+      },
+    ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test two_process_replica_acceptance_test");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
