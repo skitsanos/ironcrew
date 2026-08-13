@@ -93,7 +93,7 @@ impl McpClient {
             McpTransportConfig::Stdio { command, args, env } => {
                 #[cfg(not(unix))]
                 {
-                    let _ = (command, args, env);
+                    let _ = (command, args, env, cfg.inherit_env);
                     Err(IronCrewError::Mcp {
                         server: cfg.label.clone(),
                         message: "strict stdio MCP requires Unix process-group ownership; use HTTP on this platform".to_owned(),
