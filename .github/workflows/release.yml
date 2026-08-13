@@ -125,7 +125,7 @@ jobs:
 
       # Keep release artifacts aligned with Cargo.toml's rust-version and the
       # source Dockerfile instead of silently moving with the stable channel.
-      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
         with:
           targets: ${{ matrix.target }}
 
