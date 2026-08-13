@@ -6,11 +6,8 @@
 use axum::http::{HeaderName, HeaderValue};
 use futures::future::BoxFuture;
 use rmcp::{
-    Peer, RoleClient, ServiceExt,
-    model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
-        PaginatedRequestParams,
-    },
+    ClientServiceExt, Peer, RoleClient,
+    model::{CallToolRequestParams, PaginatedRequestParams},
     service::RunningService,
     transport::streamable_http_client::StreamableHttpClientTransportConfig,
     transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
@@ -22,10 +19,11 @@ use tokio::sync::Mutex;
 
 use crate::mcp::config::{McpServerConfig, McpTransportConfig};
 use crate::mcp::execution_policy::{McpCallPolicy, ensure_serialized_size};
+use crate::mcp::lifecycle::{client_info, discovery_lifecycle};
 use crate::utils::error::{IronCrewError, Result};
 use crate::utils::network::{OutboundNetworkPolicy, secure_no_redirect_client};
 
-const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_DISCOVERY_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LIST_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3_600;
@@ -193,9 +191,9 @@ impl McpClient {
     /// Connect using a `McpServerConfig`, respecting all security constraints.
     pub async fn connect(cfg: &McpServerConfig) -> Result<Self> {
         let call_policy = McpCallPolicy::capture()?;
-        let handshake_timeout = configured_timeout(
-            "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS",
-            DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        let discovery_timeout = configured_timeout(
+            "IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS",
+            DEFAULT_DISCOVERY_TIMEOUT_SECS,
         )?;
         match &cfg.transport {
             McpTransportConfig::Stdio { command, args, env } => {
@@ -220,20 +218,22 @@ impl McpClient {
                 })?;
 
                 let process_group = McpProcessGroupGuard::new(transport.id());
-                let service: RunningService<RoleClient, ()> =
-                    tokio::time::timeout(handshake_timeout, ().serve(transport))
-                        .await
-                        .map_err(|_| IronCrewError::Mcp {
-                            server: cfg.label.clone(),
-                            message: format!(
-                                "Handshake timed out after {} seconds",
-                                handshake_timeout.as_secs()
-                            ),
-                        })?
-                        .map_err(|e| IronCrewError::Mcp {
-                            server: cfg.label.clone(),
-                            message: format!("Handshake failed: {}", e),
-                        })?;
+                let service = tokio::time::timeout(
+                    discovery_timeout,
+                    client_info().serve_with_lifecycle(transport, discovery_lifecycle()),
+                )
+                .await
+                .map_err(|_| IronCrewError::Mcp {
+                    server: cfg.label.clone(),
+                    message: format!(
+                        "MCP discovery timed out after {} seconds",
+                        discovery_timeout.as_secs()
+                    ),
+                })?
+                .map_err(|e| IronCrewError::Mcp {
+                    server: cfg.label.clone(),
+                    message: format!("MCP discovery failed: {}", e),
+                })?;
 
                 Ok(Self::from_service(
                     service,
@@ -275,24 +275,22 @@ impl McpClient {
                     })?;
                 let transport = StreamableHttpClientTransport::with_client(http_client, config);
 
-                let client_info = ClientInfo::new(
-                    ClientCapabilities::default(),
-                    Implementation::new("ironcrew", env!("CARGO_PKG_VERSION")),
-                );
-
-                let service = tokio::time::timeout(handshake_timeout, client_info.serve(transport))
-                    .await
-                    .map_err(|_| IronCrewError::Mcp {
-                        server: cfg.label.clone(),
-                        message: format!(
-                            "HTTP handshake timed out after {} seconds",
-                            handshake_timeout.as_secs()
-                        ),
-                    })?
-                    .map_err(|e| IronCrewError::Mcp {
-                        server: cfg.label.clone(),
-                        message: format!("HTTP handshake failed: {}", e),
-                    })?;
+                let service = tokio::time::timeout(
+                    discovery_timeout,
+                    client_info().serve_with_lifecycle(transport, discovery_lifecycle()),
+                )
+                .await
+                .map_err(|_| IronCrewError::Mcp {
+                    server: cfg.label.clone(),
+                    message: format!(
+                        "MCP HTTP discovery timed out after {} seconds",
+                        discovery_timeout.as_secs()
+                    ),
+                })?
+                .map_err(|e| IronCrewError::Mcp {
+                    server: cfg.label.clone(),
+                    message: format!("MCP HTTP discovery failed: {}", e),
+                })?;
 
                 Ok(Self::from_service(service, None, call_policy))
             }
@@ -383,17 +381,7 @@ impl McpClient {
             _ => return Err(mcp_error("MCP tool arguments must be a JSON object")),
         };
 
-        let timeout = self.call_policy.timeout();
-        tokio::time::timeout(timeout, self.peer.call_tool(params))
-            .await
-            .map_err(|_| {
-                mcp_error(format!(
-                    "call_tool '{}' timed out after {} seconds",
-                    name,
-                    timeout.as_secs()
-                ))
-            })?
-            .map_err(|e| mcp_error(format!("call_tool '{name}' failed: {e}")))
+        crate::mcp::call::call_tool(&self.peer, params, name, self.call_policy).await
     }
 
     pub(super) fn call_policy(&self) -> McpCallPolicy {

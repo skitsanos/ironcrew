@@ -648,9 +648,11 @@ individual ranges stated in their descriptions.
 | `IRONCREW_MCP_ALLOWED_COMMANDS` | Comma-separated exact command strings allowed for stdio MCP servers (e.g. `"uvx,npx"`). Basenames do not authorize lookalike paths. Unset retains the development allow-all default; present-but-empty fails closed |
 | `IRONCREW_MCP_ALLOWED_HTTP_HOSTS` | Comma-separated exact HTTP MCP hostnames, or `__disabled__`. Public binds require this policy because rmcp transport frames are materialized before IronCrew's post-decode caps; enable only operator-trusted hosts |
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | Narrow opt-in for literal localhost/loopback HTTP MCP URLs. Default: blocked. The broader `IRONCREW_ALLOW_PRIVATE_IPS` override supersedes this policy and should not be used merely for a local sidecar |
-| `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` | MCP connection deadline (default: `10`; range: 1–3600 seconds) |
+| `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` | Strict MCP `2026-07-28` `server/discover` connection deadline (default: `10`; range: 1–3600 seconds). There is no legacy initialize fallback or old-name alias |
 | `IRONCREW_MCP_LIST_TIMEOUT_SECS` | Tool-discovery deadline (default: `10`; range: 1–3600 seconds) |
 | `IRONCREW_MCP_CALL_TIMEOUT_SECS` | Tool-call deadline (default: `60`; range: 1–3600 seconds) |
+| `IRONCREW_MCP_MAX_MRTR_ROUNDS` | Maximum total wire attempts for one state-only MRTR tool call (default: `10`; hard ceiling: `32`) |
+| `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | Maximum UTF-8 bytes in opaque MRTR `requestState` echoed by IronCrew (default: `65536`; hard ceiling: `1048576`) |
 | `IRONCREW_MCP_SHUTDOWN_TIMEOUT_SECS` | Graceful MCP shutdown deadline (default: `5`; range: 1–3600 seconds) |
 | `IRONCREW_MCP_MAX_TOOLS` | Maximum tools advertised by one server (default: `128`; hard ceiling: `4096`) |
 | `IRONCREW_MCP_MAX_LIST_PAGES` | Maximum discovery pages (default: `32`; hard ceiling: `256`) |

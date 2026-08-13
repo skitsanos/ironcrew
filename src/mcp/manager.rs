@@ -18,20 +18,20 @@ use crate::tools::Tool;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
 
-// ── Handshake timeout ─────────────────────────────────────────────────────────
+// ── Discovery timeout ─────────────────────────────────────────────────────────
 
-fn handshake_timeout() -> Result<Duration> {
-    let secs = match std::env::var("IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS") {
+fn discovery_timeout() -> Result<Duration> {
+    let secs = match std::env::var("IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS") {
         Ok(raw) => raw.parse::<u64>().map_err(|_| IronCrewError::Mcp {
             server: String::new(),
-            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be an integer from 1 to 3600".into(),
+            message: "IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS must be an integer from 1 to 3600".into(),
         })?,
         Err(_) => 10,
     };
     if !(1..=3_600).contains(&secs) {
         return Err(IronCrewError::Mcp {
             server: String::new(),
-            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be from 1 to 3600".into(),
+            message: "IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS must be from 1 to 3600".into(),
         });
     }
     Ok(Duration::from_secs(secs))
@@ -49,13 +49,13 @@ impl McpConnectionManager {
     /// Spawn all configured MCP servers in parallel.
     ///
     /// Each connection attempt is wrapped in a timeout of
-    /// `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` (default 10 s). A single failure
+    /// `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` (default 10 s). A single failure
     /// returns an error and no further servers are connected.
     ///
     /// After successful connection, all discovered tools are registered into
     /// `tool_registry` using the `mcp__<label>__<tool>` naming scheme.
     pub async fn connect_all(config: &McpConfig, tool_registry: &mut ToolRegistry) -> Result<Self> {
-        let timeout = handshake_timeout()?;
+        let timeout = discovery_timeout()?;
 
         // Build one connect future per server
         let connect_futs: Vec<_> = config
@@ -73,8 +73,8 @@ impl McpConnectionManager {
                         .map_err(|_| IronCrewError::Mcp {
                             server: label.clone(),
                             message: format!(
-                                "Handshake timed out after {}s. \
-                                 Adjust IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS.",
+                                "MCP discovery timed out after {}s. \
+                                 Adjust IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS.",
                                 timeout.as_secs()
                             ),
                         })??;

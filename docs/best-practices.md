@@ -254,8 +254,13 @@ source-IP capture. See `docs/rest-api.md`.
 - `IRONCREW_MCP_ALLOW_LOCALHOST` — by default IronCrew refuses `http://`
   MCP URLs pointing at loopback. Set to `1` only when the MCP server runs
   as a trusted sidecar in the same pod.
-- `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` — default `10`. Raise only when
-  slow cold-starts (`uvx` / `npx` downloading on first run) are expected.
+- `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` — default `10`. Raise only when a
+  trusted MCP `2026-07-28` server has a known slow cold start. IronCrew uses
+  strict `server/discover`; it does not fall back to `initialize`.
+- `IRONCREW_MCP_MAX_MRTR_ROUNDS` and
+  `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` — defaults `10` total attempts and
+  `65536` bytes. Keep state-only retries bounded; IronCrew rejects
+  `inputRequests` and Tasks-extension responses because it advertises neither.
 - `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` — default `262144` (256 KB). Caps
   the result size returned from any MCP tool call; oversized results are
   truncated with a marker.

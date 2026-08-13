@@ -209,8 +209,8 @@
     },
     {
       "path": "src/mcp/client.rs",
-      "max_lines": 475,
-      "rationale": "IC-011 baseline: MCP process environment, process-group cleanup, handshake and listing limits, tool discovery, shutdown, and client state share one transport lifecycle; extract process management before adding transports."
+      "max_lines": 463,
+      "rationale": "IC-011 ratchet after extracting strict lifecycle and bounded tool-call logic: MCP process environment, process-group cleanup, transport setup, tool discovery, shutdown, and client state remain one transport lifecycle; extract process management before adding transports."
     },
     {
       "path": "src/mcp/config.rs",

@@ -402,6 +402,8 @@ when `prompt_cache_key` is set on the crew.
 Model capability is only half the picture — crews can also attach
 **Model Context Protocol (MCP) servers** to expose external tools to every
 agent. Pass `mcp_servers = {...}` to `Crew.new({...})` with either a stdio
-spawn spec or an HTTP Streamable URL, and the registered tools show up
-alongside built-ins. See the MCP section of [docs/crews.md](crews.md) for
-the full config schema, transport details, and examples.
+spawn spec or a Streamable HTTP URL for a server implementing MCP
+`2026-07-28` discovery. IronCrew does not support legacy initialize/SSE
+lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
+section of [docs/crews.md](crews.md) for the full config schema, transport
+details, and examples.

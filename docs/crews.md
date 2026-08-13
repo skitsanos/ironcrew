@@ -1063,7 +1063,10 @@ delegates to a sub-crew via a custom tool that calls `run_flow()`.
 ## MCP (Model Context Protocol) Tool Servers
 
 IronCrew can connect to external [MCP](https://modelcontextprotocol.io/) servers and expose
-their tools to agents. Supported transports: **stdio** (child process) and **HTTP Streamable**.
+their tools to agents. Supported transports are **stdio** (child process) and
+**Streamable HTTP**. IronCrew requires MCP `2026-07-28`: it starts every
+connection with `server/discover` and does not send `initialize`,
+`notifications/initialized`, or fall back to an older lifecycle.
 
 MCP is enabled by default (Cargo feature `mcp`). Build without it via `--no-default-features`.
 
@@ -1071,28 +1074,28 @@ MCP is enabled by default (Cargo feature `mcp`). Build without it via `--no-defa
 
 ```lua
 local crew = Crew.new({
-    goal = "Summarise recent Git activity",
+    goal = "Echo a message through a local MCP tool",
     provider = "openai",
     model    = "gpt-5.6-luna",
 
     mcp_servers = {
         -- Label must match ^[a-z][a-z0-9_-]{0,15}$
-        git = {
+        local_tools = {
             transport = "stdio",
             -- Required if this server's tools are reachable from a persistent conversation.
-            execution_identity = "mcp-server-git@2026-08",
-            command   = "uvx",
-            args      = { "mcp-server-git" },
+            execution_identity = "ironcrew-mcp-2026-fixture-v1",
+            command   = "python3",
+            args      = { "examples/mcp/stdio-tools/server.py" },
         },
     },
 })
 
 crew:add_agent({
     name  = "analyst",
-    role  = "Git analyst",
-    goal  = "Summarise the repo",
+    role  = "MCP tool user",
+    goal  = "Echo the requested text",
     -- Tools are exposed as  mcp__<server_label>__<tool_name>
-    tools = { "mcp__git__git_status", "mcp__git__git_log" },
+    tools = { "mcp__local_tools__echo" },
 })
 ```
 
@@ -1102,11 +1105,11 @@ crew:add_agent({
 
 ```lua
 mcp_servers = {
-    mypkg = {
+    local_tools = {
         transport   = "stdio",
-        execution_identity = "mypkg@2.4.1+config-v3",
-        command     = "uvx",            -- binary to spawn
-        args        = { "mcp-server-git" },
+        execution_identity = "ironcrew-mcp-2026-fixture-v1",
+        command     = "python3",        -- binary to spawn
+        args        = { "examples/mcp/stdio-tools/server.py" },
         env         = { MY_VAR = "val" },  -- extra env vars for child (optional)
         inherit_env = false,            -- default: false (safer for cloud)
     },
@@ -1134,6 +1137,10 @@ mcp_servers = {
 
 HTTP URLs are validated against the SSRF filter (private IPs blocked by default).
 Localhost is blocked unless `IRONCREW_MCP_ALLOW_LOCALHOST=1` is set.
+Configure the Streamable HTTP POST endpoint (normally `/mcp`), not a legacy
+SSE endpoint. IronCrew uses the sessionless `2026-07-28` lifecycle: every
+request carries its protocol version, client identity, and capabilities, and
+no `Mcp-Session-Id` is negotiated.
 
 ### Persistent-conversation execution identity
 
@@ -1171,7 +1178,9 @@ Constraints:
 
 - MCP servers are **connected in parallel** when tools are first finalized for
   a run or conversation.
-- Any handshake failure aborts the run with a clear error.
+- Discovery is strict MCP `2026-07-28`. A server that rejects
+  `server/discover` or omits that supported version fails the connection; there
+  is no legacy initialization fallback.
 - The connection is **cached** for the crew's lifetime — subsequent `crew:run()` calls
   reuse the same connections without reconnecting.
 - On crew drop / server shutdown, connections are torn down gracefully: stdio children
@@ -1179,16 +1188,32 @@ Constraints:
   [cloud-deployment.md](cloud-deployment.md#graceful-shutdown) for tuning the drain
   window (`IRONCREW_SHUTDOWN_DRAIN_MS`) on Kubernetes / Railway.
 
+### Multi-round tool calls
+
+IronCrew supports bounded, state-only multi round-trip requests (MRTR). When a
+tool returns `resultType = "input_required"` with a `requestState`, IronCrew
+echoes that opaque string exactly and retries the same call. An empty string is
+valid. The call deadline spans all attempts and backoff, and the total number
+of wire attempts is capped by `IRONCREW_MCP_MAX_MRTR_ROUNDS`.
+
+IronCrew advertises no optional client capabilities or extensions. Non-empty
+`inputRequests` (including elicitation, sampling, or roots requests) and
+`resultType = "task"` therefore fail closed rather than being fulfilled or
+polled. An `input_required` result with neither a usable request nor
+`requestState` is invalid.
+
 ### Security environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `IRONCREW_MCP_ALLOWED_COMMANDS` | (unset = allow all) | Comma-separated exact commands allowed for stdio. Present-but-empty refuses all commands. E.g. `"uvx,npx"`. |
 | `IRONCREW_MCP_ALLOW_LOCALHOST` | `0` | Set to `1` to allow localhost/loopback HTTP URLs. |
-| `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` | `10` | Seconds to wait for the MCP handshake to complete. |
+| `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` | `10` | Seconds to wait for `server/discover` and connection setup. The former handshake variable is ignored; there is no compatibility alias. |
+| `IRONCREW_MCP_MAX_MRTR_ROUNDS` | `10` | Maximum total wire attempts for one state-only MRTR call (hard ceiling `32`). |
+| `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` | Maximum UTF-8 bytes in an echoed opaque `requestState` (hard ceiling `1048576`). |
 | `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` (256 KB) | Maximum bytes returned per tool call. Oversized results are truncated with a `[truncated: N bytes omitted]` marker. |
 
 ### Examples
 
-- `examples/mcp/git-tools/` — stdio example with `mcp-server-git`
-- `examples/mcp/http-tools/` — HTTP Streamable example
+- `examples/mcp/stdio-tools/` — dependency-free MCP `2026-07-28` stdio example and fixture
+- `examples/mcp/http-tools/` — strict `2026-07-28` Streamable HTTP example

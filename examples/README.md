@@ -68,9 +68,9 @@ Provider keys are read directly by IronCrew. Values accessed from Lua with
 
 ## MCP and supporting material
 
-- [`mcp/git-tools`](mcp/git-tools/) uses a local stdio MCP server.
-- [`mcp/http-tools`](mcp/http-tools/) uses Streamable HTTP MCP.
-- [`mcp/plufinder`](mcp/plufinder/) is an externally dependent MCP example.
+- [`mcp/stdio-tools`](mcp/stdio-tools/) is a dependency-free MCP `2026-07-28`
+  stdio example and deterministic protocol fixture.
+- [`mcp/http-tools`](mcp/http-tools/) uses strict `2026-07-28` Streamable HTTP.
 - [`graph-prototype`](graph-prototype/) is the static prototype behind graph
   visualization assets.
 - [`subflow_stub`](subflow_stub/) is a hermetic integration-test fixture, not a

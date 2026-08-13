@@ -226,8 +226,7 @@ impl Tool for McpBridgeTool {
         let is_error = result.is_error.unwrap_or(false);
 
         for content in &result.content {
-            // rmcp v2 flattened the `Content { raw: RawContent }` wrapper into
-            // a `ContentBlock` enum matched directly.
+            // rmcp exposes content as a non-exhaustive enum matched directly.
             let text = match content {
                 rmcp::model::ContentBlock::Text(t) => t.text.as_str(),
                 rmcp::model::ContentBlock::Image(_) => "[image content omitted]",
@@ -243,7 +242,7 @@ impl Tool for McpBridgeTool {
                 }
                 rmcp::model::ContentBlock::Audio(_) => "[audio content omitted]",
                 rmcp::model::ContentBlock::ResourceLink(_) => "[resource link omitted]",
-                // ContentBlock is #[non_exhaustive] in rmcp v2 — tolerate any
+                // ContentBlock is #[non_exhaustive] — tolerate any
                 // future content type rather than dropping the tool result.
                 _ => "[unsupported content omitted]",
             };

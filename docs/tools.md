@@ -423,8 +423,8 @@ server is registered in IronCrew's tool registry under the canonical name
 ```lua
 crew:add_agent(Agent.new({
     name = "dev",
-    goal = "Inspect repo state",
-    tools = { "mcp__git__git_status", "mcp__git__git_log" },
+    goal = "Echo a message",
+    tools = { "mcp__local_tools__echo" },
 }))
 ```
 
@@ -438,11 +438,13 @@ API behavior changes and never include tokens or secret-bearing configuration.
 Ordinary runs and ephemeral conversations do not require it.
 
 The same persistent-conversation definition binds each reachable tool's
-captured effective non-secret execution policy. This includes fingerprints of
-filesystem and Lua-tool capability roots, configured byte/count/output limits,
-extension or domain filters, the private-network opt-in, shell/default tool
-timeouts, and maximum nested-flow depth. Tool execution uses those captured
-values rather than re-reading mutable environment policy mid-conversation.
+captured effective non-secret execution policy. For MCP, that includes the
+call timeout, argument cap, maximum MRTR attempts, and `requestState` byte cap.
+This also covers fingerprints of filesystem and Lua-tool capability roots,
+configured byte/count/output limits, extension or domain filters, the
+private-network opt-in, shell/default tool timeouts, and maximum nested-flow
+depth. Tool execution uses those captured values rather than re-reading
+mutable environment policy mid-conversation.
 Secrets and raw root paths are excluded. Fixed compiled ceilings and semantics
 are not copied into each conversation record; replicas must carry the same
 attested artifact identity so those constants remain equal. A behavior-changing
@@ -452,9 +454,9 @@ policy drift changes the definition fingerprint and makes resume fail closed.
 `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` (default `262144` / 256 KiB; hard ceiling
 16 MiB). Oversized text is UTF-8-safely truncated with a marker. MCP also caps
 discovery at 128 tools/32 pages, definitions at 128 KiB, arguments at 256 KiB,
-and result content at 256 blocks by default. Separate handshake, discovery,
-call, and shutdown deadlines prevent an unresponsive server from retaining a
-run indefinitely. HTTP MCP transport does not follow redirects; loopback is
+and result content at 256 blocks by default. Separate connection-discovery,
+tool-discovery, call, and shutdown deadlines prevent an unresponsive server
+from retaining a run indefinitely. HTTP MCP transport does not follow redirects; loopback is
 available only through the narrow `IRONCREW_MCP_ALLOW_LOCALHOST` opt-in.
 rmcp currently materializes stdio/HTTP transport frames before IronCrew can
 apply its post-decode result caps, so production must permit only trusted stdio
@@ -462,6 +464,15 @@ commands and exact hosts (`IRONCREW_MCP_ALLOWED_HTTP_HOSTS`), or keep both MCP
 transports disabled. See
 the complete environment table in
 [CLI](cli.md#environment-variables).
+
+**Protocol and MRTR boundary.** IronCrew accepts only MCP `2026-07-28`, uses
+`server/discover`, and never falls back to legacy initialization. It advertises
+no optional client capabilities or extensions. Tool calls may use state-only MRTR: IronCrew echoes an
+opaque `requestState` exactly, under a 64 KiB default byte cap, for at most 10
+total wire attempts inside the overall call deadline. Non-empty
+`inputRequests` and Tasks-extension results are rejected. The MRTR attempt cap,
+state cap, argument cap, and call timeout are captured in persistent tool
+policy fingerprints.
 
 ---
 
