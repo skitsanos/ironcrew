@@ -9,11 +9,11 @@ const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-  "anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d",
+  "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
   "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8",
-  "dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e",
+  "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
@@ -163,7 +163,12 @@ describe("repository integration policy", () => {
 
   test("CI pins Rust and preserves the exact all-target gates", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const manifest = await Bun.file(join(repository, "Cargo.toml")).text();
     const toolchain = await Bun.file(join(repository, "rust-toolchain.toml")).text();
+    const dockerfile = await Bun.file(join(repository, "Dockerfile")).text();
+    const release = await Bun.file(
+      join(repository, ".github/workflows/release.yml"),
+    ).text();
     expect(source).not.toContain("dtolnay/rust-toolchain@stable");
 
     const workflow = Bun.YAML.parse(source) as {
@@ -176,9 +181,17 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
     expect(commands).toContain("cargo test --all-targets");
     expect(commands).toContain("cargo test --doc");
-    expect(source).toContain("dtolnay/rust-toolchain@1.96.0");
-    expect(toolchain).toContain('channel = "1.96.0"');
+    expect(source.match(/dtolnay\/rust-toolchain@1\.97\.1/g)).toHaveLength(8);
+    expect(manifest).toContain('rust-version = "1.97.1"');
+    expect(toolchain).toContain('channel = "1.97.1"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
+    expect(dockerfile).toContain("FROM rust:1.97.1-bookworm AS builder");
+    expect(release).toContain(
+      "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1",
+    );
+    expect(release).toContain(
+      "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
+    );
   });
 
   test("dependency audit warnings fail closed and the fixed transitive stays selected", async () => {
@@ -193,6 +206,9 @@ describe("repository integration policy", () => {
 
   test("PostgreSQL 15 process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
+    const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
+      packageRules: Array<Record<string, unknown>>;
+    };
     const agents = await Bun.file(join(repository, "AGENTS.md")).text();
     const soakGuide = await Bun.file(
       join(repository, "evaluations/replica-soak/README.md"),
@@ -208,6 +224,16 @@ describe("repository integration policy", () => {
     };
     const postgres = workflow.jobs["postgres-integration"];
     expect(postgres.services?.postgres.image).toBe("postgres:15");
+    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([
+      {
+        description: "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+        matchManagers: ["github-actions"],
+        matchDatasources: ["docker"],
+        matchPackageNames: ["postgres"],
+        matchFileNames: [".github/workflows/ci.yml"],
+        enabled: false,
+      },
+    ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test two_process_replica_acceptance_test");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
