@@ -1267,7 +1267,7 @@ docker run -p 3000:3000 \
   ironcrew
 ```
 
-The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.96.0` with
+The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.97.1` with
 `cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
 certificates. Those tags and the runtime package repositories are not a
 bit-for-bit reproducibility guarantee. The image runs as numeric non-root UID
