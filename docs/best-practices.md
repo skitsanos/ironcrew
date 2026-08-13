@@ -396,7 +396,7 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile pins Rust `1.96.0`, builds with
+**Multi-arch builds.** The Dockerfile pins Rust `1.97.1`, builds with
 `--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
 architectures with:
 

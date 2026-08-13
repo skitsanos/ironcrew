@@ -1497,7 +1497,7 @@ memory file.
 
 ### Source Dockerfile
 
-The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.96.0` builder that
+The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.97.1` builder that
 matches `Cargo.toml`'s minimum supported Rust version, builds with
 `cargo build --release --locked`, and copies the executable into
 `debian:13-slim`. The runtime is intentionally glibc-based and dynamically
@@ -1512,7 +1512,7 @@ The runtime stage:
 - supplies a runnable server `CMD`
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
-with GNU/Linux artifacts built by the release workflow using Rust `1.96.0` and
+with GNU/Linux artifacts built by the release workflow using Rust `1.97.1` and
 `--locked`. The exact tag workflow assembles one `linux/amd64` plus
 `linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
 source and OCI object hashes in a signed receipt, and publishes both as release
