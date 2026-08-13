@@ -456,23 +456,53 @@ policy drift changes the definition fingerprint and makes resume fail closed.
 discovery at 128 tools/32 pages, definitions at 128 KiB, arguments at 256 KiB,
 and result content at 256 blocks by default. Separate connection-discovery,
 tool-discovery, call, and shutdown deadlines prevent an unresponsive server
-from retaining a run indefinitely. HTTP MCP transport does not follow redirects; loopback is
+from retaining a run indefinitely. Inbound stdio lines, HTTP JSON messages,
+and SSE events are capped before JSON decoding by
+`IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` (default 1 MiB, hard ceiling 16 MiB).
+The transport must receive one OS/HTTP chunk before measuring it; that chunk
+may temporarily exceed the limit, but it is rejected before being copied into
+IronCrew-owned assembled JSON/SSE parser buffers, which never exceed the cap.
+HTTP MCP transport does not follow redirects; loopback is
 available only through the narrow `IRONCREW_MCP_ALLOW_LOCALHOST` opt-in.
-rmcp currently materializes stdio/HTTP transport frames before IronCrew can
-apply its post-decode result caps, so production must permit only trusted stdio
-commands and exact hosts (`IRONCREW_MCP_ALLOWED_HTTP_HOSTS`), or keep both MCP
-transports disabled. See
+Use exact stdio-command and HTTP-host allowlists even with these memory bounds:
+remote tool execution and side effects remain untrusted. See
 the complete environment table in
 [CLI](cli.md#environment-variables).
 
 **Protocol and MRTR boundary.** IronCrew accepts only MCP `2026-07-28`, uses
 `server/discover`, and never falls back to legacy initialization. It advertises
-no optional client capabilities or extensions. Tool calls may use state-only MRTR: IronCrew echoes an
+no optional client capabilities or extensions, and refuses a server that does
+not declare its `tools` capability before any `tools/list` request. Strict stdio
+transport is Unix-only because its cancellation contract requires owned process
+groups; use sessionless Streamable HTTP on Windows. Tool calls may use state-only MRTR: IronCrew echoes an
 opaque `requestState` exactly, under a 64 KiB default byte cap, for at most 10
 total wire attempts inside the overall call deadline. Non-empty
 `inputRequests` and Tasks-extension results are rejected. The MRTR attempt cap,
-state cap, argument cap, and call timeout are captured in persistent tool
+state cap, argument cap, inbound-message cap, and call timeout are captured in persistent tool
 policy fingerprints.
+
+For Streamable HTTP tools, IronCrew implements the final `x-mcp-header`
+contract before the SDK caches discovery results. An annotation is accepted
+only on a string, integer, or boolean property reached exclusively through
+nested `properties`; a tool with an annotation at the root, behind `$ref`, an
+array, or a composition/conditional keyword is excluded from discovery. Missing
+and `null` values omit the header. Integers must be integral JavaScript-safe
+numbers, and strings that are non-ASCII, contain controls, have edge whitespace,
+or resemble the Base64 sentinel use the protocol's Base64 wrapper.
+
+Only JSON-RPC error code `-32020` triggers a refresh. IronCrew performs one
+fully bounded `tools/list` refresh and one retry inside the original call
+deadline and total-attempt budget. The refreshed tool set and every non-header
+part of each tool definition must be unchanged; otherwise the connection fails
+closed. The compiled HTTP header-plan version is part of the persistent tool
+definition, so a successful routing-plan refresh changes the definition used by
+subsequent durable-resume checks.
+
+A timeout stops local waiting and permanently closes the connection. Stdio
+process groups are synchronously killed; the independently owned supervisor
+reaps the direct child, and explicit shutdown waits for that confirmation.
+HTTP request/SSE paths are closed locally and never reused, but cancellation
+cannot prove that a remote side effect stopped or roll it back.
 
 ---
 

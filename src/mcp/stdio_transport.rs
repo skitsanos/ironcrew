@@ -1,4 +1,4 @@
-//! Strict, pre-materialization-bounded MCP stdio transport.
+//! Strict MCP stdio transport with an assembled-line cap before JSON decode.
 
 use std::{
     io,
@@ -22,7 +22,7 @@ use tokio::{
     sync::{Mutex, watch},
 };
 
-use crate::mcp::protocol::inbound_is_allowed;
+use crate::mcp::{connection::PoisonWatch, protocol::inbound_is_allowed};
 
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -66,9 +66,19 @@ impl StdioAbortHandle {
         self.abort.send_replace(true);
     }
 
-    pub(super) async fn wait_reaped(&self) {
+    pub(super) async fn wait_reaped(&self) -> io::Result<()> {
         let mut reaped = self.reaped.clone();
-        while !*reaped.borrow() && reaped.changed().await.is_ok() {}
+        loop {
+            if *reaped.borrow() {
+                return Ok(());
+            }
+            reaped.changed().await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "MCP reaper exited before confirming process-group cleanup",
+                )
+            })?;
+        }
     }
 }
 
@@ -79,12 +89,14 @@ pub(super) struct StrictStdioTransport {
     line: Vec<u8>,
     max_inbound_bytes: usize,
     abort: StdioAbortHandle,
+    poison: PoisonWatch,
 }
 
 impl StrictStdioTransport {
     pub(super) fn spawn(
         command: &mut Command,
         max_inbound_bytes: usize,
+        poison: PoisonWatch,
     ) -> io::Result<(Self, StdioAbortHandle)> {
         command
             .stdin(Stdio::piped())
@@ -120,7 +132,7 @@ impl StrictStdioTransport {
                     }
                 }
             }
-            supervisor_abort.pgid.store(0, Ordering::Release);
+            supervisor_abort.abort();
             reaped_tx.send_replace(true);
         });
         Ok((
@@ -130,6 +142,7 @@ impl StrictStdioTransport {
                 line: Vec::new(),
                 max_inbound_bytes,
                 abort: abort.clone(),
+                poison,
             },
             abort,
         ))
@@ -139,6 +152,12 @@ impl StrictStdioTransport {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
+                if !self.line.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "MCP stdio closed with an incomplete JSON message",
+                    ));
+                }
                 return Ok(None);
             }
             let newline = available.iter().position(|byte| *byte == b'\n');
@@ -187,8 +206,7 @@ impl StrictStdioTransport {
 
     async fn reap(&mut self) -> io::Result<()> {
         self.abort.abort();
-        self.abort.wait_reaped().await;
-        Ok(())
+        self.abort.wait_reaped().await
     }
 }
 
@@ -200,16 +218,42 @@ impl Transport<RoleClient> for StrictStdioTransport {
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let writer = Arc::clone(&self.writer);
+        let poison = self.poison.clone();
         async move {
-            Self::validate_outbound(&item)?;
-            let mut encoded = serde_json::to_vec(&item).map_err(io::Error::other)?;
+            if poison.is_poisoned() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "MCP connection was closed",
+                ));
+            }
+            if let Err(error) = Self::validate_outbound(&item) {
+                poison.poison();
+                return Err(error);
+            }
+            let mut encoded = serde_json::to_vec(&item).map_err(|error| {
+                poison.poison();
+                io::Error::other(error)
+            })?;
             encoded.push(b'\n');
             let mut writer = writer.lock().await;
+            if poison.is_poisoned() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "MCP connection was closed",
+                ));
+            }
             let writer = writer
                 .as_mut()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "transport closed"))?;
-            writer.write_all(&encoded).await?;
-            writer.flush().await
+            if let Err(error) = writer.write_all(&encoded).await {
+                poison.poison();
+                return Err(error);
+            }
+            if let Err(error) = writer.flush().await {
+                poison.poison();
+                return Err(error);
+            }
+            Ok(())
         }
     }
 
@@ -219,6 +263,7 @@ impl Transport<RoleClient> for StrictStdioTransport {
             Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(%error, "closing strict MCP stdio transport");
+                self.poison.poison();
                 self.abort.abort();
                 return None;
             }
@@ -228,12 +273,14 @@ impl Transport<RoleClient> for StrictStdioTransport {
         match parsed {
             Ok(message) if !inbound_is_allowed(&message) => {
                 tracing::warn!("inbound message violates strict MCP 2026 surface");
+                self.poison.poison();
                 self.abort.abort();
                 None
             }
             Ok(message) => Some(message),
             Err(error) => {
                 tracing::warn!(%error, "closing on invalid bounded MCP stdio message");
+                self.poison.poison();
                 self.abort.abort();
                 None
             }

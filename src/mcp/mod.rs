@@ -23,9 +23,17 @@
 pub mod bridge;
 mod call;
 pub mod client;
+mod client_connect;
+mod client_operations;
 pub mod config;
 mod connection;
 mod execution_policy;
+#[cfg(test)]
+mod execution_policy_tests;
+mod http_body;
+mod http_headers;
+mod http_tool_headers;
+mod http_tool_schema;
 mod http_transport;
 mod lifecycle;
 pub mod manager;

@@ -261,6 +261,10 @@ source-IP capture. See `docs/rest-api.md`.
   `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` — defaults `10` total attempts and
   `65536` bytes. Keep state-only retries bounded; IronCrew rejects
   `inputRequests` and Tasks-extension responses because it advertises neither.
+- `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` — default `1048576` (1 MiB).
+  Bounds each assembled stdio JSON line, HTTP JSON message, or SSE event before
+  JSON decoding; keep the limit close to the largest trusted tool definition or
+  result rather than raising it for an untrusted peer.
 - `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` — default `262144` (256 KB). Caps
   the result size returned from any MCP tool call; oversized results are
   truncated with a marker.

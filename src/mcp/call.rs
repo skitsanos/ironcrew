@@ -6,7 +6,7 @@ use rmcp::{
     Peer, RoleClient,
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
-        ListToolsRequest, ListToolsResult, PaginatedRequestParams, ServerResult,
+        ErrorCode, ListToolsRequest, ListToolsResult, PaginatedRequestParams, ServerResult,
     },
     service::{PeerRequestOptions, ServiceError},
 };
@@ -15,6 +15,32 @@ use tokio::time::{Instant, sleep};
 use crate::mcp::connection::InFlightGuard;
 use crate::mcp::execution_policy::McpCallPolicy;
 use crate::utils::error::{IronCrewError, Result};
+
+pub(super) enum CallToolFailure {
+    HeaderMismatch(IronCrewError),
+    Other(IronCrewError),
+}
+
+impl CallToolFailure {
+    pub(super) fn into_error(self) -> IronCrewError {
+        match self {
+            Self::HeaderMismatch(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+enum RequestFailure {
+    HeaderMismatch(IronCrewError),
+    Other(IronCrewError),
+}
+
+impl RequestFailure {
+    fn into_error(self) -> IronCrewError {
+        match self {
+            Self::HeaderMismatch(error) | Self::Other(error) => error,
+        }
+    }
+}
 
 pub(super) async fn list_tools(
     peer: &Peer<RoleClient>,
@@ -28,25 +54,40 @@ pub(super) async fn list_tools(
         params,
         extensions: Default::default(),
     });
-    match send_request(peer, request, name, deadline, guard).await? {
+    match send_request(peer, request, name, deadline, guard)
+        .await
+        .map_err(RequestFailure::into_error)?
+    {
         ServerResult::ListToolsResult(result) => Ok(result),
-        _ => Err(mcp_error(format!(
-            "{name} returned an unexpected response type"
-        ))),
+        _ => {
+            guard.poison();
+            Err(mcp_error(format!(
+                "{name} returned an unexpected response type"
+            )))
+        }
     }
 }
 
 pub(super) async fn call_tool(
     peer: &Peer<RoleClient>,
-    mut params: CallToolRequestParams,
+    params: &mut CallToolRequestParams,
     name: &str,
     policy: McpCallPolicy,
+    deadline: Instant,
+    attempts: &mut usize,
     guard: &InFlightGuard,
-) -> Result<CallToolResult> {
-    let deadline = Instant::now() + policy.timeout();
+) -> std::result::Result<CallToolResult, CallToolFailure> {
     let max_rounds = policy.max_mrtr_rounds();
 
-    for round in 0..max_rounds {
+    loop {
+        if *attempts >= max_rounds {
+            guard.poison();
+            return Err(CallToolFailure::Other(mcp_error(format!(
+                "call_tool '{name}' exceeded the {max_rounds}-round MRTR limit"
+            ))));
+        }
+        let round = *attempts;
+        *attempts += 1;
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
         let response = match send_request(
             peer,
@@ -55,17 +96,25 @@ pub(super) async fn call_tool(
             deadline,
             guard,
         )
-        .await?
+        .await
         {
-            ServerResult::CallToolResult(result) => CallToolResponse::Complete(result),
-            ServerResult::InputRequiredResult(result) => CallToolResponse::InputRequired(result),
-            ServerResult::CreateTaskResult(result) => CallToolResponse::Task(result),
-            _ => {
-                guard.poison();
-                return Err(mcp_error(format!(
-                    "call_tool '{name}' returned an unsupported response variant"
-                )));
+            Err(RequestFailure::HeaderMismatch(error)) => {
+                return Err(CallToolFailure::HeaderMismatch(error));
             }
+            Err(RequestFailure::Other(error)) => return Err(CallToolFailure::Other(error)),
+            Ok(result) => match result {
+                ServerResult::CallToolResult(result) => CallToolResponse::Complete(result),
+                ServerResult::InputRequiredResult(result) => {
+                    CallToolResponse::InputRequired(result)
+                }
+                ServerResult::CreateTaskResult(result) => CallToolResponse::Task(result),
+                _ => {
+                    guard.poison();
+                    return Err(CallToolFailure::Other(mcp_error(format!(
+                        "call_tool '{name}' returned an unsupported response variant"
+                    ))));
+                }
+            },
         };
 
         match response {
@@ -77,48 +126,46 @@ pub(super) async fn call_tool(
                     .is_some_and(|requests| !requests.is_empty())
                 {
                     guard.poison();
-                    return Err(mcp_error(format!(
+                    return Err(CallToolFailure::Other(mcp_error(format!(
                         "call_tool '{name}' returned inputRequests for capabilities IronCrew did not advertise"
-                    )));
+                    ))));
                 }
                 let Some(request_state) = result.request_state else {
                     guard.poison();
-                    return Err(mcp_error(format!(
+                    return Err(CallToolFailure::Other(mcp_error(format!(
                         "call_tool '{name}' returned input_required without usable inputRequests or requestState"
-                    )));
+                    ))));
                 };
                 if let Err(error) = policy.validate_request_state(&request_state) {
                     guard.poison();
-                    return Err(error);
+                    return Err(CallToolFailure::Other(error));
                 }
-                if round + 1 == max_rounds {
+                if *attempts == max_rounds {
                     guard.poison();
-                    return Err(mcp_error(format!(
+                    return Err(CallToolFailure::Other(mcp_error(format!(
                         "call_tool '{name}' exceeded the {max_rounds}-round MRTR limit"
-                    )));
+                    ))));
                 }
-                sleep_with_deadline(state_only_backoff(round), deadline, name).await?;
+                sleep_with_deadline(state_only_backoff(round), deadline, name, guard)
+                    .await
+                    .map_err(CallToolFailure::Other)?;
                 params.input_responses = None;
                 params.request_state = Some(request_state);
             }
             CallToolResponse::Task(_) => {
                 guard.poison();
-                return Err(mcp_error(format!(
+                return Err(CallToolFailure::Other(mcp_error(format!(
                     "call_tool '{name}' returned a task without the io.modelcontextprotocol/tasks capability"
-                )));
+                ))));
             }
             _ => {
                 guard.poison();
-                return Err(mcp_error(format!(
+                return Err(CallToolFailure::Other(mcp_error(format!(
                     "call_tool '{name}' returned an unsupported response variant"
-                )));
+                ))));
             }
         }
     }
-    guard.poison();
-    Err(mcp_error(format!(
-        "call_tool '{name}' exceeded the {max_rounds}-round MRTR limit"
-    )))
 }
 
 async fn send_request(
@@ -127,48 +174,73 @@ async fn send_request(
     name: &str,
     deadline: Instant,
     guard: &InFlightGuard,
-) -> Result<ServerResult> {
-    let remaining = remaining(deadline, name)?;
+) -> std::result::Result<ServerResult, RequestFailure> {
+    let Some(remaining) = remaining(deadline) else {
+        guard.poison_and_wait(deadline).await;
+        return Err(RequestFailure::Other(timeout_error(name)));
+    };
     let cancellation_budget = (remaining / 10).min(Duration::from_millis(100));
     let response_budget = remaining.saturating_sub(cancellation_budget);
     let options =
         PeerRequestOptions::with_timeout(response_budget).with_max_total_timeout(response_budget);
-    let handle = tokio::time::timeout(remaining, peer.send_cancellable_request(request, options))
-        .await
-        .map_err(|_| timeout_error(name))?
-        .map_err(|error| mcp_error(format!("{name} failed: {error}")))?;
+    let handle = match tokio::time::timeout(
+        remaining,
+        peer.send_cancellable_request(request, options),
+    )
+    .await
+    {
+        Ok(result) => result
+            .map_err(|error| RequestFailure::Other(mcp_error(format!("{name} failed: {error}"))))?,
+        Err(_) => {
+            guard.poison_and_wait(deadline).await;
+            return Err(RequestFailure::Other(timeout_error(name)));
+        }
+    };
     let response = tokio::select! {
         biased;
         _ = tokio::time::sleep_until(deadline) => {
             guard.poison();
-            return Err(timeout_error(name));
+            return Err(RequestFailure::Other(timeout_error(name)));
         }
         response = handle.await_response() => response,
     };
     match response {
         Ok(result) => Ok(result),
+        Err(ServiceError::McpError(error)) if error.code == ErrorCode::HEADER_MISMATCH => Err(
+            RequestFailure::HeaderMismatch(mcp_error(format!("{name} failed: {error}"))),
+        ),
         Err(ServiceError::Timeout { .. }) => {
             guard.poison_and_wait(deadline).await;
-            Err(timeout_error(name))
+            Err(RequestFailure::Other(timeout_error(name)))
         }
-        Err(error) => Err(mcp_error(format!("{name} failed: {error}"))),
+        Err(error) => Err(RequestFailure::Other(mcp_error(format!(
+            "{name} failed: {error}"
+        )))),
     }
 }
 
-async fn sleep_with_deadline(delay: Duration, deadline: Instant, name: &str) -> Result<()> {
-    let remaining = remaining(deadline, &format!("call_tool '{name}'"))?;
+async fn sleep_with_deadline(
+    delay: Duration,
+    deadline: Instant,
+    name: &str,
+    guard: &InFlightGuard,
+) -> Result<()> {
+    let Some(remaining) = remaining(deadline) else {
+        guard.poison_and_wait(deadline).await;
+        return Err(timeout_error(&format!("call_tool '{name}'")));
+    };
     if delay >= remaining {
+        guard.poison_and_wait(deadline).await;
         return Err(timeout_error(&format!("call_tool '{name}'")));
     }
     sleep(delay).await;
     Ok(())
 }
 
-fn remaining(deadline: Instant, name: &str) -> Result<Duration> {
+fn remaining(deadline: Instant) -> Option<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| timeout_error(name))
 }
 
 fn timeout_error(name: &str) -> IronCrewError {

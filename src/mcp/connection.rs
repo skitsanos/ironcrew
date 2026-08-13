@@ -6,6 +6,7 @@ use rmcp::service::RunningServiceCancellationToken;
 use tokio::sync::watch;
 
 use crate::mcp::stdio_transport::StdioAbortHandle;
+use crate::utils::error::{IronCrewError, Result};
 
 #[derive(Clone)]
 pub(super) struct PoisonSignal {
@@ -14,17 +15,22 @@ pub(super) struct PoisonSignal {
 
 #[derive(Clone)]
 pub(super) struct PoisonWatch {
+    sender: Arc<watch::Sender<bool>>,
     receiver: watch::Receiver<bool>,
 }
 
 impl PoisonSignal {
     pub(super) fn channel() -> (Self, PoisonWatch) {
         let (sender, receiver) = watch::channel(false);
+        let sender = Arc::new(sender);
         (
             Self {
-                sender: Arc::new(sender),
+                sender: Arc::clone(&sender),
             },
-            PoisonWatch { receiver },
+            PoisonWatch {
+                sender: Arc::clone(&sender),
+                receiver,
+            },
         )
     }
 
@@ -44,6 +50,10 @@ impl PoisonWatch {
 
     pub(super) async fn poisoned(&mut self) {
         while !self.is_poisoned() && self.receiver.changed().await.is_ok() {}
+    }
+
+    pub(super) fn poison(&self) {
+        self.sender.send_replace(true);
     }
 }
 
@@ -83,7 +93,7 @@ impl ConnectionPoison {
 
     async fn wait_local_closed(&self) {
         if let Some(stdio) = &self.stdio {
-            stdio.wait_reaped().await;
+            let _ = stdio.wait_reaped().await;
         }
     }
 }
@@ -91,6 +101,77 @@ impl ConnectionPoison {
 pub(super) struct InFlightGuard {
     poison: ConnectionPoison,
     armed: bool,
+}
+
+pub(super) struct DiscoveryGuard {
+    signal: PoisonSignal,
+    stdio: Option<StdioAbortHandle>,
+    armed: bool,
+}
+
+impl DiscoveryGuard {
+    pub(super) fn new(signal: PoisonSignal, stdio: Option<StdioAbortHandle>) -> Self {
+        Self {
+            signal,
+            stdio,
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    pub(super) async fn abort(&self) {
+        self.signal.poison();
+        if let Some(stdio) = &self.stdio {
+            stdio.abort();
+            let _ = stdio.wait_reaped().await;
+        }
+    }
+
+    pub(super) async fn run<T, E>(
+        self,
+        timeout: std::time::Duration,
+        server: &str,
+        transport: &str,
+        future: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T>
+    where
+        E: std::fmt::Display,
+    {
+        let result = match tokio::time::timeout(timeout, future).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(IronCrewError::Mcp {
+                server: server.to_owned(),
+                message: format!("MCP {transport} discovery failed: {error}"),
+            }),
+            Err(_) => Err(IronCrewError::Mcp {
+                server: server.to_owned(),
+                message: format!(
+                    "MCP {transport} discovery timed out after {} seconds",
+                    timeout.as_secs()
+                ),
+            }),
+        };
+        if result.is_err() {
+            self.abort().await;
+        } else {
+            self.disarm();
+        }
+        result
+    }
+}
+
+impl Drop for DiscoveryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal.poison();
+            if let Some(stdio) = &self.stdio {
+                stdio.abort();
+            }
+        }
+    }
 }
 
 impl InFlightGuard {

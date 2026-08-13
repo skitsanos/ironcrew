@@ -1142,6 +1142,15 @@ SSE endpoint. IronCrew uses the sessionless `2026-07-28` lifecycle: every
 request carries its protocol version, client identity, and capabilities, and
 no `Mcp-Session-Id` is negotiated.
 
+HTTP discovery also enforces final-revision `x-mcp-header` routing. IronCrew
+supports statically reachable nested `properties` paths, promotes only
+string/boolean/JavaScript-safe-integer arguments, and encodes unsafe header text
+with the protocol Base64 sentinel. A tool is excluded when any annotation is
+unreachable, ambiguous, duplicated, or attached to another type. On exact
+`HeaderMismatch` code `-32020`, one complete paginated discovery refresh and
+one call retry share the original deadline and attempt cap; any non-header tool
+definition drift, a missing tool, or a second mismatch poisons the connection.
+
 ### Persistent-conversation execution identity
 
 MCP discovery describes tool names and schemas, but it cannot prove that two
@@ -1150,8 +1159,9 @@ MCP tool is reachable from a persistent conversation's selected agent tool
 graph, its server must set `execution_identity` to a stable, non-secret value
 (maximum 4096 bytes, no control characters). IronCrew hashes the value and
 binds that fingerprint, the discovered tool schema, server/tool names, and the
-resolved dependency graph into the conversation definition. The raw identity
-is not persisted.
+resolved dependency graph into the conversation definition. For HTTP tools the
+compiled parameter-header plan and policy version are bound as well. The raw
+identity is not persisted.
 
 Change the value whenever the executable/image, API implementation, relevant
 non-secret configuration, or data contract changes. Do not put bearer tokens,
@@ -1180,11 +1190,15 @@ Constraints:
   a run or conversation.
 - Discovery is strict MCP `2026-07-28`. A server that rejects
   `server/discover` or omits that supported version fails the connection; there
-  is no legacy initialization fallback.
+  is no legacy initialization fallback. The server must declare its `tools`
+  capability before IronCrew sends `tools/list`.
+- Stdio MCP is supported on Unix, where IronCrew can own and kill the complete
+  server process group. Windows deployments must use sessionless Streamable
+  HTTP so timeout/abort cleanup does not leave unowned descendants.
 - The connection is **cached** for the crew's lifetime — subsequent `crew:run()` calls
   reuse the same connections without reconnecting.
-- On crew drop / server shutdown, connections are torn down gracefully: stdio children
-  are reaped via pipe closure, HTTP streams close cleanly. See
+- On crew drop / server shutdown, connections are torn down gracefully: stdio process
+  groups are killed and the directly owned child is reaped, while HTTP request/SSE paths close locally. See
   [cloud-deployment.md](cloud-deployment.md#graceful-shutdown) for tuning the drain
   window (`IRONCREW_SHUTDOWN_DRAIN_MS`) on Kubernetes / Railway.
 
@@ -1202,6 +1216,13 @@ IronCrew advertises no optional client capabilities or extensions. Non-empty
 polled. An `input_required` result with neither a usable request nor
 `requestState` is invalid.
 
+Deadline, caller cancellation, or a protocol/capability violation poisons the
+connection so no later call or discovery request can reuse it. Stdio poisoning
+synchronously kills the process group; an independently owned supervisor reaps
+the direct child, and explicit shutdown waits for confirmation. HTTP teardown
+closes the local request, but it cannot undo or prove termination of remote
+work already started.
+
 ### Security environment variables
 
 | Variable | Default | Description |
@@ -1211,6 +1232,7 @@ polled. An `input_required` result with neither a usable request nor
 | `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` | `10` | Seconds to wait for `server/discover` and connection setup. The former handshake variable is ignored; there is no compatibility alias. |
 | `IRONCREW_MCP_MAX_MRTR_ROUNDS` | `10` | Maximum total wire attempts for one state-only MRTR call (hard ceiling `32`). |
 | `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` | Maximum UTF-8 bytes in an echoed opaque `requestState` (hard ceiling `1048576`). |
+| `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` | `1048576` | Pre-JSON cap for one stdio line, HTTP JSON message, or SSE event (hard ceiling `16777216`). One transport chunk may temporarily exceed the cap but is rejected before copying into IronCrew-owned assembly/parser buffers. |
 | `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` | `262144` (256 KB) | Maximum bytes returned per tool call. Oversized results are truncated with a `[truncated: N bytes omitted]` marker. |
 
 ### Examples
