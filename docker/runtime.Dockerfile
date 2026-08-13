@@ -1,22 +1,19 @@
-# syntax=docker/dockerfile:1
-#
 # Runtime image assembled from prebuilt release binaries — NO compilation.
-# Built by .github/workflows/docker-publish.yml for linux/amd64 + linux/arm64
-# using the signed tarballs that release.yml already cross-compiles.
+# release.yml builds one signed linux/amd64 + linux/arm64 OCI archive from the
+# release tag. Registry publication promotes that immutable archive.
 #
 # The build context must contain the matching binary at:
 #   dist/linux/<arch>/ironcrew     (arch = amd64 | arm64)
 #
-# Mirrors the base of the from-source ./Dockerfile (debian:13-slim +
-# ca-certificates) so the published image behaves identically.
-FROM debian:13-slim
+# This multi-architecture Wolfi index includes glibc, OpenSSL, and the Mozilla
+# CA bundle needed by the GNU release binaries. Keep it pinned by index digest:
+# historical tag builds must never resolve a moving base or package index.
+FROM cgr.dev/chainguard/wolfi-base@sha256:30f03343947c7ae3581fda727a6e2aa7b8ce7009b7bfc2ab8d5c9483ace5812f
 
 # Provided automatically by buildx per target platform (amd64 / arm64).
 ARG TARGETARCH
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
+RUN test -s /etc/ssl/certs/ca-certificates.crt \
     && install -d -o 10001 -g 0 -m 0770 /app /data /data/outputs \
     && install -d -o 0 -g 0 -m 0555 /flows
 

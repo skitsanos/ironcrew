@@ -1,0 +1,1932 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ironcrew.dev/schemas/crew-effectiveness-report-v3.schema.json",
+  "title": "IronCrew Crew Effectiveness Report v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "effectiveness_evidence",
+    "notice",
+    "generated_at",
+    "revision",
+    "source",
+    "binary",
+    "dataset",
+    "provider",
+    "configuration",
+    "mock_provider_stats",
+    "runs",
+    "summary",
+    "domain_summary",
+    "pairwise",
+    "evaluation_plan",
+    "pricing",
+    "decision",
+    "execution"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "ironcrew.crew-eval.v3"
+    },
+    "mode": {
+      "enum": [
+        "contract",
+        "live"
+      ]
+    },
+    "effectiveness_evidence": {
+      "type": "boolean"
+    },
+    "notice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha",
+        "dirty"
+      ],
+      "properties": {
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end",
+        "unchanged"
+      ],
+      "properties": {
+        "start": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "end": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "unchanged": {
+          "const": true
+        }
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "path_scope",
+        "version",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path_scope": {
+          "enum": [
+            "repository_relative",
+            "external_basename"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "answer_contract",
+        "correctness_rule",
+        "case_count",
+        "aggregate_sha256",
+        "oracle_injected_into_prompt",
+        "packs"
+      ],
+      "properties": {
+        "name": {
+          "const": "grounded-decisions-multipack-v1"
+        },
+        "answer_contract": {
+          "const": "source-visible-single-select-v1"
+        },
+        "correctness_rule": {
+          "const": "exact-option-id-v1"
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "aggregate_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "oracle_injected_into_prompt": {
+          "const": false
+        },
+        "packs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dataset_pack"
+          }
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "identity_source",
+        "model"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "identity_source": {
+          "enum": [
+            "evaluator-contract",
+            "operator-declared"
+          ]
+        },
+        "model": {
+          "const": "gpt-5.6-luna"
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repetitions",
+        "temperature",
+        "reasoning_effort",
+        "provider_default_parameters",
+        "order_seed",
+        "variants",
+        "planned_llm_calls_per_run",
+        "planned_llm_calls_by_task",
+        "planned_max_output_tokens_per_run",
+        "planned_max_output_tokens_by_task"
+      ],
+      "properties": {
+        "repetitions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "temperature": {
+          "const": null
+        },
+        "reasoning_effort": {
+          "const": null
+        },
+        "provider_default_parameters": {
+          "const": [
+            "reasoning_effort",
+            "temperature"
+          ]
+        },
+        "order_seed": {
+          "type": "integer"
+        },
+        "variants": {
+          "type": "array",
+          "items": [
+            {
+              "const": "single"
+            },
+            {
+              "const": "dag"
+            },
+            {
+              "const": "collaborative"
+            }
+          ],
+          "additionalItems": false,
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "planned_llm_calls_per_run": {
+          "const": {
+            "single": 1,
+            "dag": 3,
+            "collaborative": 4
+          }
+        },
+        "planned_llm_calls_by_task": {
+          "const": {
+            "single": {
+              "final": 1
+            },
+            "dag": {
+              "extract": 1,
+              "challenge": 1,
+              "final": 1
+            },
+            "collaborative": {
+              "discussion": 3,
+              "final": 1
+            }
+          }
+        },
+        "planned_max_output_tokens_per_run": {
+          "const": {
+            "single": 800,
+            "dag": 1800,
+            "collaborative": 2300
+          }
+        },
+        "planned_max_output_tokens_by_task": {
+          "const": {
+            "single": {
+              "final": 800
+            },
+            "dag": {
+              "extract": 500,
+              "challenge": 500,
+              "final": 800
+            },
+            "collaborative": {
+              "discussion": 1500,
+              "final": 800
+            }
+          }
+        }
+      }
+    },
+    "mock_provider_stats": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "request_count",
+            "requests_by_stage"
+          ],
+          "properties": {
+            "request_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "requests_by_stage": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    },
+    "summary": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/summary"
+      }
+    },
+    "domain_summary": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "pack_id",
+          "variants"
+        ],
+        "properties": {
+          "pack_id": {
+            "$ref": "#/$defs/pack_id"
+          },
+          "variants": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+              "$ref": "#/$defs/summary"
+            }
+          }
+        }
+      }
+    },
+    "pairwise": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate",
+          "baseline",
+          "paired_count",
+          "unique_case_count",
+          "mean_grounded_correctness_delta",
+          "mean_grounded_correctness_delta_interval",
+          "candidate_success_rate",
+          "baseline_success_rate",
+          "token_pair_count",
+          "latency_pair_count",
+          "mean_token_multiplier",
+          "mean_latency_multiplier",
+          "wins",
+          "ties",
+          "losses"
+        ],
+        "properties": {
+          "candidate": {
+            "enum": [
+              "dag",
+              "collaborative"
+            ]
+          },
+          "baseline": {
+            "const": "single"
+          },
+          "paired_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unique_case_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_grounded_correctness_delta": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "wins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "losses": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_grounded_correctness_delta_interval": {
+            "$ref": "#/$defs/interval"
+          },
+          "candidate_success_rate": {
+            "$ref": "#/$defs/rate"
+          },
+          "baseline_success_rate": {
+            "$ref": "#/$defs/rate"
+          },
+          "token_pair_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latency_pair_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mean_token_multiplier": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "mean_latency_multiplier": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
+    "evaluation_plan": {
+      "$ref": "#/$defs/evaluation_plan"
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicable",
+        "contract",
+        "planned_upper_bound_usd",
+        "observed_estimated_upper_bound_usd",
+        "coverage_complete",
+        "planned_bound_within_budget",
+        "observed_estimate_within_budget",
+        "estimate_not_invoice",
+        "uncached_input_priced_as_cache_write"
+      ],
+      "properties": {
+        "applicable": {
+          "type": "boolean"
+        },
+        "contract": {
+          "$ref": "#/$defs/pricing_contract"
+        },
+        "planned_upper_bound_usd": {
+          "$ref": "#/$defs/usd"
+        },
+        "observed_estimated_upper_bound_usd": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/usd"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage_complete": {
+          "type": "boolean"
+        },
+        "planned_bound_within_budget": {
+          "type": "boolean"
+        },
+        "observed_estimate_within_budget": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "estimate_not_invoice": {
+          "const": true
+        },
+        "uncached_input_priced_as_cache_write": {
+          "const": true
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "recommended_variant",
+        "reason",
+        "candidates"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not_applicable",
+            "insufficient_evidence",
+            "single_preferred",
+            "crew_qualified"
+          ]
+        },
+        "recommended_variant": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "single",
+                "dag",
+                "collaborative"
+              ]
+            }
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "candidate",
+              "qualified",
+              "checks"
+            ],
+            "properties": {
+              "candidate": {
+                "enum": [
+                  "dag",
+                  "collaborative"
+                ]
+              },
+              "qualified": {
+                "type": "boolean"
+              },
+              "checks": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "paired_count",
+                  "unique_case_count",
+              "candidate_success",
+              "baseline_success",
+              "token_coverage",
+              "latency_coverage",
+              "mean_quality_delta",
+                  "confidence_lower_bound",
+                  "token_multiplier",
+                  "latency_multiplier"
+                ],
+                "properties": {
+                  "paired_count": {
+                    "type": "boolean"
+                  },
+                  "unique_case_count": {
+                    "type": "boolean"
+                  },
+                  "candidate_success": {
+                    "type": "boolean"
+                  },
+                  "baseline_success": {
+                    "type": "boolean"
+                  },
+                  "token_coverage": {
+                    "type": "boolean"
+                  },
+                  "latency_coverage": {
+                    "type": "boolean"
+                  },
+                  "mean_quality_delta": {
+                    "type": "boolean"
+                  },
+                  "confidence_lower_bound": {
+                    "type": "boolean"
+                  },
+                  "token_multiplier": {
+                    "type": "boolean"
+                  },
+                  "latency_multiplier": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planned_run_count",
+        "completed_run_count",
+        "budget_abort"
+      ],
+      "properties": {
+        "planned_run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "completed_run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "budget_abort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "contract"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effectiveness_evidence": {
+            "const": false
+          },
+          "provider": {
+            "properties": {
+              "name": {
+                "const": "synthetic-oracle-backed-mock"
+              },
+              "identity_source": {
+                "const": "evaluator-contract"
+              }
+            }
+          },
+          "pricing": {
+            "properties": {
+              "applicable": {
+                "const": false
+              },
+              "planned_upper_bound_usd": {
+                "const": 0
+              },
+              "observed_estimated_upper_bound_usd": {
+                "type": "null"
+              },
+              "coverage_complete": {
+                "const": false
+              },
+              "planned_bound_within_budget": {
+                "const": true
+              },
+              "observed_estimate_within_budget": {
+                "type": "null"
+              }
+            }
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "not_applicable"
+              },
+              "recommended_variant": {
+                "type": "null"
+              },
+              "candidates": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effectiveness_evidence": {
+            "const": true
+          },
+        "provider": {
+          "properties": {
+            "name": {
+              "const": "openai-api"
+            },
+            "identity_source": {
+              "const": "operator-declared"
+            },
+            "model": {
+              "const": "gpt-5.6-luna"
+            }
+            }
+          },
+          "pricing": {
+            "properties": {
+              "applicable": {
+                "const": true
+              },
+              "planned_upper_bound_usd": {
+                "exclusiveMinimum": 0
+              },
+              "planned_bound_within_budget": {
+                "const": true
+              }
+            }
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "insufficient_evidence",
+                  "single_preferred",
+                  "crew_qualified"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "insufficient_evidence"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "single_preferred"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "const": "single"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "live"
+          },
+          "decision": {
+            "properties": {
+              "status": {
+                "const": "crew_qualified"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "properties": {
+              "recommended_variant": {
+                "enum": [
+                  "dag",
+                  "collaborative"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "git_revision": {
+      "type": "string",
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+    },
+    "pack_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+    },
+    "repository_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+    },
+    "usd": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "source_path_entry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "source",
+            "state"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/repository_path"
+            },
+            "source": {
+              "const": "tracked"
+            },
+            "state": {
+              "const": "deleted"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "source",
+            "state",
+            "bytes",
+            "mode",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/repository_path"
+            },
+            "source": {
+              "enum": [
+                "tracked",
+                "untracked"
+              ]
+            },
+            "state": {
+              "const": "file"
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 134217728
+            },
+            "mode": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4095
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "source_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "dirty",
+        "tracked_changed_path_count",
+        "untracked_path_count",
+        "changed_path_count",
+        "changed_file_bytes",
+        "changed_paths",
+        "tracked_diff_sha256",
+        "worktree_manifest_sha256",
+        "manifest_encoding"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/git_revision"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "tracked_changed_path_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2000
+        },
+        "untracked_path_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2000
+        },
+        "changed_path_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2000
+        },
+        "changed_file_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 536870912
+        },
+        "changed_paths": {
+          "type": "array",
+          "maxItems": 2000,
+          "items": {
+            "$ref": "#/$defs/source_path_entry"
+          }
+        },
+        "tracked_diff_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "worktree_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_encoding": {
+          "const": "sorted compact JSON of revision, tracked_diff_sha256, and changed_paths"
+        }
+      }
+    },
+    "dataset_pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pack_id",
+        "pack_version",
+        "manifest_path",
+        "manifest_sha256",
+        "cases_path",
+        "cases_sha256",
+        "oracle_path",
+        "oracle_sha256",
+        "case_count",
+        "metadata"
+      ],
+      "properties": {
+        "pack_id": {
+          "$ref": "#/$defs/pack_id"
+        },
+        "pack_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "manifest_path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/repository_path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manifest_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cases_path": {
+          "$ref": "#/$defs/repository_path"
+        },
+        "cases_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "oracle_path": {
+          "$ref": "#/$defs/repository_path"
+        },
+        "oracle_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metadata": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/domain_pack_metadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "manifest_path": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "manifest_sha256": {
+                "type": "null"
+              },
+              "metadata": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "manifest_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "metadata": {
+                "$ref": "#/$defs/domain_pack_metadata"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "domain_pack_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "intended_use",
+        "derivation",
+        "oracle_method",
+        "independent_review"
+      ],
+      "properties": {
+        "domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intended_use": {
+          "type": "string",
+          "minLength": 1
+        },
+        "derivation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "oracle_method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "independent_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reviewed_on",
+            "scope",
+            "result"
+          ],
+          "properties": {
+            "reviewed_on": {
+              "type": "string",
+              "format": "date"
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1
+            },
+            "result": {
+              "const": "passed"
+            }
+          }
+        }
+      }
+    },
+    "pricing_contract": {
+      "const": {
+        "version": "openai-gpt-5.6-luna-2026-08-12",
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+        "retrieved_on": "2026-08-12",
+        "currency": "USD",
+        "usd_per_million_tokens": {
+          "input": 0.2,
+          "cached_input": 0.02,
+          "output": 1.2
+        },
+        "cache_write_multiplier": 1.25,
+        "long_context_threshold_tokens": 272000,
+        "long_context_multipliers": {
+          "input": 2.0,
+          "output": 1.5
+        },
+        "approval_budget_usd": 3.0
+      }
+    },
+    "evaluation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "dataset",
+        "flow",
+        "limits",
+        "rate_limit",
+        "pricing",
+        "uncertainty",
+        "selection",
+        "planned_cost_upper_bound_usd",
+        "path",
+        "sha256",
+        "planned_work"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "ironcrew.crew-eval-plan.v2"
+        },
+        "dataset": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "aggregate_sha256",
+            "packs"
+          ],
+          "properties": {
+            "aggregate_sha256": {
+              "const": "bb73ad0d4835a407e22bc35de1562a9f600e33583ec219e40eba2b7b4b0c45cf"
+            },
+            "packs": {
+              "type": "array",
+              "items": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["pack_id", "pack_version", "case_count", "manifest_sha256", "cases_sha256", "oracle_sha256"],
+                  "properties": {
+                    "pack_id": {"const": "synthetic-core-v1"},
+                    "pack_version": {"const": 1},
+                    "case_count": {"const": 6},
+                    "manifest_sha256": {"type": "null"},
+                    "cases_sha256": {"const": "781b46d71581f64ef584d7705dde12b0229ac0a00b23d86013cc8f4a4afdea8f"},
+                    "oracle_sha256": {"const": "a2c5a146301d935cbfe42a7d799d8986b8184702edf2ccebfb4e418065c5e942"}
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["pack_id", "pack_version", "case_count", "manifest_sha256", "cases_sha256", "oracle_sha256"],
+                  "properties": {
+                    "pack_id": {"const": "security-operations"},
+                    "pack_version": {"const": 1},
+                    "case_count": {"const": 3},
+                    "manifest_sha256": {"const": "6b816231a3171082839777f13e81c240acf796d4bec140d04dbffdf6a13bf06b"},
+                    "cases_sha256": {"const": "87d79718140dae0812d4b2233a4506a56e14db7d14eb5600589dfb34e7c38cb8"},
+                    "oracle_sha256": {"const": "7025551183130fd186aec72f734d7ba10db434684ae2fff039bcfd611da9bcf1"}
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["pack_id", "pack_version", "case_count", "manifest_sha256", "cases_sha256", "oracle_sha256"],
+                  "properties": {
+                    "pack_id": {"const": "software-delivery"},
+                    "pack_version": {"const": 1},
+                    "case_count": {"const": 3},
+                    "manifest_sha256": {"const": "865b5bf3c4e76957f5d4eccb23b07bb5181d9b20eb74f1b9ce01ccab10193527"},
+                    "cases_sha256": {"const": "0f39caa0034e38f2386ead97d56e6a366b6ffdf3eda116cd9abd96ae47e32bf9"},
+                    "oracle_sha256": {"const": "9ff5ed17b11049808d8cf6e75c1cad2488ed467e9e41bebcea96390844ceedad"}
+                  }
+                }
+              ],
+              "additionalItems": false,
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        },
+        "flow": {
+          "const": {
+            "path": "crew.lua",
+            "sha256": "bbbdc021f3be7befbacbe4a5f96b6b9994f39b6f8d96e935ab507bd65ea1bfe8",
+            "variants": {
+              "single": {
+                "planned_llm_calls": 1,
+                "maximum_output_tokens": 800,
+                "task_llm_calls": {
+                  "final": 1
+                },
+                "task_maximum_output_tokens": {
+                  "final": 800
+                }
+              },
+              "dag": {
+                "planned_llm_calls": 3,
+                "maximum_output_tokens": 1800,
+                "task_llm_calls": {
+                  "extract": 1,
+                  "challenge": 1,
+                  "final": 1
+                },
+                "task_maximum_output_tokens": {
+                  "extract": 500,
+                  "challenge": 500,
+                  "final": 800
+                }
+              },
+              "collaborative": {
+                "planned_llm_calls": 4,
+                "maximum_output_tokens": 2300,
+                "task_llm_calls": {
+                  "discussion": 3,
+                  "final": 1
+                },
+                "task_maximum_output_tokens": {
+                  "discussion": 1500,
+                  "final": 800
+                }
+              }
+            }
+          }
+        },
+        "limits": {
+          "const": {
+            "max_case_count": 12,
+            "max_repetitions": 5,
+            "max_cli_runs": 180,
+            "max_planned_llm_calls": 480,
+            "max_planned_input_tokens": 9600000,
+            "input_token_costing_allowance_per_request": 20000,
+            "max_provider_request_body_bytes": 18000,
+            "max_completion_tokens_per_request": 800,
+            "max_planned_output_tokens": 294000,
+            "max_case_input_bytes": 65536,
+            "max_single_case_input_bytes": 4096
+          }
+        },
+        "rate_limit": {
+          "const": {
+            "minimum_provider_start_interval_ms": 3200,
+            "rolling_window_seconds": 60,
+            "maximum_provider_starts_per_window": 19,
+            "maximum_token_allowance_per_window": 395200,
+            "reference_rpm": 500,
+            "reference_tpm": 500000,
+            "reference": "openai-gpt-5.6-luna-tier-1-2026-08-12"
+          }
+        },
+        "pricing": {
+          "$ref": "#/$defs/pricing_contract"
+        },
+        "uncertainty": {
+          "const": {
+            "familywise_confidence_level": 0.95,
+            "multiplicity_correction": "bonferroni",
+            "comparison_count": 2,
+            "bootstrap_samples": 10000,
+            "bootstrap_seed": 20260808
+          }
+        },
+        "selection": {
+          "const": {
+            "minimum_paired_count": 60,
+            "minimum_unique_case_count": 12,
+            "minimum_success_rate": 1.0,
+            "minimum_mean_grounded_correctness_delta": 0.05,
+            "minimum_confidence_lower_bound": 0.0,
+            "maximum_mean_token_multiplier": 6.0,
+            "maximum_mean_latency_multiplier": 6.0
+          }
+        },
+        "planned_cost_upper_bound_usd": {
+          "const": 2.7528
+        },
+        "path": {
+          "const": "evaluations/crew-effectiveness/decision-plan.v2.json"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "planned_work": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "case_input_bytes",
+            "maximum_single_case_input_bytes",
+            "cli_runs",
+            "llm_calls",
+            "input_token_costing_allowance",
+            "maximum_output_tokens",
+            "paired_comparisons_per_candidate",
+            "unique_cases",
+            "repetitions",
+            "planned_cost_upper_bound_usd"
+          ],
+          "properties": {
+            "case_input_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65536
+            },
+            "maximum_single_case_input_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            },
+            "cli_runs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 180
+            },
+            "llm_calls": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 480
+            },
+            "input_token_costing_allowance": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9600000
+            },
+            "maximum_output_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 294000
+            },
+            "paired_comparisons_per_candidate": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            "unique_cases": {
+              "const": 12
+            },
+            "repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "planned_cost_upper_bound_usd": {
+              "$ref": "#/$defs/usd"
+            }
+          }
+        }
+      }
+    },
+    "rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "task_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task",
+        "planned_llm_calls",
+        "prompt_token_costing_allowance",
+        "completion_token_limit",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "estimated_cost_upper_bound_usd"
+      ],
+      "properties": {
+        "task": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planned_llm_calls": {
+          "enum": [
+            1,
+            3
+          ]
+        },
+        "prompt_token_costing_allowance": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "completion_token_limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1500
+        },
+        "prompt_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "completion_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1500
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 61500
+        },
+        "cached_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "estimated_cost_upper_bound_usd": {
+          "$ref": "#/$defs/usd"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "task": {
+              "const": "discussion"
+            },
+            "planned_llm_calls": {
+              "const": 3
+            },
+            "prompt_token_costing_allowance": {
+              "const": 60000
+            },
+            "completion_token_limit": {
+              "const": 1500
+            }
+          }
+        },
+        {
+          "properties": {
+            "task": {
+              "const": "final"
+            },
+            "planned_llm_calls": {
+              "const": 1
+            },
+            "prompt_token_costing_allowance": {
+              "const": 20000
+            },
+            "completion_token_limit": {
+              "const": 800
+            }
+          }
+        },
+        {
+          "properties": {
+            "task": {
+              "enum": [
+                "extract",
+                "challenge"
+              ]
+            },
+            "planned_llm_calls": {
+              "const": 1
+            },
+            "prompt_token_costing_allowance": {
+              "const": 20000
+            },
+            "completion_token_limit": {
+              "const": 500
+            }
+          }
+        }
+      ]
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "domain_pack",
+        "variant",
+        "repetition",
+        "planned_llm_calls",
+        "observed_llm_calls",
+        "execution_ok",
+        "output_parse_ok",
+        "output_schema_ok",
+        "failure_reason",
+        "client_duration_ms",
+        "run_duration_ms",
+        "run_id",
+        "run_status",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "estimated_cost_upper_bound_usd",
+        "task_usage",
+        "agent_count",
+        "task_count",
+        "task_names",
+        "task_failures",
+        "model_output",
+        "answers_total",
+        "answers_correct",
+        "grounded_correct",
+        "correctness",
+        "grounded_correctness",
+        "citation_tp",
+        "citation_fp",
+        "citation_fn",
+        "citation_precision",
+        "citation_recall",
+        "citation_f1",
+        "answer_details"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain_pack": {
+          "$ref": "#/$defs/pack_id"
+        },
+        "variant": {
+          "enum": [
+            "single",
+            "dag",
+            "collaborative"
+          ]
+        },
+        "repetition": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "planned_llm_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_llm_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "execution_ok": {
+          "type": "boolean"
+        },
+        "output_parse_ok": {
+          "type": "boolean"
+        },
+        "output_schema_ok": {
+          "type": "boolean"
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "run_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prompt_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "completion_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_cost_upper_bound_usd": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/usd"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_usage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/task_usage"
+          }
+        },
+        "agent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "task_failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_output": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "answers_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "answers_correct": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "grounded_correct": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "grounded_correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_tp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_fp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_fn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "citation_precision": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_recall": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_f1": {
+          "$ref": "#/$defs/rate"
+        },
+        "answer_details": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variant",
+        "run_count",
+        "execution_success_rate",
+        "parse_success_rate",
+        "schema_success_rate",
+        "correctness",
+        "grounded_correctness",
+        "citation_precision",
+        "citation_recall",
+        "citation_f1",
+        "latency_ms",
+        "tokens"
+      ],
+      "properties": {
+        "variant": {
+          "enum": [
+            "single",
+            "dag",
+            "collaborative"
+          ]
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "execution_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "parse_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "schema_success_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "grounded_correctness": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_precision": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_recall": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_f1": {
+          "$ref": "#/$defs/rate"
+        },
+        "latency_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "median",
+            "p95",
+            "observed_count",
+            "coverage_complete"
+          ],
+          "properties": {
+            "median": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "p95": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "coverage_complete": {
+              "type": "boolean"
+            }
+          }
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "median",
+            "total",
+            "observed_count",
+            "coverage_complete"
+          ],
+          "properties": {
+            "median": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "total": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "coverage_complete": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "confidence_level",
+        "familywise_confidence_level",
+        "multiplicity_correction",
+        "comparison_count",
+        "samples",
+        "seed",
+        "lower",
+        "upper"
+      ],
+      "properties": {
+        "method": {
+          "const": "paired-case-bootstrap-percentile-v1"
+        },
+        "confidence_level": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 0.999
+        },
+        "familywise_confidence_level": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 0.999
+        },
+        "multiplicity_correction": {
+          "const": "bonferroni"
+        },
+        "comparison_count": {
+          "const": 2
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 100
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lower": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "upper": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        }
+      }
+    }
+  }
+}

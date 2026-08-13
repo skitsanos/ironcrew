@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal     = "Inspect the current Git repository and summarise recent activity",
     provider = "openai",
-    model    = "gpt-4.1-mini",
+    model    = "gpt-5.6-luna",
 
     -- Declare MCP servers. Tools become available as mcp__<label>__<tool_name>.
     mcp_servers = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import shutil
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -260,6 +261,8 @@ class PairwiseTests(unittest.TestCase):
             mode="live",
             timeout_seconds=1,
             planned_llm_calls=1,
+            task_llm_calls={"final": 1},
+            task_maximum_output_tokens={"final": 800},
             base_environment={},
             mock_server=None,
         )
@@ -297,6 +300,8 @@ class PairwiseTests(unittest.TestCase):
                     mode="live",
                     timeout_seconds=1,
                     planned_llm_calls=1,
+                    task_llm_calls={"final": 1},
+                    task_maximum_output_tokens={"final": 800},
                     base_environment={},
                     mock_server=None,
                 )
@@ -336,6 +341,159 @@ class PairwiseTests(unittest.TestCase):
         self.assertFalse(summaries["single"]["tokens"]["coverage_complete"])
         self.assertFalse(summaries["single"]["latency_ms"]["coverage_complete"])
         self.assertEqual(summaries["dag"]["tokens"]["total"], 20)
+
+
+class ExecutionBoundaryTests(unittest.TestCase):
+    def test_schema_validation_environment_excludes_provider_credentials(self) -> None:
+        minimized = evaluate.schema_validation_environment(
+            {
+                "PATH": "/bin",
+                "SSL_CERT_FILE": "/tmp/cert.pem",
+                "TMPDIR": "/tmp",
+                "IRONCREW_LOG": "error",
+                "OPENAI_API_KEY": "secret-canary",
+                "OPENAI_BASE_URL": "https://api.openai.com/v1",
+                "OPENAI_MODEL": "gpt-5.6-luna",
+                "IRONCREW_PROVIDER_MAX_REQUEST_BYTES": "18000",
+            }
+        )
+        self.assertEqual(
+            minimized,
+            {
+                "PATH": "/bin",
+                "SSL_CERT_FILE": "/tmp/cert.pem",
+                "TMPDIR": "/tmp",
+                "IRONCREW_LOG": "error",
+            },
+        )
+
+    def test_large_report_uses_scoped_modules_not_process_arguments_or_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="ironcrew-validator-transport-") as temporary:
+            root = Path(temporary)
+            validator = root / "validate-report.lua"
+            schema = root / "report-v3.schema.json"
+            report = root / "large-report.json"
+            validator.write_text("return true\n", encoding="utf-8")
+            schema.write_text('{"type":"object"}\n', encoding="utf-8")
+            large_marker = "large-report-marker-" + "x" * 256_000
+            report.write_text(json.dumps({"marker": large_marker}), encoding="utf-8")
+
+            def completed(arguments: list[str], **kwargs: object) -> mock.Mock:
+                import report_schema_validation
+
+                serialized_arguments = "\n".join(arguments)
+                self.assertNotIn(large_marker, serialized_arguments)
+                self.assertNotIn(str(report), serialized_arguments)
+                self.assertLess(max(len(argument) for argument in arguments), 4_096)
+                self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+
+                payload = json.loads(arguments[arguments.index("--input") + 1])
+                self.assertEqual(set(payload), {"schema_chunks", "report_chunks"})
+                self.assertGreater(payload["report_chunks"], 1)
+
+                module_directory = Path(kwargs["cwd"]) / "_lib"
+                modules = [
+                    module_directory / f"validator_report_{index:04d}.lua"
+                    for index in range(1, payload["report_chunks"] + 1)
+                ]
+                self.assertTrue(all(module.is_file() for module in modules))
+                self.assertTrue(
+                    all(
+                        module.stat().st_size
+                        <= report_schema_validation.MODULE_CHUNK_BYTES + 16
+                        for module in modules
+                    )
+                )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(evaluate.subprocess, "run", side_effect=completed):
+                error = evaluate.validate_report_with_ironcrew(
+                    binary=Path("/tmp/unused-mocked-ironcrew"),
+                    repo_root=root,
+                    validator_path=validator,
+                    schema_path=schema,
+                    report_path=report,
+                    environment={
+                        "PATH": "/bin",
+                        "OPENAI_API_KEY": "secret-canary",
+                    },
+                )
+            self.assertIsNone(error)
+
+    def test_report_validator_rejects_schema_outside_repository(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ironcrew-validator-root-") as temporary:
+            temporary_root = Path(temporary)
+            root = temporary_root / "repository"
+            root.mkdir()
+            validator = root / "validate-report.lua"
+            report = root / "report.json"
+            schema = temporary_root / "outside-schema.json"
+            validator.write_text("return true\n", encoding="utf-8")
+            report.write_text("{}\n", encoding="utf-8")
+            schema.write_text("{}\n", encoding="utf-8")
+
+            with mock.patch.object(evaluate.subprocess, "run") as run:
+                error = evaluate.validate_report_with_ironcrew(
+                    binary=Path("/tmp/unused-mocked-ironcrew"),
+                    repo_root=root,
+                    validator_path=validator,
+                    schema_path=schema,
+                    report_path=report,
+                    environment={"PATH": "/bin"},
+                )
+
+            self.assertIn("schema must be a regular file inside the repository", error)
+            run.assert_not_called()
+
+    def test_report_validator_rejects_document_over_two_mebibytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ironcrew-validator-limit-") as temporary:
+            root = Path(temporary)
+            validator = root / "validate-report.lua"
+            schema = root / "report-v3.schema.json"
+            report = root / "oversized-report.json"
+            validator.write_text("return true\n", encoding="utf-8")
+            schema.write_text('{"type":"object"}\n', encoding="utf-8")
+            report.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+            with mock.patch.object(evaluate.subprocess, "run") as run:
+                error = evaluate.validate_report_with_ironcrew(
+                    binary=Path("/tmp/unused-mocked-ironcrew"),
+                    repo_root=root,
+                    validator_path=validator,
+                    schema_path=schema,
+                    report_path=report,
+                    environment={"PATH": "/bin"},
+                )
+
+            self.assertIn("report document exceeds the validator document limit", error)
+            run.assert_not_called()
+
+    def test_live_controls_force_reviewed_byte_and_pacing_boundaries(self) -> None:
+        environment: dict[str, str] = {}
+        plan = {
+            "limits": {"max_provider_request_body_bytes": 18_000},
+            "rate_limit": {"minimum_provider_start_interval_ms": 3_200},
+        }
+        evaluate.apply_live_provider_controls(environment, plan)
+        self.assertEqual(environment["IRONCREW_PROVIDER_MAX_REQUEST_BYTES"], "18000")
+        self.assertEqual(environment["IRONCREW_RATE_LIMIT_MS"], "3200")
+
+    def test_live_process_pacer_waits_after_success_or_failure_completion(self) -> None:
+        now = [10.0]
+        sleeps: list[float] = []
+        pacer = evaluate.LiveProcessPacer(
+            3_200,
+            clock=lambda: now[0],
+            sleeper=lambda delay: sleeps.append(delay),
+        )
+        pacer.wait_before_start()
+        pacer.record_completion()
+        now[0] = 11.0
+        pacer.wait_before_start()
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 2.2)
 
 
 if __name__ == "__main__":

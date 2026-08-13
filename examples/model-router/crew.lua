@@ -2,18 +2,18 @@
     Model Router Example
 
     Demonstrates routing different tasks to different models.
-    Cheap tasks use fast/cheap models, complex tasks use capable models.
+    Efficient tasks use Luna; complex synthesis and explicit overrides use Terra.
 ]]
 
 local crew = Crew.new({
     goal = "Demonstrate model routing for cost optimization",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",  -- default
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",  -- default
     base_url = env("OPENAI_BASE_URL"),
     models = {
-        task_execution = env("OPENAI_MODEL") or "gpt-4o-mini",
-        collaboration = env("OPENAI_MODEL") or "gpt-4o-mini",
-        collaboration_synthesis = env("OPENAI_MODEL") or "gpt-4o-mini",
+        task_execution = env("OPENAI_MODEL") or "gpt-5.6-luna",
+        collaboration = env("OPENAI_MODEL") or "gpt-5.6-luna",
+        collaboration_synthesis = "gpt-5.6-terra",
     },
 })
 
@@ -27,7 +27,7 @@ crew:add_agent(Agent.new({
     name = "smart_agent",
     goal = "Handle complex analysis tasks",
     capabilities = {"analysis", "reasoning"},
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",  -- agent-level override
+    model = "gpt-5.6-terra",  -- agent-level override
 }))
 
 -- Simple task: uses crew default model (via router)
@@ -49,7 +49,7 @@ crew:add_task({
 crew:add_task({
     name = "specific_model_task",
     description = "Name one advantage of Rust in one sentence.",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = "gpt-5.6-terra",
     depends_on = {"quick_task"},
 })
 

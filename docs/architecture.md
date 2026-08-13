@@ -263,10 +263,10 @@ When executing a task, the model is resolved through a priority chain:
 
 ```lua
 local crew = Crew.new({
-    model = "gpt-4.1-mini",        -- default fallback
+    model = "gpt-5.6-luna",        -- default fallback
     models = {
         task_execution = "gpt-4o",
-        collaboration = "gpt-4.1-mini",
+        collaboration = "gpt-5.6-luna",
     },
 })
 ```
@@ -360,15 +360,16 @@ Run records are persisted via a pluggable `StateStore` trait:
 - **PostgreSQL** — durable cloud records and restart recovery, with JSONB
   columns for native SQL queries. It coordinates idempotency-keyed cancellation,
   encrypted HITL, bounded run SSE replay, leases, and exact drain fences across
-  replicas. The reviewed IC-008 worktree also rehydrates a keyed conversation
-  turn from a committed incarnation/revision on either replica; its local
-  two-process PostgreSQL gate and affinity-free OpenShift canary pass. Railway
+  replicas. The committed IC-008 implementation also rehydrates a keyed
+  conversation turn from a committed incarnation/revision on either replica;
+  its local two-process PostgreSQL gate and affinity-free OpenShift canary pass.
+  Railway
   was not run, and the tested dirty artifact was unpublished and removed. The
   result does not transfer in-flight Lua/provider/tool execution, and
   PostgreSQL conversation SSE is unsupported, so the general-purpose
-  `ironcrew serve` baseline remains one replica until the behavior is released
-  and whenever clients need an owner-local surface; horizontal serving is
-  limited to the documented PostgreSQL slice.
+  `ironcrew serve` baseline remains one replica until a published release
+  contains the behavior and whenever clients need an owner-local surface;
+  horizontal serving is limited to the documented PostgreSQL slice.
 
 Set `IRONCREW_STORE` to `sqlite` or `postgres` to switch backends. See
 [Storage](storage.md) for full configuration and [CLI Reference](cli.md) for

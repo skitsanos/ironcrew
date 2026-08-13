@@ -8,10 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-009](docs/issues/IC-009.md) | P1 | In progress | Product evidence | Crew effectiveness evidence is too small for product claims |
-| [IC-011](docs/issues/IC-011.md) | P2 | Open | Maintainability | Legacy oversized Rust modules lack a growth ratchet |
-| [IC-014](docs/issues/IC-014.md) | P1 | Open | Release security | Release publication lacks a platform-enforced trusted control plane |
-| [IC-018](docs/issues/IC-018.md) | P2 | Open | Replica capacity | Replica soak lacks retention-boundary steady-state evidence |
+| — | — | — | — | No active findings |
 
 ## Working agreement
 

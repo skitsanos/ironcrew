@@ -65,6 +65,7 @@ long system prompts increase token costs on every request.
 
 **Temperature.** Set `temperature` low (0.1-0.3) for deterministic extraction tasks
 and higher (0.5-0.8) for creative generation. The default is provider-dependent.
+For `gpt-5.6-luna`, omit `temperature` and use the provider default.
 
 ## Task Design
 
@@ -172,9 +173,13 @@ Tasks in the same dependency phase execute in parallel. A concurrency semaphore
 always applies — crew `max_concurrent` > `IRONCREW_DEFAULT_MAX_CONCURRENT` env
 var > default of 4. This prevents resource exhaustion in phases with many tasks.
 
-**Model routing.** Use cheap models (`gpt-4.1-mini`, `gemini-2.5-flash`) for simple
+**Model routing.** Use efficient models (`gpt-5.6-luna`, `gemini-2.5-flash`) for simple
 tasks and reserve capable models for reasoning. Set `models` on the crew or
 `model` on individual agents and tasks.
+
+When `gpt-5.6-luna` is effective, omit explicit `temperature` values. Luna
+accepts only its provider default, and IronCrew forwards configured values
+rather than silently discarding an unsupported non-default setting.
 
 **Streaming.** Enable `stream = true` on the crew or individual tasks to get
 LLM output as it arrives. When reasoning-capable providers are used
@@ -319,15 +324,15 @@ idempotency-keyed cancellation and, with the shared HITL encryption keyring,
 encrypted cross-replica question listing/answer delivery. Its bounded run-event
 journal also supports cross-replica run SSE replay with `Last-Event-ID`;
 JSON/SQLite run and conversation SSE remain process-local, while PostgreSQL
-conversation SSE returns `409` unsupported. The reviewed worktree lets a keyed
-PostgreSQL conversation message cold-rehydrate from its
-incarnation/revision-fenced transcript on either replica. Its local two-process
+conversation SSE returns `409` unsupported. The committed IC-008
+implementation lets a keyed PostgreSQL conversation message cold-rehydrate
+from its incarnation/revision-fenced transcript on either replica. Its local two-process
 gate and affinity-free OpenShift canary pass; Railway remains unrun, and the
 tested dirty artifact was unpublished and removed. PostgreSQL still does not
 distribute an in-flight Lua/provider/tool turn, and shared conversation SSE is
-unsupported. Keep one replica until the behavior is released, on Railway until
-its own IC-008 canary passes, or whenever clients require the remaining
-owner-local surfaces through arbitrary routing. Pool size is configurable via
+unsupported. Keep one replica until a published release contains the behavior,
+on Railway until its own IC-008 canary passes, or whenever clients require the
+remaining owner-local surfaces through arbitrary routing. Pool size is configurable via
 `IRONCREW_DB_POOL_SIZE` (default 10). Table prefix (`IRONCREW_PG_TABLE_PREFIX`)
 allows sharing a database across projects — at most 37 lowercase ASCII letters,
 digits, and underscores are allowed.

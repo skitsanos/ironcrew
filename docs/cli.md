@@ -605,6 +605,7 @@ provider response and are not billing data.
 | `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | Maximum serialized `http_request` result after JSON escaping/formatting (default: `16777216` = 16 MiB) |
 | `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parse. Default: `2097152` (2 MiB) |
 | `IRONCREW_MAX_IMAGE_BYTES` | Per-image cap for local and remote image inputs (default: `20971520` = 20 MiB) |
+| `IRONCREW_PROVIDER_MAX_REQUEST_BYTES` | Maximum serialized provider JSON request body, enforced before network send (default: `33554432` = 32 MiB; hard maximum: `268435456` = 256 MiB) |
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | Maximum non-streaming provider response body (default: `16777216` = 16 MiB) |
 | `IRONCREW_PROVIDER_MAX_ERROR_BYTES` | Maximum provider/remote-image error body retained (default: `262144` = 256 KiB) |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | Maximum raw provider SSE bytes consumed for one streaming response (default: `33554432` = 32 MiB) |

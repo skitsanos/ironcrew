@@ -5,6 +5,15 @@ pub enum IronCrewError {
     #[error("LLM provider error: {0}")]
     Provider(String),
 
+    #[error(
+        "{provider} request body is {actual} bytes, exceeding the configured {limit}-byte limit"
+    )]
+    ProviderRequestTooLarge {
+        provider: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+
     #[error("Tool execution error: {tool}: {message}")]
     ToolExecution { tool: String, message: String },
 

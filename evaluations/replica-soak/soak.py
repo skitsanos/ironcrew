@@ -15,11 +15,9 @@ import json
 import math
 import os
 import platform
-import random
 import re
 import secrets
 import shutil
-import signal
 import statistics
 import subprocess
 import sys
@@ -29,17 +27,29 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from replica_topology import (
-    host_rss_pass_criterion,
     sample_replica_topology,
     topology_pass_criterion,
 )
+from soak_contract import IntervalRecorder, load_contract
+from soak_contract_evaluation import evaluate_contract
+from soak_metrics import OperationMetrics, percentile
+from soak_reporting import aggregate_workload, build_pass_criteria
+from soak_retention_probe import (
+    delayed_replay_probe,
+    post_cleanup_inventory_sql,
+)
+from soak_runtime_environment import child_environment
+from soak_runtime_logs import (
+    ReplicaLauncher,
+    runtime_log_criterion,
+)
+from source_provenance import safe_binary_path, worktree_provenance
 
 
 SCHEMA_VERSION = "ironcrew.replica-soak.v2"
@@ -60,20 +70,12 @@ TABLE_SUFFIXES = (
     "run_event_usage",
 )
 PREFIX_PATTERN = re.compile(r"[a-z][a-z0-9_]{2,31}")
-MAX_LATENCY_SAMPLES = 10_000
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_RUN_DETAILS_HARD = 1_000
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def percentile(sorted_values: list[float], quantile: float) -> float | None:
-    if not sorted_values:
-        return None
-    index = max(0, math.ceil(quantile * len(sorted_values)) - 1)
-    return round(sorted_values[index], 3)
 
 
 def sanitize_error(error: BaseException | str, secrets_to_remove: tuple[str, ...] = ()) -> str:
@@ -116,91 +118,6 @@ def sse_event_payload(event: dict[str, Any]) -> Any:
     ):
         return payload["data"]
     return payload
-
-
-class OperationMetrics:
-    """Thread-safe bounded latency/error accumulator with reservoir sampling."""
-
-    def __init__(self, max_samples: int = MAX_LATENCY_SAMPLES) -> None:
-        self._lock = threading.Lock()
-        self._max_samples = max_samples
-        self._rng = random.Random(0x1A0C0E)
-        self._operations: dict[str, dict[str, Any]] = {}
-
-    def record(
-        self,
-        operation: str,
-        latency_ms: float,
-        status: int | None,
-        ok: bool,
-        error_kind: str | None = None,
-        response_bytes: int = 0,
-    ) -> None:
-        with self._lock:
-            entry = self._operations.setdefault(
-                operation,
-                {
-                    "count": 0,
-                    "ok": 0,
-                    "errors": 0,
-                    "sum_latency_ms": 0.0,
-                    "max_latency_ms": 0.0,
-                    "response_bytes": 0,
-                    "status_counts": Counter(),
-                    "error_kinds": Counter(),
-                    "samples": [],
-                },
-            )
-            entry["count"] += 1
-            entry["ok" if ok else "errors"] += 1
-            entry["sum_latency_ms"] += latency_ms
-            entry["max_latency_ms"] = max(entry["max_latency_ms"], latency_ms)
-            entry["response_bytes"] += response_bytes
-            entry["status_counts"][str(status) if status is not None else "none"] += 1
-            if error_kind:
-                entry["error_kinds"][error_kind] += 1
-            samples: list[float] = entry["samples"]
-            if len(samples) < self._max_samples:
-                samples.append(latency_ms)
-            else:
-                replacement = self._rng.randrange(entry["count"])
-                if replacement < self._max_samples:
-                    samples[replacement] = latency_ms
-
-    def count(self, operation: str) -> int:
-        with self._lock:
-            return int(self._operations.get(operation, {}).get("count", 0))
-
-    def total_latency_ms(self, operation: str) -> float:
-        with self._lock:
-            return float(self._operations.get(operation, {}).get("sum_latency_ms", 0.0))
-
-    def report(self) -> dict[str, Any]:
-        output: dict[str, Any] = {}
-        with self._lock:
-            snapshot = list(self._operations.items())
-        for operation, entry in sorted(snapshot):
-            samples = sorted(entry["samples"])
-            count = entry["count"]
-            output[operation] = {
-                "count": count,
-                "ok": entry["ok"],
-                "errors": entry["errors"],
-                "error_rate": round(entry["errors"] / count, 6) if count else 0.0,
-                "response_bytes": entry["response_bytes"],
-                "latency_ms": {
-                    "mean": round(entry["sum_latency_ms"] / count, 3) if count else None,
-                    "p50": percentile(samples, 0.50),
-                    "p95": percentile(samples, 0.95),
-                    "p99": percentile(samples, 0.99),
-                    "max": round(entry["max_latency_ms"], 3) if count else None,
-                    "sampled_count": len(samples),
-                    "percentiles_approximate": count > len(samples),
-                },
-                "status_counts": dict(sorted(entry["status_counts"].items())),
-                "error_kinds": dict(sorted(entry["error_kinds"].items())),
-            }
-        return output
 
 
 @dataclass
@@ -299,6 +216,7 @@ class HttpClient:
         current_event = "message"
         current_id: str | None = None
         data_lines: list[str] = []
+        journal_gaps: list[dict[str, Any]] = []
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 for raw_line in response:
@@ -309,6 +227,26 @@ class HttpClient:
                         raise RuntimeError("SSE response exceeded configured byte limit")
                     line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
                     if not line:
+                        data_text = "\n".join(data_lines)
+                        try:
+                            data = json.loads(data_text) if data_text else None
+                        except json.JSONDecodeError:
+                            data = data_text
+                        if current_event == "journal_gap" and len(journal_gaps) < 100:
+                            gap = sse_event_payload(
+                                {"event": current_event, "data": data}
+                            )
+                            if isinstance(gap, dict):
+                                journal_gaps.append(
+                                    {
+                                        key: gap.get(key)
+                                        for key in (
+                                            "first_sequence",
+                                            "last_sequence",
+                                            "reason",
+                                        )
+                                    }
+                                )
                         if current_event == expected_event:
                             latency_ms = (time.perf_counter() - started) * 1000
                             self.metrics.record(
@@ -318,17 +256,13 @@ class HttpClient:
                                 True,
                                 response_bytes=total_bytes,
                             )
-                            data_text = "\n".join(data_lines)
-                            try:
-                                data = json.loads(data_text) if data_text else None
-                            except json.JSONDecodeError:
-                                data = data_text
                             return {
                                 "event": current_event,
                                 "id": current_id,
                                 "data": data,
                                 "bytes": total_bytes,
                                 "latency_ms": latency_ms,
+                                "journal_gaps": journal_gaps,
                             }
                         current_event = "message"
                         current_id = None
@@ -469,6 +403,7 @@ class ResourceSampler:
         self.max_timeline_samples = max_timeline_samples
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.thread_stopped: bool | None = None
         self.started_monotonic = time.monotonic()
         self.samples: dict[str, dict[str, Any]] = {
             name: {
@@ -488,13 +423,18 @@ class ResourceSampler:
         }
 
     def start(self) -> None:
+        self.thread_stopped = False
         self.thread = threading.Thread(target=self._run, name="resource-sampler", daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
         if self.thread:
-            self.thread.join(timeout=max(2.0, self.interval * 3))
+            self.thread.join(timeout=max(2.0, len(self.pids) * 2.0 + self.interval + 1.0))
+            self.thread_stopped = not self.thread.is_alive()
+            if not self.thread_stopped:
+                raise RuntimeError("resource sampler did not stop within its bounded timeout")
+            self.thread = None
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -573,6 +513,7 @@ class ResourceSampler:
         }
         return {
             "replicas": result,
+            "sampler_thread_stopped": self.thread_stopped,
             "cgroup_scope": {
                 "distinct_paths": sorted(cgroup_paths),
                 "shared_between_replicas": len(cgroup_paths) == 1 and len(result) == 2,
@@ -703,6 +644,7 @@ def postgres_snapshot_sql(prefix: str) -> str:
         for table in tables
     )
     events = f"{prefix}run_events"
+    event_state = f"{prefix}run_event_state"
     usage = f"{prefix}run_event_usage"
     human = f"{prefix}human_inputs"
     return f"""
@@ -774,9 +716,21 @@ SELECT json_build_object(
             'retained_events', retained_events,
             'retained_bytes', retained_bytes,
             'actual_rows', (SELECT COUNT(*)::bigint FROM {events}),
+            'expired_physical_rows', (
+                SELECT COUNT(*) FILTER (WHERE expires_at <= clock_timestamp())::bigint
+                FROM {events}
+            ),
             'payload_bytes', (SELECT COALESCE(SUM(payload_bytes), 0)::bigint FROM {events}),
             'accounted_bytes', (SELECT COALESCE(SUM(accounted_bytes), 0)::bigint FROM {events})
         ) FROM {usage} WHERE singleton = TRUE
+    ),
+    'retention_state', (
+        SELECT json_build_object(
+            'gap_runs', COUNT(*) FILTER (WHERE eviction_reason = 'retention')::bigint,
+            'dropped_sequences', COALESCE(
+                SUM(dropped_through) FILTER (WHERE eviction_reason = 'retention'), 0
+            )::bigint
+        ) FROM {event_state}
     ),
     'human_input_rows', (
         SELECT json_build_object(
@@ -896,6 +850,8 @@ def postgres_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, A
     }
     accounting_before = before.get("journal_accounting") or {}
     accounting_after = after.get("journal_accounting") or {}
+    retention_before = before.get("retention_state") or {}
+    retention_after = after.get("retention_state") or {}
     human_before = before.get("human_input_rows") or {}
     human_after = after.get("human_input_rows") or {}
     return {
@@ -920,9 +876,14 @@ def postgres_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, A
                 "retained_events",
                 "retained_bytes",
                 "actual_rows",
+                "expired_physical_rows",
                 "payload_bytes",
                 "accounted_bytes",
             )
+        },
+        "retention_state": {
+            key: numeric_delta(retention_before.get(key), retention_after.get(key))
+            for key in ("gap_runs", "dropped_sequences")
         },
         "human_input_rows": {
             key: numeric_delta(human_before.get(key), human_after.get(key))
@@ -1021,77 +982,6 @@ def docker_pid(container: str) -> int | None:
     return pid
 
 
-class ReplicaLauncher:
-    def __init__(self, report_dir: Path) -> None:
-        self.report_dir = report_dir
-        self.processes: dict[str, subprocess.Popen[bytes]] = {}
-        self.logs: dict[str, Any] = {}
-
-    def start(
-        self,
-        name: str,
-        binary: Path,
-        host: str,
-        port: int,
-        environment: dict[str, str],
-    ) -> subprocess.Popen[bytes]:
-        log_path = self.report_dir / f"replica-{name}.log"
-        log_handle = log_path.open("wb")
-        command = [
-            str(binary),
-            "serve",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--flows-dir",
-            str(FLOW_ROOT),
-        ]
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=environment,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=os.name == "posix",
-        )
-        self.processes[name] = process
-        self.logs[name] = log_handle
-        return process
-
-    def stop_all(self, grace_seconds: float = 10.0) -> dict[str, Any]:
-        outcome: dict[str, Any] = {}
-        for name, process in self.processes.items():
-            if process.poll() is None:
-                try:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGTERM)
-                    else:
-                        process.terminate()
-                except ProcessLookupError:
-                    pass
-        deadline = time.monotonic() + grace_seconds
-        for name, process in self.processes.items():
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                process.wait(timeout=remaining)
-                forced = False
-            except subprocess.TimeoutExpired:
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    process.kill()
-                process.wait(timeout=5)
-                forced = True
-            outcome[name] = {"exit_code": process.returncode, "forced_kill": forced}
-        for handle in self.logs.values():
-            handle.close()
-        return outcome
-
-
 def wait_ready(
     client: HttpClient,
     base_url: str,
@@ -1114,45 +1004,6 @@ def wait_ready(
     raise RuntimeError(f"replica readiness timed out; last HTTP status={last_status}")
 
 
-def child_environment(
-    args: argparse.Namespace,
-    instance_id: str,
-    token: str,
-    prefix: str,
-    keyring_json: str,
-) -> dict[str, str]:
-    environment = os.environ.copy()
-    for name in ("PORT", "IRONCREW_PORT", "IRONCREW_HOST"):
-        environment.pop(name, None)
-    environment.update(
-        {
-            "IRONCREW_STORE": "postgres",
-            "DATABASE_URL": args.database_url,
-            "IRONCREW_PG_TABLE_PREFIX": prefix,
-            "IRONCREW_INSTANCE_ID": instance_id,
-            "IRONCREW_API_TOKEN": token,
-            "IRONCREW_REQUIRE_IDEMPOTENCY_KEY": "true",
-            "IRONCREW_HITL_ENCRYPTION_KEYS": keyring_json,
-            "IRONCREW_HITL_ACTIVE_KEY_ID": "soak-v1",
-            "IRONCREW_DB_POOL_SIZE": str(args.db_pool_size),
-            "IRONCREW_MAX_ACTIVE_RUNS": str(args.max_active_runs),
-            "IRONCREW_MAX_SSE_CONNECTIONS": str(max(4, args.max_active_runs * 2)),
-            "IRONCREW_HITL_POLL_INTERVAL_MS": str(args.hitl_poll_ms),
-            "IRONCREW_HITL_PG_MAX_CONCURRENT_READS": str(args.hitl_pg_reads),
-            "IRONCREW_EVENT_JOURNAL_POLL_INTERVAL_MS": str(args.journal_poll_ms),
-            "IRONCREW_MAX_EVENTS": str(args.max_events),
-            "IRONCREW_RUN_LEASE_TTL_SECONDS": "10",
-            "IRONCREW_EVENT_JOURNAL_RETENTION_SECS": "600",
-            "IRONCREW_LOG": args.log_level,
-            # Fail closed even if this fixture is accidentally changed to call
-            # crew:run(). Existing values beat repository .env loading.
-            "OPENAI_API_KEY": "replica-soak-no-network",
-            "OPENAI_BASE_URL": "http://127.0.0.1:9/v1",
-        }
-    )
-    return environment
-
-
 class RunAllocator:
     def __init__(self, maximum: int, deadline: float) -> None:
         self.maximum = maximum
@@ -1167,6 +1018,10 @@ class RunAllocator:
             index = self.next_index
             self.next_index += 1
             return index
+
+    def stop_reason(self) -> str:
+        with self.lock:
+            return "run_cap" if self.next_index >= self.maximum else "duration"
 
 
 def execute_run(
@@ -1213,6 +1068,7 @@ def execute_run(
         cursor = initial_sse.get("id")
         if not isinstance(cursor, str) or not cursor.startswith(f"{run_id}:"):
             raise RuntimeError("initial SSE omitted a run-scoped cursor")
+        result["_replay_cursor"] = cursor
         pending_started = time.perf_counter()
         question: dict[str, Any] | None = None
         question_deadline = time.monotonic() + args.request_timeout
@@ -1295,7 +1151,7 @@ def run_workload(
     bases: tuple[str, str],
     client: HttpClient,
     args: argparse.Namespace,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     allocator = RunAllocator(args.runs, time.monotonic() + args.duration_seconds)
     results: list[dict[str, Any]] = []
     results_lock = threading.Lock()
@@ -1312,7 +1168,7 @@ def run_workload(
         futures = [executor.submit(worker) for _ in range(args.concurrency)]
         for future in futures:
             future.result()
-    return sorted(results, key=lambda item: item["index"])
+    return sorted(results, key=lambda item: item["index"]), allocator.stop_reason()
 
 
 class HealthProbe:
@@ -1429,6 +1285,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hitl-pg-reads", type=int, default=2)
     parser.add_argument("--journal-poll-ms", type=int, default=500)
     parser.add_argument("--max-events", type=int, default=200)
+    parser.add_argument("--event-replay-max-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--event-max-bytes", type=int, default=256 * 1024)
+    parser.add_argument("--journal-retention-seconds", type=int, default=600)
+    parser.add_argument("--journal-max-total-events", type=int, default=100_000)
+    parser.add_argument("--journal-max-total-bytes", type=int, default=256 * 1024 * 1024)
+    parser.add_argument("--journal-page-max-bytes", type=int, default=512 * 1024)
+    parser.add_argument("--journal-read-timeout-ms", type=int, default=2_000)
+    parser.add_argument("--journal-write-timeout-ms", type=int, default=1_500)
+    parser.add_argument("--journal-prune-batch", type=int, default=1_000)
     parser.add_argument(
         "--memory-comparator-mib",
         type=int,
@@ -1436,6 +1301,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="report-only Railway/OpenShift comparator; never enforced locally",
     )
     parser.add_argument("--log-level", default="warn")
+    parser.add_argument("--contract", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
 
@@ -1458,6 +1324,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         bounded_int("hitl-pg-reads", args.hitl_pg_reads, 1, 64)
         bounded_int("journal-poll-ms", args.journal_poll_ms, 100, 5000)
         bounded_int("max-events", args.max_events, 1, 10_000)
+        bounded_int(
+            "event-replay-max-bytes", args.event_replay_max_bytes, 1024, 64 * 1024 * 1024
+        )
+        bounded_int("event-max-bytes", args.event_max_bytes, 1024, 16 * 1024 * 1024)
+        bounded_int(
+            "journal-retention-seconds", args.journal_retention_seconds, 60, 2_592_000
+        )
+        bounded_int(
+            "journal-max-total-events", args.journal_max_total_events, 1, 10_000_000
+        )
+        bounded_int(
+            "journal-max-total-bytes",
+            args.journal_max_total_bytes,
+            4 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        )
+        bounded_int("journal-prune-batch", args.journal_prune_batch, 1, 10_000)
+        bounded_int(
+            "journal-page-max-bytes", args.journal_page_max_bytes, 1024, 64 * 1024 * 1024
+        )
+        bounded_int(
+            "journal-read-timeout-ms", args.journal_read_timeout_ms, 100, 30_000
+        )
+        bounded_int(
+            "journal-write-timeout-ms", args.journal_write_timeout_ms, 100, 5_000
+        )
         bounded_int("expected-instance-count", args.expected_instance_count, 2, 50)
         bounded_int("capability-samples", args.capability_samples, 1, 10_000)
         bounded_int("memory-comparator-mib", args.memory_comparator_mib, 64, 1024 * 1024)
@@ -1488,6 +1380,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("load-balanced target mode accepts one route; omit --base-b")
     if args.capability_samples < args.expected_instance_count:
         parser.error("--capability-samples must be at least --expected-instance-count")
+    if args.journal_max_total_events < args.max_events:
+        parser.error("--journal-max-total-events must be at least --max-events")
+    if args.journal_prune_batch > args.journal_max_total_events:
+        parser.error("--journal-prune-batch must not exceed --journal-max-total-events")
+    if args.event_max_bytes > args.event_replay_max_bytes:
+        parser.error("--event-max-bytes must not exceed --event-replay-max-bytes")
+    if args.event_max_bytes > args.journal_page_max_bytes:
+        parser.error("--event-max-bytes must not exceed --journal-page-max-bytes")
+    if args.event_replay_max_bytes > args.journal_max_total_bytes:
+        parser.error("--event-replay-max-bytes must not exceed --journal-max-total-bytes")
     if args.mode == "target" and not args.table_prefix:
         parser.error("target mode requires --table-prefix for scoped PostgreSQL metrics")
     if args.mode == "target" and not os.environ.get(args.api_token_env):
@@ -1496,159 +1398,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.mode == "launch" and not args.binary.is_file():
         parser.error(f"IronCrew binary not found: {args.binary}")
+    if args.contract and not args.contract.is_file():
+        parser.error(f"contract file not found: {args.contract}")
     if args.table_prefix:
         try:
             validate_prefix(args.table_prefix)
         except ValueError as error:
             parser.error(str(error))
     return args
-
-
-def git_revision() -> dict[str, Any]:
-    try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout.strip()
-        dirty = bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            ).stdout.strip()
-        )
-        return {"revision": revision, "dirty": dirty}
-    except (OSError, subprocess.SubprocessError):
-        return {"revision": None, "dirty": None}
-
-
-def choose_details(results: list[dict[str, Any]], maximum: int) -> list[dict[str, Any]]:
-    if maximum == 0:
-        return []
-    failures = [result for result in results if not result.get("success")]
-    successes = [result for result in results if result.get("success")]
-    return (failures + successes)[:maximum]
-
-
-def aggregate_workload(
-    results: list[dict[str, Any]],
-    metrics: OperationMetrics,
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    successes = [result for result in results if result.get("success")]
-    failures = [result for result in results if not result.get("success")]
-    pending_ms = sum(float(result.get("pending_ms", 0.0)) for result in successes)
-    sse_latency_ms = metrics.total_latency_ms("sse_initial") + metrics.total_latency_ms(
-        "sse_reconnect"
-    )
-    return {
-        "attempted_runs": len(results),
-        "successful_runs": len(successes),
-        "failed_runs": len(failures),
-        "requested_run_cap": args.runs,
-        "duration_cap_seconds": args.duration_seconds,
-        "operations": metrics.report(),
-        "polling_pressure": {
-            "measured_client": {
-                "question_http_polls": metrics.count("questions_poll"),
-                "sse_initial_connections": metrics.count("sse_initial"),
-                "sse_reconnections": metrics.count("sse_reconnect"),
-                "peer_answer_requests": metrics.count("answer_peer"),
-            },
-            "derived_server_opportunities": {
-                "owner_hitl_reads_upper_estimate": math.ceil(
-                    pending_ms / max(args.hitl_poll_ms, 1)
-                ),
-                "journal_sse_poll_upper_estimate": math.ceil(
-                    sse_latency_ms / max(args.journal_poll_ms, 1)
-                ),
-            },
-            "semantics": {
-                "measured_client": "exact requests/connections issued by this runner",
-                "derived_server_opportunities": (
-                    "latency divided by configured poll interval; not a database call count"
-                ),
-                "postgres_measured_calls": (
-                    "reported separately only when pg_stat_statements is installed and readable"
-                ),
-            },
-        },
-        "result_details": choose_details(results, args.max_run_details),
-        "result_details_truncated": len(results) > args.max_run_details,
-    }
-
-
-def build_pass_criteria(
-    report: dict[str, Any],
-    metrics: OperationMetrics,
-    args: argparse.Namespace,
-    launcher: ReplicaLauncher,
-) -> dict[str, Any]:
-    workload = report.get("workload", {})
-    postgres = report.get("postgres", {}).get("delta", {})
-    resources = report.get("resources", {}).get("replicas", {})
-    workload_ok = workload.get("attempted_runs", 0) > 0 and workload.get("failed_runs") == 0
-    operation_report = metrics.report()
-    liveness_errors = operation_report.get("health_liveness_probe", {}).get("errors", 0)
-    readiness_errors = operation_report.get("health_readiness_probe", {}).get("errors", 0)
-    health_errors = liveness_errors + readiness_errors
-    deadlocks = postgres.get("database_activity", {}).get("deadlocks")
-    stats_stable = postgres.get("stats_reset_changed") is False
-    if args.mode == "launch":
-        replica_states = {
-            name: process.poll() is None for name, process in launcher.processes.items()
-        }
-        replicas_alive = len(replica_states) == 2 and all(replica_states.values())
-    else:
-        replica_states = {}
-        replicas_alive = True
-    comparator = args.memory_comparator_mib * 1024 * 1024
-    criteria = {
-        "workload": {
-            "passed": workload_ok,
-            "attempted_runs": workload.get("attempted_runs", 0),
-            "failed_runs": workload.get("failed_runs"),
-        },
-        "health_probe_errors": {
-            "passed": health_errors == 0,
-            "errors": health_errors,
-            "liveness_errors": liveness_errors,
-            "readiness_errors": readiness_errors,
-        },
-        "replicas_alive_before_shutdown": {
-            "status": (
-                "passed"
-                if args.mode == "launch" and replicas_alive
-                else "failed"
-                if args.mode == "launch"
-                else "not_applicable"
-            ),
-            "passed": replicas_alive if args.mode == "launch" else None,
-            "applicable": args.mode == "launch",
-            "states": replica_states,
-        },
-        "replica_instance_count": topology_pass_criterion(
-            report.get("replica_topology")
-        ),
-        "postgres_deadlocks": {"passed": deadlocks == 0, "delta": deadlocks},
-        "postgres_stats_reset_stable": {"passed": stats_stable},
-        "host_process_rss_comparator": host_rss_pass_criterion(
-            resources, comparator
-        ),
-    }
-    criteria["overall_passed"] = all(
-        value.get("passed") is True
-        for value in criteria.values()
-        if isinstance(value, dict) and value.get("applicable", True)
-    )
-    return criteria
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -1668,6 +1425,34 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     report_path = report_path.resolve()
     report_dir = report_path.parent
     report_dir.mkdir(parents=True, exist_ok=True)
+    source_start = worktree_provenance(ROOT)
+    contract, contract_sha256 = (
+        load_contract(args.contract) if args.contract else (None, None)
+    )
+    if worktree_provenance(ROOT) != source_start:
+        raise RuntimeError("worktree changed while the soak declaration was loaded")
+    journal_configuration = {
+        "max_events_per_run": args.max_events,
+        "max_bytes_per_run": args.event_replay_max_bytes,
+        "max_event_bytes": args.event_max_bytes,
+        "retention_seconds": args.journal_retention_seconds,
+        "max_total_events": args.journal_max_total_events,
+        "max_total_bytes": args.journal_max_total_bytes,
+        "page_max_events": min(args.max_events, 64),
+        "page_max_bytes": args.journal_page_max_bytes,
+        "poll_interval_ms": args.journal_poll_ms,
+        "read_timeout_ms": args.journal_read_timeout_ms,
+        "write_timeout_ms": args.journal_write_timeout_ms,
+        "prune_batch": args.journal_prune_batch,
+    }
+    if contract and contract["journal"] != journal_configuration:
+        raise ValueError("runtime journal arguments do not match the declared contract")
+    if (
+        contract
+        and args.duration_seconds
+        < contract["requirements"]["minimum_workload_seconds"]
+    ):
+        raise ValueError("configured duration is shorter than the declared workload minimum")
     token = (
         secrets.token_urlsafe(32)
         if args.mode == "launch"
@@ -1683,9 +1468,12 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         urllib.parse.unquote(pg_client.parsed.password or ""),
         token or "",
     )
-    launcher = ReplicaLauncher(report_dir)
+    launcher = ReplicaLauncher(ROOT, FLOW_ROOT)
     sampler: ResourceSampler | None = None
     health: HealthProbe | None = None
+    contract_recorder: IntervalRecorder | None = None
+    contract_observations: list[dict[str, Any]] = []
+    replay_probe: dict[str, Any] = {}
     cleanup_performed = False
     shutdown: dict[str, Any] = {}
     report: dict[str, Any] = {
@@ -1699,7 +1487,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "machine": platform.machine(),
             "python": platform.python_version(),
         },
-        "source": {**git_revision()},
+        "source": {**source_start},
         "configuration": {
             "database": safe_database_label(args.database_url),
             "table_prefix": prefix,
@@ -1714,6 +1502,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "hitl_pg_max_concurrent_reads": args.hitl_pg_reads,
             "journal_poll_interval_ms": args.journal_poll_ms,
             "max_events_per_run": args.max_events,
+            "journal": journal_configuration,
+            "journal_configuration_applied_by_runner": args.mode == "launch",
             "memory_comparator_bytes_per_replica": args.memory_comparator_mib * 1024 * 1024,
             "memory_comparator_enforced_by_runner": False,
             "authentication_configured": bool(token),
@@ -1730,6 +1520,14 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "postgres": {},
         "cleanup": {},
     }
+    if contract:
+        report["retention_contract"] = {
+            "declaration": contract,
+            "declaration_sha256": contract_sha256,
+            "declared_before_workload": True,
+            "observations": [],
+            "replay_probe": {},
+        }
     exit_code = 1
     try:
         pg_client.execute("SELECT 1;")
@@ -1739,9 +1537,11 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
         if args.mode == "launch":
             binary = args.binary.resolve()
+            binary_path, binary_path_scope = safe_binary_path(ROOT, binary)
             report["source"].update(
                 {
-                    "binary": str(binary),
+                    "binary": binary_path,
+                    "binary_path_scope": binary_path_scope,
                     "binary_sha256": file_sha256(binary),
                     "binary_profile": "release"
                     if binary.parent.name == "release"
@@ -1751,6 +1551,15 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
             key = base64.b64encode(secrets.token_bytes(32)).decode()
             keyring_json = json.dumps({"soak-v1": key}, separators=(",", ":"))
+            launcher.configure_log_canaries(
+                {
+                    "database_url": args.database_url,
+                    "database_password": urllib.parse.unquote(pg_client.parsed.password or ""),
+                    "api_token": token or "",
+                    "hitl_key": key,
+                    "hitl_keyring": keyring_json,
+                }
+            )
             base_a = validate_base_url("base-a", f"http://{args.host}:{args.port_a}")
             base_b = validate_base_url("base-b", f"http://{args.host}:{args.port_b}")
             process_a = launcher.start(
@@ -1814,20 +1623,53 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             pids,
             args.resource_sample_interval,
             args.memory_comparator_mib * 1024 * 1024,
+            max_timeline_samples=(
+                min(
+                    100_000,
+                    math.ceil(args.duration_seconds / args.resource_sample_interval) + 4,
+                )
+                if contract
+                else 4_000
+            ),
         )
         sampler.start()
         before = pg_client.json(postgres_snapshot_sql(prefix))
         statements_before = collect_pg_stat_statements(pg_client, prefix)
         report["postgres"]["before"] = before
+        if contract:
+            contract_recorder = IntervalRecorder(
+                lambda: pg_client.json(postgres_snapshot_sql(prefix)),
+                metrics.interval_report,
+                contract["observation_interval_seconds"],
+            )
+            contract_recorder.start(before)
         health = HealthProbe(bases, client, args.health_interval)
         health.start()
         workload_started = time.monotonic()
-        results = run_workload(bases, client, args)
+        results, stop_reason = run_workload(bases, client, args)
         workload_seconds = time.monotonic() - workload_started
+        if contract:
+            replay_probe = delayed_replay_probe(
+                results,
+                bases,
+                client,
+                pg_client,
+                prefix,
+                args.max_sse_bytes,
+            )
+            report["retention_contract"]["replay_probe"] = replay_probe
         if not health.stop():
             raise RuntimeError("periodic health probe did not stop within its bounded timeout")
         health = None
-        after = pg_client.json(postgres_snapshot_sql(prefix))
+        if contract_recorder:
+            contract_observations = contract_recorder.stop()
+            contract_recorder = None
+            report["retention_contract"]["observations"] = contract_observations
+            after = contract_observations[-1].get("postgres")
+            if not isinstance(after, dict):
+                raise RuntimeError("final contract PostgreSQL observation failed")
+        else:
+            after = pg_client.json(postgres_snapshot_sql(prefix))
         statements_after = collect_pg_stat_statements(pg_client, prefix)
         report["postgres"].update(
             {
@@ -1841,7 +1683,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         sampler.stop()
         report["resources"] = sampler.report()
         sampler = None
-        report["workload"] = aggregate_workload(results, metrics, args)
+        report["workload"] = aggregate_workload(results, metrics, args, stop_reason)
         report["workload"]["elapsed_seconds"] = round(workload_seconds, 3)
         report["pass_criteria"] = build_pass_criteria(report, metrics, args, launcher)
         report["status"] = (
@@ -1855,13 +1697,50 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "message": sanitize_error(error, report_secrets),
         }
     finally:
+        if contract_recorder:
+            try:
+                contract_observations = contract_recorder.stop()
+                report["retention_contract"]["observations"] = contract_observations
+            except Exception as error:
+                report["retention_contract"]["observation_stop_error"] = sanitize_error(
+                    error, report_secrets
+                )
         if health:
             health.stop()
         if sampler:
-            sampler.stop()
+            try:
+                sampler.stop()
+            except Exception as error:
+                report["resource_sampler_stop_error"] = sanitize_error(
+                    error, report_secrets
+                )
+                report["status"] = "failed"
+                exit_code = 1
             report["resources"] = sampler.report()
         if launcher.processes:
-            shutdown = launcher.stop_all()
+            try:
+                shutdown = launcher.stop_all()
+            except Exception as error:
+                report["replica_shutdown_error"] = sanitize_error(error, report_secrets)
+                report["status"] = "failed"
+                exit_code = 1
+        report["runtime_logs"] = {
+            "capture": "streaming_sha256_and_secret_scan",
+            "raw_content_retained": False,
+            "replicas": launcher.log_evidence,
+        }
+        log_criterion = runtime_log_criterion(
+            launcher.log_evidence, applicable=args.mode == "launch"
+        )
+        base_criteria = report.setdefault("pass_criteria", {})
+        prior_passed = base_criteria.get("overall_passed") is True
+        base_criteria["runtime_logs"] = log_criterion
+        base_criteria["overall_passed"] = prior_passed and (
+            log_criterion["passed"] is True if log_criterion["applicable"] else True
+        )
+        if not base_criteria["overall_passed"]:
+            report["status"] = "failed"
+            exit_code = 1
         cleanup_requested = (
             not args.keep_database
             and ((generated_prefix and args.mode == "launch") or args.cleanup_database)
@@ -1882,6 +1761,49 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "database_cleanup_error": cleanup_error,
             "scope": f"exact validated prefix {prefix}",
         }
+        post_cleanup_inventory: dict[str, Any] = {}
+        try:
+            post_cleanup_inventory = pg_client.json(post_cleanup_inventory_sql(prefix))
+            report["cleanup"]["post_cleanup_inventory"] = post_cleanup_inventory
+        except Exception as error:
+            report["cleanup"]["post_cleanup_inventory_error"] = sanitize_error(
+                error, report_secrets
+            )
+        source_finish: dict[str, Any] = {}
+        try:
+            source_finish = worktree_provenance(ROOT)
+            report["source_at_finish"] = source_finish
+            report["source_stable_during_run"] = source_finish == source_start
+        except Exception as error:
+            report["source_at_finish_error"] = sanitize_error(error, report_secrets)
+            report["source_stable_during_run"] = False
+        if contract:
+            base_passed = base_criteria.get("overall_passed") is True
+            contract_evaluation = evaluate_contract(
+                contract,
+                contract_observations,
+                report.get("resources", {}),
+                replay_probe,
+                journal_configuration,
+                report.get("workload", {}),
+                {
+                    "replica_shutdown": shutdown,
+                    "cleanup": report["cleanup"],
+                    "post_cleanup_inventory": post_cleanup_inventory,
+                    "source_at_start": source_start,
+                    "source_at_finish": source_finish,
+                },
+                base_passed,
+            )
+            report["retention_contract"]["evaluation"] = contract_evaluation
+            base_criteria["retention_contract"] = {
+                "passed": contract_evaluation["overall_passed"]
+            }
+            base_criteria["overall_passed"] = (
+                base_passed and contract_evaluation["overall_passed"]
+            )
+            report["status"] = "passed" if base_criteria["overall_passed"] else "failed"
+            exit_code = 0 if report["status"] == "passed" else 1
         report["finished_at"] = utc_now()
         report["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 3)
         write_report(report_path, report)

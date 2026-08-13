@@ -14,8 +14,11 @@ with the repository's complete all-target Rust gate.
 
 ## Repository policy
 
-Run the validators for every changed non-Rust surface:
+Run the module policy for production Rust changes and the repository validators
+for every changed non-Rust policy surface:
 
+- `python3 -B scripts/check_module_size.py`
+- `python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'`
 - `bun run scripts/validate_skills.ts`
 - `bun run scripts/issues_registry.ts check`
 - `bun test scripts/tests/*.test.ts`

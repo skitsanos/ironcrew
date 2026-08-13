@@ -17,7 +17,6 @@ crew:add_agent(Agent.new({
     name = "assistant",
     goal = "Answer programming questions clearly and concisely",
     capabilities = {"programming", "explanation"},
-    temperature = 0.5,
 }))
 ```
 
@@ -33,7 +32,6 @@ return {
     system_prompt = "You are a data extraction specialist.",
     capabilities = {"extraction", "analysis", "json"},
     tools = {"file_write"},
-    temperature = 0.1,
     response_format = {
         type = "json_schema",
         name = "company_analysis",
@@ -61,6 +59,11 @@ not need to call `crew:add_agent()` for file-based agents.
 | `response_format` | table             | no       | nil                                | Controls LLM output format (see below)                |
 | `before_task`     | function          | no       | nil                                | Hook called before each task execution (see below)    |
 | `after_task`      | function          | no       | nil                                | Hook called after each task execution (see below)     |
+
+> **GPT-5.6 Luna temperature:** Luna accepts only its provider-default
+> temperature. Omit `temperature` whenever `gpt-5.6-luna` is the effective
+> model. IronCrew forwards explicit values; it does not silently discard them,
+> so a non-default value is rejected by the provider.
 
 ## Response Format
 
@@ -174,7 +177,7 @@ resolution chain):
 crew:add_agent(Agent.new({
     name = "deep_thinker",
     goal = "Perform complex reasoning tasks",
-    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-4.1-mini
+    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-5.6-luna
     temperature = 0.2,
 }))
 ```

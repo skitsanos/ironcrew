@@ -100,6 +100,8 @@ class PlanValidationTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(BASE_DIR / "evaluate.py"),
+                    "--mode",
+                    "live",
                     "--dry-run-plan",
                     "--repetitions",
                     "5",
@@ -116,9 +118,12 @@ class PlanValidationTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             output = json.loads(completed.stdout)
-            self.assertEqual(output["planned_work"]["cli_runs"], 90)
-            self.assertEqual(output["planned_work"]["llm_calls"], 240)
-            self.assertEqual(output["planned_work"]["maximum_output_tokens"], 147_000)
+            self.assertEqual(output["model"], "gpt-5.6-luna")
+            self.assertEqual(output["provider_id"], "openai-api")
+            self.assertEqual(output["planned_work"]["cli_runs"], 180)
+            self.assertEqual(output["planned_work"]["llm_calls"], 480)
+            self.assertEqual(output["planned_work"]["maximum_output_tokens"], 294_000)
+            self.assertEqual(output["planned_work"]["planned_cost_upper_bound_usd"], 2.7528)
             self.assertFalse(report.exists())
 
             rejected = subprocess.run(
@@ -146,7 +151,7 @@ class PlanValidationTests(unittest.TestCase):
             self.assertFalse(report.exists())
 
     def test_changed_flow_hash_is_rejected_before_binary_execution(self) -> None:
-        altered = copy.deepcopy(self.plan)
+        altered = json.loads((BASE_DIR / "decision-plan.v2.json").read_text())
         altered["flow"]["sha256"] = "0" * 64
         with tempfile.TemporaryDirectory() as temporary:
             plan_path = Path(temporary) / "altered-plan.json"
@@ -207,6 +212,40 @@ class PlanValidationTests(unittest.TestCase):
             check=False,
         )
         self.assertIn("--model must be a non-empty", invalid_model.stderr)
+
+    def test_paid_run_rejects_wrong_model_or_provider_before_binary_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing_binary = str(Path(temporary) / "missing-ironcrew")
+            common = [
+                sys.executable,
+                str(BASE_DIR / "evaluate.py"),
+                "--mode",
+                "live",
+                "--repetitions",
+                "5",
+                "--binary",
+                missing_binary,
+                "--dry-run-plan",
+            ]
+            wrong_model = subprocess.run(
+                [*common, "--provider-id", "openai-api", "--model", "gpt-5.6-terra"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(wrong_model.returncode, 0)
+            self.assertIn("requires --model gpt-5.6-luna", wrong_model.stderr)
+            self.assertNotIn("binary is not executable", wrong_model.stderr)
+
+            wrong_provider = subprocess.run(
+                [*common, "--provider-id", "azure-openai", "--model", "gpt-5.6-luna"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(wrong_provider.returncode, 0)
+            self.assertIn("requires --provider-id openai-api", wrong_provider.stderr)
+            self.assertNotIn("binary is not executable", wrong_provider.stderr)
 
 if __name__ == "__main__":
     unittest.main()

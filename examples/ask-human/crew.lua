@@ -16,7 +16,7 @@
 local crew = Crew.new({
     goal = "Draft a short product announcement",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -24,7 +24,6 @@ crew:add_agent(Agent.new({
     name = "announcer",
     goal = "Write concise, accurate product announcements",
     capabilities = { "writing", "editing" },
-    temperature = 0.4,
 }))
 
 -- Define the task before asking so `ironcrew graph` can capture the complete
