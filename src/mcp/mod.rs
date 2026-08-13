@@ -24,9 +24,14 @@ pub mod bridge;
 mod call;
 pub mod client;
 pub mod config;
+mod connection;
 mod execution_policy;
+mod http_transport;
 mod lifecycle;
 pub mod manager;
+mod protocol;
+mod sse_stream;
+mod stdio_transport;
 
 pub use config::{McpConfig, parse_mcp_config};
 pub use manager::McpConnectionManager;

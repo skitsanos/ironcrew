@@ -9,17 +9,23 @@ use rmcp::{
     ClientServiceExt, Peer, RoleClient,
     model::{CallToolRequestParams, PaginatedRequestParams},
     service::RunningService,
-    transport::streamable_http_client::StreamableHttpClientTransportConfig,
-    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        StreamableHttpClientTransport, common::client_side_sse::NeverRetry,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::mcp::config::{McpServerConfig, McpTransportConfig};
+use crate::mcp::connection::{ConnectionPoison, InFlightGuard, PoisonSignal};
 use crate::mcp::execution_policy::{McpCallPolicy, ensure_serialized_size};
-use crate::mcp::lifecycle::{client_info, discovery_lifecycle};
+use crate::mcp::http_transport::Strict2026HttpClient;
+use crate::mcp::lifecycle::{StrictClientHandler, discovery_lifecycle};
+use crate::mcp::stdio_transport::StrictStdioTransport;
 use crate::utils::error::{IronCrewError, Result};
 use crate::utils::network::{OutboundNetworkPolicy, secure_no_redirect_client};
 
@@ -83,37 +89,6 @@ fn localhost_override_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Kill the entire MCP stdio process group when a connection is cancelled,
-/// times out, or is dropped. rmcp already reaps the direct child; this guard
-/// covers grandchildren spawned by the MCP server.
-struct McpProcessGroupGuard {
-    #[cfg(unix)]
-    pgid: Option<i32>,
-}
-
-impl McpProcessGroupGuard {
-    fn new(process_id: Option<u32>) -> Self {
-        #[cfg(not(unix))]
-        let _ = process_id;
-        Self {
-            #[cfg(unix)]
-            pgid: process_id.and_then(|id| i32::try_from(id).ok()),
-        }
-    }
-}
-
-impl Drop for McpProcessGroupGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.pgid.take() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pgid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-}
-
 // ── safe-env helpers ──────────────────────────────────────────────────────────
 
 /// Env vars that are safe to forward to MCP child processes by default.
@@ -158,39 +133,48 @@ pub struct McpClient {
     peer: Peer<RoleClient>,
     shutdown: Mutex<Option<ShutdownFn>>,
     call_policy: McpCallPolicy,
+    poison: ConnectionPoison,
 }
 
 impl McpClient {
     fn from_service<S>(
         service: RunningService<RoleClient, S>,
-        process_group: Option<McpProcessGroupGuard>,
+        poison_signal: PoisonSignal,
+        stdio_abort: Option<crate::mcp::stdio_transport::StdioAbortHandle>,
         call_policy: McpCallPolicy,
     ) -> Self
     where
         S: rmcp::Service<RoleClient> + 'static,
     {
         let peer = service.peer().clone();
+        let poison = ConnectionPoison::new(
+            poison_signal.clone(),
+            service.cancellation_token(),
+            stdio_abort,
+        );
         // Own the service inside the shutdown closure. When awaited, it
         // consumes the service via `cancel()` which signals the token,
         // awaits the service loop's exit, and drops the transport.
         let shutdown: ShutdownFn = Box::new(move || {
             Box::pin(async move {
+                poison_signal.poison();
                 if let Err(e) = service.cancel().await {
                     tracing::debug!(error = %e, "MCP service cancel returned error");
                 }
-                drop(process_group);
             })
         });
         McpClient {
             peer,
             shutdown: Mutex::new(Some(shutdown)),
             call_policy,
+            poison,
         }
     }
 
     /// Connect using a `McpServerConfig`, respecting all security constraints.
     pub async fn connect(cfg: &McpServerConfig) -> Result<Self> {
         let call_policy = McpCallPolicy::capture()?;
+        let (poison_signal, poison_watch) = PoisonSignal::channel();
         let discovery_timeout = configured_timeout(
             "IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS",
             DEFAULT_DISCOVERY_TIMEOUT_SECS,
@@ -199,28 +183,23 @@ impl McpClient {
             McpTransportConfig::Stdio { command, args, env } => {
                 let child_env = build_child_env(env, cfg.inherit_env);
 
-                let transport = TokioChildProcess::new({
-                    let mut cmd = Command::new(command);
-                    cmd.args(args);
-                    // Replace the environment entirely with the curated set
-                    cmd.env_clear();
-                    for (k, v) in &child_env {
-                        cmd.env(k, v);
-                    }
-                    cmd.kill_on_drop(true);
-                    #[cfg(unix)]
-                    cmd.process_group(0);
-                    cmd.configure(|_| {})
-                })
-                .map_err(|e| IronCrewError::Mcp {
-                    server: cfg.label.clone(),
-                    message: format!("Failed to create stdio transport: {}", e),
-                })?;
+                let mut cmd = Command::new(command);
+                cmd.args(args);
+                // Replace the environment entirely with the curated set.
+                cmd.env_clear();
+                for (key, value) in &child_env {
+                    cmd.env(key, value);
+                }
+                let (transport, stdio_abort) =
+                    StrictStdioTransport::spawn(&mut cmd, call_policy.inbound_message_max_bytes())
+                        .map_err(|e| IronCrewError::Mcp {
+                            server: cfg.label.clone(),
+                            message: format!("Failed to create stdio transport: {}", e),
+                        })?;
 
-                let process_group = McpProcessGroupGuard::new(transport.id());
                 let service = tokio::time::timeout(
                     discovery_timeout,
-                    client_info().serve_with_lifecycle(transport, discovery_lifecycle()),
+                    StrictClientHandler.serve_with_lifecycle(transport, discovery_lifecycle()),
                 )
                 .await
                 .map_err(|_| IronCrewError::Mcp {
@@ -237,7 +216,8 @@ impl McpClient {
 
                 Ok(Self::from_service(
                     service,
-                    Some(process_group),
+                    poison_signal,
+                    Some(stdio_abort),
                     call_policy,
                 ))
             }
@@ -273,11 +253,19 @@ impl McpClient {
                         server: cfg.label.clone(),
                         message: format!("Failed to build safe HTTP client: {e}"),
                     })?;
+                let http_client = Strict2026HttpClient::new(
+                    http_client,
+                    call_policy.inbound_message_max_bytes(),
+                    poison_watch,
+                );
+                let mut config = config;
+                config.retry_config = std::sync::Arc::new(NeverRetry::default());
+                config.max_sse_event_size = call_policy.inbound_message_max_bytes();
                 let transport = StreamableHttpClientTransport::with_client(http_client, config);
 
                 let service = tokio::time::timeout(
                     discovery_timeout,
-                    client_info().serve_with_lifecycle(transport, discovery_lifecycle()),
+                    StrictClientHandler.serve_with_lifecycle(transport, discovery_lifecycle()),
                 )
                 .await
                 .map_err(|_| IronCrewError::Mcp {
@@ -292,7 +280,12 @@ impl McpClient {
                     message: format!("MCP HTTP discovery failed: {}", e),
                 })?;
 
-                Ok(Self::from_service(service, None, call_policy))
+                Ok(Self::from_service(
+                    service,
+                    poison_signal,
+                    None,
+                    call_policy,
+                ))
             }
         }
     }
@@ -314,19 +307,22 @@ impl McpClient {
             HARD_MAX_TOOL_DEFINITION_BYTES,
         )?;
 
-        let list = async {
+        let guard = InFlightGuard::new(self.poison.clone());
+        let deadline = Instant::now() + timeout;
+        let result = async {
             let mut tools = Vec::new();
             let mut cursor = None;
             let mut seen_cursors = std::collections::HashSet::new();
 
             for _ in 0..max_pages {
-                let result = self
-                    .peer
-                    .list_tools(Some(
-                        PaginatedRequestParams::default().with_cursor(cursor.clone()),
-                    ))
-                    .await
-                    .map_err(|e| mcp_error(format!("list_tools failed: {e}")))?;
+                let result = crate::mcp::call::list_tools(
+                    &self.peer,
+                    Some(PaginatedRequestParams::default().with_cursor(cursor.clone())),
+                    "MCP tool discovery",
+                    deadline,
+                    &guard,
+                )
+                .await?;
 
                 if tools.len().saturating_add(result.tools.len()) > max_tools {
                     return Err(mcp_error(format!(
@@ -350,14 +346,9 @@ impl McpClient {
             Err(mcp_error(format!(
                 "MCP tool discovery exceeded {max_pages} pages"
             )))
-        };
-
-        tokio::time::timeout(timeout, list).await.map_err(|_| {
-            mcp_error(format!(
-                "MCP tool discovery timed out after {} seconds",
-                timeout.as_secs()
-            ))
-        })?
+        }
+        .await;
+        self.finish_in_flight(guard, result).await
     }
 
     /// Call a tool by its server-local name (not the prefixed IronCrew name).
@@ -381,7 +372,18 @@ impl McpClient {
             _ => return Err(mcp_error("MCP tool arguments must be a JSON object")),
         };
 
-        crate::mcp::call::call_tool(&self.peer, params, name, self.call_policy).await
+        let guard = InFlightGuard::new(self.poison.clone());
+        let result =
+            crate::mcp::call::call_tool(&self.peer, params, name, self.call_policy, &guard).await;
+        self.finish_in_flight(guard, result).await
+    }
+
+    async fn finish_in_flight<T>(&self, guard: InFlightGuard, result: Result<T>) -> Result<T> {
+        if self.poison.is_poisoned() {
+            self.shutdown().await;
+        }
+        guard.disarm();
+        result
     }
 
     pub(super) fn call_policy(&self) -> McpCallPolicy {

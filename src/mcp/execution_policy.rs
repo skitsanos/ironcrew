@@ -14,10 +14,13 @@ const DEFAULT_MAX_MRTR_ROUNDS: usize = 10;
 const HARD_MAX_MRTR_ROUNDS: usize = 32;
 const DEFAULT_MAX_REQUEST_STATE_BYTES: usize = 64 * 1024;
 const HARD_MAX_REQUEST_STATE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_INBOUND_MESSAGE_BYTES: usize = 1024 * 1024;
+const HARD_MAX_INBOUND_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct McpCallPolicy {
     argument_max_bytes: usize,
+    inbound_message_max_bytes: usize,
     max_mrtr_rounds: usize,
     request_state_max_bytes: usize,
     timeout_secs: u64,
@@ -53,8 +56,15 @@ impl McpCallPolicy {
             DEFAULT_MAX_REQUEST_STATE_BYTES,
             HARD_MAX_REQUEST_STATE_BYTES,
         )?;
+        let inbound_message_max_bytes = parse_usize(
+            "IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES",
+            read("IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES"),
+            DEFAULT_MAX_INBOUND_MESSAGE_BYTES,
+            HARD_MAX_INBOUND_MESSAGE_BYTES,
+        )?;
         Ok(Self {
             argument_max_bytes,
+            inbound_message_max_bytes,
             max_mrtr_rounds,
             request_state_max_bytes,
             timeout_secs,
@@ -73,6 +83,10 @@ impl McpCallPolicy {
         self.max_mrtr_rounds
     }
 
+    pub(super) fn inbound_message_max_bytes(&self) -> usize {
+        self.inbound_message_max_bytes
+    }
+
     pub(super) fn validate_request_state(&self, state: &str) -> Result<()> {
         if state.len() > self.request_state_max_bytes {
             return Err(mcp_error(format!(
@@ -86,6 +100,7 @@ impl McpCallPolicy {
     pub(super) fn definition(&self) -> Value {
         json!({
             "argument_max_bytes": self.argument_max_bytes,
+            "inbound_message_max_bytes": self.inbound_message_max_bytes,
             "max_mrtr_rounds": self.max_mrtr_rounds,
             "request_state_max_bytes": self.request_state_max_bytes,
             "timeout_secs": self.timeout_secs,
@@ -205,6 +220,7 @@ mod tests {
             captured.definition(),
             json!({
                 "argument_max_bytes": exact_bytes,
+                "inbound_message_max_bytes": DEFAULT_MAX_INBOUND_MESSAGE_BYTES,
                 "max_mrtr_rounds": 7,
                 "request_state_max_bytes": 5,
                 "timeout_secs": 17,
