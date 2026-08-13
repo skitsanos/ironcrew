@@ -406,6 +406,29 @@ describe("repository integration policy", () => {
     expect(source).not.toContain("docker push");
   });
 
+  test("release receipt base image matches the runtime Dockerfile", async () => {
+    const workflowSource = await Bun.file(
+      join(repository, ".github/workflows/release.yml"),
+    ).text();
+    const workflow = Bun.YAML.parse(workflowSource) as {
+      env: {
+        BASE_IMAGE_REFERENCE: string;
+        BASE_IMAGE_INDEX_DIGEST: string;
+      };
+    };
+    const dockerfile = await Bun.file(
+      join(repository, "docker/runtime.Dockerfile"),
+    ).text();
+    const baseLines = dockerfile
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("FROM "));
+
+    expect(baseLines).toEqual([
+      `FROM ${workflow.env.BASE_IMAGE_REFERENCE}@${workflow.env.BASE_IMAGE_INDEX_DIGEST}`,
+    ]);
+  });
+
   test("release workflow gates builds and scopes publication authority", async () => {
     const source = await Bun.file(
       join(repository, ".github/workflows/release.yml"),
