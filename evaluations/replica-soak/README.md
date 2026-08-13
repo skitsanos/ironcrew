@@ -6,13 +6,14 @@ answer; it never calls `crew:run()`, so the workload plans **zero LLM calls**.
 The child environment also points OpenAI at an unreachable loopback port as a
 fail-closed guard.
 
-This workload does not exercise IC-008 conversation turns. The dedicated
-`ic008_shared_conversation_coordination_is_truthful` case in
-`tests/two_process_replica_acceptance_test.rs` owns that contract: required-key
-cold rehydration across two real processes, replay, source drift, owner death
-between turns, active-delete fencing, incarnation-safe recreate, durable
-history, and the shared-store SSE `409` boundary. Do not cite this soak as
-conversation portability or provider/tool exactly-once evidence.
+The provider-free retention workload does not exercise IC-008 conversation
+turns. A separate bounded profile runner in this directory covers one mock
+provider/tool flow, one 64 KiB result, and a warm-owner/cold-peer committed
+conversation boundary. The dedicated
+`ic008_shared_conversation_coordination_is_truthful` Rust case remains the
+broader conversation contract. Neither local runner proves in-flight execution
+takeover, general exactly-once external effects, live-provider behavior, or
+platform routing.
 
 The defaults mirror the conservative OpenShift baseline used for IronCrew:
 
@@ -82,8 +83,95 @@ python3 evaluations/replica-soak/soak.py \
   --runs 2 --duration-seconds 30 --concurrency 1
 ```
 
-The report path is printed on stdout. Reports and replica logs default to
-`evaluations/replica-soak/reports/` and are gitignored.
+## Predeclared 30-minute retention contract
+
+`contracts/provider-free-retention.json` is the canonical IC-018 declaration.
+It fixes the complete journal configuration, a 30-second observation cadence,
+the final 20-interval tail, and every pass/fail ceiling before admission starts.
+The run must last at least 1,800 actual workload seconds and stop because of the
+duration boundary; exhausting the run cap early fails the contract.
+Its 128 MiB per-replica RSS ceiling is evaluated from host-process samples. The
+separate 1 GiB platform-memory comparator remains unenforced and is not the
+contract pass ceiling.
+
+Run it only against an isolated PostgreSQL 15 database:
+
+```bash
+DATABASE_URL='postgres://ironcrew_runtime:...@127.0.0.1:55432/ironcrew_ic018' \
+python3 -B evaluations/replica-soak/soak.py \
+  --postgres-container ironcrew-ic018-pg \
+  --binary target/release/ironcrew \
+  --table-prefix ic018_soak_ \
+  --cleanup-database \
+  --runs 10000 \
+  --duration-seconds 1800 \
+  --concurrency 2 \
+  --resource-sample-interval 1 \
+  --journal-prune-batch 128 \
+  --contract evaluations/replica-soak/contracts/provider-free-retention.json \
+  --report /path/outside-the-worktree/ic018-soak.json
+```
+
+The machine verdict is assembled only after both child processes exit cleanly,
+the exact prefix is dropped, prefix relations/functions are zero, all sampling
+threads stop, and the start/end source manifests match. The delayed replay gate
+requires an expired numbered cursor plus a cursorless retention gap and an
+unnumbered terminal synthesized from the durable run record. PostgreSQL
+`tuples_deleted` movement and retention-state movement are both required; a
+logical accounting change alone is not accepted as physical pruning.
+
+The steady-state claim is deliberately limited to retained journal rows/bytes,
+expired rows, bounded tail growth, RSS, health, and latency. Run records, audit
+rows, retention state, and 24-hour idempotency records continue to grow during
+this profile; WAL is cumulative, and relation files need not shrink after
+`DELETE`.
+
+## Supplemental bounded profiles
+
+After the source tree and release binary are frozen, run the separate profile
+receipt against the same isolated database (using a different exact prefix):
+
+```bash
+DATABASE_URL='postgres://ironcrew_runtime:...@127.0.0.1:55432/ironcrew_ic018' \
+python3 -B evaluations/replica-soak/profiles.py \
+  --postgres-container ironcrew-ic018-pg \
+  --binary target/release/ironcrew \
+  --table-prefix ic018_profiles_ \
+  --report /path/outside-the-worktree/ic018-profiles.json
+```
+
+The provider is an attributable loopback-only mock. The receipt requires exact
+provider/effect counts, an exact 65,536-byte result digest, conversation
+identity with two consecutive committed revision increments across a cold peer,
+with history matching the latest revision, the explicit shared PostgreSQL
+conversation-SSE `409` boundary, clean exits, zero prefix objects,
+and unchanged source/binary provenance. Planned and actual paid-provider calls
+and cost are zero.
+
+## Retained IC-018 evidence
+
+The authoritative 2026-08-11 local receipts are:
+
+- [`reports/2026-08-11-local-postgres15-1800s.json`](reports/2026-08-11-local-postgres15-1800s.json),
+  SHA-256
+  `750be5c83ebd4f5df2299c5b3a4b9483b06cdae50a9fc46b18906cdee49eab4e`;
+- [`reports/2026-08-11-local-postgres15-1800s.md`](reports/2026-08-11-local-postgres15-1800s.md),
+  the reviewed human-readable companion; and
+- [`reports/2026-08-11-local-postgres15-profiles.json`](reports/2026-08-11-local-postgres15-profiles.json),
+  SHA-256
+  `2e00f1f7deca155cebbecc5adf65a36d0cec3f21a6cfb7191d49d3066a8e7d83`.
+
+The 1,800-second provider-free receipt and the supplemental loopback-mock
+receipt each bind their own start/end dirty-worktree manifest and the same
+release-binary SHA-256. The companion records PostgreSQL 15.18, the freshly
+pulled `postgres:15` digest, all predeclared ceilings, physical-prune and replay
+evidence, the serial 60-test live-PostgreSQL regression gate, and exact fixture
+cleanup. No live-provider, Railway, or OpenShift result is claimed.
+
+The report path is printed on stdout. Generated reports default to
+`evaluations/replica-soak/reports/` and are gitignored. The provider-free
+runner continuously drains child output and retains only byte counts, SHA-256
+digests, and secret-canary results; raw replica logs are not retained.
 
 ## Existing replicas / Railway / OpenShift
 

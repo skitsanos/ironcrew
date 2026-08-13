@@ -10,7 +10,7 @@
 local crew = Crew.new({
     goal = "Demonstrate agent collaboration and messaging",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
 })
 
@@ -18,21 +18,18 @@ crew:add_agent(Agent.new({
     name = "optimist",
     goal = "See the positive side of things and advocate for opportunities",
     capabilities = {"analysis", "advocacy"},
-    temperature = 0.8,
 }))
 
 crew:add_agent(Agent.new({
     name = "critic",
     goal = "Identify risks, weaknesses, and potential problems",
     capabilities = {"analysis", "risk-assessment"},
-    temperature = 0.3,
 }))
 
 crew:add_agent(Agent.new({
     name = "pragmatist",
     goal = "Find practical, balanced solutions",
     capabilities = {"synthesis", "planning"},
-    temperature = 0.5,
 }))
 
 -- Phase 1: Individual research (runs in parallel)

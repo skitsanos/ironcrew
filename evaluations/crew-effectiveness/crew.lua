@@ -2,8 +2,8 @@
 --
 -- The Python runner supplies one source-only packet and selects one of three
 -- orchestration variants. The scoring oracle is never injected into this Lua
--- VM. Every variant uses the same final agent, prompt, model, temperature, and
--- JSON Schema; only the intermediate orchestration differs.
+-- VM. Every variant uses the same final agent, prompt, model, provider-default
+-- temperature, and JSON Schema; only the intermediate orchestration differs.
 
 assert(input, "evaluation input is required")
 
@@ -65,7 +65,6 @@ do not use it when another option accurately characterizes conflicting
 evidence. Every answer must cite the evidence IDs that directly support the
 selection. Return only the requested structured JSON.
 ]],
-        temperature = 0.0,
         max_tokens = 800,
         response_format = {
             type = "json_schema",
@@ -100,14 +99,12 @@ elseif variant == "dag" then
         name = "extractor",
         goal = "Extract candidate option IDs and their direct evidence",
         system_prompt = "Compare the listed options using only explicit facts and calculations grounded in evidence IDs.",
-        temperature = 0.0,
         max_tokens = 500,
     }))
     crew:add_agent(Agent.new({
         name = "challenger",
         goal = "Independently identify contradictions and unsupported conclusions",
         system_prompt = "Challenge candidate conclusions and flag insufficient or conflicting evidence.",
-        temperature = 0.0,
         max_tokens = 500,
     }))
     add_final_agent()
@@ -152,14 +149,12 @@ else
         name = "analyst",
         goal = "Build the strongest evidence-grounded option selection for each question",
         system_prompt = "Compare the listed options using explicit evidence IDs and make a concise case.",
-        temperature = 0.0,
         max_tokens = 500,
     }))
     crew:add_agent(Agent.new({
         name = "skeptic",
         goal = "Find contradictions, weak support, and unjustified certainty",
         system_prompt = "Audit the analyst's reasoning and insist on direct evidence or abstention.",
-        temperature = 0.0,
         max_tokens = 500,
     }))
     add_final_agent()

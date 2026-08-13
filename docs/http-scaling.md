@@ -443,13 +443,14 @@ boundary. Sticky sessions reduce routing mistakes for owner-local surfaces but
 do not provide ownership transfer or failover.
 
 Do not configure an HPA or Railway replicas for applications that require
-conversation SSE, unkeyed controls, or execution failover. The current
-worktree implements arbitrary routing for keyed PostgreSQL conversation
-messages at committed turn boundaries, and IC-008's two-process PostgreSQL
-gate plus the affinity-free OpenShift canary pass. Retain one replica until the
-behavior is released, on Railway until its separate IC-008 canary passes, and
-whenever clients require an owner-local surface. Execution takeover still
-requires a checkpoint/resume design, and shared conversation SSE remains
+conversation SSE, unkeyed controls, or execution failover. The committed
+IC-008 implementation supports arbitrary routing for keyed PostgreSQL
+conversation messages at committed turn boundaries, and IC-008's two-process
+PostgreSQL gate plus the affinity-free OpenShift canary pass. Retain one replica
+until a published release contains the behavior, on Railway until its separate
+IC-008 canary passes, and whenever clients require an owner-local surface.
+Execution takeover still requires a checkpoint/resume design, and shared
+conversation SSE remains
 unsupported.
 
 ### Storage backend guidance

@@ -247,6 +247,19 @@ pub(super) async fn wait_for_status(
     run_id: &str,
     expected: &str,
 ) -> serde_json::Value {
+    wait_for_status_with_context(pair, run_id, expected, "phase-two run").await
+}
+
+fn terminal_status_mismatch(context: &str, run_id: &str, expected: &str, observed: &str) -> String {
+    format!("{context}: run {run_id} terminalized as {observed:?} instead of {expected}")
+}
+
+pub(super) async fn wait_for_status_with_context(
+    pair: &ProcessPair,
+    run_id: &str,
+    expected: &str,
+    context: &str,
+) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         let record = read_run(pair, run_id).await;
@@ -257,14 +270,35 @@ pub(super) async fn wait_for_status(
             record["status"].as_str(),
             Some("Success" | "Failed" | "Aborted" | "Abandoned" | "TimedOut" | "PartialFailure")
         ) {
+            let observed = record["status"].as_str().unwrap_or("<non-string status>");
             panic!(
-                "run terminalized as {} instead of {expected}",
-                record["status"]
+                "{}\nowner process logs:\n{}\nsurvivor process logs:\n{}",
+                terminal_status_mismatch(context, run_id, expected, observed),
+                pair.owner_a.logs(),
+                pair.survivor_b.logs(),
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("run did not reach {expected}");
+    panic!(
+        "{context}: run {run_id} did not reach {expected}\nowner process logs:\n{}\nsurvivor process logs:\n{}",
+        pair.owner_a.logs(),
+        pair.survivor_b.logs(),
+    );
+}
+
+#[test]
+fn terminal_status_mismatch_names_context_run_and_statuses() {
+    let message = terminal_status_mismatch(
+        "IC-020 replacement C direct SIGTERM",
+        "run-123",
+        "Aborted",
+        "Abandoned",
+    );
+    assert_eq!(
+        message,
+        "IC-020 replacement C direct SIGTERM: run run-123 terminalized as \"Abandoned\" instead of Aborted"
+    );
 }
 
 pub(super) async fn wait_for_next_lease(

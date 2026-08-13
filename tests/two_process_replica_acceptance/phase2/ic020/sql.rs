@@ -81,6 +81,40 @@ pub(super) async fn assert_owner_draining(pair: &ProcessPair, run_id: &str) {
     assert!(draining, "IC-020 run owner was not durably fenced");
 }
 
+pub(super) async fn wait_owner_draining(pair: &ProcessPair, run_id: &str) {
+    let pool = sqlx::PgPool::connect(&pair.database_url)
+        .await
+        .expect("connect IC-020 owner-drain waiter");
+    let statement = format!(
+        "SELECT state FROM {}idempotency \
+         WHERE operation = $1 AND resource_id = $2 \
+           AND owner_instance_id = $3 AND attempt_id <> '' \
+           AND owner_draining_at IS NOT NULL AND owner_draining_at <> ''",
+        pair.prefix
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let state: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement.clone()))
+            .bind(ironcrew::engine::idempotency::RUN_OPERATION)
+            .bind(run_id)
+            .bind(&pair.owner_a_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("read IC-020 committed owner-drain fence");
+        if let Some(state) = state {
+            pool.close().await;
+            assert!(
+                matches!(state.as_str(), "running" | "completed"),
+                "IC-020 owner-drain fence committed in unexpected ledger state {state:?}"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.close().await;
+    panic!("IC-020 owner-drain fence did not commit for run {run_id}");
+}
+
 pub(super) async fn assert_owner_not_draining(pair: &ProcessPair, run_id: &str) {
     let pool = sqlx::PgPool::connect(&pair.database_url)
         .await

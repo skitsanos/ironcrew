@@ -12,7 +12,7 @@
 local crew = Crew.new({
     goal = "Prepare a human-approved release plan",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4o-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
     base_url = env("OPENAI_BASE_URL"),
     require_approval = { "file_write" },
 })
@@ -21,7 +21,6 @@ crew:add_agent(Agent.new({
     name = "release_manager",
     goal = "Prepare release artifacts while keeping the operator in control",
     tools = { "ask_human", "file_write" },
-    temperature = 0.2,
     system_prompt = [[
 You prepare a release plan, but the human operator owns the decision.
 
