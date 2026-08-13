@@ -2,14 +2,13 @@
 //!
 //! All servers from a crew's `mcp_servers` config are connected in parallel
 //! at the first `crew:run()` call. A connection failure on any server aborts
-//! the whole batch (fail-fast). The manager is then cached on `LuaCrew` so
+//! the whole bounded batch after every connection attempt settles. The manager is then cached on `LuaCrew` so
 //! subsequent runs reuse the same connections.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures::future::try_join_all;
+use futures::future::join_all;
 
 use crate::mcp::bridge::McpBridgeTool;
 use crate::mcp::client::McpClient;
@@ -17,25 +16,6 @@ use crate::mcp::config::McpConfig;
 use crate::tools::Tool;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::{IronCrewError, Result};
-
-// ── Handshake timeout ─────────────────────────────────────────────────────────
-
-fn handshake_timeout() -> Result<Duration> {
-    let secs = match std::env::var("IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS") {
-        Ok(raw) => raw.parse::<u64>().map_err(|_| IronCrewError::Mcp {
-            server: String::new(),
-            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be an integer from 1 to 3600".into(),
-        })?,
-        Err(_) => 10,
-    };
-    if !(1..=3_600).contains(&secs) {
-        return Err(IronCrewError::Mcp {
-            server: String::new(),
-            message: "IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS must be from 1 to 3600".into(),
-        });
-    }
-    Ok(Duration::from_secs(secs))
-}
 
 // ── McpConnectionManager ──────────────────────────────────────────────────────
 
@@ -48,15 +28,14 @@ pub struct McpConnectionManager {
 impl McpConnectionManager {
     /// Spawn all configured MCP servers in parallel.
     ///
-    /// Each connection attempt is wrapped in a timeout of
-    /// `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` (default 10 s). A single failure
-    /// returns an error and no further servers are connected.
+    /// Each client enforces one transport-aware timeout from
+    /// `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` (default 10 s). A single failure
+    /// returns an error after all bounded attempts settle and closes every
+    /// connection that did succeed.
     ///
     /// After successful connection, all discovered tools are registered into
     /// `tool_registry` using the `mcp__<label>__<tool>` naming scheme.
     pub async fn connect_all(config: &McpConfig, tool_registry: &mut ToolRegistry) -> Result<Self> {
-        let timeout = handshake_timeout()?;
-
         // Build one connect future per server
         let connect_futs: Vec<_> = config
             .servers
@@ -68,16 +47,7 @@ impl McpConnectionManager {
                 async move {
                     tracing::info!(server = %label, "Connecting to MCP server");
 
-                    let client = tokio::time::timeout(timeout, McpClient::connect(&cfg))
-                        .await
-                        .map_err(|_| IronCrewError::Mcp {
-                            server: label.clone(),
-                            message: format!(
-                                "Handshake timed out after {}s. \
-                                 Adjust IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS.",
-                                timeout.as_secs()
-                            ),
-                        })??;
+                    let client = McpClient::connect(&cfg).await?;
 
                     tracing::info!(server = %label, "Connected to MCP server");
                     Ok::<(String, McpClient), IronCrewError>((label, client))
@@ -85,28 +55,47 @@ impl McpConnectionManager {
             })
             .collect();
 
-        // Parallel connect — fail fast on first error
-        let connected: Vec<(String, McpClient)> = try_join_all(connect_futs).await?;
-
-        // Wrap in Arc and collect
+        // Run every bounded connection attempt, then fail the batch as one unit.
         let mut clients: HashMap<String, Arc<McpClient>> = HashMap::new();
-        for (label, client) in connected {
-            clients.insert(label, Arc::new(client));
+        let mut connect_error = None;
+        for result in join_all(connect_futs).await {
+            match result {
+                Ok((label, client)) => {
+                    clients.insert(label, Arc::new(client));
+                }
+                Err(error) if connect_error.is_none() => connect_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = connect_error {
+            shutdown_clients(&clients).await;
+            return Err(error);
         }
 
-        // Register all tools
+        // Finish discovery for every server before mutating the caller's
+        // registry. A failure tears down all successfully connected peers.
+        let mut discovered = Vec::with_capacity(clients.len());
         for (label, client) in &clients {
-            let tools = client.list_all_tools().await.map_err(|e| {
-                if let IronCrewError::Mcp { message, .. } = e {
-                    IronCrewError::Mcp {
+            let tools = match client.list_all_tools().await {
+                Ok(tools) => tools,
+                Err(IronCrewError::Mcp { message, .. }) => {
+                    let error = IronCrewError::Mcp {
                         server: label.clone(),
                         message,
-                    }
-                } else {
-                    e
+                    };
+                    shutdown_clients(&clients).await;
+                    return Err(error);
                 }
-            })?;
+                Err(error) => {
+                    shutdown_clients(&clients).await;
+                    return Err(error);
+                }
+            };
+            discovered.push((label.clone(), Arc::clone(client), tools));
+        }
 
+        // Register tools only after every server completed bounded discovery.
+        for (label, client, tools) in discovered {
             tracing::info!(
                 server = %label,
                 count = tools.len(),
@@ -117,10 +106,10 @@ impl McpConnectionManager {
                 let execution_identity_fingerprint = config
                     .servers
                     .iter()
-                    .find(|server| server.label == *label)
+                    .find(|server| server.label == label)
                     .and_then(|server| server.execution_identity_fingerprint.clone());
                 match McpBridgeTool::from_rmcp_tool(
-                    label,
+                    &label,
                     rmcp_tool,
                     client.clone(),
                     execution_identity_fingerprint,
@@ -164,6 +153,10 @@ impl McpConnectionManager {
         let futs = self.clients.values().map(|c| c.shutdown());
         futures::future::join_all(futs).await;
     }
+}
+
+async fn shutdown_clients(clients: &HashMap<String, Arc<McpClient>>) {
+    join_all(clients.values().map(|client| client.shutdown())).await;
 }
 
 impl Drop for McpConnectionManager {

@@ -39,6 +39,10 @@ local crew = Crew.new({
 GPT-5.6 Luna accepts only its provider-default temperature. Omit explicit
 `temperature` values when Luna is effective; IronCrew forwards configured
 values and the provider rejects unsupported non-default settings.
+For Chat Completions requests with function tools, IronCrew explicitly sends
+`reasoning_effort = "none"` because Luna rejects that combination under its
+default reasoning mode. Use `provider = "openai-responses"` when explicit
+reasoning is required.
 
 ### Google Gemini
 
@@ -402,6 +406,10 @@ when `prompt_cache_key` is set on the crew.
 Model capability is only half the picture — crews can also attach
 **Model Context Protocol (MCP) servers** to expose external tools to every
 agent. Pass `mcp_servers = {...}` to `Crew.new({...})` with either a stdio
-spawn spec or an HTTP Streamable URL, and the registered tools show up
-alongside built-ins. See the MCP section of [docs/crews.md](crews.md) for
-the full config schema, transport details, and examples.
+spawn spec or a Streamable HTTP URL for a server implementing MCP
+`2026-07-28` discovery. This is the latest published MCP revision for v3.0.0;
+each later IronCrew release targets the then-current official revision only and
+removes the superseded protocol. IronCrew does not support legacy initialize/SSE
+lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
+section of [docs/crews.md](crews.md) for the full config schema, transport
+details, and examples.

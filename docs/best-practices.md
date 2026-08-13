@@ -181,6 +181,13 @@ When `gpt-5.6-luna` is effective, omit explicit `temperature` values. Luna
 accepts only its provider default, and IronCrew forwards configured values
 rather than silently discarding an unsupported non-default setting.
 
+When Luna uses Chat Completions with function tools (including agent-facing
+`ask_human`), IronCrew explicitly sends `reasoning_effort = "none"`. Luna's
+default reasoning mode rejects function tools on that endpoint. Use the
+`openai-responses` provider when the task needs both explicit reasoning and
+server-side tools; do not work around the endpoint contract by hiding tool
+failures or retrying without the requested tool.
+
 **Streaming.** Enable `stream = true` on the crew or individual tasks to get
 LLM output as it arrives. When reasoning-capable providers are used
 (Anthropic thinking, OpenAI Responses reasoning, DeepSeek/Kimi reasoning), the
@@ -254,8 +261,17 @@ source-IP capture. See `docs/rest-api.md`.
 - `IRONCREW_MCP_ALLOW_LOCALHOST` — by default IronCrew refuses `http://`
   MCP URLs pointing at loopback. Set to `1` only when the MCP server runs
   as a trusted sidecar in the same pod.
-- `IRONCREW_MCP_HANDSHAKE_TIMEOUT_SECS` — default `10`. Raise only when
-  slow cold-starts (`uvx` / `npx` downloading on first run) are expected.
+- `IRONCREW_MCP_DISCOVERY_TIMEOUT_SECS` — default `10`. Raise only when a
+  trusted MCP `2026-07-28` server has a known slow cold start. IronCrew uses
+  strict `server/discover`; it does not fall back to `initialize`.
+- `IRONCREW_MCP_MAX_MRTR_ROUNDS` and
+  `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` — defaults `10` total attempts and
+  `65536` bytes. Keep state-only retries bounded; IronCrew rejects
+  `inputRequests` and Tasks-extension responses because it advertises neither.
+- `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` — default `1048576` (1 MiB).
+  Bounds each assembled stdio JSON line, HTTP JSON message, or SSE event before
+  JSON decoding; keep the limit close to the largest trusted tool definition or
+  result rather than raising it for an untrusted peer.
 - `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` — default `262144` (256 KB). Caps
   the result size returned from any MCP tool call; oversized results are
   truncated with a marker.
@@ -396,7 +412,7 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile pins Rust `1.96.0`, builds with
+**Multi-arch builds.** The Dockerfile pins Rust `1.97.1`, builds with
 `--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
 architectures with:
 

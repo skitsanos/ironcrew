@@ -56,14 +56,23 @@ policy design.
 
 ## Verify and propose
 
-1. Review dependency drift and `cargo audit --deny warnings`; ask before incompatible major
-   upgrades or audit-policy changes.
-2. Use `$check-ironcrew` to run the complete locally reproducible repository,
+1. Prove Cargo freshness with `cargo outdated --root-deps-only`,
+   `cargo upgrade --dry-run --incompatible`, and `cargo update --dry-run
+   --verbose`, then run `cargo audit --deny warnings`. Every direct dependency
+   must be current before release. A lower transitive version is acceptable only
+   when the current direct dependency graph pins it exactly; record the upstream
+   constraint and never force an incoherent lockfile. Ask before incompatible
+   major upgrades or audit-policy changes.
+2. Open the official MCP specification index and verify the newest published
+   revision. IronCrew supports only that revision: its strict discovery pin,
+   transports, tests, examples, and docs must move together, with no fallback to
+   the superseded protocol.
+3. Use `$check-ironcrew` to run the complete locally reproducible repository,
    Rust, Lua, evaluation, PostgreSQL, replica, and release-build gates. Required
    live tests may not be skipped. Platform-only jobs remain a later CI gate.
-3. Read commits and resolved `IC-NNN` entries since the latest tag. Propose a
+4. Read commits and resolved `IC-NNN` entries since the latest tag. Propose a
    Semantic Versioning bump from behavior, not commit-message prefixes alone.
-4. Draft release notes grouped by area and referencing relevant issue IDs.
+5. Draft release notes grouped by area and referencing relevant issue IDs.
    Wait for the user's version approval.
 
 ## Cut the release

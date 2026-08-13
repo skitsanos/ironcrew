@@ -5,6 +5,7 @@ use reqwest::StatusCode;
 
 use super::*;
 
+mod hitl_agents;
 mod ic005;
 mod ic006;
 mod ic008;

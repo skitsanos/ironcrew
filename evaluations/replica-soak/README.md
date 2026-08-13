@@ -38,14 +38,14 @@ and latency evidence:
 docker pull postgres:15
 ironcrew_pg_container_id=$(docker run --rm -d --name ironcrew-replica-soak-pg \
   -e POSTGRES_USER=ironcrew \
-  -e POSTGRES_PASSWORD=ironcrew \
+  -e POSTGRES_PASSWORD=local-soak-only-9c7f6b2a \
   -e POSTGRES_DB=ironcrew_soak \
   -p 55432:5432 postgres:15) || exit 1
 test -n "$ironcrew_pg_container_id" || exit 1
 
 cargo build --release --features postgres --bin ironcrew
 
-DATABASE_URL='postgres://ironcrew:ironcrew@127.0.0.1:55432/ironcrew_soak' \
+DATABASE_URL='postgres://ironcrew:local-soak-only-9c7f6b2a@127.0.0.1:55432/ironcrew_soak' \
 python3 evaluations/replica-soak/soak.py \
   --postgres-container "$ironcrew_pg_container_id" \
   --binary target/release/ironcrew \
@@ -76,7 +76,7 @@ fi
 For a wiring smoke:
 
 ```bash
-DATABASE_URL='postgres://ironcrew:ironcrew@127.0.0.1:55432/ironcrew_soak' \
+DATABASE_URL='postgres://ironcrew:local-soak-only-9c7f6b2a@127.0.0.1:55432/ironcrew_soak' \
 python3 evaluations/replica-soak/soak.py \
   --postgres-container ironcrew-replica-soak-pg \
   --binary target/release/ironcrew \

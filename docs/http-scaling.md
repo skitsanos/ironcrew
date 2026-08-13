@@ -365,8 +365,8 @@ For the status-labeled boundary between shared PostgreSQL coordination and
 process-local live control, including the two-replica release gate, see the
 [Multi-Replica Deployment Contract](multi-replica.md).
 
-The shared PostgreSQL run journal and HITL mailbox are committed but not yet in
-a published release. A published `2.22.0` image does not contain them.
+The shared PostgreSQL run journal and HITL mailbox require IronCrew v3.0.0 or
+newer. The legacy `2.22.0` image does not contain them.
 
 ### One HTTP instance (general-purpose baseline)
 
