@@ -15,6 +15,10 @@ use tokio::{sync::oneshot, task::JoinHandle};
 const PROTOCOL_VERSION: &str = "2026-07-28";
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "different integration targets inspect different fields"
+)]
 pub(super) struct CapturedRequest {
     pub(super) http_method: Method,
     pub(super) headers: HashMap<String, String>,
@@ -25,6 +29,7 @@ pub(super) struct CapturedRequest {
 struct FixtureState {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     legacy_only: bool,
+    advertise_tools: bool,
 }
 
 pub(super) struct HttpFixture {
@@ -36,6 +41,15 @@ pub(super) struct HttpFixture {
 
 impl HttpFixture {
     pub(super) async fn spawn(legacy_only: bool) -> Self {
+        Self::spawn_inner(legacy_only, true).await
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn spawn_without_tools_capability() -> Self {
+        Self::spawn_inner(false, false).await
+    }
+
+    async fn spawn_inner(legacy_only: bool, advertise_tools: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind MCP fixture");
@@ -44,6 +58,7 @@ impl HttpFixture {
         let state = FixtureState {
             requests: Arc::clone(&requests),
             legacy_only,
+            advertise_tools,
         };
         let app = Router::new()
             .route("/mcp", any(handle_request))
@@ -114,7 +129,11 @@ async fn handle_request(
             json!({
                 "resultType": "complete",
                 "supportedVersions": [PROTOCOL_VERSION],
-                "capabilities": {"tools": {}},
+                "capabilities": if state.advertise_tools {
+                    json!({"tools": {}})
+                } else {
+                    json!({})
+                },
                 "_meta": {
                     "io.modelcontextprotocol/serverInfo": {
                         "name": "ironcrew-http-fixture",

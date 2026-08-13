@@ -14,7 +14,7 @@ const DEFAULT_MAX_MRTR_ROUNDS: usize = 10;
 const HARD_MAX_MRTR_ROUNDS: usize = 32;
 const DEFAULT_MAX_REQUEST_STATE_BYTES: usize = 64 * 1024;
 const HARD_MAX_REQUEST_STATE_BYTES: usize = 1024 * 1024;
-const DEFAULT_MAX_INBOUND_MESSAGE_BYTES: usize = 1024 * 1024;
+pub(super) const DEFAULT_MAX_INBOUND_MESSAGE_BYTES: usize = 1024 * 1024;
 const HARD_MAX_INBOUND_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,7 +31,7 @@ impl McpCallPolicy {
         Self::capture_from(|name| std::env::var(name).ok())
     }
 
-    fn capture_from(read: impl Fn(&str) -> Option<String>) -> Result<Self> {
+    pub(super) fn capture_from(read: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let argument_max_bytes = parse_usize(
             "IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES",
             read("IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES"),
@@ -175,127 +175,5 @@ fn mcp_error(message: impl Into<String>) -> IronCrewError {
     IronCrewError::Mcp {
         server: String::new(),
         message: message.into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-
-    use super::*;
-
-    #[test]
-    fn captured_policy_is_immutable_when_configuration_drifts() {
-        let args = json!({"value": "captured"});
-        let exact_bytes = serde_json::to_vec(&args).unwrap().len();
-        let configured_argument_bytes = Cell::new(exact_bytes);
-        let configured_mrtr_rounds = Cell::new(7_usize);
-        let configured_request_state_bytes = Cell::new(5_usize);
-        let configured_timeout_secs = Cell::new(17_u64);
-        let capture = || {
-            McpCallPolicy::capture_from(|name| match name {
-                "IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES" => {
-                    Some(configured_argument_bytes.get().to_string())
-                }
-                "IRONCREW_MCP_CALL_TIMEOUT_SECS" => Some(configured_timeout_secs.get().to_string()),
-                "IRONCREW_MCP_MAX_MRTR_ROUNDS" => Some(configured_mrtr_rounds.get().to_string()),
-                "IRONCREW_MCP_MAX_REQUEST_STATE_BYTES" => {
-                    Some(configured_request_state_bytes.get().to_string())
-                }
-                _ => None,
-            })
-        };
-
-        let captured = capture().unwrap();
-        configured_argument_bytes.set(exact_bytes - 1);
-        configured_mrtr_rounds.set(1);
-        configured_request_state_bytes.set(1);
-        configured_timeout_secs.set(1);
-
-        captured.validate_arguments(&args).unwrap();
-        captured.validate_request_state("state").unwrap();
-        assert_eq!(captured.max_mrtr_rounds(), 7);
-        assert_eq!(captured.timeout(), Duration::from_secs(17));
-        assert_eq!(
-            captured.definition(),
-            json!({
-                "argument_max_bytes": exact_bytes,
-                "inbound_message_max_bytes": DEFAULT_MAX_INBOUND_MESSAGE_BYTES,
-                "max_mrtr_rounds": 7,
-                "request_state_max_bytes": 5,
-                "timeout_secs": 17,
-            })
-        );
-
-        let recaptured = capture().unwrap();
-        assert!(recaptured.validate_arguments(&args).is_err());
-        assert!(recaptured.validate_request_state("state").is_err());
-        assert_eq!(recaptured.max_mrtr_rounds(), 1);
-        assert_eq!(recaptured.timeout(), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn captured_policy_rejects_oversized_arguments_at_execution_boundary() {
-        let args = json!({"value": "too large"});
-        let exact_bytes = serde_json::to_vec(&args).unwrap().len();
-        let policy = McpCallPolicy::capture_from(|name| match name {
-            "IRONCREW_MCP_TOOL_ARGUMENT_MAX_BYTES" => Some((exact_bytes - 1).to_string()),
-            "IRONCREW_MCP_CALL_TIMEOUT_SECS" => Some("9".into()),
-            _ => None,
-        })
-        .unwrap();
-
-        let error = policy.validate_arguments(&args).unwrap_err().to_string();
-        assert!(error.contains("MCP tool arguments exceeds"));
-        assert_eq!(policy.timeout(), Duration::from_secs(9));
-    }
-
-    #[test]
-    fn invalid_call_policy_fails_during_capture() {
-        let error = McpCallPolicy::capture_from(|name| {
-            (name == "IRONCREW_MCP_CALL_TIMEOUT_SECS").then(|| "0".into())
-        })
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("IRONCREW_MCP_CALL_TIMEOUT_SECS must be from 1 to 3600"));
-    }
-
-    #[test]
-    fn request_state_limit_accepts_exact_bytes_and_rejects_one_more() {
-        let policy = McpCallPolicy::capture_from(|name| {
-            (name == "IRONCREW_MCP_MAX_REQUEST_STATE_BYTES").then(|| "4".into())
-        })
-        .unwrap();
-
-        policy.validate_request_state("🙂").unwrap();
-        let error = policy
-            .validate_request_state("🙂a")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("MCP requestState exceeds 4 bytes"));
-    }
-
-    #[test]
-    fn invalid_mrtr_limits_fail_during_capture() {
-        for (name, value, expected) in [
-            (
-                "IRONCREW_MCP_MAX_MRTR_ROUNDS",
-                "0",
-                "IRONCREW_MCP_MAX_MRTR_ROUNDS must be from 1 to 32",
-            ),
-            (
-                "IRONCREW_MCP_MAX_REQUEST_STATE_BYTES",
-                "1048577",
-                "IRONCREW_MCP_MAX_REQUEST_STATE_BYTES must be from 1 to 1048576",
-            ),
-        ] {
-            let error = McpCallPolicy::capture_from(|candidate| {
-                (candidate == name).then(|| value.to_string())
-            })
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains(expected), "got: {error}");
-        }
     }
 }

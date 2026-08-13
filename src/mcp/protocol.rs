@@ -10,8 +10,6 @@ pub(super) fn inbound_is_allowed(message: &ServerJsonRpcMessage) -> bool {
             notification.notification,
             ServerNotification::CancelledNotification(_)
                 | ServerNotification::ProgressNotification(_)
-                | ServerNotification::LoggingMessageNotification(_)
-                | ServerNotification::ToolListChangedNotification(_)
         ),
     }
 }

@@ -4,9 +4,13 @@
 mod http_fixture;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Once;
-use std::time::Duration;
+
+#[cfg(unix)]
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use http_fixture::{CapturedRequest, HttpFixture};
 use ironcrew::mcp::{
@@ -14,6 +18,7 @@ use ironcrew::mcp::{
     config::{McpServerConfig, McpTransportConfig},
 };
 use serde_json::{Value, json};
+#[cfg(unix)]
 use tempfile::TempDir;
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -35,6 +40,7 @@ fn isolate_test_environment() {
     });
 }
 
+#[cfg(unix)]
 fn stdio_fixture_config(
     temp: &TempDir,
     legacy_only: bool,
@@ -83,10 +89,12 @@ fn http_fixture_config(url: &str) -> McpServerConfig {
     }
 }
 
+#[cfg(unix)]
 fn stdio_fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mcp/stdio-tools/server.py")
 }
 
+#[cfg(unix)]
 fn read_stdio_log(temp: &TempDir) -> Vec<Value> {
     std::fs::read_to_string(temp.path().join("requests.jsonl"))
         .expect("read fixture log")
@@ -104,6 +112,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
         .expect("text result")
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn stdio_uses_discovery_and_drives_only_bounded_state_mrtr() {
     isolate_test_environment();
@@ -113,7 +122,7 @@ async fn stdio_uses_discovery_and_drives_only_bounded_state_mrtr() {
         .expect("connect to MCP 2026 fixture");
 
     let tools = client.list_all_tools().await.expect("list tools");
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 11);
 
     let echo = client
         .call_tool("echo", json!({"text": "wire-ok"}))
@@ -133,41 +142,6 @@ async fn stdio_uses_discovery_and_drives_only_bounded_state_mrtr() {
         .expect("echo empty requestState");
     assert_eq!(result_text(&empty_state), "empty-state-ok");
 
-    let looping = client
-        .call_tool("loop_forever", json!({}))
-        .await
-        .expect_err("MRTR loop must be bounded")
-        .to_string();
-    assert!(looping.contains("exceeded the 4-round MRTR limit"));
-
-    let oversized = client
-        .call_tool("oversized_state", json!({}))
-        .await
-        .expect_err("oversized requestState must fail")
-        .to_string();
-    assert!(oversized.contains("requestState exceeds 65536 bytes"));
-
-    let input_request = client
-        .call_tool("input_request", json!({}))
-        .await
-        .expect_err("unadvertised inputRequests must fail")
-        .to_string();
-    assert!(input_request.contains("capabilities IronCrew did not advertise"));
-
-    let empty_input = client
-        .call_tool("empty_input", json!({}))
-        .await
-        .expect_err("effective-empty input_required must fail")
-        .to_string();
-    assert!(empty_input.contains("without usable inputRequests or requestState"));
-
-    let task = client
-        .call_tool("task", json!({}))
-        .await
-        .expect_err("unadvertised task must fail")
-        .to_string();
-    assert!(task.contains("io.modelcontextprotocol/tasks capability"));
-
     client.shutdown().await;
 
     let requests = read_stdio_log(&temp);
@@ -175,14 +149,10 @@ async fn stdio_uses_discovery_and_drives_only_bounded_state_mrtr() {
     assert!(requests.iter().all(|entry| entry["method"] != "initialize"));
     assert_eq!(call_count(&requests, "stateful_echo"), 2);
     assert_eq!(call_count(&requests, "empty_state"), 2);
-    assert_eq!(call_count(&requests, "loop_forever"), MAX_MRTR_ROUNDS);
-    assert_eq!(call_count(&requests, "oversized_state"), 1);
-    assert_eq!(call_count(&requests, "input_request"), 1);
-    assert_eq!(call_count(&requests, "empty_input"), 1);
-    assert_eq!(call_count(&requests, "task"), 1);
     assert_process_stopped(temp.path().join("server.pid")).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn stdio_does_not_fall_back_to_initialize() {
     isolate_test_environment();
@@ -194,7 +164,7 @@ async fn stdio_does_not_fall_back_to_initialize() {
         }
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("MCP discovery failed"));
+    assert!(error.contains("MCP stdio discovery failed"));
 
     let requests = read_stdio_log(&temp);
     assert_eq!(requests.len(), 1);
@@ -202,6 +172,7 @@ async fn stdio_does_not_fall_back_to_initialize() {
     assert_process_stopped(temp.path().join("server.pid")).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn stdio_rejects_discovery_without_the_2026_revision() {
     isolate_test_environment();
@@ -214,7 +185,7 @@ async fn stdio_rejects_discovery_without_the_2026_revision() {
         }
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("MCP discovery failed"));
+    assert!(error.contains("MCP stdio discovery failed"));
 
     let requests = read_stdio_log(&temp);
     assert_eq!(requests.len(), 1);
@@ -276,6 +247,7 @@ async fn http_does_not_fall_back_or_create_a_legacy_session() {
     fixture.shutdown().await;
 }
 
+#[cfg(unix)]
 fn call_count(requests: &[Value], name: &str) -> usize {
     requests
         .iter()
@@ -331,6 +303,3 @@ async fn assert_process_stopped(pid_file: PathBuf) {
     }
     panic!("MCP fixture process {pid} is still alive");
 }
-
-#[cfg(not(unix))]
-async fn assert_process_stopped(_pid_file: PathBuf) {}

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,21 @@ TOOLS = [
     {
         "name": "task",
         "description": "Return an unadvertised Tasks extension result.",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
+        "name": "oversized_frame",
+        "description": "Emit a response frame larger than IronCrew's inbound cap.",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
+        "name": "hang",
+        "description": "Remain blocked until IronCrew cancels and reaps the fixture.",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
+        "name": "partial_eof",
+        "description": "Emit an incomplete JSON frame and close stdout.",
         "inputSchema": {"type": "object", "additionalProperties": False},
     },
 ]
@@ -140,6 +157,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
     params = request.get("params") or {}
 
     if method == "server/discover":
+        if os.environ.get("MCP_FIXTURE_HANG_DISCOVERY") == "1":
+            time.sleep(60)
         if os.environ.get("MCP_FIXTURE_LEGACY_ONLY") == "1":
             return method_not_found(request_id, "server/discover is unavailable")
         supported_version = os.environ.get(
@@ -150,7 +169,11 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
             {
                 "resultType": "complete",
                 "supportedVersions": [supported_version],
-                "capabilities": {"tools": {}},
+                "capabilities": (
+                    {}
+                    if os.environ.get("MCP_FIXTURE_OMIT_TOOLS_CAPABILITY") == "1"
+                    else {"tools": {}}
+                ),
                 "_meta": {
                     SERVER_INFO_KEY: {
                         "name": "ironcrew-mcp-2026-fixture",
@@ -163,6 +186,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
             },
         )
     if method == "tools/list":
+        if os.environ.get("MCP_FIXTURE_HANG_LIST") == "1":
+            time.sleep(60)
         return result(
             request_id,
             {
@@ -248,6 +273,11 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
                 "pollIntervalMs": 100,
             },
         )
+    if name == "oversized_frame":
+        return complete_text(request_id, "x" * (1024 * 1024))
+    if name == "hang":
+        time.sleep(60)
+        return complete_text(request_id, "unreachable")
     return error(request_id, f"unknown tool: {name}")
 
 
@@ -255,6 +285,17 @@ def main() -> int:
     pid_file = os.environ.get("MCP_FIXTURE_PID_FILE")
     if pid_file:
         Path(pid_file).write_text(str(os.getpid()), encoding="ascii")
+
+    if os.environ.get("MCP_FIXTURE_SPAWN_GRANDCHILD") == "1":
+        grandchild = subprocess.Popen(  # noqa: S603 - fixed hermetic fixture command
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        grandchild_pid_file = os.environ.get("MCP_FIXTURE_GRANDCHILD_PID_FILE")
+        if grandchild_pid_file:
+            Path(grandchild_pid_file).write_text(str(grandchild.pid), encoding="ascii")
 
     first = True
     for raw_line in sys.stdin.buffer:
@@ -266,12 +307,25 @@ def main() -> int:
             log_request(request)
             validate_request(request, first=first)
             first = False
+            if (
+                request.get("method") == "tools/call"
+                and (request.get("params") or {}).get("name") == "partial_eof"
+            ):
+                sys.stdout.write('{"jsonrpc":"2.0"')
+                sys.stdout.flush()
+                return 0
             response = handle(request)
         except Exception as exc:  # fixture must turn malformed input into protocol evidence
             request_id = request.get("id") if isinstance(request, dict) else None
             response = error(request_id, str(exc))
         sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+        if (
+            os.environ.get("MCP_FIXTURE_EXIT_AFTER_DISCOVER") == "1"
+            and isinstance(request, dict)
+            and request.get("method") == "server/discover"
+        ):
+            return 0
     return 0
 
 

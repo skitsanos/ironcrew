@@ -185,6 +185,7 @@ impl Tool for McpBridgeTool {
             "server_label": self.server_label,
             "server_tool_name": self.server_tool_name,
             "execution_identity_fingerprint": identity,
+            "transport_execution": self.client.transport_execution_definition(&self.server_tool_name)?,
             "call_policy": self.call_policy.definition(),
             "result_max_bytes": self.result_max_bytes,
             "max_content_items": self.max_content_items,
