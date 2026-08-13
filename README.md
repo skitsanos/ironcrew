@@ -8,7 +8,7 @@ Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native),
 local crew = Crew.new({
     goal = "Research and summarize a topic",
     provider = "openai",
-    model = env("OPENAI_MODEL") or "gpt-4.1-mini",
+    model = env("OPENAI_MODEL") or "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

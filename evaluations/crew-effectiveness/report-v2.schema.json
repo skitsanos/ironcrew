@@ -164,7 +164,7 @@
           "minimum": 1
         },
         "temperature": {
-          "const": 0
+          "const": null
         },
         "order_seed": {
           "type": "integer"

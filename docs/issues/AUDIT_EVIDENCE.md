@@ -36,6 +36,39 @@ simpler workflows. Contract mode uses an oracle-backed mock provider and is
 only evidence that orchestration, reporting, and scoring behave as designed.
 IC-009 owns the repeated six-case and representative-domain evidence gap.
 
+On 2026-08-11, the active runtime, scaffold, demos, and IC-009 plan moved to
+`gpt-5.6-luna`; the July GPT-4.1 receipt remains historical rather than being
+rewritten. Bounded real-endpoint text/strict-JSON and image-input probes passed
+after GPT-5 Chat requests adopted `max_completion_tokens` and Luna-backed flows
+removed unsupported explicit temperatures. Those probes establish API/runtime
+compatibility only. They are not a repeated Luna effectiveness result, and the
+full five-repetition synthetic run plus two independently reviewed intended-use
+domain packs remain outstanding under IC-009.
+
+On 2026-08-12, that bounded gap closed. The frozen GPT-5.6 Luna plan completed
+180/180 local live-provider runs across 12 cases, five repetitions, and three
+topologies, with 60 matched pairs per crew candidate and no execution, parse,
+or schema failures. The DAG raised mean grounded correctness from 0.6500 to
+0.7833; its +0.1333 paired delta had a Bonferroni-adjusted 97.5% interval of
+[0.0500, 0.2167], and its 3.2113x token and 4.5645x latency multipliers stayed
+inside the predeclared 6x ceilings. It therefore met every check and was the
+bounded recommendation. The collaborative variant reached 0.7333 but did not
+qualify because its interval crossed zero and its 6.7050x latency multiplier
+exceeded the ceiling. `crew_qualified` means that the DAG qualified for this
+plan; it does not mean every crew topology qualified.
+
+Provider-reported usage was 289,816 prompt, 107,821 completion, zero cached,
+and 397,637 total tokens. The frozen-price observed estimated upper bound was
+$0.2018392, versus a $2.7528 planned bound and $3 approval budget; this is a
+conservative token-derived estimate, not an invoice. The aggregate corpus,
+plan, flow, and release-binary hashes are retained in the dated JSON receipt,
+which also proves the dirty source manifest and binary stayed unchanged during
+the run. The six-case synthetic core and two independently reviewed
+representative synthetic intended-use packs are not production samples. This
+is one operator-declared OpenAI API/GPT-5.6 Luna configuration running locally,
+not multi-model, production-data, deployed-platform, or broad-superiority
+evidence. The July GPT-4.1 receipts remain unchanged historical evidence.
+
 ## Two-process PostgreSQL replica evidence
 
 On 2026-07-19, two independent `ironcrew serve` processes sharing PostgreSQL
@@ -168,7 +201,8 @@ returned to zero, with the namespace baseline restored at
 
 ## Execution and storage metrics closure — 2026-08-11
 
-The reviewed worktree extends the authenticated `/metrics` response with
+The committed, not-yet-released implementation extends the authenticated
+`/metrics` response with
 fixed-cardinality, process-local counters and histograms for run, task, tool,
 provider, provider-token, SSE, lease-loss, reconciliation, terminal-persistence,
 and explicitly instrumented storage outcomes. Closed enums own every label;
@@ -205,6 +239,249 @@ production alert policy exists. IC-010 is resolved on implementation, local
 regression, disposable PostgreSQL, and bounded separate-process evidence; no
 deployed per-pod scraper or release is claimed.
 
+## Retention-boundary replica soak closure — 2026-08-11
+
+IC-018's predeclared provider-free contract passed with two direct release
+processes sharing an isolated PostgreSQL 15.18 database. The 1,800.651-second
+workload completed 2,613/2,613 keyed cross-replica HITL/SSE runs with zero
+readiness, liveness, workload, or deadlock failures. Sixty-one observations
+crossed the configured 600-second journal-retention boundary; 40 were
+post-boundary, and the final 20 intervals covered 602.081 seconds with 7,322
+latency samples and no declared violation.
+
+Maximum retained journal state was 3,696 rows/3,784,704 bytes against
+8,192/8 MiB ceilings. Expired physical rows peaked at 5 against 128, and
+post-prune retained growth was zero rows/bytes against 512/1 MiB. Retention
+state and PostgreSQL delete statistics advanced in 41 and 40 intervals. Prefix
+delete deltas are correlated aggregate evidence rather than per-batch causality.
+Prefix relations peaked at 11,984,896 bytes, WAL reached 69,072,576 bytes,
+replica RSS peaked at 17,924,096/17,989,632 bytes, and tail RSS growth was
+16,384/0 bytes. The required expired cursor, explicit retention gap, incomplete
+synthesized terminal, and zero-row replay anchor all passed.
+
+A separate bounded loopback-mock receipt passed exact provider/tool counts, an
+exact 65,536-byte result, and a two-turn warm-owner/cold-peer committed
+conversation boundary with matching history and the PostgreSQL conversation
+SSE `409`. Paid-provider calls and estimated cost were zero. That receipt
+explicitly records `in_flight_takeover_proven: false`; it is not live-provider
+or arbitrary exactly-once external-effect evidence.
+
+The long-soak and profile JSON receipts hash to
+`sha256:750be5c83ebd4f5df2299c5b3a4b9483b06cdae50a9fc46b18906cdee49eab4e`
+and
+`sha256:2e00f1f7deca155cebbecc5adf65a36d0cec3f21a6cfb7191d49d3066a8e7d83`.
+Both bind revision `fe906f50e37640adb00b37a846be648b3a1178f9`, the same
+release-binary hash, and separately stable dirty-worktree manifests. The serial
+live-PostgreSQL regression gate passed 48/48 store, 2/2 multi-replica HTTP, and
+10/10 process tests against freshly pulled PostgreSQL 15.18 at digest
+`sha256:6eb0add3b77c081df18aa518ce43df58fdcc40f2e6d868a6fd08038dc7acd425`.
+
+The JSON receipts prove clean process exits and exact prefix cleanup to zero.
+Separate fixture evidence confirms that the captured labeled `--rm`
+PostgreSQL container was removed without a broad prune. Raw logs were not
+retained. This closes IC-018's provider-free local-process evidence gap. No
+live-provider, Railway, OpenShift, load-balancer, cgroup/OOM, autoscaling, or
+production-monitoring result is claimed; the dirty artifacts were not published.
+
+## Release-image promotion checkpoint — 2026-08-12
+
+The IC-015 implementation moves multi-platform image construction
+into the exact tag's release workflow. It produces one signed OCI archive and
+a strict signed receipt bound to the tag commit, checksummed release binaries,
+Dockerfile, content-addressed Wolfi base index, OCI index and platform objects,
+and builder. The separately authorized Docker publisher verifies those assets
+and promotes the archive without rebuilding current default-branch source.
+Version promotion is absent-or-identical only; a conflicting existing digest
+fails closed. Shared workflow coordination and bounded post-write GitHub
+release revalidation cover the repository-side `latest` race between releases
+that carry the complete signed IC-015 asset set.
+
+Initial read-only GitHub and Docker Hub API checks on 2026-08-12 found GitHub stable
+release `v2.22.0` (published 2026-07-07), but Docker Hub `latest` still matched
+`2.20.0` at
+`sha256:fa336f85a0347001438d576f2e945136eb40485f7a6a0355a77ea0dbf38230c6`;
+the `2.21.0` and `2.22.0` tag endpoints returned `404`. Docker Hub also
+reported immutable tags disabled, with the inactive rule `.*`.
+
+Later live remediation enabled the exact stable-semver-only rule on
+`skitsanos/ironcrew`; `latest` remains mutable. No production image or tag was
+published or moved, and the pre-existing tag snapshot stayed unchanged. A
+uniquely named disposable Docker Hub repository then passed initial promotion,
+identical replay, conflict refusal, direct immutable-tag enforcement, second
+version publication, and a two-attempt `latest` repair. Same-archive mutable
+`latest` write/restore controls ruled out an unrelated copy failure as the
+immutable-version rejection cause. Authenticated API and
+registry checks proved the repository and all three acceptance tags absent
+after exact UI cleanup. The sanitized retained receipt is
+[`2026-08-12-ic015-dockerhub.json`](../../evaluations/release-acceptance/reports/2026-08-12-ic015-dockerhub.json),
+SHA-256
+`6635719fcda499cadc3a076182f7c7ab3b00cd19f362edbcd6781636bc9e2a11`.
+The implementation and acceptance receipt landed in commit
+`8bccba9b1c19f2deb9bd4353406b4623ebfeab14`. After a bounded test-only
+stabilization for IC-017's minimum journal-read deadline, exact-head commit
+`56fd1d96d3ae1f78ea92ed1590643e434f7cb98b` passed all nine jobs in
+[CI run 31596627801](https://github.com/skitsanos/ironcrew/actions/runs/31596627801),
+including PostgreSQL integration and replica-soak smoke. IC-015 is resolved;
+production Docker publication remains deferred to the user's release-last
+sequence and the protected IC-014 path.
+
+This is a next-release protocol, not a historical-image backfill: the current
+legacy `v2.22.0` release has none of the new OCI/receipt assets. A newer release
+created outside the trusted workflow, or observed before its complete signed
+asset set exists, fails closed. At that checkpoint, preventing the former event
+remained IC-014's platform boundary; the trusted-control closure below supplies
+that boundary under the accepted sole-owner model.
+
+## Trusted release-control closure — 2026-08-12
+
+The resolved IC-014 source checkpoint replaces release tag-push and
+branch-selectable manual triggers with versioned `repository_dispatch` events.
+GitHub selects these workflows from the default branch. The request validator
+accepts an exact stable tag and `validate` or `publish` mode, rejects extra or
+ambiguous payload fields, and binds the event to the repository and triggering
+actor. Release selection separately requires a direct annotated tag-to-commit
+reference, matching manifest version, `main` ancestry, and the same resolved
+commit before final publication. The trusted workflow identity is
+`release.yml@refs/heads/main`, while the strict image receipt retains the exact
+tag and commit source binding.
+
+Both release and Docker workflows now have a non-publishing `validate` path
+through an environment named `release`. That path has contents-read permission
+and no release, OIDC-signing, Docker-secret, or registry operation. Image build,
+receipt, and SBOM packaging remain in a contents-read job. The final protected
+release job only independently verifies the expected artifacts, signs them,
+and creates the release once; only the Docker promotion job references Docker
+credentials. These are local workflow and policy-test properties, not proof of
+remote enforcement.
+
+Initial read-only GitHub API checks on 2026-08-12 found zero repository
+rulesets, zero environments, and no `main` protection object (`404`). The sole
+direct collaborator was owner `skitsanos` with administrator access, so no
+independent release reviewer currently exists. Actions allowed all actions, did
+not require full-SHA pinning, used read as the default workflow permission, and
+did not allow workflows to approve pull-request reviews.
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` remained repository-scoped Actions
+secrets. Immutable GitHub releases were initially disabled (`enabled: false`,
+`enforced_by_owner: false`). The new preview workflow-execution-policy control
+was not available as authoritative stable-API evidence during that initial
+check; the later authenticated UI review recorded below found zero policies.
+
+Default-branch dispatch selection does not prevent a tag-capable actor from
+placing a separate tag-push workflow in an off-main commit. In the original
+multi-actor threat model, GitHub's preview workflow-execution protections or an
+equivalent authority boundary were therefore required. The accepted sole-owner
+model below supersedes that requirement: only the trusted owner may create
+`v*` tags and compromised owner authority is out of scope. Existing CI also
+uses push events on `main` and `develop`, so no broad preview policy is enabled
+without a separate design and canary. Direct repository dispatch is still not
+used as the approval channel because it requires Contents write; the Issues
+controller below supplies a lower-standing-authority request path.
+
+There is also a tag time-of-check/time-of-use boundary: final tag revalidation
+and `gh release create --verify-tag` are not atomic. Active `v*` rules must
+restrict creation and prevent update/deletion without administrator bypass, and
+immutable GitHub releases must be enabled, before the exact tag can be treated
+as stable through publication.
+
+Live remediation later on 2026-08-12 enabled immutable GitHub releases. The API
+now reports `enabled: true` and `enforced_by_owner: false`; this applies to
+future releases and did not retroactively change legacy release `v2.22.0`,
+which still reports `immutable: false`.
+
+At the interim checkpoint, active repository tag ruleset `20741649`, named
+`Lock v* release tags pending trusted publisher`, targeted `refs/tags/v*` with
+creation, update, and deletion restrictions. It had no bypass actors, and the
+API reported that the current user could never bypass it. This deliberately
+fail-closed state preceded the final owner-only tag-creation rule.
+
+A real push of canary tag `v0.0.0-ic014-lock-canary-20260812` was rejected by
+GitHub with `GH013`. A follow-up ref lookup confirmed the remote tag is absent.
+No release, image, workflow run, environment, `main` rule, collaborator, secret
+scope, or registry state was created or changed by that canary.
+
+The owner subsequently accepted an explicit sole-owner authority model:
+`skitsanos` is the trusted root and the only current `develop` to `main` and
+release approver. A second-person approval is no longer an IC-014 requirement;
+malicious or compromised owner authority is outside the claimed boundary. The
+local low-standing-authority request path is an owner-authored issue with the
+exact `release-request` label and canonical bounded JSON body. A trusted-main
+controller validates the owner, actor, repository, issue, target, stable tag,
+and mode before using only its run-scoped `GITHUB_TOKEN` for the fixed
+downstream repository dispatch. No long-lived Contents-write personal token is
+part of this design.
+
+Label removal/reapplication and owner-triggered workflow reruns are deliberate
+reauthorizations, not deduplicated retries. Attempts serialize per issue, both
+the original and rerunning actors remain owner-bound, and downstream
+publication remains fail-closed under replay. The request issue is closed after
+the downstream run completes rather than granting the controller Issues-write
+authority.
+
+The live sole-owner controls were then applied. Environment `release`
+(`19770322300`) requires normal approval by `skitsanos`, permits deliberate
+self-review, has administrator bypass disabled in the authenticated UI, and
+admits only `main` through policy `57181717`. No-bypass branch ruleset
+`20762614` protects `main` with PR-only integration, resolved conversations,
+strict current-head enforcement, all nine established CI jobs, zero required
+second-person approvals, deletion protection, and non-fast-forward protection.
+Tag ruleset `20762625` permits only user `skitsanos` to create `v*`; separate
+no-bypass ruleset `20741649` prevents everyone, including the owner, from
+updating or deleting those tags. Label `release-request` is present.
+
+Docker credentials now exist only as environment secrets
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`; the repository secret count is zero.
+The replacement is a 90-day read/write token, and the positively attributed
+legacy `ironcrew-git-publish` token was deleted. A first replacement appeared in
+the automation transcript and was revoked before use or GitHub storage; a
+separate token was transferred without rendering or retaining its value. No
+release, tag, image, registry alias, or dispatch was created.
+
+The controller and downstream workflows reached trusted `main` through
+protected pull request
+[#63](https://github.com/skitsanos/ironcrew/pull/63). Exact PR head
+`bd829415dff114c5cfc7faafb5a72d15c4b7f755` passed all nine required jobs in
+[PR CI run 31633359970](https://github.com/skitsanos/ironcrew/actions/runs/31633359970),
+and merge commit `0ece62c4973d343b83f8ea8d31a28a7bc7cb043c` passed the same nine-job
+matrix on `main` in
+[CI run 31634085607](https://github.com/skitsanos/ironcrew/actions/runs/31634085607).
+
+The two protected live validation receipts are:
+
+- owner issue [#64](https://github.com/skitsanos/ironcrew/issues/64), release
+  controller [run 31635027122](https://github.com/skitsanos/ironcrew/actions/runs/31635027122),
+  and release downstream
+  [run 31635064079](https://github.com/skitsanos/ironcrew/actions/runs/31635064079);
+- owner issue [#65](https://github.com/skitsanos/ironcrew/issues/65), Docker
+  controller [run 31635324542](https://github.com/skitsanos/ironcrew/actions/runs/31635324542),
+  and Docker downstream
+  [run 31635348636](https://github.com/skitsanos/ironcrew/actions/runs/31635348636).
+
+Each exact canonical issue selected `mode: validate`, each controller selected
+only its requested fixed dispatch, and each downstream run bound itself to the
+trusted `main` workflow. Owner `skitsanos` supplied a normal approval for
+environment `release` (`19770322300`) in both runs. The release target builds,
+immutable-image build, and release-creation job were skipped; the Docker
+promotion job was skipped. Both downstream runs reported zero Actions
+artifacts.
+
+Branch ruleset `20762614`, owner-only tag-creation ruleset `20762625`,
+no-bypass tag-update/deletion ruleset `20741649`, and main-only environment
+branch policy `57181717` remained active. Normalized snapshots of exact `main`,
+all `v*` refs, releases, release assets, and public Docker tags were identical
+before and after each canary at SHA-256
+`0ec913fd66f5bfc4bfee560d5d4100f3edd6d50368e406898b09f7e4c357aa31`.
+No release, Git tag, release asset, image, registry alias, or additional product
+version change occurred. Issues #64 and #65 were closed after their downstream
+runs completed.
+
+This is trusted-control and non-publishing dry-run evidence under the accepted
+sole-owner model, not a publish-mode run or a new release. `skitsanos` remains
+the trusted root and only current `develop` to `main` and release approver;
+malicious or compromised owner authority remains outside the claimed boundary.
+A future release still requires separate authorization, a product version bump
+in `Cargo.toml` and the root `Cargo.lock`, a matching annotated tag, and the
+protected publish path.
+
 ## Current evidence boundaries
 
 The following remain explicitly unproven, incomplete, or unsupported. Tracked
@@ -212,14 +489,28 @@ gaps retain their issue-registry owners:
 
 - execution takeover/checkpoint resume and exactly-once arbitrary external
   provider/tool effects, neither of which follows from replica routing;
-- a retention-boundary steady-state soak with predeclared ceilings;
+- live-provider and Railway/OpenShift retention-boundary resource profiles;
+  IC-018's predeclared provider-free local-process contract is green, but it is
+  not platform or production steady-state proof;
 - an attributed Railway load-balancer canary and a published release for
   arbitrary-routed keyed conversation turns. IC-008's local PostgreSQL and
   OpenShift dirty-artifact results are green, but Railway remains unrun;
   in-flight turn takeover and durable PostgreSQL conversation SSE remain
   unsupported;
-- broader, repeated crew-effectiveness evidence;
+- production-sample, multi-model, and deployed-platform crew-effectiveness
+  generality beyond IC-009's bounded local GPT-5.6 Luna result;
 - deployment-specific authenticated per-pod metrics collection, a hosted
   telemetry backend/dashboard, and billing remain external operator concerns;
-- an honest module-size baseline ratchet for legacy oversized Rust modules; and
-- a platform-enforced trusted release control plane.
+- publish-mode execution of the resolved trusted release path. IC-014's
+  default-branch controller, remote environment, protected default branch and
+  tags, future immutable releases, environment-scoped credentials, denied tag
+  canary, protected integration, and both owner-approved non-publishing
+  validation runs are complete. No new release was attempted; version/tag and
+  publication evidence remain intentionally deferred to the eventual release
+  phase.
+
+The preview Actions Policies page currently contains zero policies. Under the
+accepted sole-owner boundary that is recorded rather than treated as a closure
+blocker: only the trusted owner may create `v*` tags, owner compromise is out of
+scope, and a broad event policy would interfere with current CI and controller
+events without closing the owner-authority boundary.

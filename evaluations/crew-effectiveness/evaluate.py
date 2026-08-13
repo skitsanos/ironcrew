@@ -16,16 +16,37 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from corpus_loader import load_corpus
 from decision_analysis import topology_decision
-from evaluation_setup import plan_receipt, prepare_plan, validate_run_request
+from evaluation_plan_v2 import VARIANTS as PLAN_VARIANTS
+from evaluation_plan_v2 import load_plan as load_plan_v2
+from evaluation_plan_v2 import preflight as preflight_v2
+from evaluation_reporting_v3 import (
+    dataset_receipt,
+    domain_summaries,
+    empty_usage,
+    pricing_receipt,
+    report_json_bytes,
+    successful_run_usage,
+)
+from evaluation_setup import validate_run_request
+from live_provider_environment import live_provider_environment, redaction_canaries
 from mock_openai import ContractServer, create_server
 from pairwise_analysis import pairwise_comparisons, summarize_runs
+from pricing_budget import require_approved_budget
+from report_schema_validation import validate_report
+from source_provenance import (
+    require_unchanged_provenance,
+    safe_binary_path,
+    worktree_provenance,
+)
 
 
-SCHEMA_VERSION = "ironcrew.crew-eval.v2"
-VARIANTS = ("single", "dag", "collaborative")
+SCHEMA_VERSION = "ironcrew.crew-eval.v3"
+DEFAULT_MODEL = "gpt-5.6-luna"
+VARIANTS = tuple(PLAN_VARIANTS)
 EXPECTED_TASKS = {
     "single": {"final"},
     "dag": {"extract", "challenge", "final"},
@@ -38,9 +59,78 @@ CONTRACT_NOTICE = (
     "these scores are never evidence that one crew topology is more effective."
 )
 LIVE_NOTICE = (
-    "Exploratory live-provider evidence on a small synthetic dataset. Interpret "
-    "quality, token, and latency deltas together; this is not broad proof of superiority."
+    "Decision-grade local live-provider evidence on representative synthetic intended-use "
+    "packs. Interpret quality, cost, and latency together; this is not production-sample, "
+    "multi-model, deployed-platform, or broad superiority evidence."
 )
+
+
+class LiveProcessPacer:
+    """Keep the first provider start in consecutive CLI processes separated.
+
+    IronCrew enforces the same interval between calls inside one process. This
+    evaluator additionally starts the interval when each CLI process finishes,
+    including failed and timed-out runs, so process-local limiter state cannot
+    reset the cross-process boundary.
+    """
+
+    def __init__(
+        self,
+        interval_ms: int,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if interval_ms < 1:
+            raise ValueError("live process interval must be positive")
+        self._interval_seconds = interval_ms / 1_000
+        self._clock = clock
+        self._sleeper = sleeper
+        self._last_completion: float | None = None
+
+    def wait_before_start(self) -> None:
+        if self._last_completion is None:
+            return
+        remaining = self._last_completion + self._interval_seconds - self._clock()
+        if remaining > 0:
+            self._sleeper(remaining)
+
+    def record_completion(self) -> None:
+        self._last_completion = self._clock()
+
+
+def apply_live_provider_controls(
+    environment: dict[str, str], plan: dict[str, Any]
+) -> None:
+    """Force the reviewed pre-send byte boundary and in-process pacing."""
+    environment["IRONCREW_PROVIDER_MAX_REQUEST_BYTES"] = str(
+        plan["limits"]["max_provider_request_body_bytes"]
+    )
+    environment["IRONCREW_RATE_LIMIT_MS"] = str(
+        plan["rate_limit"]["minimum_provider_start_interval_ms"]
+    )
+
+
+def schema_validation_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep report validation independent of provider credentials and dotenv."""
+    allowed = {
+        "PATH",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SYSTEMROOT",
+        "WINDIR",
+        "IRONCREW_LOG",
+    }
+    return {name: value for name, value in environment.items() if name in allowed}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -426,12 +516,17 @@ def run_one(
     flow_dir: Path,
     case: dict[str, Any],
     oracle: dict[str, Any],
+    domain_pack: str = "synthetic-core-v1",
     variant: str,
     repetition: int,
     model: str,
     mode: str,
     timeout_seconds: int,
     planned_llm_calls: int,
+    task_llm_calls: dict[str, int],
+    task_maximum_output_tokens: dict[str, int],
+    input_token_costing_allowance_per_request: int = 20_000,
+    max_completion_tokens_per_request: int = 800,
     base_environment: dict[str, str],
     mock_server: ContractServer | None,
 ) -> dict[str, Any]:
@@ -460,7 +555,7 @@ def run_one(
     try:
         completed = subprocess.run(
             command,
-            cwd=repo_root,
+            cwd=flow_dir,
             env=base_environment,
             capture_output=True,
             text=True,
@@ -474,6 +569,7 @@ def run_one(
             observed = mock_server.snapshot()["request_count"] - before_requests
         result = {
             "case_id": case["case_id"],
+            "domain_pack": domain_pack,
             "variant": variant,
             "repetition": repetition,
             "planned_llm_calls": planned_llm_calls,
@@ -486,14 +582,13 @@ def run_one(
             "run_duration_ms": None,
             "run_id": None,
             "run_status": None,
-            "total_tokens": None,
-            "cached_tokens": None,
             "agent_count": 0,
             "task_count": 0,
             "task_names": [],
             "task_failures": 0,
             "model_output": None,
         }
+        result.update(empty_usage())
         result.update(empty_score(oracle))
         return result
 
@@ -502,6 +597,7 @@ def run_one(
         observed = mock_server.snapshot()["request_count"] - before_requests
     result = {
         "case_id": case["case_id"],
+        "domain_pack": domain_pack,
         "variant": variant,
         "repetition": repetition,
         "planned_llm_calls": planned_llm_calls,
@@ -514,14 +610,13 @@ def run_one(
         "run_duration_ms": None,
         "run_id": None,
         "run_status": None,
-        "total_tokens": None,
-        "cached_tokens": None,
         "agent_count": 0,
         "task_count": 0,
         "task_names": [],
         "task_failures": 0,
         "model_output": None,
     }
+    result.update(empty_usage())
     result.update(empty_score(oracle))
 
     if completed.returncode != 0:
@@ -547,11 +642,6 @@ def run_one(
             "run_id": record.get("run_id"),
             "run_status": status,
             "run_duration_ms": record.get("duration_ms"),
-            # A non-successful run can report only a lower bound after one or
-            # more paid calls. Treat aggregate usage as unknown rather than
-            # presenting a partial number as a complete cost measurement.
-            "total_tokens": record.get("total_tokens", 0) if run_succeeded else None,
-            "cached_tokens": record.get("cached_tokens", 0) if run_succeeded else None,
             "agent_count": record.get("agent_count", 0),
             "task_count": record.get("task_count", 0),
             "task_names": sorted(
@@ -564,6 +654,24 @@ def run_one(
             ),
         }
     )
+    if run_succeeded:
+        try:
+            usage = successful_run_usage(
+                task_results,
+                task_llm_calls,
+                task_maximum_output_tokens,
+                input_token_costing_allowance_per_request,
+                max_completion_tokens_per_request,
+            )
+            if (
+                record.get("total_tokens") != usage["total_tokens"]
+                or record.get("cached_tokens") != usage["cached_tokens"]
+            ):
+                raise ValueError("aggregate run and task token accounting differ")
+            result.update(usage)
+        except ValueError as error:
+            result["failure_reason"] = f"token measurement failed: {error}"
+            return result
     if not run_succeeded:
         result["failure_reason"] = f"run status was {status or 'missing'}"
         return result
@@ -637,54 +745,40 @@ def validate_report_with_ironcrew(
     report_path: Path,
     environment: dict[str, str],
 ) -> str | None:
-    payload = {
-        "schema": schema_path.read_text(encoding="utf-8"),
-        "report": report_path.read_text(encoding="utf-8"),
-    }
-    try:
-        with tempfile.TemporaryDirectory(prefix="ironcrew-eval-schema-") as temporary:
-            isolated_validator = Path(temporary) / "validate-report.lua"
-            shutil.copy2(validator_path, isolated_validator)
-            completed = subprocess.run(
-                [
-                    str(binary),
-                    "run",
-                    str(isolated_validator),
-                    "--input",
-                    json.dumps(payload, separators=(",", ":")),
-                ],
-                cwd=repo_root,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-    except (OSError, subprocess.SubprocessError) as error:
-        return f"could not execute report schema validator: {error}"
-    if completed.returncode != 0:
-        detail = redact_error(completed.stderr, environment)
-        return detail or f"report schema validator exited with status {completed.returncode}"
-    return None
+    return validate_report(
+        binary=binary,
+        repo_root=repo_root,
+        validator_path=validator_path,
+        schema_path=schema_path,
+        report_path=report_path,
+        environment=schema_validation_environment(environment),
+        redact_error=lambda detail: redact_error(detail, environment),
+    )
 
 
 def build_parser(base_dir: Path, repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("contract", "live"), default="contract")
     parser.add_argument("--binary", type=Path, default=repo_root / "target/debug/ironcrew")
-    parser.add_argument("--model", default="gpt-4.1-mini")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--provider-id",
         help="non-secret operator-declared provider identity required for live runs",
     )
     parser.add_argument("--cases", type=Path, default=base_dir / "cases.v1.jsonl")
     parser.add_argument("--oracle", type=Path, default=base_dir / "oracle.v1.jsonl")
-    parser.add_argument("--plan", type=Path, default=base_dir / "decision-plan.v1.json")
+    parser.add_argument(
+        "--domain-pack-manifest",
+        action="append",
+        type=Path,
+        help="versioned domain-pack manifest; defaults to every checked-in v1 pack",
+    )
+    parser.add_argument("--plan", type=Path, default=base_dir / "decision-plan.v2.json")
     parser.add_argument("--report", type=Path, default=base_dir / "reports/latest.json")
     parser.add_argument("--repetitions", type=int)
     parser.add_argument("--order-seed", type=int, default=20260719)
-    parser.add_argument("--case-limit", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument(
         "--dry-run-plan",
         action="store_true",
@@ -712,28 +806,61 @@ def main() -> int:
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    if args.case_limit is not None and args.case_limit < 1:
-        raise SystemExit("--case-limit must be at least 1")
     if args.timeout_seconds < 1:
         raise SystemExit("--timeout-seconds must be at least 1")
+    if args.progress_every < 1:
+        raise SystemExit("--progress-every must be at least 1")
 
-    cases = load_jsonl(cases_path)
-    oracle_records = load_jsonl(oracle_path)
-    oracle_by_id = validate_dataset(cases, oracle_records)
-    if args.case_limit is not None:
-        cases = cases[: args.case_limit]
+    # Bind source before reading any decision-bearing corpus, oracle, plan, or
+    # flow bytes. Dry-run is intentionally provider-free and leaves no receipt.
+    source_start = None if args.dry_run_plan else worktree_provenance(repo_root)
 
     try:
-        plan, planned_work, planned_calls, planned_output_tokens = prepare_plan(
-            base_dir=base_dir,
-            plan_path=plan_path,
-            cases=cases,
-            repetitions=repetitions,
-            mode=args.mode,
-            variants=VARIANTS,
+        manifest_paths = args.domain_pack_manifest or sorted(
+            (base_dir / "domain-packs").glob("*/manifest.v1.json")
         )
+        corpus = load_corpus(
+            base_cases_path=cases_path,
+            base_oracle_path=oracle_path,
+            manifest_paths=manifest_paths,
+            validate_dataset=validate_dataset,
+        )
+        plan = load_plan_v2(plan_path, base_dir)
+        case_sizes = [
+            len(json.dumps(case, sort_keys=True, separators=(",", ":")).encode())
+            for case in corpus.cases
+        ]
+        planned_work = preflight_v2(
+            plan=plan,
+            corpus_receipt=corpus.receipt,
+            case_sizes=case_sizes,
+            repetitions=repetitions,
+            require_complete=args.mode == "live",
+        )
+        sanitized_dataset = dataset_receipt(repo_root, corpus.receipt)
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    planned_calls = {
+        name: plan["flow"]["variants"][name]["planned_llm_calls"] for name in VARIANTS
+    }
+    planned_task_calls = {
+        name: plan["flow"]["variants"][name]["task_llm_calls"] for name in VARIANTS
+    }
+    planned_task_output_tokens = {
+        name: plan["flow"]["variants"][name]["task_maximum_output_tokens"]
+        for name in VARIANTS
+    }
+    planned_output_tokens = {
+        name: plan["flow"]["variants"][name]["maximum_output_tokens"]
+        for name in VARIANTS
+    }
+    plan_path_label = plan_path.relative_to(repo_root).as_posix()
+    plan_receipt = {
+        **plan,
+        "path": plan_path_label,
+        "sha256": sha256_file(plan_path),
+        "planned_work": planned_work,
+    }
 
     if args.dry_run_plan:
         print(
@@ -742,9 +869,8 @@ def main() -> int:
                     "mode": args.mode,
                     "model": args.model,
                     "provider_id": provider_id,
-                    "plan": plan_receipt(
-                        plan=plan, plan_path=plan_path, planned_work=planned_work
-                    ),
+                    "dataset": sanitized_dataset,
+                    "plan": plan_receipt,
                     "planned_work": planned_work,
                 },
                 indent=2,
@@ -755,53 +881,136 @@ def main() -> int:
 
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SystemExit(f"IronCrew binary is not executable: {binary}")
+    binary_label, binary_path_scope = safe_binary_path(repo_root, binary)
+    binary_sha256 = sha256_file(binary)
+    assert source_start is not None
 
     work: list[tuple[int, dict[str, Any], str]] = [
         (repetition, case, variant)
         for repetition in range(repetitions)
-        for case in cases
+        for case in corpus.cases
         for variant in VARIANTS
     ]
     random.Random(args.order_seed).shuffle(work)
 
-    environment = os.environ.copy()
+    if args.mode == "live":
+        try:
+            environment = live_provider_environment(repo_root, args.model)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        effective_base = environment.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if effective_base.rstrip("/") != "https://api.openai.com/v1":
+            raise SystemExit("IC-009 requires the official OpenAI API base URL")
+        apply_live_provider_controls(environment, plan)
+    else:
+        environment = {
+            name: value
+            for name in (
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "TMPDIR",
+            )
+            if (value := os.environ.get(name)) is not None
+        }
+        environment["IRONCREW_PROVIDER_MAX_REQUEST_BYTES"] = str(
+            plan["limits"]["max_provider_request_body_bytes"]
+        )
     environment["IRONCREW_STORE"] = "json"
     environment["IRONCREW_LOG"] = "error"
 
     mock_server: ContractServer | None = None
     mock_thread: threading.Thread | None = None
-    if args.mode == "contract":
-        mock_server = create_server(oracle_path)
-        host, port = mock_server.server_address[:2]
-        environment["OPENAI_API_KEY"] = "ironcrew-contract-key"
-        environment["OPENAI_BASE_URL"] = f"http://{host}:{port}/v1"
-        environment["IRONCREW_ALLOW_PRIVATE_IPS"] = "1"
-        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
-        mock_thread.start()
-
     runs: list[dict[str, Any]] = []
+    budget_abort: str | None = None
+    live_pacer = (
+        LiveProcessPacer(plan["rate_limit"]["minimum_provider_start_interval_ms"])
+        if args.mode == "live"
+        else None
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="ironcrew-crew-eval-") as temporary:
             flow_dir = Path(temporary) / "flow"
             flow_dir.mkdir()
             shutil.copy2(base_dir / "crew.lua", flow_dir / "crew.lua")
-            for repetition, case, variant in work:
-                run = run_one(
-                    binary=binary,
-                    repo_root=repo_root,
-                    flow_dir=flow_dir,
-                    case=case,
-                    oracle=oracle_by_id[case["case_id"]],
-                    variant=variant,
-                    repetition=repetition,
-                    model=args.model,
-                    mode=args.mode,
-                    timeout_seconds=args.timeout_seconds,
-                    planned_llm_calls=planned_calls[variant],
-                    base_environment=environment,
-                    mock_server=mock_server,
+            if args.mode == "contract":
+                combined_oracle = Path(temporary) / "oracle.jsonl"
+                combined_oracle.write_text(
+                    "".join(
+                        json.dumps(record, sort_keys=True) + "\n"
+                        for record in corpus.oracle_records
+                    ),
+                    encoding="utf-8",
                 )
+                combined_oracle.chmod(0o600)
+                mock_server = create_server(combined_oracle)
+                host, port = mock_server.server_address[:2]
+                environment["OPENAI_API_KEY"] = "ironcrew-contract-key"
+                environment["OPENAI_BASE_URL"] = f"http://{host}:{port}/v1"
+                environment["IRONCREW_ALLOW_PRIVATE_IPS"] = "1"
+                mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+                mock_thread.start()
+            for index, (repetition, case, variant) in enumerate(work, 1):
+                if live_pacer is not None:
+                    live_pacer.wait_before_start()
+                try:
+                    run = run_one(
+                        binary=binary,
+                        repo_root=repo_root,
+                        flow_dir=flow_dir,
+                        case=case,
+                        oracle=corpus.oracle_by_id[case["case_id"]],
+                        domain_pack=corpus.case_pack_ids[case["case_id"]],
+                        variant=variant,
+                        repetition=repetition,
+                        model=args.model,
+                        mode=args.mode,
+                        timeout_seconds=args.timeout_seconds,
+                        planned_llm_calls=planned_calls[variant],
+                        task_llm_calls=planned_task_calls[variant],
+                        task_maximum_output_tokens=planned_task_output_tokens[variant],
+                        input_token_costing_allowance_per_request=plan["limits"][
+                            "input_token_costing_allowance_per_request"
+                        ],
+                        max_completion_tokens_per_request=plan["limits"][
+                            "max_completion_tokens_per_request"
+                        ],
+                        base_environment=environment,
+                        mock_server=mock_server,
+                    )
+                finally:
+                    if live_pacer is not None:
+                        live_pacer.record_completion()
                 runs.append(run)
+                if (
+                    args.mode == "live"
+                    and str(run.get("run_status", "")).casefold() == "success"
+                    and run.get("estimated_cost_upper_bound_usd") is None
+                ):
+                    budget_abort = (
+                        "successful live run lacked complete token usage and cost accounting"
+                    )
+                    break
+                observed_costs = [
+                    item["estimated_cost_upper_bound_usd"]
+                    for item in runs
+                    if isinstance(item.get("estimated_cost_upper_bound_usd"), (int, float))
+                ]
+                try:
+                    require_approved_budget(sum(observed_costs))
+                except ValueError as error:
+                    budget_abort = str(error)
+                    break
+                if index % args.progress_every == 0 or index == len(work):
+                    print(
+                        f"progress {index}/{len(work)}; successful="
+                        f"{sum(item['execution_ok'] for item in runs)}; "
+                        f"estimated_upper_bound_usd={sum(observed_costs):.6f}",
+                        file=os.sys.stderr,
+                        flush=True,
+                    )
     finally:
         if mock_server is not None:
             mock_server.shutdown()
@@ -809,30 +1018,32 @@ def main() -> int:
         if mock_thread is not None:
             mock_thread.join(timeout=5)
 
+    source_end = worktree_provenance(repo_root)
+    try:
+        require_unchanged_provenance(source_start, source_end)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if sha256_file(binary) != binary_sha256:
+        raise SystemExit("evaluation binary changed during execution")
     summaries = summarize_runs(runs, VARIANTS)
     comparisons = pairwise_comparisons(runs, plan["uncertainty"])
     decision = topology_decision(mode=args.mode, comparisons=comparisons, plan=plan)
+    packs = sorted(set(corpus.case_pack_ids.values()))
     report = {
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
         "effectiveness_evidence": args.mode == "live",
         "notice": CONTRACT_NOTICE if args.mode == "contract" else LIVE_NOTICE,
         "generated_at": datetime.now(UTC).isoformat(),
-        "revision": git_metadata(repo_root),
+        "revision": {"sha": source_start["revision"], "dirty": source_start["dirty"]},
+        "source": {"start": source_start, "end": source_end, "unchanged": True},
         "binary": {
-            "path": str(binary),
+            "path": binary_label,
+            "path_scope": binary_path_scope,
             "version": command_output([str(binary), "--version"], repo_root),
-            "sha256": sha256_file(binary),
+            "sha256": binary_sha256,
         },
-        "dataset": {
-            "name": "grounded-decisions-options-v1",
-            "answer_contract": "source-visible-single-select-v1",
-            "correctness_rule": "exact-option-id-v1",
-            "case_count": len(cases),
-            "cases_sha256": sha256_file(cases_path),
-            "oracle_sha256": sha256_file(oracle_path),
-            "oracle_injected_into_prompt": False,
-        },
+        "dataset": sanitized_dataset,
         "provider": {
             "name": "synthetic-oracle-backed-mock"
             if args.mode == "contract"
@@ -842,36 +1053,52 @@ def main() -> int:
             else "operator-declared",
             "model": args.model,
         },
-        "evaluation_plan": plan_receipt(
-            plan=plan, plan_path=plan_path, planned_work=planned_work
-        ),
+        "evaluation_plan": plan_receipt,
         "configuration": {
             "repetitions": repetitions,
-            "temperature": 0.0,
+            "temperature": None,
+            "reasoning_effort": None,
+            "provider_default_parameters": ["reasoning_effort", "temperature"],
             "order_seed": args.order_seed,
             "variants": list(VARIANTS),
             "planned_llm_calls_per_run": planned_calls,
+            "planned_llm_calls_by_task": planned_task_calls,
+            "planned_max_output_tokens_by_task": planned_task_output_tokens,
             "planned_max_output_tokens_per_run": planned_output_tokens,
         },
         "mock_provider_stats": mock_server.snapshot() if mock_server else None,
         "runs": sorted(runs, key=lambda run: (run["case_id"], run["repetition"], run["variant"])),
         "summary": summaries,
+        "domain_summary": domain_summaries(runs, packs, VARIANTS),
         "pairwise": comparisons,
+        "pricing": pricing_receipt(
+            mode=args.mode,
+            runs=runs,
+            planned_upper_bound_usd=planned_work["planned_cost_upper_bound_usd"],
+        ),
         "decision": decision,
+        "execution": {
+            "planned_run_count": len(work),
+            "completed_run_count": len(runs),
+            "budget_abort": budget_abort,
+        },
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_bytes = report_json_bytes(report)
+    if any(canary.encode() in report_bytes for canary in redaction_canaries(environment)):
+        raise SystemExit("refusing to retain a report containing a credential canary")
+    report_path.write_bytes(report_bytes)
 
     schema_error = validate_report_with_ironcrew(
         binary=binary,
         repo_root=repo_root,
         validator_path=base_dir / "validate-report.lua",
-        schema_path=base_dir / "report-v2.schema.json",
+        schema_path=base_dir / "report-v3.schema.json",
         report_path=report_path,
         environment=environment,
     )
     if schema_error:
-        print(f"FAIL: generated report did not match report-v2.schema.json: {schema_error}")
+        print(f"FAIL: generated report did not match report-v3.schema.json: {schema_error}")
         print(f"Report: {report_path}")
         return 1
 
@@ -889,12 +1116,9 @@ def main() -> int:
             f"{total_answers}/{total_answers} grounded answers."
         )
     else:
-        print(
-            f"Live exploratory evaluation completed: {len(runs)} CLI runs; "
-            f"decision={decision['status']}."
-        )
+        print(f"Live evaluation completed: {len(runs)} CLI runs; decision={decision['status']}.")
     print(f"Report: {report_path}")
-    return 0
+    return 1 if budget_abort else 0
 
 
 if __name__ == "__main__":

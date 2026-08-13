@@ -13,7 +13,7 @@ export const CREW = {
   // label for the crew node in the DAG.
   name: 'research-crew',
   provider: 'openai',
-  model: 'gpt-4o-mini',
+  model: 'gpt-5.6-luna',
   goal: 'Produce a brief report on a topic',
 
   agents: [
@@ -22,7 +22,6 @@ export const CREW = {
       goal: 'Find and analyze information on given topics',
       capabilities: ['research', 'analysis'],
       source: 'auto_discovered',  // derived: loaded from agents/researcher.lua
-      temperature: 0.3,
     },
     {
       name: 'writer',
@@ -30,7 +29,6 @@ export const CREW = {
       capabilities: ['writing', 'summarization', 'editing'],
       tools: ['summarize'],
       source: 'auto_discovered',  // derived: loaded from agents/writer.lua
-      temperature: 0.7,
     },
   ],
 

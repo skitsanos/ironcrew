@@ -1,0 +1,25 @@
+{
+  "schema_version": "ironcrew.crew-eval-domain-pack.v1",
+  "pack_id": "security-operations",
+  "pack_version": 1,
+  "domain": "Security operations",
+  "intended_use": "Evaluate evidence-grounded decisions about credential exposure, session theft, and exploited-vulnerability containment in security operations.",
+  "derivation": "Synthetic representative operational scenarios authored for this evaluation; no production records, provider outputs, or historical receipts were used as source material.",
+  "oracle_method": "One exact option ID per question selected by direct policy, chronology, arithmetic, or evidence entailment and paired with a minimal sufficient citation set.",
+  "independent_review": {
+    "reviewed_on": "2026-08-12",
+    "scope": "Independent read-only review of evidence entailment, distractor ambiguity, oracle separation, citation sufficiency, and answer-position artifacts.",
+    "result": "passed"
+  },
+  "case_count": 3,
+  "files": {
+    "cases": {
+      "path": "cases.v1.jsonl",
+      "sha256": "87d79718140dae0812d4b2233a4506a56e14db7d14eb5600589dfb34e7c38cb8"
+    },
+    "oracle": {
+      "path": "oracle.v1.jsonl",
+      "sha256": "7025551183130fd186aec72f734d7ba10db434684ae2fff039bcfd611da9bcf1"
+    }
+  }
+}

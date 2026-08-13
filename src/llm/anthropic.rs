@@ -80,6 +80,15 @@ impl AnthropicProvider {
         }
     }
 
+    fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
+        if self.api_key.trim().is_empty() {
+            return Err(IronCrewError::Validation(
+                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
+            ));
+        }
+        self.execution_policy.serialize_request("Anthropic", body)
+    }
+
     /// Build the Anthropic Messages API request body from a ChatRequest.
     fn build_body(&self, request: &ChatRequest, tools: Option<&[ToolSchema]>) -> Value {
         // 1. Extract system messages → top-level `system` param
@@ -268,11 +277,7 @@ impl AnthropicProvider {
 
     /// Send a non-streaming request to the Anthropic Messages API.
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
-            ));
-        }
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
@@ -288,7 +293,7 @@ impl AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;
@@ -333,17 +338,12 @@ impl AnthropicProvider {
         mut body: Value,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        if self.api_key.trim().is_empty() {
-            return Err(IronCrewError::Validation(
-                "ANTHROPIC_API_KEY is required for Anthropic provider".into(),
-            ));
-        }
+        body["stream"] = json!(true);
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
         }
-
-        body["stream"] = json!(true);
 
         let url = format!("{}/v1/messages", self.base_url);
         crate::utils::network::validate_url_not_private(&url)
@@ -355,7 +355,7 @@ impl AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;

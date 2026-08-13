@@ -87,6 +87,9 @@
   1. `cargo fmt --all -- --check`
   2. `cargo clippy --all-targets -- -D warnings`
   3. `cargo test --all-targets`
+- After production Rust module or repository-policy changes, run both
+  `python3 -B scripts/check_module_size.py` and
+  `python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'`.
 - Add focused negative, cancellation, concurrency, and boundary tests while
   iterating. Run the live PostgreSQL targets with `IRONCREW_TEST_PG_URL` when
   storage, schemas, leases, idempotency, HITL, journals, or replicas change; a

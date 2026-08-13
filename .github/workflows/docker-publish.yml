@@ -1,21 +1,12 @@
 name: Docker Publish
 
-# Publishes the multi-arch Docker image to Docker Hub. Deliberately decoupled
-# from release.yml (which builds binaries): releases created with GITHUB_TOKEN
-# do not emit a cascading release event, and image publication requires its own
-# explicit authorization. This workflow therefore runs only by manual dispatch
-# from the default branch with an exact stable release tag.
-#
-# The workflow reuses the signed linux-amd64/arm64 tarballs release.yml already
-# produced, so there is no recompilation here (~1-2 min end to end).
-
+# Default-branch repository dispatch promotes only the signed OCI archive
+# produced by release.yml. It never rebuilds an image from this checkout.
+# `validate` mode traverses the protected environment without registry writes;
+# `publish` authorizes exact promotion and bounded reconciliation of `latest`.
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Exact stable release tag to publish (for example v2.24.0)."
-        required: true
-        type: string
+  repository_dispatch:
+    types: [ironcrew_docker_publish_v1]
 
 permissions: {}
 
@@ -23,124 +14,119 @@ env:
   IMAGE: skitsanos/ironcrew
 
 concurrency:
-  group: docker-publish
+  group: release-publication
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build & push image
+  guard:
+    name: Authorize promotion from trusted main
     runs-on: ubuntu-latest
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     permissions:
-      contents: read # gh release download needs read access to release assets
-      id-token: write # keyless signing of the immutable pushed image digest
+      contents: read
+    outputs:
+      tag: ${{ steps.dispatch.outputs.tag }}
+      mode: ${{ steps.dispatch.outputs.mode }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-
-      - name: Validate release tag
-        id: tag
+      - name: Bind event to the default-branch workflow
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+          DISPATCH_ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          tag="$RELEASE_TAG_INPUT"
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Release tag must match stable tag form vX.Y.Z"
-            exit 1
-          fi
+          test "$GITHUB_EVENT_NAME" = repository_dispatch
+          test "$DISPATCH_ACTION" = ironcrew_docker_publish_v1
+          test "$DEFAULT_BRANCH" = main
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_REF" = \
+            "$GITHUB_REPOSITORY/.github/workflows/docker-publish.yml@refs/heads/main"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
 
-          release_state=$(gh release view "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json tagName,isDraft,isPrerelease \
-            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
-          IFS=$'\t' read -r resolved_tag is_draft is_prerelease <<< "$release_state"
-          if [[ "$resolved_tag" != "$tag" || "$is_draft" != "false" || "$is_prerelease" != "false" ]]; then
-            echo "::error::Tag $tag must identify a published stable GitHub release"
-            exit 1
-          fi
+      - name: Check out trusted promotion controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
-          version="${tag#v}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Publishing image for tag $tag (version $version)"
+      - name: Bind checkout to the trusted workflow commit
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Validate exact repository-dispatch payload
+        id: dispatch
+        run: >-
+          python3 -B scripts/validate_release_dispatch.py
+          --event "$GITHUB_EVENT_PATH"
+          --event-type ironcrew_docker_publish_v1
+          --repository "$GITHUB_REPOSITORY"
+          --actor "$GITHUB_ACTOR"
+          --output "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate protected promotion authority
+    needs: guard
+    if: needs.guard.outputs.mode == 'validate'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm safe canary boundary
+        env:
+          RELEASE_TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test -n "$RELEASE_TAG"
+          echo "Protected promotion authority validated without registry access."
+
+  publish:
+    name: Promote signed release image
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: needs.guard.outputs.mode == 'publish'
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      # This checkout supplies only the promotion verifier. Image bytes come
+      # exclusively from the tag-bound, signed GitHub release assets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Bind promotion controls to trusted main
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_REF" = \
+            "$GITHUB_REPOSITORY/.github/workflows/docker-publish.yml@refs/heads/main"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # Pull the prebuilt binaries and their integrity metadata. Verify both
-      # the published SHA-256 and the keyless release-workflow signature before
-      # extracting any archive into the image build context.
-      - name: Download and verify release binaries
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install promotion transport
         run: |
-          mkdir -p dist/linux/amd64 dist/linux/arm64
-          gh release download "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'ironcrew-linux-amd64.tar.gz' \
-            --pattern 'ironcrew-linux-amd64.tar.gz.sha256' \
-            --pattern 'ironcrew-linux-amd64.tar.gz.bundle' \
-            --pattern 'ironcrew-linux-arm64.tar.gz' \
-            --pattern 'ironcrew-linux-arm64.tar.gz.sha256' \
-            --pattern 'ironcrew-linux-arm64.tar.gz.bundle'
-          sha256sum --check ironcrew-linux-amd64.tar.gz.sha256
-          sha256sum --check ironcrew-linux-arm64.tar.gz.sha256
-          identity="https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ steps.tag.outputs.tag }}"
-          for arch in amd64 arm64; do
-            cosign verify-blob \
-              --bundle "ironcrew-linux-${arch}.tar.gz.bundle" \
-              --certificate-identity "$identity" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "ironcrew-linux-${arch}.tar.gz"
-          done
-          tar xzf ironcrew-linux-amd64.tar.gz -C dist/linux/amd64
-          tar xzf ironcrew-linux-arm64.tar.gz -C dist/linux/arm64
-          test -x dist/linux/amd64/ironcrew
-          test -x dist/linux/arm64/ironcrew
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & push multi-arch image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/runtime.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: mode=max
-          sbom: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.version }}
-
-      - name: Sign pushed image digest
+      - name: Promote signed release image and reconcile latest
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-
-      - name: Move latest alias only for the current GitHub release
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_TAG_INPUT: ${{ needs.guard.outputs.tag }}
         run: |
-          current_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
-          if [[ "$current_tag" != "$RELEASE_TAG" ]]; then
-            echo "Skipping latest alias: $RELEASE_TAG is not current ($current_tag)"
-            exit 0
-          fi
-          docker buildx imagetools create \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}@${DIGEST}"
+          python3 -B scripts/promote_release_image.py \
+            --tag "$RELEASE_TAG_INPUT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --image "$IMAGE" \
+            --authorize-latest-reconciliation \
+            --max-latest-attempts 3

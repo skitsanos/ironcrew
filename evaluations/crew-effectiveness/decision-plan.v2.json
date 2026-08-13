@@ -1,0 +1,130 @@
+{
+  "schema_version": "ironcrew.crew-eval-plan.v2",
+  "dataset": {
+    "aggregate_sha256": "bb73ad0d4835a407e22bc35de1562a9f600e33583ec219e40eba2b7b4b0c45cf",
+    "packs": [
+      {
+        "pack_id": "synthetic-core-v1",
+        "pack_version": 1,
+        "case_count": 6,
+        "manifest_sha256": null,
+        "cases_sha256": "781b46d71581f64ef584d7705dde12b0229ac0a00b23d86013cc8f4a4afdea8f",
+        "oracle_sha256": "a2c5a146301d935cbfe42a7d799d8986b8184702edf2ccebfb4e418065c5e942"
+      },
+      {
+        "pack_id": "security-operations",
+        "pack_version": 1,
+        "case_count": 3,
+        "manifest_sha256": "6b816231a3171082839777f13e81c240acf796d4bec140d04dbffdf6a13bf06b",
+        "cases_sha256": "87d79718140dae0812d4b2233a4506a56e14db7d14eb5600589dfb34e7c38cb8",
+        "oracle_sha256": "7025551183130fd186aec72f734d7ba10db434684ae2fff039bcfd611da9bcf1"
+      },
+      {
+        "pack_id": "software-delivery",
+        "pack_version": 1,
+        "case_count": 3,
+        "manifest_sha256": "865b5bf3c4e76957f5d4eccb23b07bb5181d9b20eb74f1b9ce01ccab10193527",
+        "cases_sha256": "0f39caa0034e38f2386ead97d56e6a366b6ffdf3eda116cd9abd96ae47e32bf9",
+        "oracle_sha256": "9ff5ed17b11049808d8cf6e75c1cad2488ed467e9e41bebcea96390844ceedad"
+      }
+    ]
+  },
+  "flow": {
+    "path": "crew.lua",
+    "sha256": "bbbdc021f3be7befbacbe4a5f96b6b9994f39b6f8d96e935ab507bd65ea1bfe8",
+    "variants": {
+      "single": {
+        "planned_llm_calls": 1,
+        "maximum_output_tokens": 800,
+        "task_llm_calls": {
+          "final": 1
+        },
+        "task_maximum_output_tokens": {
+          "final": 800
+        }
+      },
+      "dag": {
+        "planned_llm_calls": 3,
+        "maximum_output_tokens": 1800,
+        "task_llm_calls": {
+          "extract": 1,
+          "challenge": 1,
+          "final": 1
+        },
+        "task_maximum_output_tokens": {
+          "extract": 500,
+          "challenge": 500,
+          "final": 800
+        }
+      },
+      "collaborative": {
+        "planned_llm_calls": 4,
+        "maximum_output_tokens": 2300,
+        "task_llm_calls": {
+          "discussion": 3,
+          "final": 1
+        },
+        "task_maximum_output_tokens": {
+          "discussion": 1500,
+          "final": 800
+        }
+      }
+    }
+  },
+  "limits": {
+    "max_case_count": 12,
+    "max_repetitions": 5,
+    "max_cli_runs": 180,
+    "max_planned_llm_calls": 480,
+    "max_planned_input_tokens": 9600000,
+    "input_token_costing_allowance_per_request": 20000,
+    "max_provider_request_body_bytes": 18000,
+    "max_completion_tokens_per_request": 800,
+    "max_planned_output_tokens": 294000,
+    "max_case_input_bytes": 65536,
+    "max_single_case_input_bytes": 4096
+  },
+  "rate_limit": {
+    "minimum_provider_start_interval_ms": 3200,
+    "rolling_window_seconds": 60,
+    "maximum_provider_starts_per_window": 19,
+    "maximum_token_allowance_per_window": 395200,
+    "reference_rpm": 500,
+    "reference_tpm": 500000,
+    "reference": "openai-gpt-5.6-luna-tier-1-2026-08-12"
+  },
+  "pricing": {
+    "version": "openai-gpt-5.6-luna-2026-08-12",
+    "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "retrieved_on": "2026-08-12",
+    "currency": "USD",
+    "usd_per_million_tokens": {
+      "input": 0.2,
+      "cached_input": 0.02,
+      "output": 1.2
+    },
+    "cache_write_multiplier": 1.25,
+    "long_context_threshold_tokens": 272000,
+    "long_context_multipliers": {
+      "input": 2.0,
+      "output": 1.5
+    },
+    "approval_budget_usd": 3.0
+  },
+  "uncertainty": {
+    "familywise_confidence_level": 0.95,
+    "multiplicity_correction": "bonferroni",
+    "comparison_count": 2,
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20260808
+  },
+  "selection": {
+    "minimum_paired_count": 60,
+    "minimum_unique_case_count": 12,
+    "minimum_success_rate": 1.0,
+    "minimum_mean_grounded_correctness_delta": 0.05,
+    "minimum_confidence_lower_bound": 0.0,
+    "maximum_mean_token_multiplier": 6.0,
+    "maximum_mean_latency_multiplier": 6.0
+  }
+}

@@ -7,6 +7,8 @@ use super::provider::*;
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
+mod request_body;
+
 pub struct OpenAiProvider {
     client: Client,
     base_url: String,
@@ -119,9 +121,7 @@ impl OpenAiProvider {
         if let Some(temp) = request.temperature {
             body["temperature"] = json!(temp);
         }
-        if let Some(max) = request.max_tokens {
-            body["max_tokens"] = json!(max);
-        }
+        request_body::insert_completion_token_limit(&mut body, &request.model, request.max_tokens);
 
         if let Some(ref fmt) = request.response_format {
             match fmt {
@@ -171,17 +171,17 @@ impl OpenAiProvider {
         body
     }
 
-    fn ensure_api_key(&self) -> Result<()> {
+    fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
         if self.api_key.trim().is_empty() {
             return Err(IronCrewError::Validation(
                 "OPENAI_API_KEY is required for OpenAI provider".into(),
             ));
         }
-        Ok(())
+        self.execution_policy.serialize_request("OpenAI", body)
     }
 
     async fn send_request(&self, body: Value) -> Result<ChatResponse> {
-        self.ensure_api_key()?;
+        let request_body = self.prepare_request(&body)?;
 
         // Rate limit: wait if needed
         if let Some(ref limiter) = self.rate_limit {
@@ -197,7 +197,7 @@ impl OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;
@@ -292,13 +292,12 @@ impl OpenAiProvider {
         mut body: Value,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        self.ensure_api_key()?;
+        body["stream"] = json!(true);
+        let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
             limiter.wait().await;
         }
-
-        body["stream"] = json!(true);
 
         let url = format!("{}/chat/completions", self.base_url);
         crate::utils::network::validate_url_not_private(&url)
@@ -309,7 +308,7 @@ impl OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
+            .body(request_body)
             .send()
             .await
             .map_err(IronCrewError::Http)?;

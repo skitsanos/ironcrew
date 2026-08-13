@@ -1,0 +1,1274 @@
+{
+  "cleanup": {
+    "error": null,
+    "performed": true,
+    "remaining_objects": 0,
+    "scope": "exact validated prefix ic018_profiles_",
+    "zero_verified": true
+  },
+  "configuration": {
+    "database": "postgres://127.0.0.1:55432/ironcrew_ic018",
+    "postgres_observer": {
+      "container_id": "ironcrew-ic018-pg",
+      "kind": "docker_exec"
+    },
+    "profiles": [
+      {
+        "actual_paid_provider_calls": 0,
+        "bounds": {
+          "provider_calls": 2,
+          "runs": 1,
+          "tool_effects": 1
+        },
+        "estimated_paid_provider_cost_usd": 0.0,
+        "execution_evidence_class": "local_process",
+        "expected_mock_activity": {
+          "provider_tool_provider_calls": 2,
+          "provider_tool_tool_effects": 1
+        },
+        "id": "provider_tool",
+        "live_provider_evidence": false,
+        "planned_paid_provider_calls": 0,
+        "platform_evidence": null,
+        "provider_evidence_class": "bounded_loopback_mock",
+        "provider_free": false,
+        "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+        "workload_class": "provider_and_counted_http_tool"
+      },
+      {
+        "actual_paid_provider_calls": 0,
+        "bounds": {
+          "provider_calls": 1,
+          "result_bytes": 65536,
+          "runs": 1
+        },
+        "estimated_paid_provider_cost_usd": 0.0,
+        "execution_evidence_class": "local_process",
+        "expected_mock_activity": {
+          "large_result_provider_calls": 1
+        },
+        "id": "large_result",
+        "live_provider_evidence": false,
+        "planned_paid_provider_calls": 0,
+        "platform_evidence": null,
+        "provider_evidence_class": "bounded_loopback_mock",
+        "provider_free": false,
+        "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+        "workload_class": "bounded_large_provider_result"
+      },
+      {
+        "actual_paid_provider_calls": 0,
+        "bounds": {
+          "conversations": 1,
+          "max_history": 8,
+          "turns": 2
+        },
+        "estimated_paid_provider_cost_usd": 0.0,
+        "execution_evidence_class": "local_process",
+        "expected_mock_activity": {
+          "conversation_provider_calls": 2
+        },
+        "id": "owner_local_conversation_boundary",
+        "live_provider_evidence": false,
+        "planned_paid_provider_calls": 0,
+        "platform_evidence": null,
+        "provider_evidence_class": "bounded_loopback_mock",
+        "provider_free": false,
+        "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+        "workload_class": "conversation_warm_owner_and_cold_peer"
+      }
+    ],
+    "table_prefix": "ic018_profiles_"
+  },
+  "evidence_boundary": {
+    "actual_paid_provider_calls": 0,
+    "estimated_paid_provider_cost_usd": 0.0,
+    "execution": "local_direct_two_process",
+    "live_provider": false,
+    "openshift": false,
+    "planned_paid_provider_calls": 0,
+    "provider": "bounded_loopback_mock",
+    "provider_free": false,
+    "railway": false
+  },
+  "finished_at": "2026-08-11T18:28:51.516845+00:00",
+  "http_metrics": {
+    "capabilities_a": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 0.493,
+        "mean": 0.493,
+        "p50": 0.493,
+        "p95": 0.493,
+        "p99": 0.493,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 471,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "capabilities_b": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 0.409,
+        "mean": 0.409,
+        "p50": 0.409,
+        "p95": 0.409,
+        "p99": 0.409,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 471,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "conversation_delete_peer": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 2.905,
+        "mean": 2.905,
+        "p50": 2.905,
+        "p95": 2.905,
+        "p99": 2.905,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 52,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "conversation_history_owner": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 0.786,
+        "mean": 0.786,
+        "p50": 0.786,
+        "p95": 0.786,
+        "p99": 0.786,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 806,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "conversation_message_cold_peer": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 15.49,
+        "mean": 15.49,
+        "p50": 15.49,
+        "p95": 15.49,
+        "p99": 15.49,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 294,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "conversation_message_warm_owner": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 15.164,
+        "mean": 15.164,
+        "p50": 15.164,
+        "p95": 15.164,
+        "p99": 15.164,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 294,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "conversation_sse_shared_store_boundary": {
+      "count": 1,
+      "error_kinds": {
+        "http_409": 1
+      },
+      "error_rate": 1.0,
+      "errors": 1,
+      "latency_ms": {
+        "max": 0.856,
+        "mean": 0.856,
+        "p50": 0.856,
+        "p95": 0.856,
+        "p99": 0.856,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 0,
+      "response_bytes": 115,
+      "status_counts": {
+        "409": 1
+      }
+    },
+    "conversation_start_owner": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 11.741,
+        "mean": 11.741,
+        "p50": 11.741,
+        "p95": 11.741,
+        "p99": 11.741,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 541,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "profile-large-result_read": {
+      "count": 2,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 2.539,
+        "mean": 1.958,
+        "p50": 1.376,
+        "p95": 2.539,
+        "p99": 2.539,
+        "percentiles_approximate": false,
+        "sampled_count": 2
+      },
+      "ok": 2,
+      "response_bytes": 66539,
+      "status_counts": {
+        "200": 2
+      }
+    },
+    "profile-large-result_start": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 21.187,
+        "mean": 21.187,
+        "p50": 21.187,
+        "p95": 21.187,
+        "p99": 21.187,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 219,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "profile-provider-tool_read": {
+      "count": 2,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 2.366,
+        "mean": 1.751,
+        "p50": 1.136,
+        "p95": 2.366,
+        "p99": 2.366,
+        "percentiles_approximate": false,
+        "sampled_count": 2
+      },
+      "ok": 2,
+      "response_bytes": 1030,
+      "status_counts": {
+        "200": 2
+      }
+    },
+    "profile-provider-tool_start": {
+      "count": 1,
+      "error_kinds": {},
+      "error_rate": 0.0,
+      "errors": 0,
+      "latency_ms": {
+        "max": 15.767,
+        "mean": 15.767,
+        "p50": 15.767,
+        "p95": 15.767,
+        "p99": 15.767,
+        "percentiles_approximate": false,
+        "sampled_count": 1
+      },
+      "ok": 1,
+      "response_bytes": 220,
+      "status_counts": {
+        "200": 1
+      }
+    },
+    "startup_ready": {
+      "count": 5,
+      "error_kinds": {
+        "URLError": 3
+      },
+      "error_rate": 0.6,
+      "errors": 3,
+      "latency_ms": {
+        "max": 35.549,
+        "mean": 14.411,
+        "p50": 9.663,
+        "p95": 35.549,
+        "p99": 35.549,
+        "percentiles_approximate": false,
+        "sampled_count": 5
+      },
+      "ok": 2,
+      "response_bytes": 118,
+      "status_counts": {
+        "200": 2,
+        "none": 3
+      }
+    }
+  },
+  "mock_provider": {
+    "counts": {
+      "conversation_provider_calls": 2,
+      "invalid_requests": 0,
+      "large_result_provider_calls": 1,
+      "provider_tool_provider_calls": 2,
+      "provider_tool_tool_effects": 1
+    },
+    "exposure": "loopback_only",
+    "request_or_response_content_retained": false
+  },
+  "pass_criteria": {
+    "cleanup_performed": true,
+    "conversation_identity_revision_contract": true,
+    "exact_mock_activity": true,
+    "execution_completed": true,
+    "no_forced_kill": true,
+    "overall_passed": true,
+    "process_exit_zero": true,
+    "profile_set_complete": true,
+    "profiles_passed": true,
+    "replica_identity": true,
+    "replica_shutdown_complete": true,
+    "runtime_log_secret_scan": true,
+    "source_provenance_unchanged": true,
+    "zero_prefix_objects": true
+  },
+  "platform": {
+    "machine": "arm64",
+    "system": "Darwin"
+  },
+  "profiles": [
+    {
+      "actual_paid_provider_calls": 0,
+      "bounds": {
+        "provider_calls": 2,
+        "runs": 1,
+        "tool_effects": 1
+      },
+      "error": null,
+      "estimated_paid_provider_cost_usd": 0.0,
+      "evidence": {
+        "output_bytes": 22,
+        "output_sha256": "sha256:9506da25e39dba8156ca54c2d86f92c091598bdc71eb20184f217e5eff770ead",
+        "polls": 2,
+        "route": "execution_owner_a_terminal_read_peer_b",
+        "run_id": "d769537d-0da7-4bef-92d5-eb41932be216",
+        "terminal_read_scope": "shared_postgresql_record"
+      },
+      "execution_evidence_class": "local_process",
+      "expected_mock_activity": {
+        "provider_tool_provider_calls": 2,
+        "provider_tool_tool_effects": 1
+      },
+      "id": "provider_tool",
+      "live_provider_evidence": false,
+      "mock_activity": {
+        "conversation_provider_calls": 0,
+        "invalid_requests": 0,
+        "large_result_provider_calls": 0,
+        "provider_tool_provider_calls": 2,
+        "provider_tool_tool_effects": 1
+      },
+      "mock_activity_passed": true,
+      "planned_paid_provider_calls": 0,
+      "platform_evidence": null,
+      "provider_evidence_class": "bounded_loopback_mock",
+      "provider_free": false,
+      "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+      "status": "passed",
+      "workload_class": "provider_and_counted_http_tool"
+    },
+    {
+      "actual_paid_provider_calls": 0,
+      "bounds": {
+        "provider_calls": 1,
+        "result_bytes": 65536,
+        "runs": 1
+      },
+      "error": null,
+      "estimated_paid_provider_cost_usd": 0.0,
+      "evidence": {
+        "output_bytes": 65536,
+        "output_sha256": "sha256:ec884ed0adc0139379edc8da354c20dffacfe4b8b9824bb3315d80529c84c799",
+        "polls": 2,
+        "raw_output_retained_in_report": false,
+        "route": "execution_owner_b_terminal_read_peer_a",
+        "run_id": "e8c97fb9-144a-4cee-88be-56ae9f9dd849",
+        "terminal_read_scope": "shared_postgresql_record"
+      },
+      "execution_evidence_class": "local_process",
+      "expected_mock_activity": {
+        "large_result_provider_calls": 1
+      },
+      "id": "large_result",
+      "live_provider_evidence": false,
+      "mock_activity": {
+        "conversation_provider_calls": 0,
+        "invalid_requests": 0,
+        "large_result_provider_calls": 1,
+        "provider_tool_provider_calls": 0,
+        "provider_tool_tool_effects": 0
+      },
+      "mock_activity_passed": true,
+      "planned_paid_provider_calls": 0,
+      "platform_evidence": null,
+      "provider_evidence_class": "bounded_loopback_mock",
+      "provider_free": false,
+      "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+      "status": "passed",
+      "workload_class": "bounded_large_provider_result"
+    },
+    {
+      "actual_paid_provider_calls": 0,
+      "bounds": {
+        "conversations": 1,
+        "max_history": 8,
+        "turns": 2
+      },
+      "error": null,
+      "estimated_paid_provider_cost_usd": 0.0,
+      "evidence": {
+        "assistant_output_sha256": "sha256:58f33eab79ecfc38ff9c3987aac76d2ee624c2c3ff31601b69d773335d3a1f94",
+        "conversation_id": "ic018-5a3a0b9883ad4dc5930e419f9739ba53",
+        "history_messages": 5,
+        "history_role_counts": {
+          "assistant": 2,
+          "system": 1,
+          "user": 2
+        },
+        "identity": {
+          "conversation_id": "ic018-5a3a0b9883ad4dc5930e419f9739ba53",
+          "definition_fingerprint": "sha256:1aa7aa950eb9b0509fc1acf9ebfc1702e8460699be73c7b13238a02375832e2a",
+          "incarnation_id": "1300bd4e-45f4-4db5-b416-3870308072e2"
+        },
+        "in_flight_takeover_proven": false,
+        "revisions": [
+          1,
+          2,
+          3,
+          3
+        ],
+        "steps": [
+          {
+            "operation": "start",
+            "route": "warm_owner_a",
+            "status": 200
+          },
+          {
+            "operation": "message_1",
+            "route": "warm_owner_a",
+            "status": 200
+          },
+          {
+            "operation": "message_2",
+            "route": "cold_peer_b_committed_boundary_rehydration",
+            "status": 200
+          },
+          {
+            "operation": "history",
+            "route": "shared_store_via_owner_a",
+            "status": 200
+          },
+          {
+            "error_sha256": "sha256:6a0f67af87aca1f96c664159e53fa35d8cf18c413f35a0e1c2fad0441136b42d",
+            "operation": "conversation_sse",
+            "route": "shared_store_unsupported_via_peer_b",
+            "status": 409
+          },
+          {
+            "operation": "delete",
+            "route": "peer_b",
+            "status": 200
+          }
+        ],
+        "turns": 2
+      },
+      "execution_evidence_class": "local_process",
+      "expected_mock_activity": {
+        "conversation_provider_calls": 2
+      },
+      "id": "owner_local_conversation_boundary",
+      "live_provider_evidence": false,
+      "mock_activity": {
+        "conversation_provider_calls": 2,
+        "invalid_requests": 0,
+        "large_result_provider_calls": 0,
+        "provider_tool_provider_calls": 0,
+        "provider_tool_tool_effects": 0
+      },
+      "mock_activity_passed": true,
+      "planned_paid_provider_calls": 0,
+      "platform_evidence": null,
+      "provider_evidence_class": "bounded_loopback_mock",
+      "provider_free": false,
+      "secret_boundary": "live provider credentials and base URLs are removed before launch; flows receive only a fixed non-secret loopback fixture",
+      "status": "passed",
+      "workload_class": "conversation_warm_owner_and_cold_peer"
+    }
+  ],
+  "runtime_logs": {
+    "files": {
+      "replica-a.log": 1549,
+      "replica-b.log": 1549
+    },
+    "raw_content_in_report": false,
+    "retained": false
+  },
+  "schema_version": "ironcrew.replica-profiles.v1",
+  "shutdown": {
+    "a": {
+      "exit_code": 0,
+      "forced_kill": false
+    },
+    "b": {
+      "exit_code": 0,
+      "forced_kill": false
+    }
+  },
+  "source": {
+    "after_cleanup": {
+      "binary_sha256": "05ba329223cd7894de862c558cb918a52f8ab556e8e67aaff2b125a6afcf72ab",
+      "changed_path_count": 55,
+      "changed_paths": [
+        {
+          "bytes": 4177,
+          "path": ".agents/skills/check-ironcrew/SKILL.md",
+          "sha256": "14b93a110b8c23ef2d6180162261bdc7d386011a9444f9e33bbf72c9a0277eb1",
+          "state": "file"
+        },
+        {
+          "bytes": 3828,
+          "path": ".agents/skills/release-ironcrew/SKILL.md",
+          "sha256": "17a9c8011791c14e1c768ecfaa5eda8a5f94215cc76f0f6a595bd86212938a00",
+          "state": "file"
+        },
+        {
+          "bytes": 2013,
+          "path": ".claude/skills/check/SKILL.md",
+          "sha256": "9be86808189a949076b25c1bcc98349be5b9273aa997d2336a8d047167f929c2",
+          "state": "file"
+        },
+        {
+          "bytes": 3292,
+          "path": ".claude/skills/release-workflow/SKILL.md",
+          "sha256": "e721cf125a49e1592df28e1b515bbf66b704f9c838d37bc35ae85587c467d63b",
+          "state": "file"
+        },
+        {
+          "bytes": 6278,
+          "path": ".github/workflows/ci.yml",
+          "sha256": "a6152d26803fcfedf098f5ad0221b71d5014bb440856bf7671cc20da60895159",
+          "state": "file"
+        },
+        {
+          "bytes": 7382,
+          "path": "AGENTS.md",
+          "sha256": "e22477f526e39997cfe0c18f5d1e759903473afc62643558ac1fbe8bc6d2a628",
+          "state": "file"
+        },
+        {
+          "bytes": 2081,
+          "path": "ISSUES.md",
+          "sha256": "6299c2c06cc06c7c0822cf20fb5a49c1f29d649236117d9e0bf72b6f8d5802e6",
+          "state": "file"
+        },
+        {
+          "bytes": 21575,
+          "path": "deploy/openshift.yaml",
+          "sha256": "f10f00ecb8eb3c708daf10a6d7b808b5aa185b363a63e229a2187d0a1f6a856b",
+          "state": "file"
+        },
+        {
+          "bytes": 18701,
+          "path": "docs/architecture.md",
+          "sha256": "3ab614e7b6a83cbfe1e09b6796535eb53dd6042f90fcd207162a8c4d695f2515",
+          "state": "file"
+        },
+        {
+          "bytes": 21302,
+          "path": "docs/best-practices.md",
+          "sha256": "c364e7ef952f592099c4d3d336ef4db951d2232a90cf5113a712dcf0b2f8ac5c",
+          "state": "file"
+        },
+        {
+          "bytes": 100250,
+          "path": "docs/cloud-deployment.md",
+          "sha256": "4df7a4b1d5eb1e54c5276e0c26911e45b38a122213501653db4a5004d2ef2133",
+          "state": "file"
+        },
+        {
+          "bytes": 25535,
+          "path": "docs/http-scaling.md",
+          "sha256": "c86b287c1afa8f71762bfa487c85f872e92e0bd781348a7b60838514335bb542",
+          "state": "file"
+        },
+        {
+          "bytes": 13540,
+          "path": "docs/issues/AUDIT_EVIDENCE.md",
+          "sha256": "8b319ba903c5708f686ee8e9781497d8b98c941883558be0316fa9e29a798f9c",
+          "state": "file"
+        },
+        {
+          "bytes": 10884,
+          "path": "docs/issues/IC-008.md",
+          "sha256": "0c337348ceec73357e19be59ab70f165ce524fcf6920a3d4e0dee5274f4cabcc",
+          "state": "file"
+        },
+        {
+          "bytes": 5951,
+          "path": "docs/issues/IC-011.md",
+          "sha256": "06f848a854bcc9f1ae65fc657cd1c1879f434a3e045c330cd854e6594e700070",
+          "state": "file"
+        },
+        {
+          "bytes": 6258,
+          "path": "docs/issues/IC-015.md",
+          "sha256": "46ea9bfe1bfd38179aaae5ba440c3ed70608187093a2722529e6e83106c2edac",
+          "state": "file"
+        },
+        {
+          "bytes": 1892,
+          "path": "docs/issues/IC-018.md",
+          "sha256": "f9a1afebdec3b4277b6fdfc0d8192d83d6726ae32bdb63df3f810d15484fb45f",
+          "state": "file"
+        },
+        {
+          "bytes": 3017,
+          "path": "docs/issues/README.md",
+          "sha256": "5a9b74383e7dd60a779dbcf64bf37ea7c39b1e49555ca62510dd1ec06b40d27e",
+          "state": "file"
+        },
+        {
+          "bytes": 74320,
+          "path": "docs/multi-replica.md",
+          "sha256": "009cbe6414588f25dbeceba0d882b02bb9eaf055c702ef5023ea6a6e2ef912d7",
+          "state": "file"
+        },
+        {
+          "bytes": 11477,
+          "path": "evaluations/replica-soak/README.md",
+          "sha256": "8a54f0a20dca16d4ad5ed7ee3d021b55c2c17fba4859adda7d260bfdbfe3ccca",
+          "state": "file"
+        },
+        {
+          "bytes": 1915,
+          "path": "evaluations/replica-soak/contracts/provider-free-retention.json",
+          "sha256": "16964ee771ea830d1ba612ceeb516e58b2825945891384f43415264a88f81055",
+          "state": "file"
+        },
+        {
+          "bytes": 875,
+          "path": "evaluations/replica-soak/flows/profile-conversation/crew.lua",
+          "sha256": "6bde0a6a7d9b1c67711a27e2c6a5d99f0761c50bceac2589f5283b7d294a7757",
+          "state": "file"
+        },
+        {
+          "bytes": 1190,
+          "path": "evaluations/replica-soak/flows/profile-large-result/crew.lua",
+          "sha256": "353463d7159bdc0e6472c0d773edc1cc35415cf5486f77be9ab53d3c55d9e46c",
+          "state": "file"
+        },
+        {
+          "bytes": 1280,
+          "path": "evaluations/replica-soak/flows/profile-provider-tool/crew.lua",
+          "sha256": "608d659f39414efeafadf9c8b1b4ae20b45c36f326a233fa7078c21604b28cfe",
+          "state": "file"
+        },
+        {
+          "bytes": 2064,
+          "path": "evaluations/replica-soak/profile_contract.py",
+          "sha256": "a176b6b37676fc81743624338293377ed859a3c394e1f54e5d608dea4780f35d",
+          "state": "file"
+        },
+        {
+          "bytes": 2800,
+          "path": "evaluations/replica-soak/profile_conversation_contract.py",
+          "sha256": "b4df57d01ff8dfd994793269e3745bb1d4e1cdc5a697d0e6e6e716c7ae614424",
+          "state": "file"
+        },
+        {
+          "bytes": 9046,
+          "path": "evaluations/replica-soak/profile_provider.py",
+          "sha256": "1cfaf7900bbbda8988506c4de6e5bf22e892ae7a326b7f69f16ce15bdcc82ae3",
+          "state": "file"
+        },
+        {
+          "bytes": 4941,
+          "path": "evaluations/replica-soak/profile_receipt.py",
+          "sha256": "8eb4920000667efe3f1dfcc56d2dbfba3913fcc7efa317691916a00cbfeb492f",
+          "state": "file"
+        },
+        {
+          "bytes": 5616,
+          "path": "evaluations/replica-soak/profile_runtime.py",
+          "sha256": "86a3a1f0f29d9b2b39e547829d41896ac7bef22d24b9d850f023fe4a45231d9a",
+          "state": "file"
+        },
+        {
+          "bytes": 10119,
+          "path": "evaluations/replica-soak/profile_workloads.py",
+          "sha256": "d2853d98f01aa63b18ec58dedc17607769a4494230e1dbe443bd7dd1e26822f2",
+          "state": "file"
+        },
+        {
+          "bytes": 10161,
+          "path": "evaluations/replica-soak/profiles.py",
+          "sha256": "5144651bddfca1ec2bb49b0495d12442fd906180d861c504296df449baf1ca26",
+          "state": "file"
+        },
+        {
+          "bytes": 211,
+          "path": "evaluations/replica-soak/reports/.gitignore",
+          "sha256": "d4789abb8394099724ec444fca3a4d40f1a61fd137dcdc47e80928beab7f1ac9",
+          "state": "file"
+        },
+        {
+          "bytes": 73576,
+          "path": "evaluations/replica-soak/soak.py",
+          "sha256": "0b88a9f273ce5193cd28c94cb502c3bc90ef9c64c68fc1f9d7201064aa43b6a6",
+          "state": "file"
+        },
+        {
+          "bytes": 11625,
+          "path": "evaluations/replica-soak/soak_contract.py",
+          "sha256": "c2deba87ee59cf387571313d9825484d995bc49e1a1ad1ce2dece7d13331f580",
+          "state": "file"
+        },
+        {
+          "bytes": 11389,
+          "path": "evaluations/replica-soak/soak_contract_evaluation.py",
+          "sha256": "611161c553228402fcb3b346dfe6d45c8ad6430b53521561a8ae0d84019a52ce",
+          "state": "file"
+        },
+        {
+          "bytes": 9466,
+          "path": "evaluations/replica-soak/soak_contract_signals.py",
+          "sha256": "c056ca1454f14f2b78c4b368b44485a328e1eca5571411a6d63561518925b9cd",
+          "state": "file"
+        },
+        {
+          "bytes": 4779,
+          "path": "evaluations/replica-soak/soak_metrics.py",
+          "sha256": "a5921c997f1a1e8726c11142ed700ddb2e96c3bbb674e3357ea2be046fd4943d",
+          "state": "file"
+        },
+        {
+          "bytes": 5308,
+          "path": "evaluations/replica-soak/soak_reporting.py",
+          "sha256": "894e081a45d55f26b5ec4ac7b55b016fb2293786e18ac5649157010e29276c39",
+          "state": "file"
+        },
+        {
+          "bytes": 5508,
+          "path": "evaluations/replica-soak/soak_retention_probe.py",
+          "sha256": "2d1452968339c22959efa29af4e8c5d56f9e189f8805bd7f7593754c0d2ed617",
+          "state": "file"
+        },
+        {
+          "bytes": 2441,
+          "path": "evaluations/replica-soak/soak_runtime_directory.py",
+          "sha256": "087135c8092b179c7d9df094ec87b3739d03437f1e46ee5f2a23872897db950d",
+          "state": "file"
+        },
+        {
+          "bytes": 2988,
+          "path": "evaluations/replica-soak/soak_runtime_environment.py",
+          "sha256": "4ba6262b8ebf8d524c57c7a220a9b9d4d8ba3f428ecbc2a4fcde97342af7a768",
+          "state": "file"
+        },
+        {
+          "bytes": 9605,
+          "path": "evaluations/replica-soak/soak_runtime_logs.py",
+          "sha256": "0eeb4f231143edbb28fb69f6004a8055ccfedee71b9c076895b21a9e6be9bdff",
+          "state": "file"
+        },
+        {
+          "bytes": 3211,
+          "path": "evaluations/replica-soak/source_provenance.py",
+          "sha256": "765004fde751627b98542b7974fc42c68c440ae7ca81f01fc81450af979dd494",
+          "state": "file"
+        },
+        {
+          "bytes": 3907,
+          "path": "evaluations/replica-soak/test_profile_provider.py",
+          "sha256": "ced1f23b494cbfe5cf1459b1ea399bb45104e3ee4295c44845b9ad1e1cdbe0e4",
+          "state": "file"
+        },
+        {
+          "bytes": 5942,
+          "path": "evaluations/replica-soak/test_profile_receipt.py",
+          "sha256": "6ac5e11e170879c7d0e42372d8e3a10f39aa04985dd0e8525341b2fbea5acd85",
+          "state": "file"
+        },
+        {
+          "bytes": 8594,
+          "path": "evaluations/replica-soak/test_profile_workloads.py",
+          "sha256": "61547c29bc51e1ad66e945c04c6a2119f22ad3fe43ed4823694aaea1a2e48654",
+          "state": "file"
+        },
+        {
+          "bytes": 18798,
+          "path": "evaluations/replica-soak/test_soak_contract.py",
+          "sha256": "e52445a86060133f7f06857d404b85d4d8732ab28377bc79805a8ebf82de8bce",
+          "state": "file"
+        },
+        {
+          "bytes": 8512,
+          "path": "evaluations/replica-soak/test_soak_runtime_logs.py",
+          "sha256": "5bf1390d1f5334301ed5fc17aa11aa3f5359c8608fee707b5ce4227e9efb3afc",
+          "state": "file"
+        },
+        {
+          "bytes": 2862,
+          "path": "evaluations/replica-soak/test_source_provenance.py",
+          "sha256": "1575153a2352497dee9af092ce81f2d8ba5028ce14bea7bcc00f8b73c8d0b018",
+          "state": "file"
+        },
+        {
+          "bytes": 10408,
+          "path": "scripts/check_module_size.py",
+          "sha256": "c8ddc5694ac39d46dc936783e1197e8212668edbd7376a17c8b229a220fd9736",
+          "state": "file"
+        },
+        {
+          "bytes": 15308,
+          "path": "scripts/module_size_policy.json",
+          "sha256": "93b9434d4e881a4da7c89ad8506fc1f38adc43042bfa5cc3ea77bfa647112ff0",
+          "state": "file"
+        },
+        {
+          "bytes": 19535,
+          "path": "scripts/tests/repository_policy.test.ts",
+          "sha256": "78347ddd621c64cbe8b5ea01b7169a8fb758a85f2fbcacca7b42215ec3ad4bd2",
+          "state": "file"
+        },
+        {
+          "bytes": 10349,
+          "path": "scripts/tests/test_check_module_size.py",
+          "sha256": "9e2db98fede29cb38bcef90c898c9fc7a6b5f4a4675a7914a687ee7e447ad6be",
+          "state": "file"
+        },
+        {
+          "bytes": 85447,
+          "path": "src/api/conversations.rs",
+          "sha256": "d8f2f9f722e9d5d4ceb19593956e7104947bf1299ea8fbc21af78bbd634da5bb",
+          "state": "file"
+        },
+        {
+          "bytes": 7289,
+          "path": "src/api/conversations/events.rs",
+          "sha256": "394783a4d579c453856a0b6e63aa4c210c6a3521455c60f955e38b412e38c5de",
+          "state": "file"
+        }
+      ],
+      "dirty": true,
+      "manifest_encoding": "sorted compact JSON of revision plus changed_paths",
+      "revision": "fe906f50e37640adb00b37a846be648b3a1178f9",
+      "worktree_manifest_sha256": "3291f55c31b3e1a6f3423ceab7993c398b0aad4617a7bf18b3f26668e8b04b41"
+    },
+    "binary_sha256": "05ba329223cd7894de862c558cb918a52f8ab556e8e67aaff2b125a6afcf72ab",
+    "capture_boundary": "before database and process work",
+    "changed_path_count": 55,
+    "changed_paths": [
+      {
+        "bytes": 4177,
+        "path": ".agents/skills/check-ironcrew/SKILL.md",
+        "sha256": "14b93a110b8c23ef2d6180162261bdc7d386011a9444f9e33bbf72c9a0277eb1",
+        "state": "file"
+      },
+      {
+        "bytes": 3828,
+        "path": ".agents/skills/release-ironcrew/SKILL.md",
+        "sha256": "17a9c8011791c14e1c768ecfaa5eda8a5f94215cc76f0f6a595bd86212938a00",
+        "state": "file"
+      },
+      {
+        "bytes": 2013,
+        "path": ".claude/skills/check/SKILL.md",
+        "sha256": "9be86808189a949076b25c1bcc98349be5b9273aa997d2336a8d047167f929c2",
+        "state": "file"
+      },
+      {
+        "bytes": 3292,
+        "path": ".claude/skills/release-workflow/SKILL.md",
+        "sha256": "e721cf125a49e1592df28e1b515bbf66b704f9c838d37bc35ae85587c467d63b",
+        "state": "file"
+      },
+      {
+        "bytes": 6278,
+        "path": ".github/workflows/ci.yml",
+        "sha256": "a6152d26803fcfedf098f5ad0221b71d5014bb440856bf7671cc20da60895159",
+        "state": "file"
+      },
+      {
+        "bytes": 7382,
+        "path": "AGENTS.md",
+        "sha256": "e22477f526e39997cfe0c18f5d1e759903473afc62643558ac1fbe8bc6d2a628",
+        "state": "file"
+      },
+      {
+        "bytes": 2081,
+        "path": "ISSUES.md",
+        "sha256": "6299c2c06cc06c7c0822cf20fb5a49c1f29d649236117d9e0bf72b6f8d5802e6",
+        "state": "file"
+      },
+      {
+        "bytes": 21575,
+        "path": "deploy/openshift.yaml",
+        "sha256": "f10f00ecb8eb3c708daf10a6d7b808b5aa185b363a63e229a2187d0a1f6a856b",
+        "state": "file"
+      },
+      {
+        "bytes": 18701,
+        "path": "docs/architecture.md",
+        "sha256": "3ab614e7b6a83cbfe1e09b6796535eb53dd6042f90fcd207162a8c4d695f2515",
+        "state": "file"
+      },
+      {
+        "bytes": 21302,
+        "path": "docs/best-practices.md",
+        "sha256": "c364e7ef952f592099c4d3d336ef4db951d2232a90cf5113a712dcf0b2f8ac5c",
+        "state": "file"
+      },
+      {
+        "bytes": 100250,
+        "path": "docs/cloud-deployment.md",
+        "sha256": "4df7a4b1d5eb1e54c5276e0c26911e45b38a122213501653db4a5004d2ef2133",
+        "state": "file"
+      },
+      {
+        "bytes": 25535,
+        "path": "docs/http-scaling.md",
+        "sha256": "c86b287c1afa8f71762bfa487c85f872e92e0bd781348a7b60838514335bb542",
+        "state": "file"
+      },
+      {
+        "bytes": 13540,
+        "path": "docs/issues/AUDIT_EVIDENCE.md",
+        "sha256": "8b319ba903c5708f686ee8e9781497d8b98c941883558be0316fa9e29a798f9c",
+        "state": "file"
+      },
+      {
+        "bytes": 10884,
+        "path": "docs/issues/IC-008.md",
+        "sha256": "0c337348ceec73357e19be59ab70f165ce524fcf6920a3d4e0dee5274f4cabcc",
+        "state": "file"
+      },
+      {
+        "bytes": 5951,
+        "path": "docs/issues/IC-011.md",
+        "sha256": "06f848a854bcc9f1ae65fc657cd1c1879f434a3e045c330cd854e6594e700070",
+        "state": "file"
+      },
+      {
+        "bytes": 6258,
+        "path": "docs/issues/IC-015.md",
+        "sha256": "46ea9bfe1bfd38179aaae5ba440c3ed70608187093a2722529e6e83106c2edac",
+        "state": "file"
+      },
+      {
+        "bytes": 1892,
+        "path": "docs/issues/IC-018.md",
+        "sha256": "f9a1afebdec3b4277b6fdfc0d8192d83d6726ae32bdb63df3f810d15484fb45f",
+        "state": "file"
+      },
+      {
+        "bytes": 3017,
+        "path": "docs/issues/README.md",
+        "sha256": "5a9b74383e7dd60a779dbcf64bf37ea7c39b1e49555ca62510dd1ec06b40d27e",
+        "state": "file"
+      },
+      {
+        "bytes": 74320,
+        "path": "docs/multi-replica.md",
+        "sha256": "009cbe6414588f25dbeceba0d882b02bb9eaf055c702ef5023ea6a6e2ef912d7",
+        "state": "file"
+      },
+      {
+        "bytes": 11477,
+        "path": "evaluations/replica-soak/README.md",
+        "sha256": "8a54f0a20dca16d4ad5ed7ee3d021b55c2c17fba4859adda7d260bfdbfe3ccca",
+        "state": "file"
+      },
+      {
+        "bytes": 1915,
+        "path": "evaluations/replica-soak/contracts/provider-free-retention.json",
+        "sha256": "16964ee771ea830d1ba612ceeb516e58b2825945891384f43415264a88f81055",
+        "state": "file"
+      },
+      {
+        "bytes": 875,
+        "path": "evaluations/replica-soak/flows/profile-conversation/crew.lua",
+        "sha256": "6bde0a6a7d9b1c67711a27e2c6a5d99f0761c50bceac2589f5283b7d294a7757",
+        "state": "file"
+      },
+      {
+        "bytes": 1190,
+        "path": "evaluations/replica-soak/flows/profile-large-result/crew.lua",
+        "sha256": "353463d7159bdc0e6472c0d773edc1cc35415cf5486f77be9ab53d3c55d9e46c",
+        "state": "file"
+      },
+      {
+        "bytes": 1280,
+        "path": "evaluations/replica-soak/flows/profile-provider-tool/crew.lua",
+        "sha256": "608d659f39414efeafadf9c8b1b4ae20b45c36f326a233fa7078c21604b28cfe",
+        "state": "file"
+      },
+      {
+        "bytes": 2064,
+        "path": "evaluations/replica-soak/profile_contract.py",
+        "sha256": "a176b6b37676fc81743624338293377ed859a3c394e1f54e5d608dea4780f35d",
+        "state": "file"
+      },
+      {
+        "bytes": 2800,
+        "path": "evaluations/replica-soak/profile_conversation_contract.py",
+        "sha256": "b4df57d01ff8dfd994793269e3745bb1d4e1cdc5a697d0e6e6e716c7ae614424",
+        "state": "file"
+      },
+      {
+        "bytes": 9046,
+        "path": "evaluations/replica-soak/profile_provider.py",
+        "sha256": "1cfaf7900bbbda8988506c4de6e5bf22e892ae7a326b7f69f16ce15bdcc82ae3",
+        "state": "file"
+      },
+      {
+        "bytes": 4941,
+        "path": "evaluations/replica-soak/profile_receipt.py",
+        "sha256": "8eb4920000667efe3f1dfcc56d2dbfba3913fcc7efa317691916a00cbfeb492f",
+        "state": "file"
+      },
+      {
+        "bytes": 5616,
+        "path": "evaluations/replica-soak/profile_runtime.py",
+        "sha256": "86a3a1f0f29d9b2b39e547829d41896ac7bef22d24b9d850f023fe4a45231d9a",
+        "state": "file"
+      },
+      {
+        "bytes": 10119,
+        "path": "evaluations/replica-soak/profile_workloads.py",
+        "sha256": "d2853d98f01aa63b18ec58dedc17607769a4494230e1dbe443bd7dd1e26822f2",
+        "state": "file"
+      },
+      {
+        "bytes": 10161,
+        "path": "evaluations/replica-soak/profiles.py",
+        "sha256": "5144651bddfca1ec2bb49b0495d12442fd906180d861c504296df449baf1ca26",
+        "state": "file"
+      },
+      {
+        "bytes": 211,
+        "path": "evaluations/replica-soak/reports/.gitignore",
+        "sha256": "d4789abb8394099724ec444fca3a4d40f1a61fd137dcdc47e80928beab7f1ac9",
+        "state": "file"
+      },
+      {
+        "bytes": 73576,
+        "path": "evaluations/replica-soak/soak.py",
+        "sha256": "0b88a9f273ce5193cd28c94cb502c3bc90ef9c64c68fc1f9d7201064aa43b6a6",
+        "state": "file"
+      },
+      {
+        "bytes": 11625,
+        "path": "evaluations/replica-soak/soak_contract.py",
+        "sha256": "c2deba87ee59cf387571313d9825484d995bc49e1a1ad1ce2dece7d13331f580",
+        "state": "file"
+      },
+      {
+        "bytes": 11389,
+        "path": "evaluations/replica-soak/soak_contract_evaluation.py",
+        "sha256": "611161c553228402fcb3b346dfe6d45c8ad6430b53521561a8ae0d84019a52ce",
+        "state": "file"
+      },
+      {
+        "bytes": 9466,
+        "path": "evaluations/replica-soak/soak_contract_signals.py",
+        "sha256": "c056ca1454f14f2b78c4b368b44485a328e1eca5571411a6d63561518925b9cd",
+        "state": "file"
+      },
+      {
+        "bytes": 4779,
+        "path": "evaluations/replica-soak/soak_metrics.py",
+        "sha256": "a5921c997f1a1e8726c11142ed700ddb2e96c3bbb674e3357ea2be046fd4943d",
+        "state": "file"
+      },
+      {
+        "bytes": 5308,
+        "path": "evaluations/replica-soak/soak_reporting.py",
+        "sha256": "894e081a45d55f26b5ec4ac7b55b016fb2293786e18ac5649157010e29276c39",
+        "state": "file"
+      },
+      {
+        "bytes": 5508,
+        "path": "evaluations/replica-soak/soak_retention_probe.py",
+        "sha256": "2d1452968339c22959efa29af4e8c5d56f9e189f8805bd7f7593754c0d2ed617",
+        "state": "file"
+      },
+      {
+        "bytes": 2441,
+        "path": "evaluations/replica-soak/soak_runtime_directory.py",
+        "sha256": "087135c8092b179c7d9df094ec87b3739d03437f1e46ee5f2a23872897db950d",
+        "state": "file"
+      },
+      {
+        "bytes": 2988,
+        "path": "evaluations/replica-soak/soak_runtime_environment.py",
+        "sha256": "4ba6262b8ebf8d524c57c7a220a9b9d4d8ba3f428ecbc2a4fcde97342af7a768",
+        "state": "file"
+      },
+      {
+        "bytes": 9605,
+        "path": "evaluations/replica-soak/soak_runtime_logs.py",
+        "sha256": "0eeb4f231143edbb28fb69f6004a8055ccfedee71b9c076895b21a9e6be9bdff",
+        "state": "file"
+      },
+      {
+        "bytes": 3211,
+        "path": "evaluations/replica-soak/source_provenance.py",
+        "sha256": "765004fde751627b98542b7974fc42c68c440ae7ca81f01fc81450af979dd494",
+        "state": "file"
+      },
+      {
+        "bytes": 3907,
+        "path": "evaluations/replica-soak/test_profile_provider.py",
+        "sha256": "ced1f23b494cbfe5cf1459b1ea399bb45104e3ee4295c44845b9ad1e1cdbe0e4",
+        "state": "file"
+      },
+      {
+        "bytes": 5942,
+        "path": "evaluations/replica-soak/test_profile_receipt.py",
+        "sha256": "6ac5e11e170879c7d0e42372d8e3a10f39aa04985dd0e8525341b2fbea5acd85",
+        "state": "file"
+      },
+      {
+        "bytes": 8594,
+        "path": "evaluations/replica-soak/test_profile_workloads.py",
+        "sha256": "61547c29bc51e1ad66e945c04c6a2119f22ad3fe43ed4823694aaea1a2e48654",
+        "state": "file"
+      },
+      {
+        "bytes": 18798,
+        "path": "evaluations/replica-soak/test_soak_contract.py",
+        "sha256": "e52445a86060133f7f06857d404b85d4d8732ab28377bc79805a8ebf82de8bce",
+        "state": "file"
+      },
+      {
+        "bytes": 8512,
+        "path": "evaluations/replica-soak/test_soak_runtime_logs.py",
+        "sha256": "5bf1390d1f5334301ed5fc17aa11aa3f5359c8608fee707b5ce4227e9efb3afc",
+        "state": "file"
+      },
+      {
+        "bytes": 2862,
+        "path": "evaluations/replica-soak/test_source_provenance.py",
+        "sha256": "1575153a2352497dee9af092ce81f2d8ba5028ce14bea7bcc00f8b73c8d0b018",
+        "state": "file"
+      },
+      {
+        "bytes": 10408,
+        "path": "scripts/check_module_size.py",
+        "sha256": "c8ddc5694ac39d46dc936783e1197e8212668edbd7376a17c8b229a220fd9736",
+        "state": "file"
+      },
+      {
+        "bytes": 15308,
+        "path": "scripts/module_size_policy.json",
+        "sha256": "93b9434d4e881a4da7c89ad8506fc1f38adc43042bfa5cc3ea77bfa647112ff0",
+        "state": "file"
+      },
+      {
+        "bytes": 19535,
+        "path": "scripts/tests/repository_policy.test.ts",
+        "sha256": "78347ddd621c64cbe8b5ea01b7169a8fb758a85f2fbcacca7b42215ec3ad4bd2",
+        "state": "file"
+      },
+      {
+        "bytes": 10349,
+        "path": "scripts/tests/test_check_module_size.py",
+        "sha256": "9e2db98fede29cb38bcef90c898c9fc7a6b5f4a4675a7914a687ee7e447ad6be",
+        "state": "file"
+      },
+      {
+        "bytes": 85447,
+        "path": "src/api/conversations.rs",
+        "sha256": "d8f2f9f722e9d5d4ceb19593956e7104947bf1299ea8fbc21af78bbd634da5bb",
+        "state": "file"
+      },
+      {
+        "bytes": 7289,
+        "path": "src/api/conversations/events.rs",
+        "sha256": "394783a4d579c453856a0b6e63aa4c210c6a3521455c60f955e38b412e38c5de",
+        "state": "file"
+      }
+    ],
+    "dirty": true,
+    "final_capture_error": null,
+    "manifest_encoding": "sorted compact JSON of revision plus changed_paths",
+    "revision": "fe906f50e37640adb00b37a846be648b3a1178f9",
+    "unchanged_during_run": true,
+    "worktree_manifest_sha256": "3291f55c31b3e1a6f3423ceab7993c398b0aad4617a7bf18b3f26668e8b04b41"
+  },
+  "started_at": "2026-08-11T18:28:43.915535+00:00",
+  "status": "passed",
+  "topology": {
+    "instance_ids": [
+      "ic018-profile-a",
+      "ic018-profile-b"
+    ],
+    "kind": "direct_two_process",
+    "load_balancer_in_scope": false
+  }
+}
