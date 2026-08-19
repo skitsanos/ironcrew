@@ -48,6 +48,7 @@ async-stream = "0.3.6"
 axum = "0.8.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
+sqlx-postgres = { version = "0.9.0", default-features = false, features = ["json"], optional = true }
 tower-http = { version = "0.7.0", features = ["cors"] }
 rmcp = { version = "3.1.2", optional = true, default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "tower"] }
 sse-stream = { version = "0.2.5", optional = true }
@@ -63,7 +64,7 @@ crossterm = { version = "0.29.0", default-features = false, features = ["event-s
 
 [features]
 default = ["postgres", "mcp"]
-postgres = ["sqlx"]
+postgres = ["sqlx", "dep:sqlx-postgres"]
 mcp = ["dep:bytes", "dep:rmcp", "dep:sse-stream"]
 
 [dev-dependencies]
