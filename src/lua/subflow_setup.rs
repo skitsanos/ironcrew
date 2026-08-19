@@ -116,7 +116,11 @@ fn finish_vm(
         lua.set_app_data(bus.clone());
     }
     register_agent_constructor(lua)?;
-    register_crew_constructor(lua, context.runtime.clone(), agents, sub_dir.to_path_buf())
+    register_crew_constructor(lua, context.runtime.clone(), agents, sub_dir.to_path_buf())?;
+    // v1: sub-flows get a fail-closed stub only, never live postgres.*
+    // capability -- a diagnosable error instead of a raw nil-global crash.
+    // Live capability inside run_flow sub-flows is an explicit follow-up.
+    crate::lua::postgres::register_postgres_stub(lua, crate::lua::postgres::STUB_SUBFLOW)
 }
 
 fn validate_requested_path(path: &str) -> Result<(), IronCrewError> {

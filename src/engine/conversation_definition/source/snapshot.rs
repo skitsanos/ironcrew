@@ -120,6 +120,8 @@ impl FlowSourceSnapshot {
     }
 
     /// Stem + source for every captured `sql/*.sql` file, in path order.
+    // only called from the postgres-gated wiring
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub fn sql_sources(&self) -> Vec<(String, Arc<str>)> {
         self.files
             .iter()
