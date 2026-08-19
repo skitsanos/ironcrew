@@ -174,13 +174,13 @@
     },
     {
       "path": "src/lua/conversation.rs",
-      "max_lines": 964,
-      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features."
+      "max_lines": 969,
+      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting."
     },
     {
       "path": "src/lua/crew_userdata.rs",
-      "max_lines": 1049,
-      "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods."
+      "max_lines": 1050,
+      "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods. Task 8: passes the `lua` handle into build_conversation for app-db fingerprint lookup."
     },
     {
       "path": "src/lua/dialog.rs",
