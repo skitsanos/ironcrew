@@ -271,6 +271,42 @@ pub fn secure_no_redirect_client(
         .build()
 }
 
+/// SSRF-aware redirect policy that additionally refuses to leave the original
+/// origin.
+///
+/// reqwest strips only `Authorization`/`Cookie`-style headers across hosts, so
+/// a request carrying a secret in a custom header (`x-api-key`, a configured
+/// `api_key` header) would hand that secret to whatever public host a 3xx
+/// pointed at. Callers that send such headers use this policy so a redirect can
+/// never move the credential to another origin.
+pub(crate) fn same_origin_redirect_policy(
+    policy: OutboundNetworkPolicy,
+    allow_private: bool,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects (max 10)".to_string());
+        }
+        let Some(origin) = attempt.previous().first() else {
+            return attempt.error("redirect without an originating URL".to_string());
+        };
+        let target = attempt.url();
+        let same_origin = target.scheme() == origin.scheme()
+            && target.host_str() == origin.host_str()
+            && target.port_or_known_default() == origin.port_or_known_default();
+        if !same_origin {
+            return attempt.error(
+                "refusing to follow a cross-origin redirect on a request carrying credentials"
+                    .to_string(),
+            );
+        }
+        match validate_url_with_private_access(target.as_str(), policy, allow_private) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
+}
+
 #[allow(dead_code)] // public helper retained for embedders; built-ins use a captured override
 pub fn ssrf_redirect_policy_with_policy(
     policy: OutboundNetworkPolicy,
@@ -294,144 +330,4 @@ fn ssrf_redirect_policy_with_private_access(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn v4(value: &str) -> IpAddr {
-        IpAddr::V4(value.parse().expect("valid test IPv4"))
-    }
-
-    fn v6(value: &str) -> IpAddr {
-        IpAddr::V6(value.parse().expect("valid test IPv6"))
-    }
-
-    #[test]
-    fn blocks_private_reserved_and_documentation_ipv4() {
-        for ip in [
-            "0.0.0.1",
-            "10.0.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "169.254.169.254",
-            "172.31.255.255",
-            "192.0.0.8",
-            "192.0.2.1",
-            "192.168.1.1",
-            "198.18.0.1",
-            "198.51.100.1",
-            "203.0.113.1",
-            "224.0.0.1",
-            "255.255.255.255",
-        ] {
-            assert!(
-                check_ip(v4(ip), OutboundNetworkPolicy::PublicOnly).is_err(),
-                "expected {ip} to be blocked"
-            );
-        }
-    }
-
-    #[test]
-    fn allows_public_ipv4() {
-        for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34"] {
-            assert!(
-                check_ip(v4(ip), OutboundNetworkPolicy::PublicOnly).is_ok(),
-                "expected {ip} to be allowed"
-            );
-        }
-    }
-
-    #[test]
-    fn blocks_private_reserved_and_documentation_ipv6() {
-        for ip in [
-            "::1",
-            "::",
-            "64:ff9b:1::1",
-            "100::1",
-            "2001::1",
-            "2001:2::1",
-            "2001:db8::1",
-            "3fff::1",
-            "5f00::1",
-            "fc00::1",
-            "fd12:3456::1",
-            "fe80::1",
-            "fec0::1",
-            "ff02::1",
-        ] {
-            assert!(
-                check_ip(v6(ip), OutboundNetworkPolicy::PublicOnly).is_err(),
-                "expected {ip} to be blocked"
-            );
-        }
-    }
-
-    #[test]
-    fn blocks_embedded_private_ipv4_but_allows_public_nat64() {
-        assert!(check_ip(v6("::ffff:127.0.0.1"), OutboundNetworkPolicy::PublicOnly).is_err());
-        assert!(check_ip(v6("64:ff9b::a00:1"), OutboundNetworkPolicy::PublicOnly).is_err());
-        assert!(check_ip(v6("64:ff9b::808:808"), OutboundNetworkPolicy::PublicOnly).is_ok());
-    }
-
-    #[test]
-    fn loopback_only_policy_does_not_allow_other_private_ranges() {
-        assert!(check_ip(v4("127.0.0.1"), OutboundNetworkPolicy::AllowLoopback).is_ok());
-        assert!(check_ip(v6("::1"), OutboundNetworkPolicy::AllowLoopback).is_ok());
-        assert!(check_ip(v4("10.0.0.1"), OutboundNetworkPolicy::AllowLoopback).is_err());
-        assert!(check_ip(v6("fd00::1"), OutboundNetworkPolicy::AllowLoopback).is_err());
-    }
-
-    #[test]
-    fn rejects_bad_scheme_and_defers_hostname_resolution() {
-        assert!(validate_url_not_private("file:///etc/passwd").is_err());
-        assert!(validate_url_not_private("http://definitely-not-a-real-host.invalid/").is_ok());
-    }
-
-    #[test]
-    fn redirect_targets_are_validated_with_the_selected_policy() {
-        assert!(
-            validate_url_with_policy(
-                "http://127.0.0.1/metadata",
-                OutboundNetworkPolicy::PublicOnly
-            )
-            .is_err()
-        );
-        assert!(
-            validate_url_with_policy(
-                "http://127.0.0.1/local-mcp",
-                OutboundNetworkPolicy::AllowLoopback
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn allows_public_ipv6() {
-        assert!(
-            check_ip(
-                v6("2606:4700:4700::1111"),
-                OutboundNetworkPolicy::PublicOnly
-            )
-            .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn connection_resolver_fails_closed_for_private_and_missing_names() {
-        let private = SafeDnsResolver::default()
-            .resolve("localhost".parse().expect("valid DNS name"))
-            .await;
-        assert!(
-            private.is_err(),
-            "public-only resolver must reject loopback"
-        );
-
-        let missing = SafeDnsResolver::default()
-            .resolve(
-                "definitely-not-a-real-host.invalid"
-                    .parse()
-                    .expect("valid DNS name"),
-            )
-            .await;
-        assert!(missing.is_err(), "DNS failures must not fail open");
-    }
-}
+mod tests;

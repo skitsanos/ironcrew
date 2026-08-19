@@ -36,7 +36,7 @@ Environment variables control storage:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
+| `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` (alias `postgresql`; case-insensitive) | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
 | `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) | — |
 | `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases: at most 37 lowercase ASCII alphanumeric/underscore bytes | `""` (table = `runs`) |

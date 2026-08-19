@@ -114,6 +114,19 @@ response_format = {
 This is particularly useful for data extraction pipelines where downstream tasks
 expect a specific JSON structure.
 
+**Provider support.** All three provider types enforce `response_format`, but
+they express it differently:
+
+| Provider | Mechanism |
+|----------|-----------|
+| `openai` (Chat Completions) | Native top-level `response_format` |
+| `openai-responses` | Native `text.format` (json_schema / json_object / text) |
+| `anthropic` | `json_schema` is enforced by defining a single-purpose tool and forcing the model to call it; the tool input is returned as the task output |
+
+Because Anthropic enforces a schema through a forced tool call, an agent using
+`json_schema` on that provider spends one tool definition on the schema. Its own
+tools continue to work normally, and their calls are unaffected.
+
 ## Agent Selection Heuristics
 
 When a task does not specify `agent = "name"`, the engine auto-selects the best
