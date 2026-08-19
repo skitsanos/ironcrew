@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::time::Duration;
 
 use super::provider::*;
+use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
 mod request_body;
+mod stream_tools;
 
 pub struct OpenAiProvider {
     client: Client,
@@ -17,46 +18,14 @@ pub struct OpenAiProvider {
     execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
-/// Simple token-bucket rate limiter for LLM API calls.
-struct RateLimiter {
-    min_interval: Duration,
-    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
-}
-
-impl RateLimiter {
-    fn new(min_interval_ms: u64) -> Self {
-        Self {
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now()
-                    .checked_sub(Duration::from_secs(60))
-                    .unwrap_or_else(std::time::Instant::now),
-            )),
-        }
-    }
-
-    async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = std::time::Instant::now();
-    }
-}
-
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
-        let client = crate::utils::network::secure_client_builder(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-        )
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client");
-
         // Capture provider policy once so durable conversation identity and
         // execution cannot drift between replicas or later environment reads.
         let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let client = super::provider_http::secure_provider_client_builder(execution_policy)
+            .build()
+            .expect("Failed to build HTTP client");
         let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         if rate_limit.is_some() {
@@ -190,18 +159,23 @@ impl OpenAiProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(
+                read_error_response(resp, self.execution_policy, "OpenAI error response")
+                    .await?
+                    .into_error(),
+            );
+        }
 
         // Read with a strict byte budget before parsing. This remains resilient
         // to HTTP/2 framing quirks without allowing an unbounded allocation.
-        let response_limit = if status.is_success() {
-            self.execution_policy.response_bytes()
-        } else {
-            self.execution_policy.error_bytes()
-        };
-        let resp_bytes =
-            crate::utils::http::read_response_bytes(resp, response_limit, "OpenAI response")
-                .await
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        let resp_bytes = crate::utils::http::read_response_bytes(
+            resp,
+            self.execution_policy.response_bytes(),
+            "OpenAI response",
+        )
+        .await
+        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
         let resp_text = String::from_utf8(resp_bytes)
             .map_err(|_| IronCrewError::Provider("OpenAI response was not valid UTF-8".into()))?;
         let resp_body: Value = serde_json::from_str(&resp_text).map_err(|e| {
@@ -212,33 +186,6 @@ impl OpenAiProvider {
             );
             IronCrewError::Provider(format!("Invalid JSON response from LLM provider: {}", e))
         })?;
-
-        if !status.is_success() {
-            // Handle different error formats across providers:
-            // OpenAI: {"error": {"message": "..."}}
-            // Gemini: [{"error": {"message": "...", "status": "..."}}]  (array-wrapped!)
-            // Others: {"message": "..."} or plain {"error": "string"}
-            let error_root = if resp_body.is_array() {
-                // Gemini wraps errors in an array
-                resp_body.get(0).unwrap_or(&resp_body)
-            } else {
-                &resp_body
-            };
-            let error_msg = error_root["error"]["message"]
-                .as_str()
-                .or_else(|| error_root["message"].as_str())
-                .or_else(|| error_root["error"].as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    let raw = serde_json::to_string(&resp_body).unwrap_or_default();
-                    tracing::debug!("Unknown error response body: {}", raw);
-                    raw
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
 
         let choice = &resp_body["choices"][0]["message"];
 
@@ -301,24 +248,11 @@ impl OpenAiProvider {
             .map_err(IronCrewError::Http)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let limit = self.execution_policy.error_bytes();
-            let bytes =
-                crate::utils::http::read_response_bytes(resp, limit, "OpenAI error response")
-                    .await
-                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let error_msg = error_body["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let raw = String::from_utf8_lossy(&bytes);
-                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
+            return Err(
+                read_error_response(resp, self.execution_policy, "OpenAI error response")
+                    .await?
+                    .into_error(),
+            );
         }
 
         let mut full_content = String::new();
@@ -326,145 +260,92 @@ impl OpenAiProvider {
         let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
         // Track tool call assembly (streaming sends deltas)
-        let mut tool_call_buffers: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new(); // index -> (id, name, arguments)
+        let mut tool_call_buffers = stream_tools::StreamToolCalls::default();
 
-        // Read SSE stream
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let stream_limit = self.execution_policy.stream_bytes();
-        let mut buffer = crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI stream");
+        let mut lines = ProviderSseLines::new(resp, self.execution_policy, "OpenAI stream");
         // Track terminal delivery: a mid-stream `{"error": …}` chunk or a stream
         // that ends before `data: [DONE]` must fail rather than return whatever
         // partial content accumulated.
         let mut stream_error: Option<String> = None;
         let mut saw_done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(IronCrewError::Http)?;
-            let lines = buffer
-                .push(&chunk)
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        while let Some(raw_line) = lines.next_line().await? {
+            let line = raw_line.trim();
 
-            // Process complete lines
-            for raw_line in lines {
-                let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
 
-                if line.is_empty() {
-                    continue;
-                }
+            if line == "data: [DONE]" {
+                saw_done = true;
+                let _ = tx.send(StreamChunk::Done).await;
+                continue;
+            }
 
-                if line == "data: [DONE]" {
-                    saw_done = true;
-                    let _ = tx.send(StreamChunk::Done).await;
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ")
-                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
-                {
-                    // Some OpenAI-compatible servers report failures as an inline
-                    // `{"error": {...}}` data event mid-stream.
-                    if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
-                        let msg = err["message"]
-                            .as_str()
-                            .or_else(|| err.as_str())
-                            .unwrap_or("stream error");
-                        stream_error = Some(msg.to_string());
-                        break;
-                    }
-
-                    let delta = &parsed["choices"][0]["delta"];
-
-                    // Text content delta
-                    if let Some(content) = delta["content"].as_str() {
-                        crate::utils::http::bounded_push_str(
-                            &mut full_content,
-                            content,
-                            &mut stored_output_bytes,
-                            output_limit,
-                            "OpenAI accumulated output",
-                        )
-                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                        let _ = tx.send(StreamChunk::Text(content.to_string())).await;
-                    }
-
-                    // Reasoning delta (DeepSeek, Kimi, Moonshot use reasoning_content)
-                    if let Some(reasoning) = delta["reasoning_content"]
+            if let Some(data) = sse_field(line, "data")
+                && let Ok(parsed) = serde_json::from_str::<Value>(data)
+            {
+                // Some OpenAI-compatible servers report failures as an inline
+                // `{"error": {...}}` data event mid-stream.
+                if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
+                    let msg = err["message"]
                         .as_str()
-                        .or_else(|| delta["reasoning"].as_str())
-                    {
-                        crate::utils::http::bounded_push_str(
-                            &mut full_reasoning,
-                            reasoning,
+                        .or_else(|| err.as_str())
+                        .unwrap_or("stream error");
+                    stream_error = Some(msg.to_string());
+                    break;
+                }
+
+                let delta = &parsed["choices"][0]["delta"];
+
+                // Text content delta
+                if let Some(content) = delta["content"].as_str() {
+                    crate::utils::http::bounded_push_str(
+                        &mut full_content,
+                        content,
+                        &mut stored_output_bytes,
+                        output_limit,
+                        "OpenAI accumulated output",
+                    )
+                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                    let _ = tx.send(StreamChunk::Text(content.to_string())).await;
+                }
+
+                // Reasoning delta (DeepSeek, Kimi, Moonshot use reasoning_content)
+                if let Some(reasoning) = delta["reasoning_content"]
+                    .as_str()
+                    .or_else(|| delta["reasoning"].as_str())
+                {
+                    crate::utils::http::bounded_push_str(
+                        &mut full_reasoning,
+                        reasoning,
+                        &mut stored_output_bytes,
+                        output_limit,
+                        "OpenAI accumulated output",
+                    )
+                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                    let _ = tx.send(StreamChunk::Thinking(reasoning.to_string())).await;
+                }
+
+                // Tool calls delta
+                if let Some(tc_deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tc_deltas {
+                        let updates = tool_call_buffers.apply_delta(
+                            tc,
                             &mut stored_output_bytes,
                             output_limit,
-                            "OpenAI accumulated output",
-                        )
-                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string())).await;
-                    }
-
-                    // Tool calls delta
-                    if let Some(tc_deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                        for tc in tc_deltas {
-                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                            let entry = tool_call_buffers
-                                .entry(index)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()));
-
-                            if let Some(id) = tc["id"].as_str() {
-                                if entry.0.is_empty() {
-                                    crate::utils::http::bounded_push_str(
-                                        &mut entry.0,
-                                        id,
-                                        &mut stored_output_bytes,
-                                        output_limit,
-                                        "OpenAI accumulated output",
-                                    )
-                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    if entry.1.is_empty() {
-                                        crate::utils::http::bounded_push_str(
-                                            &mut entry.1,
-                                            name,
-                                            &mut stored_output_bytes,
-                                            output_limit,
-                                            "OpenAI accumulated output",
-                                        )
-                                        .map_err(
-                                            |error| IronCrewError::Provider(error.to_string()),
-                                        )?;
-                                    }
-                                    let _ = tx.try_send(StreamChunk::ToolCallStart {
-                                        id: id.to_string(),
-                                        name: name.to_string(),
-                                    });
-                                }
-                            }
-
-                            if let Some(args_delta) = tc["function"]["arguments"].as_str() {
-                                crate::utils::http::bounded_push_str(
-                                    &mut entry.2,
-                                    args_delta,
-                                    &mut stored_output_bytes,
-                                    output_limit,
-                                    "OpenAI accumulated output",
-                                )
-                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                let _ = tx.try_send(StreamChunk::ToolCallDelta {
-                                    id: entry.0.clone(),
-                                    arguments_delta: args_delta.to_string(),
-                                });
-                            }
+                        )?;
+                        if let Some((id, name)) = updates.start {
+                            let _ = tx.try_send(StreamChunk::ToolCallStart { id, name });
+                        }
+                        if let Some((id, arguments_delta)) = updates.arguments {
+                            let _ = tx.try_send(StreamChunk::ToolCallDelta {
+                                id,
+                                arguments_delta,
+                            });
                         }
                     }
                 }
-            }
-
-            if stream_error.is_some() {
-                break;
             }
         }
 
@@ -475,15 +356,7 @@ impl OpenAiProvider {
         }
 
         // Assemble tool calls from buffers
-        let tool_calls: Vec<ToolCallRequest> = tool_call_buffers
-            .into_values()
-            .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
-            .map(|(id, name, arguments)| ToolCallRequest {
-                id,
-                call_type: "function".to_string(),
-                function: ToolCallFunction { name, arguments },
-            })
-            .collect();
+        let tool_calls = tool_call_buffers.finish()?;
 
         // A stream that ended before `[DONE]` *and* produced nothing is a
         // truncated/dropped connection — fail with a clear message instead of

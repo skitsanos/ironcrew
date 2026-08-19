@@ -615,6 +615,8 @@ provider response and are not billing data.
 | `IRONCREW_PROVIDER_MAX_ERROR_BYTES` | Maximum provider/remote-image error body retained (default: `262144` = 256 KiB) |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | Maximum raw provider SSE bytes consumed for one streaming response (default: `33554432` = 32 MiB) |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | Maximum accumulated provider text/reasoning output (default: `16777216` = 16 MiB) |
+| `IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` | Provider TCP/TLS connection deadline (default: `10`; range: 1–120 seconds; invalid or excessive values use the default) |
+| `IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` | Total provider request deadline, including response streaming (default: `900`; range: 1–86400 seconds). Raise deliberately for unusually long extended-thinking responses |
 | `IRONCREW_CHAT_HISTORY_MAX_BYTES` | Maximum estimated in-memory bytes retained in one provider chat history (default: `33554432` = 32 MiB; hard ceiling: `268435456`) |
 | `IRONCREW_MAX_REASONING_BYTES` | Maximum reasoning/thinking text retained across one provider tool loop (default: `1048576` = 1 MiB; hard ceiling: `16777216`) |
 | `IRONCREW_FILE_READ_MAX_BYTES` | Max bytes read by `file_read` or per file in `file_read_glob` (default: `10485760` = 10 MiB; hard ceiling: `268435456` = 256 MiB) |

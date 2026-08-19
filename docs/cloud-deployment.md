@@ -256,6 +256,8 @@ per-flow read grants.
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Non-streaming model response cap. |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | `33554432` (32 MiB) | Raw model SSE stream cap. |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Accumulated model output/reasoning cap. |
+| `IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` | `10` | Provider TCP/TLS connection deadline (range 1–120 seconds). |
+| `IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` | `900` | Total provider request deadline, including streaming (range 1–86400 seconds). |
 | `IRONCREW_CHAT_HISTORY_MAX_BYTES` | `33554432` (32 MiB) | Aggregate in-memory provider history cap (hard ceiling 256 MiB). |
 | `IRONCREW_MAX_REASONING_BYTES` | `1048576` (1 MiB) | Reasoning retained during one provider tool loop (hard ceiling 16 MiB). |
 | `IRONCREW_MAX_IMAGE_BYTES` | `20971520` (20 MiB) | Per-image local/remote input cap. |

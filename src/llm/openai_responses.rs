@@ -10,10 +10,10 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
 
 use super::provider::*;
+use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -47,33 +47,6 @@ pub enum ServerTool {
     },
 }
 
-struct RateLimiter {
-    min_interval: Duration,
-    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
-}
-
-impl RateLimiter {
-    fn new(min_interval_ms: u64) -> Self {
-        Self {
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now()
-                    .checked_sub(Duration::from_secs(60))
-                    .unwrap_or_else(std::time::Instant::now),
-            )),
-        }
-    }
-
-    async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = std::time::Instant::now();
-    }
-}
-
 pub struct OpenAiResponsesProvider {
     client: Client,
     base_url: String,
@@ -85,14 +58,10 @@ pub struct OpenAiResponsesProvider {
 
 impl OpenAiResponsesProvider {
     pub fn new(api_key: String, base_url: Option<String>, config: ResponsesConfig) -> Self {
-        let client = crate::utils::network::secure_client_builder(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-        )
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client");
-
         let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let client = super::provider_http::secure_provider_client_builder(execution_policy)
+            .build()
+            .expect("Failed to build HTTP client");
         let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
@@ -366,14 +335,18 @@ impl OpenAiResponsesProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
-        let response_limit = if status.is_success() {
-            self.execution_policy.response_bytes()
-        } else {
-            self.execution_policy.error_bytes()
-        };
+        if !status.is_success() {
+            return Err(read_error_response(
+                resp,
+                self.execution_policy,
+                "OpenAI Responses error response",
+            )
+            .await?
+            .into_error());
+        }
         let bytes = crate::utils::http::read_response_bytes(
             resp,
-            response_limit,
+            self.execution_policy.response_bytes(),
             "OpenAI Responses response",
         )
         .await
@@ -388,16 +361,6 @@ impl OpenAiResponsesProvider {
             );
             IronCrewError::Provider(format!("Invalid JSON from Responses API: {}", e))
         })?;
-
-        if !status.is_success() {
-            let error_msg = resp_body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown Responses API error");
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
 
         parse_responses_response(&resp_body)
     }
@@ -429,41 +392,25 @@ impl OpenAiResponsesProvider {
             .map_err(IronCrewError::Http)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let limit = self.execution_policy.error_bytes();
-            let bytes = crate::utils::http::read_response_bytes(
+            return Err(read_error_response(
                 resp,
-                limit,
+                self.execution_policy,
                 "OpenAI Responses error response",
             )
-            .await
-            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let error_msg = error_body["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let raw = String::from_utf8_lossy(&bytes);
-                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
+            .await?
+            .into_error());
         }
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
         let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
-        let mut item_states: HashMap<String, ItemState> = HashMap::new();
+        let mut item_states: BTreeMap<usize, ItemState> = BTreeMap::new();
+        let mut item_indexes: HashMap<String, usize> = HashMap::new();
         let mut usage_data: Option<Value> = None;
 
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let stream_limit = self.execution_policy.stream_bytes();
-        let mut buffer =
-            crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI Responses stream");
+        let mut lines =
+            ProviderSseLines::new(resp, self.execution_policy, "OpenAI Responses stream");
         let mut current_event_type = String::new();
         // Track terminal delivery: `response.failed`/`error`, or a stream that
         // ends before `response.completed`, must fail rather than return
@@ -471,143 +418,140 @@ impl OpenAiResponsesProvider {
         let mut stream_error: Option<String> = None;
         let mut saw_completed = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(IronCrewError::Http)?;
-            let lines = buffer
-                .push(&chunk)
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        while let Some(raw_line) = lines.next_line().await? {
+            let line = raw_line.trim();
 
-            for raw_line in lines {
-                let line = raw_line.trim();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(event_type) = line.strip_prefix("event: ") {
-                    current_event_type = event_type.trim().to_string();
-                    continue;
-                }
-
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-
-                if data == "[DONE]" {
-                    saw_completed = true;
-                    let _ = tx.send(StreamChunk::Done).await;
-                    continue;
-                }
-
-                let Ok(parsed) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-
-                match current_event_type.as_str() {
-                    "response.output_item.added" => {
-                        let item = &parsed["item"];
-                        let item_id = item["id"].as_str().unwrap_or("").to_string();
-                        let item_type = item["type"].as_str().unwrap_or("").to_string();
-
-                        if item_type == "function_call" {
-                            let name = item["name"].as_str().unwrap_or("").to_string();
-                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                            let _ = tx
-                                .send(StreamChunk::ToolCallStart {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await;
-                            item_states.insert(
-                                item_id.clone(),
-                                ItemState {
-                                    item_type,
-                                    call_id,
-                                    name,
-                                    text: String::new(),
-                                },
-                            );
-                        } else {
-                            item_states.insert(
-                                item_id,
-                                ItemState {
-                                    item_type,
-                                    call_id: String::new(),
-                                    name: String::new(),
-                                    text: String::new(),
-                                },
-                            );
-                        }
-                    }
-                    "response.output_text.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            crate::utils::http::bounded_push_str(
-                                &mut full_content,
-                                delta,
-                                &mut stored_output_bytes,
-                                output_limit,
-                                "OpenAI Responses accumulated output",
-                            )
-                            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                            let _ = tx.send(StreamChunk::Text(delta.to_string())).await;
-                        }
-                    }
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            crate::utils::http::bounded_push_str(
-                                &mut full_reasoning,
-                                delta,
-                                &mut stored_output_bytes,
-                                output_limit,
-                                "OpenAI Responses accumulated output",
-                            )
-                            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                            let _ = tx.send(StreamChunk::Thinking(delta.to_string())).await;
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            let item_id = parsed["item_id"].as_str().unwrap_or("");
-                            if let Some(state) = item_states.get_mut(item_id) {
-                                crate::utils::http::bounded_push_str(
-                                    &mut state.text,
-                                    delta,
-                                    &mut stored_output_bytes,
-                                    output_limit,
-                                    "OpenAI Responses accumulated output",
-                                )
-                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                let _ = tx
-                                    .send(StreamChunk::ToolCallDelta {
-                                        id: state.call_id.clone(),
-                                        arguments_delta: delta.to_string(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    "response.completed" => {
-                        saw_completed = true;
-                        if let Some(usage) = parsed["response"].get("usage").cloned() {
-                            usage_data = Some(usage);
-                        }
-                        let _ = tx.send(StreamChunk::Done).await;
-                    }
-                    "response.failed" | "error" => {
-                        let err_msg = parsed["error"]["message"]
-                            .as_str()
-                            .or_else(|| parsed["response"]["error"]["message"].as_str())
-                            .unwrap_or("Responses API stream error");
-                        let _ = tx.send(StreamChunk::Error(err_msg.to_string())).await;
-                        stream_error = Some(err_msg.to_string());
-                        break;
-                    }
-                    _ => {}
-                }
+            if line.is_empty() {
+                continue;
             }
 
-            if stream_error.is_some() {
-                break;
+            if let Some(event_type) = sse_field(line, "event") {
+                current_event_type = event_type.trim().to_string();
+                continue;
+            }
+
+            let Some(data) = sse_field(line, "data") else {
+                continue;
+            };
+
+            if data == "[DONE]" {
+                saw_completed = true;
+                let _ = tx.send(StreamChunk::Done).await;
+                continue;
+            }
+
+            let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+
+            match current_event_type.as_str() {
+                "response.output_item.added" => {
+                    let item = &parsed["item"];
+                    let item_id = item["id"].as_str().unwrap_or("").to_string();
+                    let item_type = item["type"].as_str().unwrap_or("").to_string();
+                    let output_index = parsed["output_index"]
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(item_states.len());
+                    item_indexes.insert(item_id, output_index);
+
+                    if item_type == "function_call" {
+                        let name = item["name"].as_str().unwrap_or("").to_string();
+                        let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+                        let _ = tx
+                            .send(StreamChunk::ToolCallStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })
+                            .await;
+                        item_states.insert(
+                            output_index,
+                            ItemState {
+                                item_type,
+                                call_id,
+                                name,
+                                text: String::new(),
+                            },
+                        );
+                    } else {
+                        item_states.insert(
+                            output_index,
+                            ItemState {
+                                item_type,
+                                call_id: String::new(),
+                                name: String::new(),
+                                text: String::new(),
+                            },
+                        );
+                    }
+                }
+                "response.output_text.delta" => {
+                    if let Some(delta) = parsed["delta"].as_str() {
+                        crate::utils::http::bounded_push_str(
+                            &mut full_content,
+                            delta,
+                            &mut stored_output_bytes,
+                            output_limit,
+                            "OpenAI Responses accumulated output",
+                        )
+                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                        let _ = tx.send(StreamChunk::Text(delta.to_string())).await;
+                    }
+                }
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    if let Some(delta) = parsed["delta"].as_str() {
+                        crate::utils::http::bounded_push_str(
+                            &mut full_reasoning,
+                            delta,
+                            &mut stored_output_bytes,
+                            output_limit,
+                            "OpenAI Responses accumulated output",
+                        )
+                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                        let _ = tx.send(StreamChunk::Thinking(delta.to_string())).await;
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    if let Some(delta) = parsed["delta"].as_str() {
+                        let item_id = parsed["item_id"].as_str().unwrap_or("");
+                        if let Some(state) = item_indexes
+                            .get(item_id)
+                            .and_then(|index| item_states.get_mut(index))
+                        {
+                            crate::utils::http::bounded_push_str(
+                                &mut state.text,
+                                delta,
+                                &mut stored_output_bytes,
+                                output_limit,
+                                "OpenAI Responses accumulated output",
+                            )
+                            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                            let _ = tx
+                                .send(StreamChunk::ToolCallDelta {
+                                    id: state.call_id.clone(),
+                                    arguments_delta: delta.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                "response.completed" => {
+                    saw_completed = true;
+                    if let Some(usage) = parsed["response"].get("usage").cloned() {
+                        usage_data = Some(usage);
+                    }
+                    let _ = tx.send(StreamChunk::Done).await;
+                }
+                "response.failed" | "error" => {
+                    let err_msg = parsed["error"]["message"]
+                        .as_str()
+                        .or_else(|| parsed["response"]["error"]["message"].as_str())
+                        .unwrap_or("Responses API stream error");
+                    let _ = tx.send(StreamChunk::Error(err_msg.to_string())).await;
+                    stream_error = Some(err_msg.to_string());
+                    break;
+                }
+                _ => {}
             }
         }
 
@@ -625,17 +569,24 @@ impl OpenAiResponsesProvider {
 
         // Assemble tool calls from item states
         let tool_calls: Vec<ToolCallRequest> = item_states
-            .into_values()
-            .filter(|s| s.item_type == "function_call" && !s.call_id.is_empty())
-            .map(|s| ToolCallRequest {
-                id: s.call_id,
-                call_type: "function".to_string(),
-                function: ToolCallFunction {
-                    name: s.name,
-                    arguments: s.text,
-                },
+            .into_iter()
+            .filter(|(_, state)| state.item_type == "function_call")
+            .map(|(index, state)| {
+                if state.call_id.is_empty() || state.name.is_empty() {
+                    return Err(IronCrewError::Provider(format!(
+                        "OpenAI Responses stream ended with incomplete tool call at index {index}"
+                    )));
+                }
+                Ok(ToolCallRequest {
+                    id: state.call_id,
+                    call_type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: state.name,
+                        arguments: state.text,
+                    },
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let content = if full_content.is_empty() {
             None

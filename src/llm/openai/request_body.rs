@@ -74,11 +74,14 @@ mod tests {
     fn policy(request_bytes: usize) -> ProviderExecutionPolicy {
         ProviderExecutionPolicy::from_values(
             None,
-            request_bytes,
-            16 * 1024 * 1024,
-            256 * 1024,
-            16 * 1024 * 1024,
-            32 * 1024 * 1024,
+            [
+                request_bytes,
+                16 * 1024 * 1024,
+                256 * 1024,
+                16 * 1024 * 1024,
+                32 * 1024 * 1024,
+            ],
+            [10, 900],
         )
     }
 
