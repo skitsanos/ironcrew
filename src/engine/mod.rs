@@ -23,6 +23,7 @@ pub mod memory;
 pub mod messagebus;
 pub mod model_router;
 pub mod orchestrator;
+pub mod pg_runtime;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 pub mod reconciler;
