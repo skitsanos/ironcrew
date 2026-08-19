@@ -644,24 +644,25 @@ async fn abort_is_persisted_and_terminal_sse_is_delivered_with_flow_isolation() 
 
 #[tokio::test]
 async fn timeout_and_pre_intent_error_are_persisted() {
-    let server = spawn_server(2, 4, Duration::from_millis(50)).await;
+    let timeout_server = spawn_server(2, 4, Duration::from_millis(50)).await;
     let client = reqwest::Client::new();
 
-    let timed_out: serde_json::Value = start_run(&client, &server, "flow-a")
+    let timed_out: serde_json::Value = start_run(&client, &timeout_server, "flow-a")
         .await
         .json()
         .await
         .unwrap();
     let timed_out_id = timed_out["run_id"].as_str().unwrap();
-    wait_for_status(&server.store, timed_out_id, RunStatus::TimedOut).await;
+    wait_for_status(&timeout_server.store, timed_out_id, RunStatus::TimedOut).await;
 
-    let failed: serde_json::Value = start_run(&client, &server, "error")
+    let failure_server = spawn_server(2, 4, Duration::from_secs(60)).await;
+    let failed: serde_json::Value = start_run(&client, &failure_server, "error")
         .await
         .json()
         .await
         .unwrap();
     let failed_id = failed["run_id"].as_str().unwrap();
-    wait_for_status(&server.store, failed_id, RunStatus::Failed).await;
+    wait_for_status(&failure_server.store, failed_id, RunStatus::Failed).await;
 }
 
 #[tokio::test]
