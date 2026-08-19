@@ -13,10 +13,8 @@ mod header;
 
 use header::{op_error, parse_params, validate_op_name};
 
-#[allow(dead_code)]
-pub const MAX_OP_NAME_BYTES: usize = 128;
-#[allow(dead_code)]
-pub const MAX_PARAMS: usize = 32;
+const MAX_OP_NAME_BYTES: usize = 128;
+const MAX_PARAMS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -90,6 +88,7 @@ fn parse_operation(name: &str, source: &str) -> Result<Operation> {
     let mut params = Vec::new();
     let mut body_lines: Vec<&str> = Vec::new();
     let mut in_header = true;
+    let mut saw_params_line = false;
     for line in lines {
         let trimmed = line.trim_start();
         if in_header && trimmed.starts_with("--") {
@@ -98,9 +97,10 @@ fn parse_operation(name: &str, source: &str) -> Result<Operation> {
                 .trim_start()
                 .strip_prefix("params:")
             {
-                if !params.is_empty() {
+                if saw_params_line {
                     return Err(op_error(name, "duplicate '-- params:' line"));
                 }
+                saw_params_line = true;
                 params = parse_params(name, rest)?;
             }
             continue;
