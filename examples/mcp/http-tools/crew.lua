@@ -23,14 +23,12 @@ local crew = Crew.new({
 })
 
 crew:add_agent({
-    name      = "api_agent",
-    role      = "API tool user",
-    goal      = "Invoke MCP server tools and report results",
-    backstory = "Expert at using external APIs via MCP.",
+    name          = "api_agent",
+    goal          = "Invoke MCP server tools and report results",
+    system_prompt = "You are an expert at using external APIs via MCP.",
     -- Use mcp__<label>__<tool> naming.
     -- Replace 'increment' with an actual tool name from your MCP server.
-    tools     = { "mcp__myapi__increment" },
-    max_iter  = 3,
+    tools         = { "mcp__myapi__increment" },
 })
 
 crew:add_task({

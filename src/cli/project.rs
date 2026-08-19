@@ -114,6 +114,53 @@ fn setup_crew_runtime_inner(
             .map_err(IronCrewError::Lua)?;
     }
 
+    // postgres.* capability: live database when IRONCREW_APP_DATABASE_URL is
+    // set (feature-gated), fail-closed stub otherwise so a flow calling
+    // postgres.* always gets a diagnosable error instead of a nil index.
+    // Register before config.lua evaluation so attempted calls fail through
+    // the declarative-config purity marker instead of nil-indexing.
+    #[cfg(feature = "postgres")]
+    {
+        use crate::engine::app_db::{AppDb, operations, policy::AppDbPolicy};
+        let app_db_url = std::env::var("IRONCREW_APP_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if let Some(url) = app_db_url {
+            let app_policy = AppDbPolicy::capture()?;
+            let sources = match &snapshot {
+                Some((context, _)) => context
+                    .snapshot
+                    .sql_sources()
+                    .into_iter()
+                    .map(|(name, source)| (name, source.to_string()))
+                    .collect(),
+                None => operations::read_sql_dir(loader.project_dir(), &app_policy)?,
+            };
+            let registry = operations::OperationRegistry::from_sources(sources, &app_policy)?;
+            let app_db = std::sync::Arc::new(AppDb::new(url, app_policy, registry));
+            lua.set_app_data(crate::engine::conversation_definition::AppDbFingerprint(
+                app_db.definition(),
+            ));
+            crate::lua::postgres::register_postgres(&lua, app_db).map_err(IronCrewError::Lua)?;
+        } else {
+            crate::lua::postgres::register_postgres_stub(
+                &lua,
+                crate::lua::postgres::STUB_UNCONFIGURED,
+            )
+            .map_err(IronCrewError::Lua)?;
+        }
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        if std::env::var("IRONCREW_APP_DATABASE_URL").is_ok_and(|value| !value.trim().is_empty()) {
+            return Err(IronCrewError::Validation(
+                "IRONCREW_APP_DATABASE_URL is set but this binary was built without the 'postgres' feature".into(),
+            ));
+        }
+        crate::lua::postgres::register_postgres_stub(&lua, crate::lua::postgres::STUB_NO_FEATURE)
+            .map_err(IronCrewError::Lua)?;
+    }
+
     // Optionally load config.lua and store the resulting table as a Lua global.
     // Crew.new() will shallow-merge missing keys from this table at call time.
     let snapshot_config = snapshot
@@ -132,19 +179,21 @@ fn setup_crew_runtime_inner(
             Some(source) => source.shared_source(),
             None => Arc::from(crate::lua::source::read_lua_source(&cfg_path)?),
         };
-        let table: mlua::Table = {
+        lua.set_app_data(crate::lua::bootstrap::ConfigEvaluation);
+        let evaluated = {
             let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
             lua.load(content.as_ref())
                 .set_name(format!("config:{}", cfg_path.display()))
                 .eval()
-                .map_err(|e| {
-                    IronCrewError::Validation(format!(
-                        "config.lua at {} must return a table: {}",
-                        cfg_path.display(),
-                        e
-                    ))
-                })?
         };
+        lua.remove_app_data::<crate::lua::bootstrap::ConfigEvaluation>();
+        let table: mlua::Table = evaluated.map_err(|e| {
+            IronCrewError::Validation(format!(
+                "config.lua at {} must return a table: {}",
+                cfg_path.display(),
+                e
+            ))
+        })?;
         lua.globals()
             .set("__ironcrew_config_defaults", table)
             .map_err(IronCrewError::Lua)?;

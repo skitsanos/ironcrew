@@ -130,6 +130,15 @@ child can still exit cleanly) and a truncation marker is appended to the
 captured output. Timeout, cancellation, and normal completion terminate the
 whole child process group, including background descendants.
 
+**Environment isolation:** shell commands are model-controlled, so the child does
+**not** inherit the IronCrew process environment. It starts from `PATH`, `HOME`,
+`USER`, `LANG`, `TZ`, `TERM`, and any `LC_*` variables. Provider keys
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...) and every `IRONCREW_*` setting are
+withheld, so a command cannot read them back into the model's context. To pass
+additional variables, list their exact names in
+`IRONCREW_SHELL_ENV_PASSTHROUGH` (comma-separated); `IRONCREW_*` names are never
+re-admitted through it.
+
 ### http_request
 
 Make an HTTP request with full control over method, headers, body, and
@@ -283,17 +292,23 @@ Custom tools run in a restricted sandbox (no `os`, `io`, `require`, `loadfile`,
 `dofile`). A `fs` namespace scoped to the project directory is available
 (`fs.read(path)`, `fs.write(path, content)`).
 
-**Tools cannot call `http.*` directly.** The `http` global is not registered in
-the tool sandbox. You have three options when a custom tool needs remote data:
+**Tools can call `http.*`, under the outbound-network policy.** The `http`
+namespace is registered in the tool sandbox, so a custom tool may fetch remote
+data directly. Every request is subject to the same policy as crew-level calls:
+SSRF validation (private, loopback, and link-local targets are rejected unless
+explicitly allowed) and the configured response body-size limit. The policy is
+captured when the tool is created, so a tool's limits cannot drift mid-run.
 
-1. **Delegate to a sub-flow via `run_flow`** (recommended for composing logic) —
-   custom tools can call [`run_flow(path, input)`](#run_flow-sub-crew-delegation)
-   to invoke a sub-crew Lua script that *does* have `http` access. The sub-flow
-   runs in its own sandboxed VM and its result is JSON-bridged back to the tool.
-2. **Fetch the data in `crew.lua`** (where `http` is available) and pass it via
-   context, memory, or task results.
+Alternatives that are still useful:
+
+1. **Delegate to a sub-flow via `run_flow`** (for composing logic) — custom
+   tools can call [`run_flow(path, input)`](#run_flow-sub-crew-delegation) to
+   invoke a sub-crew Lua script. The sub-flow runs in its own sandboxed VM and
+   its result is JSON-bridged back to the tool.
+2. **Fetch the data in `crew.lua`** and pass it via context, memory, or task
+   results — useful when several tools need the same payload.
 3. **Let the agent call the built-in `http_request` tool** directly — no custom
-   Lua tool wrapper required.
+   Lua tool wrapper required, and it participates in approval gates.
 
 ---
 
@@ -355,7 +370,13 @@ VM boundary via JSON.
   crew Lua VM *and* on the per-tool Lua VM used by custom `tools/*.lua` files
   (including tools invoked during a `crew:conversation()` tool-call loop). This
   is the key feature: **custom tools can delegate to sub-crews in-process**,
-  bypassing the tool-sandbox restrictions on `http` and friends.
+  reusing a sub-flow's agents and tasks rather than reimplementing them.
+- **No `postgres.*` capability inside the sub-flow.** In v1, a sub-flow VM
+  (whether reached via `run_flow` or `crew:subworkflow`) never receives the
+  live app-database handle. Calling `postgres.*` there fails closed with a
+  message to perform app-database operations in the parent flow and pass
+  results in via `input`. See
+  [PostgreSQL App Data: sub-flow limitation](postgres-app-data.md#sub-flow-limitation-run_flow).
 
 ### Path validation
 
@@ -515,15 +536,15 @@ IronCrew exposes Lua globals in two distinct sandboxes:
 
 | Sandbox | Where it runs | What's available |
 |---------|---------------|------------------|
-| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, and `require` (shared modules from `_lib/`) |
-| **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access and `run_flow` — but **no `http`** |
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, and `require` (shared modules from `_lib/`). Async `crew.lua` execution also receives `postgres` named app-data operations; effectful calls are rejected while declarative `config.lua` is evaluated. See [docs/postgres-app-data.md](postgres-app-data.md). |
+| **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access, the `http` namespace, and `run_flow` — but **no `require`** |
 
-> **Important constraint:** Custom Lua tools cannot call `http.*` directly. The
-> `http` global is only registered in the crew sandbox. If a tool needs remote
-> data, either delegate to a sub-flow via
-> [`run_flow`](#run_flow-sub-crew-delegation) (which *does* get `http` in its
-> own sandbox), fetch the data in `crew.lua` and pass it through
-> memory/context, or let the agent invoke the built-in `http_request` tool.
+> **Network access:** custom Lua tools can call `http.*`. Requests are governed
+> by the outbound-network policy — SSRF validation plus the configured response
+> body-size limit — captured when the tool is created. Treat a custom tool as a
+> network-capable component when reviewing a flow; if you need a human sign-off
+> on remote calls, use the built-in `http_request` tool with an approval gate
+> instead.
 
 The `run_flow(path, input?)` primitive (see [`run_flow`](#run_flow-sub-crew-delegation))
 is available in **both sandboxes** — it's the recommended way to compose crews
@@ -714,9 +735,10 @@ avoid recompilation.
 
 ### HTTP Namespace (crew sandbox only)
 
-Async HTTP client available in `crew.lua`, `config.lua`, and agent definitions.
-**Not available in custom tool execute functions.** All methods return a
-response table. Uses a shared connection pool (singleton `reqwest::Client`).
+Async HTTP client available during `crew.lua` execution and agent definitions.
+HTTP calls are rejected while declarative `config.lua` is evaluated and are
+not available in custom tool execute functions. All methods return a response
+table. Uses a shared connection pool (singleton `reqwest::Client`).
 
 **Security:** All `http.*` calls enforce SSRF protection — requests to
 private/internal IPs are blocked at DNS resolution, connection, and redirect

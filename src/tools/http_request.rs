@@ -9,8 +9,10 @@ use crate::llm::provider::ToolSchema;
 use crate::utils::error::{IronCrewError, Result};
 
 mod policy;
+mod redirect_policy;
 mod request;
 pub(crate) use policy::HttpToolPolicy;
+use redirect_policy::client_for_request;
 
 /// Shared HTTP client singleton — reused across all tool instances and Lua sandboxes.
 /// Connection pool is shared, reducing memory and improving connection reuse.
@@ -127,7 +129,8 @@ impl Tool for HttpRequestTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolCallContext) -> Result<String> {
-        let req = request::build(&self.client, &args, &self.policy)?;
+        let client = client_for_request(&self.policy, &args, &self.client);
+        let req = request::build(&client, &args, &self.policy)?;
 
         // Send
         let resp = req.send().await.map_err(|e| IronCrewError::ToolExecution {
@@ -245,3 +248,6 @@ mod tests {
         assert!(error.to_string().contains("128"));
     }
 }
+
+#[cfg(test)]
+mod redirect_credential_tests;

@@ -205,7 +205,20 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     }
     println!();
 
-    // 4. Reference integrity: agent tool references
+    // 4. Postgres operations: parse sql/*.sql headers when present so a
+    // typo'd declaration fails validation, not the first run.
+    #[cfg(feature = "postgres")]
+    {
+        use crate::engine::app_db::{operations, policy::AppDbPolicy};
+        let app_policy = AppDbPolicy::capture()?;
+        let sources = operations::read_sql_dir(loader.project_dir(), &app_policy)?;
+        if !sources.is_empty() {
+            let registry = operations::OperationRegistry::from_sources(sources, &app_policy)?;
+            println!("\u{2713} {} postgres operation(s) valid", registry.len());
+        }
+    }
+
+    // 5. Reference integrity: agent tool references
     let mut issues = 0;
     for agent in &agents {
         for tool_name in &agent.tools {
@@ -224,7 +237,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     }
     println!();
 
-    // 5. Summary
+    // 6. Summary
     if issues > 0 {
         println!("Validation FAILED with {} issue(s).", issues);
         Err(IronCrewError::Validation(format!(
@@ -241,28 +254,8 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
 }
 
 pub fn cmd_nodes() -> Result<()> {
-    // Create a temporary registry to get all built-in tools
-    let mut registry = crate::tools::registry::ToolRegistry::new();
-
-    // Register all built-in tools
-    registry.register(Box::new(crate::tools::file_read::FileReadTool::new(None)));
-    registry.register(Box::new(
-        crate::tools::file_read_glob::FileReadGlobTool::new(None),
-    ));
-    registry.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-        None, None,
-    )));
-    registry.register(Box::new(crate::tools::web_scrape::WebScrapeTool::new(None)));
-    registry.register(Box::new(crate::tools::shell::ShellTool::new()));
-    registry.register(Box::new(crate::tools::http_request::HttpRequestTool::new()));
-    registry.register(Box::new(crate::tools::hash::HashTool::new()));
-    registry.register(Box::new(
-        crate::tools::template_render::TemplateRenderTool::new(),
-    ));
-    registry.register(Box::new(
-        crate::tools::validate_schema::ValidateSchemaTool::new(),
-    ));
-    registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new()));
+    // Shared with `GET /nodes` so the two catalogs cannot drift.
+    let registry = crate::tools::builtin_tool_catalog();
 
     println!("Built-in tools ({}):", registry.list().len());
     println!();

@@ -149,6 +149,9 @@ deliberately enabled. Local
 | GET    | `/flows/{flow}/runs`             | List past runs for a flow |
 | GET    | `/flows/{flow}/runs/{id}`        | Get run details |
 | DELETE | `/flows/{flow}/runs/{id}`        | Delete a run record |
+| POST   | `/flows/{flow}/abort/{run_id}`   | Abort an in-flight run |
+| GET    | `/flows/{flow}/questions/{run_id}` | List pending `ask_human` questions for a run |
+| POST   | `/flows/{flow}/answer/{run_id}`  | Answer a pending `ask_human` question |
 | GET    | `/flows/{flow}/validate`         | Validate a flow |
 | GET    | `/flows/{flow}/agents`           | List agents in a flow |
 | POST   | `/flows/{flow}/conversations/{id}/start`    | Create or re-open a chat session |
@@ -158,6 +161,7 @@ deliberately enabled. Local
 | DELETE | `/flows/{flow}/conversations/{id}`          | Drop handle + delete record |
 | GET    | `/flows/{flow}/conversations`               | Paginated list (filtered by flow) |
 | GET    | `/nodes`                         | List built-in tools |
+| GET    | `/audit`                         | Protected, paginated audit event log |
 
 `/health/ready` is pessimistic about run-lease maintenance. A bounded startup
 reconciliation or PostgreSQL idempotency-prune failure allows the HTTP process
@@ -588,7 +592,7 @@ provider response and are not billing data.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` or `true` to allow protected HTTP clients to reach private/internal addresses. Unset keeps DNS resolution, actual connections, and redirect targets restricted to public addresses |
-| `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read. Fail-closed: every name not listed returns `nil`. |
+| `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read (matched case-insensitively, but names must match in full). Fail-closed: every name not listed returns `nil`. |
 | `IRONCREW_TRUST_PROXY` | Set to `1` to honor `X-Forwarded-For` for source-IP capture in audit events (only enable when running behind a trusted reverse proxy) |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | Default page size on `GET /audit` (default `50`) |
 | `IRONCREW_AUDIT_MAX_LIMIT` | Hard cap on `GET /audit?limit=` (default `500`) |
@@ -621,6 +625,7 @@ provider response and are not billing data.
 | `IRONCREW_GLOB_MAX_OUTPUT_BYTES` | Maximum final serialized `file_read_glob` JSON output, including escaping and metadata (default: `67108864` = 64 MiB; hard ceiling: `268435456` = 256 MiB) |
 | `IRONCREW_SHELL_TIMEOUT_SECS` | Default shell command deadline (default: `60`; range: 1–3600). A call-level `timeout_secs` can override it within the same range |
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | Max bytes captured per stream (stdout and stderr independently) by the `shell` tool (default: `1048576`; range: 1–16777216) |
+| `IRONCREW_SHELL_ENV_PASSTHROUGH` | Comma-separated exact env var names passed to `shell` children in addition to `PATH`, `HOME`, `USER`, `LANG`, `TZ`, `TERM`, and `LC_*`. The child never inherits the full process environment; `IRONCREW_*` names are never re-admitted |
 | `IRONCREW_JSON_SCHEMA_MAX_BYTES` | Maximum serialized JSON Schema accepted by `validate_schema` (default: `262144`; range: 1024–4194304). External `$ref` retrieval is disabled; local `#` fragments remain supported |
 | `IRONCREW_ASK_HUMAN_TIMEOUT` | Default question timeout when a flow omits `timeout_s` (default: `600`) |
 | `IRONCREW_ASK_HUMAN_MAX_TIMEOUT` | Maximum accepted per-question timeout (default: `3600`; hard ceiling: `86400` seconds) |
@@ -668,7 +673,7 @@ individual ranges stated in their descriptions.
 
 | Variable          | Description |
 |-------------------|-------------|
-| `IRONCREW_STORE`    | Storage backend: exactly `json`, `sqlite`, or `postgres` (`json` only when absent). Public server binds require this to be explicit; unknown values fail startup |
+| `IRONCREW_STORE`    | Storage backend: `json`, `sqlite`, or `postgres` (`postgresql` is accepted as an alias; matching is case-insensitive). Defaults to `json` when absent. Public server binds require this to be explicit; unknown values fail startup |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
 | `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) |
 | `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`), at most 37 lowercase ASCII alphanumeric/underscore bytes |
@@ -695,6 +700,22 @@ repeated database failures can extend that window; this mechanism records
 `abandoned` work and never resumes execution on another process. See
 [Storage Backends](storage.md#run-ownership-and-terminal-writes) for the exact
 formula and minimum-TTL example.
+
+**App Data (`postgres.*`):**
+
+| Variable | Description |
+|---|---|
+| `IRONCREW_APP_DATABASE_URL` | Dedicated app-data PostgreSQL URL for the `postgres.*` Lua namespace; separate from `DATABASE_URL` (the internal `StateStore`'s connection string). Not readable from Lua by default; becomes readable only if explicitly listed in `IRONCREW_ENV_ALLOWLIST` — never allowlist it (or `DATABASE_URL`). Unset → `postgres.*` calls fail with a configuration hint |
+| `IRONCREW_APP_DB_MAX_CONNECTIONS` | Pool size for the app-data database (default: `4`; hard ceiling: `32`) |
+| `IRONCREW_APP_DB_STATEMENT_TIMEOUT_MS` | Server-side `statement_timeout` set for each app-data transaction (default: `5000`; hard ceiling: `60000`) |
+| `IRONCREW_APP_DB_MAX_ROWS` | Maximum rows returned by one `postgres.query` call (default: `500`; hard ceiling: `10000`) |
+| `IRONCREW_APP_DB_MAX_RESPONSE_BYTES` | Maximum serialized bytes returned by one `postgres.query`/`query_one` call (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_PARAM_BYTES` | Maximum serialized bytes for one bound parameter (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_OPERATIONS` | Maximum `sql/*.sql` operations loaded for one project (load-time; default: `64`; hard ceiling: `256`) |
+| `IRONCREW_APP_DB_MAX_SQL_BYTES` | Maximum bytes in one operation's `.sql` file (load-time; default: `65536` = 64 KiB; hard ceiling: `1048576` = 1 MiB) |
+
+See [PostgreSQL App Data](postgres-app-data.md) for the trust model, operation
+format, Lua API, and the sub-flow limitation.
 
 **Crew memory:**
 

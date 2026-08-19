@@ -414,13 +414,21 @@ fn map_err_to_response(e: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
     {
         return map_err_to_response(embedded);
     }
-    let status = match e {
-        IronCrewError::Conflict(_) => StatusCode::CONFLICT,
-        IronCrewError::Validation(_) => StatusCode::BAD_REQUEST,
-        IronCrewError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    error_response(status, e.to_string())
+    // Client errors carry an actionable message; server-side failures are
+    // logged in full and answered generically so storage and filesystem
+    // internals do not reach the caller.
+    match e {
+        // Client errors keep their actionable message verbatim.
+        IronCrewError::Conflict(_) => error_response(StatusCode::CONFLICT, e.to_string()),
+        IronCrewError::Validation(_) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        _ => {
+            tracing::error!(error = %e, "conversation request failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
+    }
 }
 
 fn embedded_lua_client_error(error: &mlua::Error) -> Option<&IronCrewError> {

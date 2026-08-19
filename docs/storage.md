@@ -36,7 +36,7 @@ Environment variables control storage:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` | `json` |
+| `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` (alias `postgresql`; case-insensitive) | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
 | `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) | — |
 | `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases: at most 37 lowercase ASCII alphanumeric/underscore bytes | `""` (table = `runs`) |
@@ -982,3 +982,9 @@ A future `ironcrew migrate` command may automate this.
 | Production single-server | `sqlite` — handles concurrent reads well |
 | Production HTTP service | `postgres` — durable shared records, bounded run SSE, keyed conversation-turn rehydration, and optional keyed-run HITL mailbox; live execution and conversation SSE remain process-local/unsupported as documented |
 | Cloud deployment (Railway, OpenShift) | `postgres` — managed/cluster database; scale replicas only within the documented live-control boundary |
+
+**App data vs. run records:** `IRONCREW_STORE` persists IronCrew's own
+run/conversation records. Flow-defined tables live behind the separate
+`postgres.*` capability on `IRONCREW_APP_DATABASE_URL` — see
+[postgres-app-data.md](postgres-app-data.md). The two must not share a role
+or schema.

@@ -107,7 +107,9 @@ impl FlowSourceSnapshot {
         validate_relative_path(directory, true)?;
         let mut sources = Vec::new();
         for (path, source) in &self.files {
-            if path.parent() == Some(directory) {
+            if path.parent() == Some(directory)
+                && path.extension().and_then(|value| value.to_str()) == Some("lua")
+            {
                 sources.push(SnapshotLuaSource {
                     relative_path: path.clone(),
                     source: source.clone(),
@@ -115,6 +117,29 @@ impl FlowSourceSnapshot {
             }
         }
         Ok(sources)
+    }
+
+    /// Stem + source for every captured `sql/*.sql` file that is a *direct*
+    /// child of `sql/`, in path order. Flat by design, matching the
+    /// non-recursive filesystem discovery in `read_sql_dir` and the "one
+    /// file per operation under sql/" docs contract — nested files like
+    /// `sql/sub/x.sql` do not qualify (though they still participate in the
+    /// recursive fingerprint capture in `unix.rs`).
+    // only called from the postgres-gated wiring
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub fn sql_sources(&self) -> Vec<(String, Arc<str>)> {
+        self.files
+            .iter()
+            .filter(|(path, _)| {
+                path.parent() == Some(Path::new("sql"))
+                    && path.extension().and_then(|e| e.to_str()) == Some("sql")
+            })
+            .filter_map(|(path, source)| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| (stem.to_string(), source.clone()))
+            })
+            .collect()
     }
 }
 
@@ -200,7 +225,7 @@ fn canonical_relative_path(path: &Path) -> Result<String> {
             Component::Normal(part) => part
                 .to_str()
                 .map(str::to_owned)
-                .ok_or_else(|| validation("Lua source relative path must be valid UTF-8")),
+                .ok_or_else(|| validation("flow source relative path must be valid UTF-8")),
             _ => unreachable!("validated relative components"),
         })
         .collect::<Result<Vec<_>>>()

@@ -1,0 +1,74 @@
+version: "3"
+
+vars:
+  # Released images are published exclusively by the signed workflow in
+  # .github/workflows/docker-publish.yml, which promotes the attested OCI
+  # archive built from docker/runtime.Dockerfile. Local tasks must never write
+  # to that repository: they build a different (Debian) base from the working
+  # tree and carry no signature or provenance.
+  DEV_IMAGE: skitsanos/ironcrew-dev
+  VERSION:
+    sh: grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'
+
+tasks:
+  docker-build:
+    desc: Build the Docker image locally (current platform, never pushed)
+    cmds:
+      - docker build -t {{.DEV_IMAGE}}:{{.VERSION}} -t {{.DEV_IMAGE}}:local .
+
+  docker-build-multi:
+    desc: Build and push a multi-arch DEVELOPMENT image (amd64 + arm64)
+    cmds:
+      # Fail fast with a clear message if the buildx plugin is missing
+      # (Docker Desktop bundles it; standalone `docker` on Linux often
+      # does not). This prevents the downstream "unknown flag: --name"
+      # error that `docker buildx create` surfaces when the plugin
+      # isn't installed.
+      - docker buildx version
+      # Use explicit if/else instead of `A && B || C` — the latter is
+      # fragile under Task's shell interpreter when any step exits
+      # non-zero.
+      - |
+        if docker buildx inspect ironcrew-builder >/dev/null 2>&1; then
+          docker buildx use ironcrew-builder
+        else
+          docker buildx create --name ironcrew-builder --use
+        fi
+      # Pushes to DEV_IMAGE only. The released tags (IMAGE:{{.VERSION}} and
+      # IMAGE:latest) are owned by the signed promotion workflow.
+      - >-
+        docker buildx build
+        --platform linux/amd64,linux/arm64
+        -t {{.DEV_IMAGE}}:{{.VERSION}}
+        --push .
+
+  docker-run:
+    desc: Run IronCrew API server in Docker
+    vars:
+      PORT: '{{.PORT | default "3000"}}'
+      FLOWS_DIR: '{{.FLOWS_DIR | default "./examples"}}'
+    cmds:
+      - >-
+        docker run --rm -d
+        --name ironcrew
+        -p {{.PORT}}:3000
+        --env-file .env
+        -v {{.PWD}}/.env:/app/.env:ro
+        -v {{.PWD}}/{{.FLOWS_DIR}}:/app/flows
+        {{.DEV_IMAGE}}:{{.VERSION}}
+        serve --host 0.0.0.0 --flows-dir /app/flows --port 3000
+    preconditions:
+      - test -f .env
+
+  docker-stop:
+    desc: Stop the running IronCrew container
+    cmds:
+      - docker stop ironcrew
+
+  docker-publish:
+    desc: >-
+      Push a multi-arch DEVELOPMENT image. Released images are published only by
+      the signed .github/workflows/docker-publish.yml promotion.
+    cmds:
+      - echo "Pushing {{.DEV_IMAGE}}:{{.VERSION}} — this does NOT publish a release."
+      - task: docker-build-multi

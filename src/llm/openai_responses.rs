@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::provider::*;
+use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
 /// OpenAI Responses API-specific configuration.
@@ -56,7 +57,9 @@ impl RateLimiter {
         Self {
             min_interval: Duration::from_millis(min_interval_ms),
             last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(std::time::Instant::now),
             )),
         }
     }
@@ -149,13 +152,28 @@ impl OpenAiResponsesProvider {
 
             match msg.role.as_str() {
                 "user" => {
+                    // Text first, then any attachments as `input_image` parts.
+                    // Dropping images here would silently answer as if nothing
+                    // had been attached.
+                    let mut content = vec![json!({
+                        "type": "input_text",
+                        "text": msg.content.as_deref().unwrap_or(""),
+                    })];
+                    if let Some(ref images) = msg.images {
+                        for image in images {
+                            content.push(json!({
+                                "type": "input_image",
+                                "image_url": format!(
+                                    "data:{};base64,{}",
+                                    image.mime_type, image.data
+                                ),
+                            }));
+                        }
+                    }
                     input_items.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": [{
-                            "type": "input_text",
-                            "text": msg.content.as_deref().unwrap_or(""),
-                        }],
+                        "content": content,
                     }));
                 }
                 "assistant" => {
@@ -224,6 +242,23 @@ impl OpenAiResponsesProvider {
         // Temperature
         if let Some(temp) = request.temperature {
             body["temperature"] = json!(temp);
+        }
+
+        // Structured output. The Responses API nests the format under `text`
+        // rather than using Chat Completions' top-level `response_format`.
+        if let Some(ref format) = request.response_format {
+            body["text"] = match format {
+                ResponseFormat::Text => json!({"format": {"type": "text"}}),
+                ResponseFormat::JsonObject => json!({"format": {"type": "json_object"}}),
+                ResponseFormat::JsonSchema { name, schema } => json!({
+                    "format": {
+                        "type": "json_schema",
+                        "name": name,
+                        "schema": schema,
+                        "strict": true,
+                    }
+                }),
+            };
         }
 
         // Reasoning config
@@ -866,3 +901,6 @@ impl LlmProvider for OpenAiResponsesProvider {
         self.send_request_stream(body, tx).await
     }
 }
+
+#[cfg(test)]
+mod tests;
