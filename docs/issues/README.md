@@ -6,8 +6,8 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 39
-- Active findings: 5
+- Total findings: 40
+- Active findings: 6
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -52,3 +52,4 @@ priority, area, and title. The registry is generated with
 | [IC-037](./IC-037.md) | P3 | Open | Provider maintainability | Provider scaffolding is triplicated and RateLimiter::new can panic |
 | [IC-038](./IC-038.md) | P3 | Resolved | Documentation accuracy | Documentation and example drift across nodes, endpoints, and model pins |
 | [IC-039](./IC-039.md) | P3 | Resolved | Build hygiene | Build context, dev-dependency comment, and client material housekeeping |
+| [IC-040](./IC-040.md) | P2 | Open | Maintainability | postgres_store.rs needs domain decomposition |
