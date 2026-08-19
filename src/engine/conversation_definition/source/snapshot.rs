@@ -225,7 +225,7 @@ fn canonical_relative_path(path: &Path) -> Result<String> {
             Component::Normal(part) => part
                 .to_str()
                 .map(str::to_owned)
-                .ok_or_else(|| validation("Lua source relative path must be valid UTF-8")),
+                .ok_or_else(|| validation("flow source relative path must be valid UTF-8")),
             _ => unreachable!("validated relative components"),
         })
         .collect::<Result<Vec<_>>>()

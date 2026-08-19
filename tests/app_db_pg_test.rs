@@ -45,6 +45,9 @@ async fn upsert_query_and_query_one_round_trip() {
             ("all", ALL),
         ],
     );
+    // Teardown first: an earlier run aborted mid-test must not poison this
+    // one with stale rows (DROP IF EXISTS is idempotent).
+    db.execute("teardown", &[]).await.unwrap();
     db.execute("setup", &[]).await.unwrap();
 
     let payload = serde_json::json!({"stage": "classification", "score": 0.9});
@@ -120,6 +123,9 @@ async fn multi_statement_execute_is_atomic() {
             ),
         ],
     );
+    // Teardown first: an earlier run aborted mid-test must not poison this
+    // one with stale rows (DROP IF EXISTS is idempotent).
+    db.execute("teardown", &[]).await.unwrap();
     db.execute("setup", &[]).await.unwrap();
     db.execute("both", &[serde_json::json!("x")])
         .await

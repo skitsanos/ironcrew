@@ -29,7 +29,6 @@ mod split_tests;
 /// Flow-facing app database. Own URL/pool/role — never the StateStore's.
 /// The pool connects lazily on first use so flows that never call
 /// `postgres.*` pay nothing.
-#[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
 pub struct AppDb {
     url: String,
     policy: AppDbPolicy,
@@ -38,7 +37,6 @@ pub struct AppDb {
 }
 
 impl AppDb {
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub fn new(url: String, policy: AppDbPolicy, registry: OperationRegistry) -> Self {
         Self {
             url,
@@ -48,12 +46,10 @@ impl AppDb {
         }
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub fn policy(&self) -> &AppDbPolicy {
         &self.policy
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub fn operation(&self, name: &str) -> Result<&operations::Operation> {
         self.registry.get(name).ok_or_else(|| {
             IronCrewError::Validation(if self.registry.is_empty() {
@@ -66,7 +62,6 @@ impl AppDb {
         })
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub fn definition(&self) -> serde_json::Value {
         serde_json::json!({
             "policy": self.policy.definition(),
@@ -89,12 +84,10 @@ impl AppDb {
             .await
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub async fn execute(&self, name: &str, params: &[serde_json::Value]) -> Result<u64> {
         execute::run_execute(self, name, params).await
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub async fn query(
         &self,
         name: &str,
@@ -103,7 +96,6 @@ impl AppDb {
         execute::run_query(self, name, params).await
     }
 
-    #[allow(dead_code)] // consumed by src/lua/postgres.rs (Task 6)
     pub async fn query_one(
         &self,
         name: &str,

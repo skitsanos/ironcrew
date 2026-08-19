@@ -199,6 +199,11 @@ work around by restructuring flows today.
   validation instead of silently doing nothing.
 - **Pool connects lazily.** A flow that never calls `postgres.*` pays no
   connection cost even when the URL is configured.
+- **`ironcrew validate` is stricter than an URL-less run:** validation always
+  parses `sql/*.sql` and captures the `IRONCREW_APP_DB_*` limits (so a
+  malformed declaration or invalid limit fails validation even without a
+  database), while a run without `IRONCREW_APP_DATABASE_URL` skips both and
+  only surfaces the fail-closed stub when `postgres.*` is actually called.
 
 ## Example
 

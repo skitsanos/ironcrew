@@ -32,68 +32,79 @@ pub fn register_postgres_stub(lua: &Lua, reason: &'static str) -> LuaResult<()> 
     lua.globals().set("postgres", table)
 }
 
+/// Convert a Lua params table into ordered JSON bind values for one declared
+/// operation. Module-level (rather than nested in `register_postgres`) so the
+/// validation paths are unit-testable without a database.
+#[cfg(feature = "postgres")]
+fn params_for(
+    app_db: &crate::engine::app_db::AppDb,
+    name: &str,
+    table: Option<mlua::Table>,
+) -> LuaResult<Vec<serde_json::Value>> {
+    use crate::lua::json::lua_value_to_json;
+    use mlua::Value;
+
+    let operation = app_db.operation(name).map_err(mlua::Error::external)?;
+    let max_param_bytes = app_db.policy().max_param_bytes();
+    let table = match table {
+        Some(table) => table,
+        None if operation.params.is_empty() => return Ok(Vec::new()),
+        None => {
+            return Err(mlua::Error::external(format!(
+                "postgres operation '{name}' expects a params table"
+            )));
+        }
+    };
+    // Reject unknown keys (IC-028 house rule).
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::external(format!(
+                "postgres operation '{name}': params table must use string keys"
+            )));
+        };
+        let key = key.to_str()?.to_string();
+        if !operation.params.iter().any(|(param, _)| *param == key) {
+            let supported: Vec<&str> = operation
+                .params
+                .iter()
+                .map(|(param, _)| param.as_str())
+                .collect();
+            let supported = if supported.is_empty() {
+                "none".to_string()
+            } else {
+                supported.join(", ")
+            };
+            return Err(mlua::Error::external(format!(
+                "postgres operation '{name}': unknown param '{key}'. Declared params: {supported}"
+            )));
+        }
+    }
+    let mut values = Vec::with_capacity(operation.params.len());
+    for (param, _) in &operation.params {
+        let value: Value = table.get(param.as_str())?;
+        let json = lua_value_to_json(value)
+            .map_err(|e| mlua::Error::external(format!("param '{param}': {e}")))?;
+        let bytes = serde_json::to_string(&json)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if bytes > max_param_bytes {
+            return Err(mlua::Error::external(format!(
+                "param '{param}' exceeds IRONCREW_APP_DB_MAX_PARAM_BYTES ({max_param_bytes})"
+            )));
+        }
+        values.push(json);
+    }
+    Ok(values)
+}
+
 #[cfg(feature = "postgres")]
 pub fn register_postgres(
     lua: &Lua,
     app_db: std::sync::Arc<crate::engine::app_db::AppDb>,
 ) -> LuaResult<()> {
-    use crate::lua::json::{json_value_to_lua, lua_value_to_json};
+    use crate::lua::json::json_value_to_lua;
     use mlua::{Table, Value};
-
-    fn params_for(
-        app_db: &crate::engine::app_db::AppDb,
-        name: &str,
-        table: Option<Table>,
-    ) -> LuaResult<Vec<serde_json::Value>> {
-        let operation = app_db.operation(name).map_err(mlua::Error::external)?;
-        let max_param_bytes = app_db.policy().max_param_bytes();
-        let table = match table {
-            Some(table) => table,
-            None if operation.params.is_empty() => return Ok(Vec::new()),
-            None => {
-                return Err(mlua::Error::external(format!(
-                    "postgres operation '{name}' expects a params table"
-                )));
-            }
-        };
-        // Reject unknown keys (IC-028 house rule).
-        for pair in table.clone().pairs::<Value, Value>() {
-            let (key, _) = pair?;
-            let Value::String(key) = key else {
-                return Err(mlua::Error::external(format!(
-                    "postgres operation '{name}': params table must use string keys"
-                )));
-            };
-            let key = key.to_str()?.to_string();
-            if !operation.params.iter().any(|(param, _)| *param == key) {
-                let supported: Vec<&str> = operation
-                    .params
-                    .iter()
-                    .map(|(param, _)| param.as_str())
-                    .collect();
-                return Err(mlua::Error::external(format!(
-                    "postgres operation '{name}': unknown param '{key}'. Declared params: {}",
-                    supported.join(", ")
-                )));
-            }
-        }
-        let mut values = Vec::with_capacity(operation.params.len());
-        for (param, _) in &operation.params {
-            let value: Value = table.get(param.as_str())?;
-            let json = lua_value_to_json(value)
-                .map_err(|e| mlua::Error::external(format!("param '{param}': {e}")))?;
-            let bytes = serde_json::to_string(&json)
-                .map(|s| s.len())
-                .unwrap_or(usize::MAX);
-            if bytes > max_param_bytes {
-                return Err(mlua::Error::external(format!(
-                    "param '{param}' exceeds IRONCREW_APP_DB_MAX_PARAM_BYTES ({max_param_bytes})"
-                )));
-            }
-            values.push(json);
-        }
-        Ok(values)
-    }
 
     let table = lua.create_table()?;
 
@@ -108,7 +119,10 @@ pub fn register_postgres(
                     .execute(&name, &values)
                     .await
                     .map_err(mlua::Error::external)?;
-                Ok(affected as i64)
+                // Saturate rather than wrap: rows_affected > i64::MAX is not
+                // reachable in practice, but a wrapped negative count would be
+                // a lie to the flow.
+                Ok(i64::try_from(affected).unwrap_or(i64::MAX))
             }
         })?,
     )?;
@@ -176,5 +190,98 @@ mod tests {
             matches!(value, Value::Nil),
             "tool sandbox must not see postgres.*"
         );
+    }
+
+    #[cfg(feature = "postgres")]
+    mod params_for_validation {
+        use super::super::params_for;
+        use crate::engine::app_db::{AppDb, operations::OperationRegistry, policy::AppDbPolicy};
+        use mlua::{Lua, Table};
+
+        fn fixture(max_param_bytes: u64) -> AppDb {
+            let policy =
+                AppDbPolicy::from_values(4, 5_000, 500, 1 << 20, max_param_bytes, 64, 64 * 1024);
+            let sources = vec![
+                (
+                    "save".to_string(),
+                    "-- ironcrew:op\n-- params: run_id text, payload json\nSELECT $1, $2;\n"
+                        .to_string(),
+                ),
+                (
+                    "count".to_string(),
+                    "-- ironcrew:op\nSELECT 1;\n".to_string(),
+                ),
+            ];
+            let registry = OperationRegistry::from_sources(sources, &policy).unwrap();
+            // The URL is never dialed: params_for validates before any connection.
+            AppDb::new("postgres://invalid.invalid/x".into(), policy, registry)
+        }
+
+        fn lua_table(lua: &Lua, entries: &[(&str, &str)]) -> Table {
+            let table = lua.create_table().unwrap();
+            for (key, value) in entries {
+                table.set(*key, *value).unwrap();
+            }
+            table
+        }
+
+        #[test]
+        fn unknown_param_error_lists_declared_params() {
+            let lua = Lua::new();
+            let app = fixture(1 << 20);
+            let table = lua_table(&lua, &[("run_id", "x"), ("bogus", "y")]);
+            let error = params_for(&app, "save", Some(table))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("'bogus'"), "{error}");
+            assert!(error.contains("run_id, payload"), "{error}");
+        }
+
+        #[test]
+        fn zero_param_op_unknown_key_says_none() {
+            let lua = Lua::new();
+            let app = fixture(1 << 20);
+            let table = lua_table(&lua, &[("stray", "y")]);
+            let error = params_for(&app, "count", Some(table))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Declared params: none"), "{error}");
+        }
+
+        #[test]
+        fn non_string_keys_are_rejected() {
+            let lua = Lua::new();
+            let app = fixture(1 << 20);
+            let table = lua.create_table().unwrap();
+            table.set(1, "positional").unwrap();
+            let error = params_for(&app, "save", Some(table))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("string keys"), "{error}");
+        }
+
+        #[test]
+        fn omitted_declared_param_passes_through_as_null() {
+            let lua = Lua::new();
+            let app = fixture(1 << 20);
+            let table = lua_table(&lua, &[("run_id", "x")]);
+            let values = params_for(&app, "save", Some(table)).unwrap();
+            assert_eq!(values[0], serde_json::json!("x"));
+            assert!(values[1].is_null(), "omitted param must bind as SQL NULL");
+        }
+
+        #[test]
+        fn per_param_byte_budget_is_enforced() {
+            let lua = Lua::new();
+            let app = fixture(8);
+            let table = lua_table(
+                &lua,
+                &[("run_id", "this string serializes past eight bytes")],
+            );
+            let error = params_for(&app, "save", Some(table))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("IRONCREW_APP_DB_MAX_PARAM_BYTES"), "{error}");
+        }
     }
 }
