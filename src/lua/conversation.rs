@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use mlua::{Table, UserData, UserDataMethods, Value};
+use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::agent_turn::ActiveTurnGuard;
@@ -830,6 +830,7 @@ async fn parse_images_from_opts(
 /// `true` for persistent sessions and is a no-op for ephemeral ones.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_conversation(
+    lua: &Lua,
     table: Table,
     agents: &[Agent],
     provider: Arc<dyn LlmProvider>,
@@ -923,6 +924,9 @@ pub async fn build_conversation(
     let resolved_tools_fingerprint = tool_registry
         .conversation_execution_fingerprint(&agent.tools)
         .map_err(mlua::Error::external)?;
+    let app_db_fingerprint = lua
+        .app_data_ref::<crate::engine::conversation_definition::AppDbFingerprint>()
+        .map(|data| data.0.clone());
     let definition_fingerprint = conversation_definition_fingerprint(&ConversationDefinition {
         source_fingerprint,
         agent: &agent,
@@ -933,6 +937,7 @@ pub async fn build_conversation(
         max_tool_rounds: crew_max_tool_rounds,
         resolved_tools_fingerprint: &resolved_tools_fingerprint,
         provider_execution_fingerprint: &provider_execution_fingerprint,
+        app_db: app_db_fingerprint.as_ref(),
     })
     .map_err(mlua::Error::external)?;
 

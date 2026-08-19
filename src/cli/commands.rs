@@ -205,7 +205,20 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     }
     println!();
 
-    // 4. Reference integrity: agent tool references
+    // 4. Postgres operations: parse sql/*.sql headers when present so a
+    // typo'd declaration fails validation, not the first run.
+    #[cfg(feature = "postgres")]
+    {
+        use crate::engine::app_db::{operations, policy::AppDbPolicy};
+        let app_policy = AppDbPolicy::capture()?;
+        let sources = operations::read_sql_dir(loader.project_dir(), &app_policy)?;
+        if !sources.is_empty() {
+            let registry = operations::OperationRegistry::from_sources(sources, &app_policy)?;
+            println!("\u{2713} {} postgres operation(s) valid", registry.len());
+        }
+    }
+
+    // 5. Reference integrity: agent tool references
     let mut issues = 0;
     for agent in &agents {
         for tool_name in &agent.tools {
@@ -224,7 +237,7 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
     }
     println!();
 
-    // 5. Summary
+    // 6. Summary
     if issues > 0 {
         println!("Validation FAILED with {} issue(s).", issues);
         Err(IronCrewError::Validation(format!(

@@ -34,13 +34,13 @@
     },
     {
       "path": "src/cli/commands.rs",
-      "max_lines": 786,
-      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command."
+      "max_lines": 799,
+      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command. Task 9: cmd_validate gained a feature-gated postgres operations validation step."
     },
     {
       "path": "src/cli/graph_extract.rs",
-      "max_lines": 682,
-      "rationale": "IC-011 baseline: isolated Lua graph capture, stub-global registration, task normalization, and agent resolution form one extraction pipeline; split capture stubs from graph normalization before expanding either side."
+      "max_lines": 704,
+      "rationale": "IC-011 baseline: isolated Lua graph capture, stub-global registration, task normalization, and agent resolution form one extraction pipeline; split capture stubs from graph normalization before expanding either side. Bumped for the final-review fix wave's postgres.* stub (item F), which follows the existing http stub idiom exactly."
     },
     {
       "path": "src/cli/server.rs",
@@ -104,7 +104,7 @@
     },
     {
       "path": "src/engine/postgres_store.rs",
-      "max_lines": 8892,
+      "max_lines": 8808,
       "rationale": "IC-011 priority debt: one SQLx implementation still contains schema migration and repositories for runs, idempotency, leases, HITL, journals, conversations, and audit; extract table-focused repositories before extending storage."
     },
     {
@@ -174,13 +174,13 @@
     },
     {
       "path": "src/lua/conversation.rs",
-      "max_lines": 964,
-      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features."
+      "max_lines": 969,
+      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting."
     },
     {
       "path": "src/lua/crew_userdata.rs",
-      "max_lines": 1049,
-      "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods."
+      "max_lines": 1050,
+      "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods. Task 8: passes the `lua` handle into build_conversation for app-db fingerprint lookup."
     },
     {
       "path": "src/lua/dialog.rs",

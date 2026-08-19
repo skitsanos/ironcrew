@@ -513,6 +513,35 @@ async fn legacy_subworkflow_still_works() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Sub-flow VMs get a fail-closed postgres.* stub, not a raw nil-global error
+// ──────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn subflow_postgres_call_fails_closed_with_stub_message() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.lua"),
+        r#"
+        local ok, err = pcall(function() return postgres.query("x") end)
+        if ok then return "OK" else return tostring(err) end
+        "#,
+    )
+    .unwrap();
+
+    let (lua, _runtime) = build_fixture_lua(dir.path());
+
+    let script = r#"
+        return run_flow("sub.lua", {})
+    "#;
+    let result: String = lua.load(script).eval_async().await.expect("eval");
+    assert!(
+        result.contains("not available inside run_flow sub-flows"),
+        "expected fail-closed postgres stub message, got: {}",
+        result
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Sub-flow require: sub-flow can load a module from its own _lib dir (#34)
 // ──────────────────────────────────────────────────────────────────────────
 
