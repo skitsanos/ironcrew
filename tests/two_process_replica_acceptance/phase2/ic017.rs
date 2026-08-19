@@ -2,6 +2,7 @@ use reqwest::header::HeaderValue;
 
 use super::ic017_deadline::assert_read_deadline_contract;
 use super::ic017_http::*;
+use super::ic017_sse::get_sse_when_available;
 use super::ic017_support::*;
 use super::*;
 
@@ -145,10 +146,8 @@ async fn ic017_durable_sse_edges_cross_real_process_boundary() {
                 )
                 .await;
 
-                let terminal = authenticated(pair.client.get(event_url(pair, run_id)))
-                    .send()
-                    .await
-                    .expect("read bounded terminal replay through replica B");
+                let terminal =
+                    get_sse_when_available(pair, run_id, None, "bounded terminal replay").await;
                 assert_eq!(terminal.status(), StatusCode::OK);
                 assert_sse_cache_policy(&terminal);
                 let terminal_body = terminal.text().await.expect("read bounded terminal SSE");
@@ -181,11 +180,13 @@ async fn ic017_durable_sse_edges_cross_real_process_boundary() {
                 );
                 assert_no_forbidden("bounded terminal replay", &terminal_body);
 
-                let resumed = authenticated(pair.client.get(event_url(pair, run_id)))
-                    .header("Last-Event-ID", format!("{run_id}:3"))
-                    .send()
-                    .await
-                    .expect("resume bounded terminal replay through replica B");
+                let resumed = get_sse_when_available(
+                    pair,
+                    run_id,
+                    Some(HeaderValue::from_str(&format!("{run_id}:3")).unwrap()),
+                    "resumed terminal replay",
+                )
+                .await;
                 assert_eq!(resumed.status(), StatusCode::OK);
                 assert_sse_cache_policy(&resumed);
                 let resumed_body = resumed.text().await.expect("read resumed IC-017 SSE");
@@ -200,10 +201,8 @@ async fn ic017_durable_sse_edges_cross_real_process_boundary() {
                 assert_no_forbidden("resumed terminal replay", &resumed_body);
 
                 expire_journal_rows(&pool, &pair.prefix, run_id, 4).await;
-                let fallback = authenticated(pair.client.get(event_url(pair, run_id)))
-                    .send()
-                    .await
-                    .expect("read retention fallback through replica B");
+                let fallback =
+                    get_sse_when_available(pair, run_id, None, "retention fallback").await;
                 assert_eq!(fallback.status(), StatusCode::OK);
                 assert_sse_cache_policy(&fallback);
                 let fallback_body = fallback.text().await.expect("read IC-017 fallback SSE");
@@ -224,10 +223,8 @@ async fn ic017_durable_sse_edges_cross_real_process_boundary() {
                 );
                 assert_no_forbidden("retention fallback", &fallback_body);
 
-                let repeated = authenticated(pair.client.get(event_url(pair, run_id)))
-                    .send()
-                    .await
-                    .expect("repeat retention fallback through replica B");
+                let repeated =
+                    get_sse_when_available(pair, run_id, None, "repeated retention fallback").await;
                 assert_eq!(repeated.status(), StatusCode::OK);
                 assert_sse_cache_policy(&repeated);
                 let repeated = repeated

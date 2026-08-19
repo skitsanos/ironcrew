@@ -21,6 +21,7 @@ mod ic016_sql;
 mod ic017;
 mod ic017_deadline;
 mod ic017_http;
+mod ic017_sse;
 mod ic017_support;
 mod ic019;
 mod ic019_http;
