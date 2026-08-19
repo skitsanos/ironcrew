@@ -5,7 +5,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::provider::*;
+use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
+
+mod response;
+use response::{parse_anthropic_response, structured_output_tool_name};
 
 /// Anthropic-specific configuration (server-side tools, extended thinking).
 #[derive(Debug, Clone, Default)]
@@ -34,7 +38,9 @@ impl RateLimiter {
         Self {
             min_interval: Duration::from_millis(min_interval_ms),
             last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(std::time::Instant::now),
             )),
         }
     }
@@ -60,9 +66,15 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: String, base_url: Option<String>, config: AnthropicConfig) -> Self {
+        // Every request carries the API key in `x-api-key`, which reqwest does
+        // not strip across hosts, so a redirect must never leave the origin.
         let client = crate::utils::network::secure_client_builder(
             crate::utils::network::OutboundNetworkPolicy::PublicOnly,
         )
+        .redirect(crate::utils::network::same_origin_redirect_policy(
+            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
+            crate::utils::network::private_ips_override_enabled(),
+        ))
         .timeout(Duration::from_secs(120))
         .build()
         .expect("Failed to build HTTP client");
@@ -268,15 +280,48 @@ impl AnthropicProvider {
             }
         }
 
+        // 7. Structured output. The Messages API has no `response_format`, so a
+        // JSON Schema is enforced by defining a single-purpose tool and forcing
+        // the model to call it. `JsonObject`/`Text` have no schema to bind and
+        // are steered through the system prompt instead (see `build_system`).
+        let has_other_tools = !tools_json.is_empty();
+        let schema_tool = match request.response_format {
+            Some(ResponseFormat::JsonSchema {
+                ref name,
+                ref schema,
+            }) => {
+                tools_json.push(json!({
+                    "name": name,
+                    "description":
+                        "Return the final answer. You must call this tool exactly once \
+                         with the complete result.",
+                    "input_schema": schema,
+                }));
+                Some(name.clone())
+            }
+            _ => None,
+        };
+
         if !tools_json.is_empty() {
             body["tools"] = json!(tools_json);
+        }
+
+        // Force the structured-output tool so the model cannot answer in prose.
+        if let Some(name) = schema_tool
+            && !has_other_tools
+        {
+            body["tool_choice"] = json!({"type": "tool", "name": name});
         }
 
         body
     }
 
     /// Send a non-streaming request to the Anthropic Messages API.
-    async fn send_request(&self, body: Value) -> Result<ChatResponse> {
+    async fn send_request(
+        &self,
+        body: Value,
+        structured_output_tool: Option<&str>,
+    ) -> Result<ChatResponse> {
         let request_body = self.prepare_request(&body)?;
 
         if let Some(ref limiter) = self.rate_limit {
@@ -329,13 +374,14 @@ impl AnthropicProvider {
             )));
         }
 
-        parse_anthropic_response(&resp_body)
+        parse_anthropic_response(&resp_body, structured_output_tool)
     }
 
     /// Send a streaming request to the Anthropic Messages API.
     async fn send_request_stream(
         &self,
         mut body: Value,
+        structured_output_tool: Option<&str>,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
         body["stream"] = json!(true);
@@ -583,24 +629,39 @@ impl AnthropicProvider {
             ));
         }
 
-        // Assemble tool calls from block states
+        // Assemble tool calls from block states. A forced structured-output
+        // tool carries the answer itself, so its accumulated JSON becomes the
+        // response content rather than a tool call.
+        let mut structured_output: Option<String> = None;
         let tool_calls: Vec<ToolCallRequest> = block_states
             .into_values()
             .filter(|s| s.block_type == "tool_use" && !s.id.is_empty())
-            .map(|s| ToolCallRequest {
-                id: s.id,
-                call_type: "function".to_string(),
-                function: ToolCallFunction {
-                    name: s.name,
-                    arguments: s.text, // accumulated JSON string
-                },
+            .filter_map(|s| {
+                if structured_output_tool == Some(s.name.as_str()) {
+                    structured_output = Some(s.text);
+                    return None;
+                }
+                Some(ToolCallRequest {
+                    id: s.id,
+                    call_type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: s.name,
+                        arguments: s.text, // accumulated JSON string
+                    },
+                })
             })
             .collect();
 
-        let content = if full_content.is_empty() {
-            None
-        } else {
-            Some(full_content)
+        if structured_output_tool.is_some() && structured_output.is_none() && tool_calls.is_empty()
+        {
+            return Err(IronCrewError::Provider(
+                "Anthropic response omitted the required structured-output tool".into(),
+            ));
+        }
+        let content = match structured_output {
+            Some(json) => Some(json),
+            None if full_content.is_empty() => None,
+            None => Some(full_content),
         };
 
         let reasoning = if full_reasoning.is_empty() {
@@ -637,122 +698,6 @@ struct BlockState {
     id: String,
     name: String,
     text: String, // accumulated text or JSON arguments
-}
-
-/// Parse a non-streaming Anthropic response into ChatResponse.
-fn parse_anthropic_response(resp: &Value) -> Result<ChatResponse> {
-    let content_blocks = resp["content"]
-        .as_array()
-        .ok_or_else(|| IronCrewError::Provider("Missing 'content' array in response".into()))?;
-
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut reasoning_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
-    // Thinking blocks captured verbatim (with their `signature`) so the tool
-    // loop can replay them on the next turn — Anthropic 400s on a `tool_use`
-    // that isn't preceded by its `thinking` block when thinking is enabled.
-    let mut raw_blocks: Vec<Value> = Vec::new();
-
-    for block in content_blocks {
-        let block_type = block["type"].as_str().unwrap_or("");
-        match block_type {
-            "text" => {
-                if let Some(text) = block["text"].as_str() {
-                    text_parts.push(text.to_string());
-                }
-            }
-            "tool_use" => {
-                let id = block["id"].as_str().unwrap_or("").to_string();
-                let name = block["name"].as_str().unwrap_or("").to_string();
-                // Stringify the input object so the executor can parse it
-                let arguments =
-                    serde_json::to_string(&block["input"]).unwrap_or_else(|_| "{}".into());
-                tool_calls.push(ToolCallRequest {
-                    id,
-                    call_type: "function".to_string(),
-                    function: ToolCallFunction { name, arguments },
-                });
-            }
-            "thinking" => {
-                // Capture the readable text as reasoning AND the whole block
-                // (thinking + signature) verbatim for replay.
-                if let Some(text) = block["thinking"].as_str() {
-                    reasoning_parts.push(text.to_string());
-                }
-                raw_blocks.push(block.clone());
-            }
-            "redacted_thinking" => {
-                // Opaque encrypted reasoning — no readable text, but it must be
-                // echoed back unchanged alongside any tool_use.
-                raw_blocks.push(block.clone());
-            }
-            "web_search_tool_result" => {
-                // Append search results as text for the agent to see
-                if let Some(content) = block.get("content").and_then(|c| c.as_array()) {
-                    for item in content {
-                        if item["type"].as_str() == Some("web_search_result") {
-                            let title = item["title"].as_str().unwrap_or("");
-                            let url = item["url"].as_str().unwrap_or("");
-                            let snippets: Vec<&str> = item["content"]
-                                .as_array()
-                                .map(|arr| arr.iter().filter_map(|s| s["text"].as_str()).collect())
-                                .unwrap_or_default();
-                            text_parts.push(format!(
-                                "[Web: {} ({})] {}",
-                                title,
-                                url,
-                                snippets.join(" ")
-                            ));
-                        }
-                    }
-                }
-            }
-            "code_execution_tool_result" => {
-                if let Some(stdout) = block.get("content").and_then(|c| {
-                    c.as_array().and_then(|arr| {
-                        arr.iter()
-                            .find(|item| item["type"].as_str() == Some("output"))
-                            .and_then(|item| item["output"].as_str())
-                    })
-                }) {
-                    text_parts.push(format!("[Code output] {}", stdout));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let usage = resp.get("usage").map(|u| TokenUsage {
-        prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-        total_tokens: (u["input_tokens"].as_u64().unwrap_or(0)
-            + u["output_tokens"].as_u64().unwrap_or(0)) as u32,
-        cached_tokens: u["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
-    });
-
-    let content = if text_parts.is_empty() {
-        None
-    } else {
-        Some(text_parts.join("\n"))
-    };
-
-    let reasoning = if reasoning_parts.is_empty() {
-        None
-    } else {
-        Some(reasoning_parts.join("\n"))
-    };
-
-    Ok(ChatResponse {
-        content,
-        reasoning,
-        tool_calls,
-        usage,
-        raw_blocks: if raw_blocks.is_empty() {
-            None
-        } else {
-            Some(raw_blocks)
-        },
-    })
 }
 
 /// Merge consecutive messages with the same role (Anthropic requires strict alternation).
@@ -829,8 +774,9 @@ impl LlmProvider for AnthropicProvider {
             tools = 0,
             "LLM request metadata"
         );
+        let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, None);
-        let response = self.send_request(body).await?;
+        let response = self.send_request(body, structured_output_tool).await?;
         tracing::debug!(
             provider = "anthropic",
             content_bytes = response.content.as_ref().map_or(0, String::len),
@@ -859,8 +805,9 @@ impl LlmProvider for AnthropicProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
+        let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, Some(tools));
-        let response = self.send_request(body).await?;
+        let response = self.send_request(body, structured_output_tool).await?;
         tracing::debug!(
             provider = "anthropic",
             content_bytes = response.content.as_ref().map_or(0, String::len),
@@ -881,98 +828,13 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
+        let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, None);
         tracing::debug!("Anthropic streaming request");
-        self.send_request_stream(body, tx).await
+        self.send_request_stream(body, structured_output_tool, tx)
+            .await
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_captures_thinking_blocks_verbatim() {
-        let resp = json!({
-            "content": [
-                {"type": "thinking", "thinking": "let me think", "signature": "sig-abc"},
-                {"type": "text", "text": "hello"},
-                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "x"}}
-            ],
-            "usage": {"input_tokens": 5, "output_tokens": 3}
-        });
-        let parsed = parse_anthropic_response(&resp).unwrap();
-        let raw = parsed.raw_blocks.expect("thinking block captured");
-        assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0]["type"], "thinking");
-        // Signature preserved verbatim — the API rejects modified blocks.
-        assert_eq!(raw[0]["signature"], "sig-abc");
-        assert_eq!(raw[0]["thinking"], "let me think");
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.reasoning.as_deref(), Some("let me think"));
-    }
-
-    #[test]
-    fn parse_without_thinking_has_no_raw_blocks() {
-        let resp = json!({
-            "content": [{"type": "text", "text": "hi"}],
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        });
-        let parsed = parse_anthropic_response(&resp).unwrap();
-        assert!(parsed.raw_blocks.is_none());
-    }
-
-    #[test]
-    fn build_body_replays_thinking_before_tool_use() {
-        let provider = AnthropicProvider::new(
-            "k".into(),
-            None,
-            AnthropicConfig {
-                thinking_budget: Some(2048),
-                server_tools: vec![],
-            },
-        );
-        let thinking = json!({"type": "thinking", "thinking": "reasoning", "signature": "sig-1"});
-        let assistant = ChatMessage::assistant_with_blocks(
-            None,
-            Some(vec![ToolCallRequest {
-                id: "tu_1".into(),
-                call_type: "function".into(),
-                function: ToolCallFunction {
-                    name: "search".into(),
-                    arguments: "{\"q\":\"x\"}".into(),
-                },
-            }]),
-            Some(vec![thinking]),
-        );
-        let req = ChatRequest {
-            messages: vec![
-                ChatMessage::user("hi"),
-                assistant,
-                ChatMessage::tool("tu_1", "result"),
-            ],
-            model: "claude-x".into(),
-            temperature: None,
-            max_tokens: None,
-            response_format: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
-        let body = provider.build_body(&req, None);
-        let messages = body["messages"].as_array().unwrap();
-        let asst = messages
-            .iter()
-            .find(|m| m["role"] == "assistant")
-            .expect("assistant message present");
-        let blocks = asst["content"].as_array().unwrap();
-        // Thinking block must come first, with its signature intact, before tool_use.
-        assert_eq!(blocks[0]["type"], "thinking");
-        assert_eq!(blocks[0]["signature"], "sig-1");
-        let think_pos = blocks.iter().position(|b| b["type"] == "thinking").unwrap();
-        let tool_pos = blocks.iter().position(|b| b["type"] == "tool_use").unwrap();
-        assert!(
-            think_pos < tool_pos,
-            "thinking block must precede tool_use to satisfy Anthropic"
-        );
-    }
-}
+mod tests;

@@ -13,6 +13,9 @@ use crate::lua::json_policy::JsonLimits;
 use crate::lua::limits::install_lua_limits;
 use crate::tools::runtime_policy::LuaVmPolicy;
 
+mod eval_vm;
+pub(crate) use eval_vm::{create_eval_lua, fresh_eval_environment};
+
 // Regexes are cached per worker thread. Bound both the number and compiled
 // program size so a flow cannot turn distinct patterns into persistent pod RSS.
 const REGEX_CACHE_MAX: usize = 16;
@@ -1321,10 +1324,11 @@ pub(crate) fn create_tool_lua_with_execution_policy(
         lua.globals().set("fs", fs_table)?;
     }
 
-    // Note: llm and http namespaces require async and a provider/client reference.
-    // These are registered per-execution in LuaScriptTool::execute when a provider
-    // is available. For v1, Lua tools that need llm:chat() or http:get() will need
-    // to be wired in a future iteration with the async tool sandbox.
+    // `http` is registered by `register_lua_globals_with_policy` above and is
+    // available to tools under the captured outbound-network policy (SSRF
+    // validation plus the response body-size limit). The `llm` namespace still
+    // needs a provider reference and is bound per-execution in
+    // `LuaScriptTool::execute`.
 
     Ok(lua)
 }

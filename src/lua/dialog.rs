@@ -6,8 +6,7 @@
 //! opponent's name for context.
 //!
 //! Created via `crew:dialog({})`. Reuses the crew's provider, model, and tool
-//! registry. Streams to stderr (with dim reasoning) and captures reasoning per
-//! turn.
+//! registry. Streams to stderr and captures reasoning per turn.
 //!
 //! ## Future work
 //! - Cross-run persistence
@@ -1326,6 +1325,7 @@ pub async fn build_dialog(
     flow_name: String,
     flow_path: Option<String>,
 ) -> mlua::Result<AgentDialog> {
+    crate::lua::parsers::option_keys::reject_dialog_keys(&table)?;
     let agents_table = table.get::<Table>("agents").map_err(|_| {
         mlua::Error::external(IronCrewError::Validation(
             "Dialog requires an `agents = {\"name\", ...}` array of two or more \

@@ -409,6 +409,16 @@ fn sanitize_error(err: &IronCrewError) -> String {
     }
 }
 
+/// Build a 500 response whose body carries no backend detail. The full error is
+/// logged, not returned, so store and filesystem internals stay server-side.
+fn internal_error(err: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%err, "internal server error");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
+}
+
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
@@ -634,6 +644,21 @@ fn run_not_found(error: &IronCrewError, run_id: &str) -> bool {
         error,
         IronCrewError::Validation(message)
             if message == &format!("Run '{}' not found", run_id)
+    )
+}
+
+/// Map a run-store error to a response. A genuinely missing run is 404; every
+/// other failure (outage, pool exhaustion) is a 503 with no backend detail, so
+/// a client cannot mistake a transient outage for "this run never existed" and
+/// re-execute paid work under a fresh idempotency key.
+fn run_lookup_error(error: &IronCrewError, run_id: &str) -> (StatusCode, Json<ErrorResponse>) {
+    if run_not_found(error, run_id) {
+        return error_response(StatusCode::NOT_FOUND, format!("Run '{}' not found", run_id));
+    }
+    tracing::error!(%error, run_id, "run store lookup failed");
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Run store is unavailable".to_string(),
     )
 }
 
@@ -3132,12 +3157,12 @@ pub async fn list_runs(
     let runs = store
         .list_runs_summary(&filter, limit, offset)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     let total = store
         .count_runs(&filter)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     Ok(Json(ListRunsResponse {
         runs,
@@ -3161,7 +3186,7 @@ pub async fn get_run(
         .store
         .get_run(&id)
         .await
-        .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(|e| run_lookup_error(&e, &id))?;
 
     // Scope by flow: a run launched under a different flow is invisible here,
     // reported as 404 rather than confirming it exists elsewhere.
@@ -3195,7 +3220,7 @@ pub async fn delete_run(
             .store
             .get_run(&id)
             .await
-            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+            .map_err(|e| run_lookup_error(&e, &id))?;
         if record.flow != flow_slug {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
@@ -3220,7 +3245,7 @@ pub async fn delete_run(
             .store
             .delete_run(&id)
             .await
-            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+            .map_err(|e| run_lookup_error(&e, &id))?;
         Ok(Json(serde_json::json!({"deleted": id})))
     }
     .await;
@@ -3266,15 +3291,20 @@ pub async fn validate_flow(
     } else {
         ProjectLoader::from_directory(&flow_path)
     }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
 
-    let lua = create_tool_lua()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let lua = create_tool_lua().map_err(|e| {
+        tracing::error!(%e, "tool Lua VM could not be created for flow validation");
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
+        )
+    })?;
 
     let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
     let tool_defs = load_tool_defs_from_files(loader.tool_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
 
     // Check entrypoint syntax
     let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
@@ -3297,7 +3327,15 @@ pub async fn validate_flow(
             "tools": a.tools,
         })).collect::<Vec<_>>(),
         "custom_tools": tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>(),
-        "entrypoint": loader.entrypoint().map(|p| p.display().to_string()),
+        // Flow-relative: the absolute server path is not the client's business.
+        "entrypoint": loader
+            .entrypoint()
+            .and_then(|p| {
+                p.strip_prefix(&flow_path)
+                    .ok()
+                    .map(|relative| relative.display().to_string())
+                    .or_else(|| p.file_name().map(|name| name.to_string_lossy().into_owned()))
+            }),
     })))
 }
 
@@ -3316,10 +3354,10 @@ pub async fn list_agents(
     } else {
         ProjectLoader::from_directory(&flow_path)
     }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
 
     let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
 
     let result: Vec<serde_json::Value> = agents
         .iter()
@@ -3343,24 +3381,8 @@ pub async fn list_agents(
 // ---------------------------------------------------------------------------
 
 pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
-    use crate::tools::registry::ToolRegistry;
-    use crate::tools::{
-        file_read::FileReadTool, file_read_glob::FileReadGlobTool, file_write::FileWriteTool,
-        hash::HashTool, http_request::HttpRequestTool, shell::ShellTool,
-        template_render::TemplateRenderTool, validate_schema::ValidateSchemaTool,
-        web_scrape::WebScrapeTool,
-    };
-
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new(None)));
-    registry.register(Box::new(FileReadGlobTool::new(None)));
-    registry.register(Box::new(FileWriteTool::new(None, None)));
-    registry.register(Box::new(WebScrapeTool::new(None)));
-    registry.register(Box::new(ShellTool::new()));
-    registry.register(Box::new(HttpRequestTool::new()));
-    registry.register(Box::new(HashTool::new()));
-    registry.register(Box::new(TemplateRenderTool::new()));
-    registry.register(Box::new(ValidateSchemaTool::new()));
+    // Shared with `ironcrew nodes` so the two catalogs cannot drift.
+    let registry = crate::tools::builtin_tool_catalog();
 
     let mut tools: Vec<serde_json::Value> = Vec::new();
     let mut names = registry.list();
@@ -3740,12 +3762,12 @@ pub async fn list_audit(
         .store
         .list_audit_events(&filter, limit, offset)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
     let total = state
         .store
         .count_audit_events(&filter)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     Ok(Json(ListAuditResponse {
         events,
