@@ -24,6 +24,7 @@ pub(super) fn split_statements(sql: &str) -> Result<Vec<SplitStatement>, String>
     let bytes: Vec<char> = sql.chars().collect();
     let mut state = State::Normal;
     let mut current = String::new();
+    let mut has_content = false;
     let mut max_placeholder = 0usize;
     let mut statements = Vec::new();
     let mut index = 0usize;
@@ -33,7 +34,12 @@ pub(super) fn split_statements(sql: &str) -> Result<Vec<SplitStatement>, String>
         match &state {
             State::Normal => match character {
                 ';' => {
-                    push_statement(&mut statements, &mut current, &mut max_placeholder);
+                    push_statement(
+                        &mut statements,
+                        &mut current,
+                        &mut max_placeholder,
+                        &mut has_content,
+                    );
                     index += 1;
                     continue;
                 }
@@ -45,12 +51,14 @@ pub(super) fn split_statements(sql: &str) -> Result<Vec<SplitStatement>, String>
                         max_placeholder = max_placeholder.max(placeholder);
                         current.extend(&bytes[index..index + consumed]);
                         index += consumed;
+                        has_content = true;
                         continue;
                     }
                     if let Some((tag, consumed)) = read_dollar_tag(&bytes, index) {
                         current.extend(&bytes[index..index + consumed]);
                         index += consumed;
                         state = State::DollarQuote(tag);
+                        has_content = true;
                         continue;
                     }
                 }
@@ -95,6 +103,11 @@ pub(super) fn split_statements(sql: &str) -> Result<Vec<SplitStatement>, String>
                 }
             }
         }
+        if (matches!(state, State::Normal) && !character.is_whitespace())
+            || matches!(state, State::SingleQuote | State::DollarQuote(_))
+        {
+            has_content = true;
+        }
         current.push(character);
         index += 1;
     }
@@ -107,13 +120,23 @@ pub(super) fn split_statements(sql: &str) -> Result<Vec<SplitStatement>, String>
             return Err(format!("unterminated dollar-quoted string (${tag}$)"));
         }
     }
-    push_statement(&mut statements, &mut current, &mut max_placeholder);
+    push_statement(
+        &mut statements,
+        &mut current,
+        &mut max_placeholder,
+        &mut has_content,
+    );
     Ok(statements)
 }
 
-fn push_statement(statements: &mut Vec<SplitStatement>, current: &mut String, max: &mut usize) {
-    let sql = strip_comment_only(current.trim());
-    if !sql.is_empty() {
+fn push_statement(
+    statements: &mut Vec<SplitStatement>,
+    current: &mut String,
+    max: &mut usize,
+    has_content: &mut bool,
+) {
+    let sql = current.trim();
+    if *has_content && !sql.is_empty() {
         statements.push(SplitStatement {
             sql: sql.to_string(),
             max_placeholder: *max,
@@ -121,15 +144,7 @@ fn push_statement(statements: &mut Vec<SplitStatement>, current: &mut String, ma
     }
     current.clear();
     *max = 0;
-}
-
-/// A fragment consisting only of `--` comment lines and whitespace is not a
-/// statement.
-fn strip_comment_only(fragment: &str) -> &str {
-    let only_comments = fragment
-        .lines()
-        .all(|line| line.trim().is_empty() || line.trim_start().starts_with("--"));
-    if only_comments { "" } else { fragment }
+    *has_content = false;
 }
 
 fn read_placeholder(bytes: &[char], index: usize) -> Option<(usize, usize)> {
