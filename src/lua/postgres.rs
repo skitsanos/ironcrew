@@ -14,6 +14,7 @@ pub const STUB_UNCONFIGURED: &str =
 #[cfg_attr(feature = "postgres", allow(dead_code))]
 pub const STUB_NO_FEATURE: &str =
     "postgres.* is unavailable: this binary was built without the 'postgres' cargo feature";
+pub const STUB_SUBFLOW: &str = "postgres.* is not available inside run_flow sub-flows in this version; perform app-database operations in the parent flow and pass results in via input";
 
 /// Register a namespace whose every call fails with `reason`. Fail-closed but
 /// diagnosable: a flow calling postgres.* gets a configuration hint instead of
