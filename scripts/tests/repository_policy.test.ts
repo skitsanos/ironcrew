@@ -11,7 +11,7 @@ const trustedReleaseActions = new Set([
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
   "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
-  "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
+  "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e",
   "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8",
   "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
