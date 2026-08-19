@@ -1,4 +1,7 @@
 pub mod agent;
+// This module is a public library contract; the binary declares the same
+// module tree privately and does not consume every public surface directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub mod app_db;
 pub mod audit;
 pub mod collaborative;

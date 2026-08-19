@@ -16,6 +16,11 @@ fn config_lua_can_observe_postgres_stub_during_evaluation() {
     // stray app-db URL leaks in from the test environment so the fail-closed
     // "unconfigured" stub (not a live connection attempt) is what
     // config.lua's assertions observe.
+    //
+    // NOTE: process-env mutation is safe only while this file stays a
+    // single-test binary. If more tests are ever added here, they will run in
+    // parallel threads sharing this environment — move the env handling to a
+    // serialized harness first.
     unsafe {
         std::env::remove_var("IRONCREW_APP_DATABASE_URL");
     }

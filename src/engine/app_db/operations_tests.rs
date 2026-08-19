@@ -112,3 +112,25 @@ async fn call_validation_rejects_unknown_op_and_wrong_arity() {
     let err = app.execute("save", &[]).await.unwrap_err().to_string();
     assert!(err.contains("expects 2 param(s), got 0"), "{err}");
 }
+
+#[test]
+fn params_line_after_header_closes_is_rejected() {
+    // A '-- params:'-shaped comment after SQL has begun must not be silently
+    // treated as body text.
+    let source = "-- ironcrew:op\nSELECT 1;\n-- params: a text\nSELECT 2;\n";
+    let err = OperationRegistry::from_sources(vec![("x".into(), source.into())], &policy())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("header"), "{err}");
+}
+
+#[test]
+fn blank_line_between_marker_and_params_is_rejected() {
+    // A blank line ends the header; a later '-- params:' line must error
+    // clearly instead of silently landing in the SQL body.
+    let source = "-- ironcrew:op\n\n-- params: a text\nSELECT $1;\n";
+    let err = OperationRegistry::from_sources(vec![("x".into(), source.into())], &policy())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("header"), "{err}");
+}

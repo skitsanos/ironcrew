@@ -17,7 +17,6 @@ const MAX_OP_NAME_BYTES: usize = 128;
 const MAX_PARAMS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ParamType {
     Text,
     Integer,
@@ -27,7 +26,6 @@ pub enum ParamType {
 }
 
 impl ParamType {
-    #[allow(dead_code)]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "text" => Some(Self::Text),
@@ -39,7 +37,6 @@ impl ParamType {
         }
     }
 
-    #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Text => "text",
@@ -52,7 +49,6 @@ impl ParamType {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Statement {
     pub sql: String,
     /// Number of params to bind: the highest `$n` this statement references.
@@ -60,7 +56,6 @@ pub struct Statement {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Operation {
     pub name: String,
     pub params: Vec<(String, ParamType)>,
@@ -69,12 +64,10 @@ pub struct Operation {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OperationRegistry {
     operations: BTreeMap<String, Operation>,
 }
 
-#[allow(dead_code)]
 fn parse_operation(name: &str, source: &str) -> Result<Operation> {
     let mut lines = source.lines();
     let marker = lines.next().map(str::trim);
@@ -106,6 +99,20 @@ fn parse_operation(name: &str, source: &str) -> Result<Operation> {
             continue;
         }
         in_header = false;
+        // A '-- params:'-shaped comment outside the header would silently
+        // become SQL body text (and only fail closed when the SQL happens to
+        // reference placeholders). Reject it explicitly instead.
+        if trimmed
+            .strip_prefix("--")
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with("params:"))
+        {
+            return Err(op_error(
+                name,
+                "'-- params:' must appear in the operation header, immediately after \
+                 '-- ironcrew:op' with no blank lines in between",
+            ));
+        }
         body_lines.push(line);
     }
 
@@ -153,7 +160,6 @@ fn parse_operation(name: &str, source: &str) -> Result<Operation> {
 }
 
 impl OperationRegistry {
-    #[allow(dead_code)]
     pub fn from_sources(sources: Vec<(String, String)>, policy: &AppDbPolicy) -> Result<Self> {
         if sources.len() > policy.max_operations() {
             return Err(IronCrewError::Validation(format!(
@@ -183,23 +189,19 @@ impl OperationRegistry {
         Ok(Self { operations })
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&Operation> {
         self.operations.get(name)
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.operations.len()
     }
 
     /// Sorted, non-secret description for the drift fingerprint.
-    #[allow(dead_code)]
     pub fn definition(&self) -> serde_json::Value {
         serde_json::Value::Array(
             self.operations
@@ -221,7 +223,6 @@ impl OperationRegistry {
 }
 
 /// Read `<project>/sql/*.sql` (non-recursive, sorted). Missing dir → empty.
-#[allow(dead_code)]
 pub fn read_sql_dir(project_dir: &Path, policy: &AppDbPolicy) -> Result<Vec<(String, String)>> {
     let sql_dir = project_dir.join("sql");
     if !sql_dir.is_dir() {
