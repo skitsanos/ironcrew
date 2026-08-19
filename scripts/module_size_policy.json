@@ -39,8 +39,8 @@
     },
     {
       "path": "src/cli/graph_extract.rs",
-      "max_lines": 682,
-      "rationale": "IC-011 baseline: isolated Lua graph capture, stub-global registration, task normalization, and agent resolution form one extraction pipeline; split capture stubs from graph normalization before expanding either side."
+      "max_lines": 704,
+      "rationale": "IC-011 baseline: isolated Lua graph capture, stub-global registration, task normalization, and agent resolution form one extraction pipeline; split capture stubs from graph normalization before expanding either side. Bumped for the final-review fix wave's postgres.* stub (item F), which follows the existing http stub idiom exactly."
     },
     {
       "path": "src/cli/server.rs",
