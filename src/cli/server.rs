@@ -189,10 +189,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         );
     }
 
-    // Bootstrap the persistence store ONCE at server startup. Every
-    // request handler below reuses `state.store` — this avoids per-call
-    // Postgres migrations and keeps one connection pool across the
-    // server's lifetime.
+    // Bootstrap one persistence store and reuse its connection pool.
     let store = crate::engine::store::create_store(flows_dir.join(".ironcrew"))
         .await
         .map_err(|e| IronCrewError::Validation(format!("Failed to init store: {}", e)))?;
@@ -215,6 +212,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let max_active_conversation_lifecycles =
         api::conversation_lifecycle::max_active_conversation_lifecycles();
     let max_active_runs = api::handlers::max_active_runs();
+    let max_active_inspections = api::handlers::max_active_inspections();
     let max_sse_connections = api::handlers::max_sse_connections();
     let max_run_lifetime = api::handlers::max_run_lifetime();
     let idempotency = api::idempotency::IdempotencyConfig::from_env(max_run_lifetime)?;
@@ -256,6 +254,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_active_conversations)),
         max_active_runs,
         run_permits: Arc::new(tokio::sync::Semaphore::new(max_active_runs)),
+        max_active_inspections,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(max_active_inspections)),
         max_sse_connections,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(max_sse_connections)),
         max_run_lifetime,

@@ -24,8 +24,8 @@
     },
     {
       "path": "src/api/handlers.rs",
-      "max_lines": 3778,
-      "rationale": "IC-011 baseline: run HTTP handlers currently combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized."
+      "max_lines": 3745,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 flow-inspection extraction: run HTTP handlers still combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized."
     },
     {
       "path": "src/api/idempotency.rs",
@@ -46,11 +46,6 @@
       "path": "src/cli/server.rs",
       "max_lines": 487,
       "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy."
-    },
-    {
-      "path": "src/engine/collaborative.rs",
-      "max_lines": 302,
-      "rationale": "IC-011 ratchet after extracting focused tests and usage accounting: bounded collaborative transcript construction and the participant-turn execution loop remain one responsibility; extract prompt construction before adding another collaboration strategy."
     },
     {
       "path": "src/engine/crew.rs",
@@ -88,9 +83,14 @@
       "rationale": "IC-011 baseline: local and durable HITL registration, bounded pending-question accounting, wait and answer delivery, cancellation, and cleanup remain coordinated here; separate durable mailbox adaptation before new input modes."
     },
     {
+      "path": "src/engine/json_file_store.rs",
+      "max_lines": 352,
+      "rationale": "IC-029 reviewed adapter: the object-safe StateStore contract requires one cohesive implementation containing every JSON method, while synchronous core dispatch and construction are extracted into focused sub-300-line modules; split the store trait itself before adding another method family."
+    },
+    {
       "path": "src/engine/memory.rs",
-      "max_lines": 668,
-      "rationale": "IC-011 baseline: bounded ephemeral and JSON-backed memory items share TTL and revision semantics, context selection, eviction, atomic persistence, and statistics; extract filesystem persistence before adding another backend."
+      "max_lines": 633,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 persistence extraction: bounded ephemeral and JSON-backed memory items share TTL and revision semantics, context selection, eviction, and statistics; split selection or eviction before adding another backend."
     },
     {
       "path": "src/engine/messagebus.rs",
@@ -114,8 +114,8 @@
     },
     {
       "path": "src/engine/run_history.rs",
-      "max_lines": 2608,
-      "rationale": "IC-011 priority debt: the JSON-file StateStore combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family."
+      "max_lines": 2544,
+      "rationale": "IC-011 priority debt, ratcheted by IC-029 async-adapter extraction: the synchronous JSON core still combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family."
     },
     {
       "path": "src/engine/sqlite_store.rs",
@@ -124,8 +124,8 @@
     },
     {
       "path": "src/engine/store.rs",
-      "max_lines": 777,
-      "rationale": "IC-011 baseline: the StateStore contract owns lease and instance configuration, backend capability defaults, all durable protocol methods, and backend construction; extract lease and factory code before adding another store capability."
+      "max_lines": 767,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 local-backend bootstrap extraction: the StateStore contract owns lease and instance configuration, backend capability defaults, all durable protocol methods, and backend selection; split the trait's protocol families before adding another store capability."
     },
     {
       "path": "src/engine/task.rs",
@@ -169,8 +169,8 @@
     },
     {
       "path": "src/lua/api.rs",
-      "max_lines": 788,
-      "rationale": "IC-011 baseline: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys."
+      "max_lines": 787,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys."
     },
     {
       "path": "src/lua/conversation.rs",

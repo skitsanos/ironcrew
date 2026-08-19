@@ -662,25 +662,15 @@ pub async fn create_store(
     };
 
     match store_type.to_lowercase().as_str() {
-        "json" => Ok(std::sync::Arc::new(super::run_history::JsonFileStore::new(
-            default_dir,
-        )?)),
+        "json" => Ok(std::sync::Arc::new(
+            super::run_history::JsonFileStore::open(default_dir).await?,
+        )),
         "sqlite" => {
             let db_path = std::env::var("IRONCREW_STORE_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| default_dir.join("ironcrew.db"));
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
-            }
-            Ok(std::sync::Arc::new(super::sqlite_store::SqliteStore::new(
-                db_path,
-            )?))
+            let store = super::store_bootstrap::open_sqlite(db_path).await?;
+            Ok(std::sync::Arc::new(store))
         }
         #[cfg(feature = "postgres")]
         "postgres" | "postgresql" => {

@@ -134,6 +134,8 @@ async fn spawn_server_with_idempotency(
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_conversations)),
         max_active_runs: max_runs,
         run_permits: Arc::new(tokio::sync::Semaphore::new(max_runs)),
+        max_active_inspections: 4,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_sse_connections: 100,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_run_lifetime: max_lifetime,
@@ -234,7 +236,33 @@ async fn concurrent_run_admission_never_exceeds_cap() {
         .unwrap();
     assert_eq!(aborted.status(), reqwest::StatusCode::OK);
     wait_for_status(&server.store, &run_id, RunStatus::Aborted).await;
-    assert_eq!(server.state.run_permits.available_permits(), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.state.run_permits.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run admission permit should follow durable terminalization");
+}
+
+#[tokio::test]
+async fn flow_inspection_fails_fast_when_dedicated_capacity_is_exhausted() {
+    let server = spawn_server(1, 1, Duration::from_secs(60)).await;
+    server.state.inspection_permits.close();
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/flows/flow-a/validate", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("flow-inspection limit")
+    );
 }
 
 #[tokio::test]

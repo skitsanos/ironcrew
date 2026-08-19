@@ -106,7 +106,8 @@ text is returned. Output is truncated to 10 000 characters.
 **Limit:** raw HTML is streamed with a byte cap of
 `IRONCREW_WEB_SCRAPE_MAX_BYTES` (default 2 MB) **before** DOM parsing, to
 avoid the quadratic worst case of feeding very large HTML to the parser.
-Responses exceeding the cap are rejected with an error.
+Responses exceeding the cap are rejected with an error. DOM parsing and text
+extraction run on an owned blocking worker rather than the async runtime.
 
 ### shell
 

@@ -327,7 +327,10 @@ contain sensitive task output.
 
 **Default (JSON files).** By default, run records are stored as individual JSON
 files under `<flow>/.ironcrew/runs/`. This requires no extra dependencies and
-works well for development and moderate workloads.
+works well for development and moderate workloads. The asynchronous store
+adapter moves directory access, JSON parsing, atomic writes, and fsyncs onto
+owned blocking workers; its process-wide file lock never parks a Tokio worker.
+Persistent crew-memory load/save uses the same blocking-worker boundary.
 
 **SQLite backend.** Set `IRONCREW_STORE=sqlite` to store run records in a SQLite
 database instead. The database file defaults to `<flow>/.ironcrew/ironcrew.db`
