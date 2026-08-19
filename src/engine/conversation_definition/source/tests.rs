@@ -148,6 +148,87 @@ fn concurrent_symlink_swap_never_hashes_an_outside_target() {
     assert_eq!(flow_source_fingerprint(&flow).unwrap(), baseline);
 }
 
+#[cfg(unix)]
+#[test]
+fn sql_files_participate_in_the_source_fingerprint() {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    for dir in [&left, &right] {
+        write(dir.path(), "crew.lua", "return 1");
+        write(dir.path(), "sql/save.sql", "-- ironcrew:op\nSELECT 1;");
+    }
+    let a = capture_flow_source(left.path()).unwrap();
+    let b = capture_flow_source(right.path()).unwrap();
+    assert_eq!(
+        a.fingerprint(),
+        b.fingerprint(),
+        "identical trees must match"
+    );
+    assert_eq!(a.sql_sources().len(), 1);
+    assert_eq!(a.sql_sources()[0].0, "save");
+
+    write(right.path(), "sql/save.sql", "-- ironcrew:op\nSELECT 2;");
+    let c = capture_flow_source(right.path()).unwrap();
+    assert_ne!(
+        a.fingerprint(),
+        c.fingerprint(),
+        "sql edit must change the fingerprint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sql_sources_scopes_to_the_sql_directory_while_fingerprint_covers_all_sql_files() {
+    let directory = TempDir::new().unwrap();
+    write(directory.path(), "crew.lua", "return 1");
+    write(
+        directory.path(),
+        "sql/save.sql",
+        "-- ironcrew:op\nSELECT 1;",
+    );
+    write(
+        directory.path(),
+        "sql/sub/nested.sql",
+        "-- ironcrew:op\nSELECT 2;",
+    );
+    write(
+        directory.path(),
+        "queries/outside.sql",
+        "-- ironcrew:op\nSELECT 3;",
+    );
+    let snapshot = capture_flow_source(directory.path()).unwrap();
+
+    let mut stems: Vec<_> = snapshot
+        .sql_sources()
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .collect();
+    stems.sort();
+    assert_eq!(
+        stems,
+        vec!["nested", "save"],
+        "sql_sources includes sql/ and its nested paths"
+    );
+
+    let baseline = snapshot.fingerprint().to_owned();
+    write(
+        directory.path(),
+        "queries/outside.sql",
+        "-- ironcrew:op\nSELECT 4;",
+    );
+    let changed = capture_flow_source(directory.path()).unwrap();
+    assert_ne!(
+        baseline,
+        changed.fingerprint(),
+        "queries/ sql files still participate in the fingerprint"
+    );
+    assert_eq!(
+        changed.sql_sources().len(),
+        2,
+        "queries/ sql files are excluded from sql_sources()"
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn platforms_without_guaranteed_no_follow_fail_closed() {

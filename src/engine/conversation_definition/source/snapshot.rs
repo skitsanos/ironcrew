@@ -116,6 +116,23 @@ impl FlowSourceSnapshot {
         }
         Ok(sources)
     }
+
+    /// Stem + source for every captured `sql/*.sql` file, in path order.
+    // wired in src/cli/project.rs (Task 9)
+    #[allow(dead_code)]
+    pub fn sql_sources(&self) -> Vec<(String, Arc<str>)> {
+        self.files
+            .iter()
+            .filter(|(path, _)| {
+                path.starts_with("sql") && path.extension().and_then(|e| e.to_str()) == Some("sql")
+            })
+            .filter_map(|(path, source)| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| (stem.to_string(), source.clone()))
+            })
+            .collect()
+    }
 }
 
 /// Snapshot plus the lexical directory used by `require` and `run_flow`.
