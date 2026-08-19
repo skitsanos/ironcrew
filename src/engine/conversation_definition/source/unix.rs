@@ -101,12 +101,12 @@ impl Capture<'_> {
             .filter(|bytes| *bytes <= MAX_AGGREGATE_BYTES)
             .ok_or_else(|| {
                 validation(format!(
-                    "flow Lua sources exceed the aggregate limit of {MAX_AGGREGATE_BYTES} bytes"
+                    "flow sources exceed the aggregate limit of {MAX_AGGREGATE_BYTES} bytes"
                 ))
             })?;
         let source = String::from_utf8(bytes).map_err(|error| {
             validation(format!(
-                "Lua source '{}' is not valid UTF-8: {error}",
+                "flow source '{}' is not valid UTF-8: {error}",
                 display_path.display()
             ))
         })?;

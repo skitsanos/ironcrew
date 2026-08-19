@@ -229,6 +229,29 @@ fn sql_sources_scopes_to_the_sql_directory_while_fingerprint_covers_all_sql_file
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn misplaced_sql_files_do_not_enter_lua_roles() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "crew.lua", "return 1");
+    write(dir.path(), "agents/helper.lua", "return 2");
+    write(dir.path(), "agents/lookup.sql", "-- ironcrew:op\nSELECT 1;");
+    let snapshot = capture_flow_source(dir.path()).unwrap();
+    let roles = snapshot.roles().unwrap();
+    let agent_paths: Vec<_> = roles
+        .agents
+        .iter()
+        .map(|source| source.relative_path().to_path_buf())
+        .collect();
+    assert_eq!(agent_paths, vec![Path::new("agents/helper.lua")]);
+    // The stray file still participates in the fingerprint.
+    assert_eq!(
+        snapshot.sql_sources().len(),
+        0,
+        "not under sql/ so not an operation"
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn platforms_without_guaranteed_no_follow_fail_closed() {
