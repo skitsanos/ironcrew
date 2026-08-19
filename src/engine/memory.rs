@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::utils::error::{IronCrewError, Result};
+
+#[path = "memory/persistence.rs"]
+mod persistence;
 
 /// Configuration for memory store limits.
 #[derive(Debug, Clone)]
@@ -532,55 +535,17 @@ impl MemoryStore {
                 })?
             };
 
-            Self::atomic_save(path, json.as_bytes())?;
+            let save_path = path.clone();
+            tokio::task::spawn_blocking(move || Self::atomic_save(&save_path, json.as_bytes()))
+                .await
+                .map_err(|error| {
+                    IronCrewError::Validation(format!(
+                        "memory snapshot blocking task failed while saving: {error}"
+                    ))
+                })??;
             tracing::debug!("Memory persisted to {}", path.display());
         }
         Ok(())
-    }
-
-    fn atomic_save(path: &std::path::Path, json: &[u8]) -> Result<()> {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent).map_err(IronCrewError::Io)?;
-
-        #[cfg(unix)]
-        if parent != std::path::Path::new(".") {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(IronCrewError::Io)?;
-        }
-
-        let file_name = path.file_name().ok_or_else(|| {
-            IronCrewError::Validation(format!("invalid memory path '{}'", path.display()))
-        })?;
-        let temporary = parent.join(format!(
-            ".{}.{}.tmp",
-            file_name.to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-
-        let write_result = (|| -> std::io::Result<()> {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(json)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)?;
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        write_result.map_err(IronCrewError::Io)
     }
 
     /// Clear all memory.

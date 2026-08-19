@@ -471,6 +471,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `8`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
 | `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | Hard cap on distinct conversation IDs with an in-flight start/message/delete/eviction operation (default: `256`; hard ceiling: `4096`). Saturation for a new ID returns `503`; entries are removed after their final owner exits |
 | `IRONCREW_MAX_ACTIVE_RUNS` | Hard cap on simultaneously in-flight flow runs (`POST /flows/{flow}/run`, default: `4`). Breaches return `503` |
+| `IRONCREW_MAX_ACTIVE_INSPECTIONS` | Dedicated cap on concurrent `GET /flows/{flow}/validate` and `/agents` inspections (default: `4`; hard ceiling: `64`). Saturation returns `503` without consuming a Tokio worker |
 | `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | Aggregate retained collaborative-task transcript (default: `8388608` = 8 MiB; hard ceiling: 32 MiB) |
 | `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | Maximum provider response retained for one collaborative turn (default: `1048576` = 1 MiB; hard ceiling: 8 MiB) |
 | `IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS` | Maximum `participants × max_turns` per collaborative task (default: `64`; hard ceiling: `512`) |
@@ -607,7 +608,7 @@ provider response and are not billing data.
 | `IRONCREW_HTTP_MAX_HEADER_BYTES` | Aggregate response-header cap for protected HTTP tools (default: `65536` = 64 KiB) |
 | `IRONCREW_HTTP_MAX_JSON_BYTES` | Largest HTTP body auto-parsed into an additional JSON tree (default: `2097152` = 2 MiB) |
 | `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | Maximum serialized `http_request` result after JSON escaping/formatting (default: `16777216` = 16 MiB) |
-| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parse. Default: `2097152` (2 MiB) |
+| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parsing, which runs on a blocking worker. Default: `2097152` (2 MiB) |
 | `IRONCREW_MAX_IMAGE_BYTES` | Per-image cap for local and remote image inputs (default: `20971520` = 20 MiB) |
 | `IRONCREW_PROVIDER_MAX_REQUEST_BYTES` | Maximum serialized provider JSON request body, enforced before network send (default: `33554432` = 32 MiB; hard maximum: `268435456` = 256 MiB) |
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | Maximum non-streaming provider response body (default: `16777216` = 16 MiB) |

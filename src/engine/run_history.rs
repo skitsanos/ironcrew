@@ -21,6 +21,8 @@ use crate::engine::sessions::{
 use crate::engine::task::TaskResult;
 use crate::utils::error::{IronCrewError, Result};
 
+pub use super::json_file_store::JsonFileStore;
+use super::json_file_store_runtime::JsonFileStoreCore;
 use super::store::StateStore;
 
 type JsonRunLockRegistry = Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>;
@@ -229,7 +231,7 @@ fn write_serialized_record_create_new<T: Serialize>(
 /// runtime. Share one process-local lock per runs directory so their
 /// read-modify-write cycles cannot resurrect a record that another handle just
 /// terminalized.
-fn shared_json_run_lock(runs_dir: &Path) -> Arc<Mutex<()>> {
+pub(super) fn shared_json_run_lock(runs_dir: &Path) -> Arc<Mutex<()>> {
     let key = std::fs::canonicalize(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
     let registry = JSON_RUN_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut registry = registry
@@ -746,26 +748,6 @@ fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
     true
 }
 
-/// JSON file-based store rooted at an `.ironcrew/` directory.
-///
-/// Each record type gets its own subdirectory: `runs/`, `conversations/`,
-/// `dialogs/`, `audit_events/`, and `idempotency/`. All five are owner-only
-/// (0o700) on Unix since they may contain sensitive model output or request
-/// fingerprints.
-pub struct JsonFileStore {
-    runs_dir: PathBuf,
-    conversations_dir: PathBuf,
-    dialogs_dir: PathBuf,
-    audit_events_dir: PathBuf,
-    /// Persistent request-idempotency records. These share `run_lock` with
-    /// conversations so a completed message response and its revised
-    /// conversation snapshot can be published as one process-local critical
-    /// section.
-    idempotency_dir: PathBuf,
-    lease: super::store::RunLeaseConfig,
-    run_lock: Arc<Mutex<()>>,
-}
-
 fn idempotency_path(dir: &Path, key_hash: &str) -> Result<PathBuf> {
     validate_digest("idempotency key hash", key_hash)?;
     Ok(dir.join(format!("{key_hash}.json")))
@@ -1100,54 +1082,8 @@ fn complete_json_run_idempotency(dir: &Path, run_id: &str, completed_at: &str) -
     })
 }
 
-impl JsonFileStore {
-    /// Create (or open) a JSON-backed store inside the given `.ironcrew/`
-    /// directory. The directory — and the four subdirectories it contains
-    /// — are created with `create_dir_all` if they don't already exist.
-    pub fn new(ironcrew_dir: PathBuf) -> Result<Self> {
-        Self::new_with_lease_config(ironcrew_dir, super::store::RunLeaseConfig::from_env()?)
-    }
-
-    pub fn new_with_lease_config(
-        ironcrew_dir: PathBuf,
-        lease: super::store::RunLeaseConfig,
-    ) -> Result<Self> {
-        let runs_dir = ironcrew_dir.join("runs");
-        let conversations_dir = ironcrew_dir.join("conversations");
-        let dialogs_dir = ironcrew_dir.join("dialogs");
-        let audit_events_dir = ironcrew_dir.join("audit_events");
-        let idempotency_dir = ironcrew_dir.join("idempotency");
-
-        for dir in [
-            &runs_dir,
-            &conversations_dir,
-            &dialogs_dir,
-            &audit_events_dir,
-            &idempotency_dir,
-        ] {
-            std::fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-
-        let run_lock = shared_json_run_lock(&runs_dir);
-        Ok(Self {
-            runs_dir,
-            conversations_dir,
-            dialogs_dir,
-            audit_events_dir,
-            idempotency_dir,
-            lease,
-            run_lock,
-        })
-    }
-}
-
 #[async_trait]
-impl StateStore for JsonFileStore {
+impl StateStore for JsonFileStoreCore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
         if let Some(run_id) = intent.suggested_id.as_deref() {
             validate_run_id(run_id)?;

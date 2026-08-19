@@ -373,7 +373,7 @@ fn validate_run_tags(input: Option<&serde_json::Value>) -> Result<Vec<String>, I
     Ok(validated)
 }
 
-fn flow_status(err: &IronCrewError) -> StatusCode {
+pub(super) fn flow_status(err: &IronCrewError) -> StatusCode {
     if err.to_string().contains("not found") {
         StatusCode::NOT_FOUND
     } else {
@@ -383,7 +383,7 @@ fn flow_status(err: &IronCrewError) -> StatusCode {
 
 /// Sanitize an error for API responses: log the full detail, return a safe message.
 /// Strips filesystem paths and internal details that could leak server structure.
-fn sanitize_error(err: &IronCrewError) -> String {
+pub(super) fn sanitize_error(err: &IronCrewError) -> String {
     let full = err.to_string();
     tracing::warn!("API error: {}", full);
 
@@ -1902,7 +1902,6 @@ async fn execute_crew_from_path_with_events(
     input: Option<&serde_json::Value>,
     context: RunExecutionContext,
 ) -> std::result::Result<RunWorkResult, IronCrewError> {
-    use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
 
     let RunExecutionContext {
@@ -1967,8 +1966,7 @@ async fn execute_crew_from_path_with_events(
         }
     }
 
-    let loader = load_project(flow_path)?;
-    let (lua, _runtime) = setup_crew_runtime(&loader)?;
+    let (loader, lua, _runtime, script) = load_http_crew_runtime(flow_path.to_path_buf()).await?;
 
     // Unlike a CLI invocation, an HTTP run owns the complete Lua entrypoint.
     // `crew:run()` stages its rich completion here so flow-level Lua can keep
@@ -2014,12 +2012,6 @@ async fn execute_crew_from_path_with_events(
             .set("input", lua_input)
             .map_err(IronCrewError::Lua)?;
     }
-
-    // Execute the Lua script
-    let entrypoint = loader
-        .entrypoint()
-        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = crate::lua::source::read_lua_source(entrypoint)?;
 
     let exec_err = {
         let _execution =
@@ -2084,16 +2076,7 @@ async fn execute_crew_from_path_with_events(
 pub async fn execute_crew_from_path(
     flow_path: &std::path::Path,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
-    use crate::cli::project::{load_project, setup_crew_runtime};
-
-    let loader = load_project(flow_path)?;
-    let (lua, _runtime) = setup_crew_runtime(&loader)?;
-
-    // Execute
-    let entrypoint = loader
-        .entrypoint()
-        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = crate::lua::source::read_lua_source(entrypoint)?;
+    let (loader, lua, _runtime, script) = load_http_crew_runtime(flow_path.to_path_buf()).await?;
 
     {
         let _execution =
@@ -2139,6 +2122,32 @@ pub async fn execute_crew_from_path(
         total_tokens: 0,
         results: vec![],
     })
+}
+
+async fn load_http_crew_runtime(
+    flow_path: std::path::PathBuf,
+) -> std::result::Result<
+    (
+        crate::lua::loader::ProjectLoader,
+        mlua::Lua,
+        Arc<crate::engine::runtime::Runtime>,
+        String,
+    ),
+    IronCrewError,
+> {
+    tokio::task::spawn_blocking(move || {
+        let loader = crate::cli::project::load_project(&flow_path)?;
+        let (lua, runtime) = crate::cli::project::setup_crew_runtime(&loader)?;
+        let entrypoint = loader
+            .entrypoint()
+            .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
+        Ok((loader, lua, runtime, script))
+    })
+    .await
+    .map_err(|error| {
+        IronCrewError::Validation(format!("flow runtime blocking task failed: {error}"))
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -3092,6 +3101,11 @@ pub fn max_active_runs() -> usize {
     positive_bounded_env("IRONCREW_MAX_ACTIVE_RUNS", 4, 1024)
 }
 
+/// Process-wide cap for filesystem/Lua flow-inspection work.
+pub fn max_active_inspections() -> usize {
+    positive_bounded_env("IRONCREW_MAX_ACTIVE_INSPECTIONS", 4, 64)
+}
+
 /// Process-wide cap for long-lived run and conversation SSE connections.
 pub fn max_sse_connections() -> usize {
     positive_bounded_env("IRONCREW_MAX_SSE_CONNECTIONS", 16, 1024)
@@ -3279,101 +3293,54 @@ pub async fn validate_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-
-    use crate::lua::api::*;
-    use crate::lua::loader::ProjectLoader;
-    use crate::lua::sandbox::create_tool_lua;
-
-    let loader = if flow_path.is_file() {
-        ProjectLoader::from_file(&flow_path)
-    } else {
-        ProjectLoader::from_directory(&flow_path)
-    }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
-
-    let lua = create_tool_lua().map_err(|e| {
-        tracing::error!(%e, "tool Lua VM could not be created for flow validation");
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal server error".to_string(),
-        )
-    })?;
-
-    let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
-    let tool_defs = load_tool_defs_from_files(loader.tool_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
-
-    // Check entrypoint syntax
-    let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
-        if let Ok(script) = crate::lua::source::read_lua_source(ep) {
-            lua.load(&script).into_function().is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    Ok(Json(serde_json::json!({
-        "flow": flow,
-        "valid": entrypoint_valid,
-        "agents": agents.iter().map(|a| serde_json::json!({
-            "name": a.name,
-            "goal": a.goal,
-            "capabilities": a.capabilities,
-            "tools": a.tools,
-        })).collect::<Vec<_>>(),
-        "custom_tools": tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>(),
-        // Flow-relative: the absolute server path is not the client's business.
-        "entrypoint": loader
-            .entrypoint()
-            .and_then(|p| {
-                p.strip_prefix(&flow_path)
-                    .ok()
-                    .map(|relative| relative.display().to_string())
-                    .or_else(|| p.file_name().map(|name| name.to_string_lossy().into_owned()))
-            }),
-    })))
+    let _permit = state
+        .inspection_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| inspection_limit_error(&state))?;
+    let worker_state = Arc::clone(&state);
+    let value =
+        tokio::task::spawn_blocking(move || super::inspection::validate_flow(&worker_state, flow))
+            .await
+            .map_err(inspection_join_error)?
+            .map_err(|(status, message)| error_response(status, message))?;
+    Ok(Json(value))
 }
 
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let _permit = state
+        .inspection_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| inspection_limit_error(&state))?;
+    let worker_state = Arc::clone(&state);
+    let agents =
+        tokio::task::spawn_blocking(move || super::inspection::list_agents(&worker_state, flow))
+            .await
+            .map_err(inspection_join_error)?
+            .map_err(|(status, message)| error_response(status, message))?;
+    Ok(Json(agents))
+}
 
-    use crate::lua::api::*;
-    use crate::lua::loader::ProjectLoader;
+fn inspection_limit_error(state: &AppState) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "Active flow-inspection limit reached ({} requests). Raise IRONCREW_MAX_ACTIVE_INSPECTIONS or retry after current inspections finish.",
+            state.max_active_inspections
+        ),
+    )
+}
 
-    let loader = if flow_path.is_file() {
-        ProjectLoader::from_file(&flow_path)
-    } else {
-        ProjectLoader::from_directory(&flow_path)
-    }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
-
-    let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, sanitize_error(&e)))?;
-
-    let result: Vec<serde_json::Value> = agents
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "name": a.name,
-                "goal": a.goal,
-                "capabilities": a.capabilities,
-                "tools": a.tools,
-                "temperature": a.temperature,
-                "model": a.model,
-            })
-        })
-        .collect();
-
-    Ok(Json(result))
+fn inspection_join_error(error: tokio::task::JoinError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%error, "flow-inspection blocking task failed");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------

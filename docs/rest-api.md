@@ -869,6 +869,11 @@ curl http://localhost:3000/flows/research-crew/agents
 Returns agent definitions including `name`, `goal`, `capabilities`, `tools`,
 `temperature`, and `model`.
 
+Both inspection routes run project discovery, file reads, Lua parsing, and VM
+construction outside Tokio's async worker pool. A dedicated process-local
+semaphore bounds their concurrency through `IRONCREW_MAX_ACTIVE_INSPECTIONS`
+(default `4`, hard ceiling `64`); saturation fails fast with `503`.
+
 ### List Built-in Tools
 
 ```bash

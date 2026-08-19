@@ -307,6 +307,7 @@ per-flow read grants.
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
 | `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | `256` | Bounds distinct conversation IDs with an in-flight lifecycle operation, preventing unbounded coordination-map growth (hard ceiling 4096). |
 | `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
+| `IRONCREW_MAX_ACTIVE_INSPECTIONS` | `4` | Max concurrent flow validation/agent-list inspections per process (hard ceiling 64). Exceeding returns 503. |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run and JSON/SQLite message retries cannot silently duplicate work. PostgreSQL conversation messages require a key regardless. |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | `86400` | Replay/tombstone retention; must exceed max run lifetime by at least one hour. |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | `8388608` | Per-key transient serialization and stored-response cap. Lower to 4 MiB for the 1 GiB baseline. |
@@ -420,6 +421,9 @@ have explicit per-service CPU/RAM limits and conservative application caps.
 - `IRONCREW_RATE_LIMIT_MS` — per-provider minimum interval between LLM calls (milliseconds). Use to stay within provider-side quotas.
 - `IRONCREW_DEFAULT_MAX_CONCURRENT` limits task parallelism inside each crew run; it is not a process-wide provider limit.
 - `IRONCREW_MAX_ACTIVE_RUNS` and `IRONCREW_MAX_ACTIVE_CONVERSATIONS` are process-wide admission limits for the HTTP server.
+- `IRONCREW_MAX_ACTIVE_INSPECTIONS` independently bounds concurrent flow
+  validation/agent-list requests (default `4`, hard ceiling `64`); saturation
+  fails fast with `503` while filesystem and parse work runs off Tokio workers.
 - `IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE` / `IRONCREW_ADMISSION_WORK_BURST`
   apply a per-principal token bucket before run and conversation-message work
   begins (defaults `60` / `10`).

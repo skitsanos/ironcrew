@@ -7,7 +7,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts check`.
 
 - Total findings: 40
-- Active findings: 6
+- Active findings: 5
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -41,7 +41,7 @@ priority, area, and title. The registry is generated with
 | [IC-026](./IC-026.md) | P2 | Resolved | Provider fidelity | Image attachments are silently dropped by the Responses provider |
 | [IC-027](./IC-027.md) | P2 | Resolved | Egress security | Secret-bearing custom headers survive cross-host redirects |
 | [IC-028](./IC-028.md) | P2 | Resolved | Configuration safety | Unknown Lua configuration keys are silently ignored |
-| [IC-029](./IC-029.md) | P2 | Open | Async discipline | Blocking filesystem and parse work runs on Tokio workers in several paths |
+| [IC-029](./IC-029.md) | P2 | Resolved | Async discipline | Blocking filesystem and parse work runs on Tokio workers in several paths |
 | [IC-030](./IC-030.md) | P2 | Resolved | Orchestration correctness | Foreach total failure does not gate dependent tasks |
 | [IC-031](./IC-031.md) | P2 | Resolved | API contract | Store failures are reported as 404 on run read and delete |
 | [IC-032](./IC-032.md) | P2 | Resolved | Release governance | Taskfile publish can overwrite signed release images |

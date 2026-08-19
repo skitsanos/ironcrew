@@ -1,4 +1,5 @@
 pub mod admission;
+mod admission_paths;
 pub mod audit;
 pub mod auth;
 pub mod conversation_lifecycle;
@@ -6,6 +7,7 @@ pub mod conversations;
 pub mod deployment;
 pub mod handlers;
 pub mod idempotency;
+mod inspection;
 pub mod lifecycle;
 mod metrics;
 mod resource_metrics;

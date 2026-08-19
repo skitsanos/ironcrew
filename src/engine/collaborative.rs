@@ -161,7 +161,6 @@ pub async fn execute_collaborative_task(
 
     let mut total_usage = UsageAccumulator::default();
 
-    // Build conversation history shared across all agents
     let mut conversation = Transcript::new(transcript_limit);
     conversation.push(task_name, "Task: ", task_description)?;
 
@@ -169,7 +168,6 @@ pub async fn execute_collaborative_task(
         conversation.push(task_name, "Context:\n", memory_context)?;
     }
 
-    // Add dependency results as context
     for (name, result) in completed_results {
         if result.success {
             let label = format!("Result from '{name}': ");

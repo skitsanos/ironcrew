@@ -176,9 +176,7 @@ fn strict_string_list(
     Ok(values)
 }
 
-// Re-export everything that was previously defined here so that existing
-// import paths (`crate::lua::api::…`) continue to work unchanged.
-// Some re-exports are only consumed by integration tests or downstream crates.
+// Preserve the established `crate::lua::api` import surface.
 #[allow(unused_imports)]
 pub use super::crew_userdata::LuaCrew;
 #[allow(unused_imports)]
@@ -188,10 +186,6 @@ pub use super::parsers::{
     LuaToolDef, agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files,
     task_from_lua_table, tool_def_from_lua_table,
 };
-
-// ---------------------------------------------------------------------------
-// Global registrations
-// ---------------------------------------------------------------------------
 
 /// Marker type — when set as app-data on a Lua VM, signals that the VM is
 /// being driven in chat REPL / HTTP conversation mode rather than the default
@@ -263,8 +257,11 @@ pub fn register_crew_constructor(
         lua.set_app_data(crate::lua::subflow::SubflowDepth(0));
     }
 
-    let new_fn = lua.create_function(move |lua, table: Table| {
+    let new_fn = lua.create_async_function(move |lua, table: Table| {
+        let agents = Arc::clone(&agents);
         let project_dir = (*project_dir).clone();
+        let runtime = Arc::clone(&runtime);
+        async move {
 
         // Shallow-merge defaults from config.lua (if present) into the user's
         // table. Only keys not already present are added — user values win.
@@ -583,7 +580,8 @@ pub fn register_crew_constructor(
         let memory = match memory_mode.as_str() {
             "persistent" => {
                 let memory_path = project_dir.join(".ironcrew").join("memory.json");
-                MemoryStore::persistent_with_config(memory_path, memory_config)
+                MemoryStore::persistent_with_config_async(memory_path, memory_config)
+                    .await
                     .map_err(mlua::Error::external)?
             }
             "ephemeral" => MemoryStore::ephemeral_with_config(memory_config),
@@ -707,6 +705,7 @@ pub fn register_crew_constructor(
 
         let ud = lua.create_userdata(lua_crew)?;
         Ok(mlua::Value::UserData(ud))
+        }
     })?;
 
     crew_table.set("new", new_fn)?;

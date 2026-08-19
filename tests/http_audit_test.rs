@@ -51,6 +51,8 @@ async fn spawn_test_server() -> SocketAddr {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_active_runs: 100,
         run_permits: Arc::new(tokio::sync::Semaphore::new(100)),
+        max_active_inspections: 100,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_sse_connections: 100,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_run_lifetime: std::time::Duration::from_secs(30 * 60),

@@ -101,6 +101,8 @@ async fn spawn_server(root: &Path) -> Server {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         max_active_runs: 2,
         run_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+        max_active_inspections: 2,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
         max_sse_connections: 2,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(2)),
         max_run_lifetime: Duration::from_secs(10),

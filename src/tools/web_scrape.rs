@@ -179,26 +179,50 @@ impl Tool for WebScrapeTool {
                 })?;
         let html = String::from_utf8_lossy(&html_bytes).into_owned();
 
-        let document = Html::parse_document(&html);
-        let body_selector = Selector::parse("body").unwrap();
-
-        let text = document
-            .select(&body_selector)
-            .flat_map(|el| el.text())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Truncate to avoid overwhelming LLM context (UTF-8 safe)
-        let truncated = if text.chars().count() > 10000 {
-            let s: String = text.chars().take(10000).collect();
-            format!("{}... [truncated]", s)
-        } else {
-            text
-        };
+        let truncated = tokio::task::spawn_blocking(move || extract_page_text(&html))
+            .await
+            .map_err(|error| IronCrewError::ToolExecution {
+                tool: "web_scrape".into(),
+                message: format!("HTML parsing worker failed: {error}"),
+            })?;
 
         Ok(truncated)
+    }
+}
+
+fn extract_page_text(html: &str) -> String {
+    let document = Html::parse_document(html);
+    let body_selector = Selector::parse("body").expect("static body selector is valid");
+    let text = document
+        .select(&body_selector)
+        .flat_map(|element| element.text())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if text.chars().count() > 10_000 {
+        format!(
+            "{}... [truncated]",
+            text.chars().take(10_000).collect::<String>()
+        )
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_page_text;
+
+    #[test]
+    fn extracts_normalized_body_text() {
+        assert_eq!(
+            extract_page_text(
+                "<html><head><title>skip</title></head><body>A <b>B</b>\n C</body></html>"
+            ),
+            "A B C"
+        );
     }
 }

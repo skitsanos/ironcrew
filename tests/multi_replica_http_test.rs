@@ -110,6 +110,8 @@ async fn spawn_replica(flows_dir: std::path::PathBuf, store: Arc<dyn StateStore>
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_active_runs: 4,
         run_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+        max_active_inspections: 4,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_sse_connections: 8,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         max_run_lifetime: Duration::from_secs(60),

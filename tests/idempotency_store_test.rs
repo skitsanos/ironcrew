@@ -1876,6 +1876,8 @@ async fn metrics_omit_persisted_principal_identifiers() {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_active_runs: 1,
         run_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_active_inspections: 1,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_sse_connections: 1,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_run_lifetime: std::time::Duration::from_secs(60),
