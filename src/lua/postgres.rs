@@ -3,17 +3,21 @@
 
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-#[allow(dead_code)] // wired in src/cli/project.rs (Task 9)
+// Each hint string is referenced from exactly one arm of the `#[cfg(feature =
+// "postgres")]` / `#[cfg(not(...))]` split in `setup_crew_runtime_inner`, so
+// it is genuinely unused under the *other* feature configuration's plain
+// `cargo build` (the unconditional unit test below covers STUB_UNCONFIGURED
+// under both configurations).
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub const STUB_UNCONFIGURED: &str =
     "postgres.* is not configured: set IRONCREW_APP_DATABASE_URL (see docs/postgres-app-data.md)";
-#[allow(dead_code)] // wired in src/cli/project.rs (Task 9)
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub const STUB_NO_FEATURE: &str =
     "postgres.* is unavailable: this binary was built without the 'postgres' cargo feature";
 
 /// Register a namespace whose every call fails with `reason`. Fail-closed but
 /// diagnosable: a flow calling postgres.* gets a configuration hint instead of
 /// a nil-index error.
-#[allow(dead_code)] // wired in src/cli/project.rs (Task 9)
 pub fn register_postgres_stub(lua: &Lua, reason: &'static str) -> LuaResult<()> {
     let table = lua.create_table()?;
     for method in ["execute", "query", "query_one"] {
@@ -28,7 +32,6 @@ pub fn register_postgres_stub(lua: &Lua, reason: &'static str) -> LuaResult<()> 
 }
 
 #[cfg(feature = "postgres")]
-#[allow(dead_code)] // wired in src/cli/project.rs (Task 9)
 pub fn register_postgres(
     lua: &Lua,
     app_db: std::sync::Arc<crate::engine::app_db::AppDb>,

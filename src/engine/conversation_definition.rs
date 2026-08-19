@@ -40,7 +40,6 @@ pub struct ConversationDefinition<'a> {
 /// Non-secret app-db description (`AppDb::definition()`), stored as Lua
 /// app-data by project setup and read back when a conversation is defined.
 #[derive(Clone)]
-#[allow(dead_code)] // set by src/cli/project.rs (Task 9)
 pub struct AppDbFingerprint(pub serde_json::Value);
 
 /// Hash all effective, non-secret inputs that define conversation behavior.
