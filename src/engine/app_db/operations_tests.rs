@@ -90,3 +90,12 @@ fn definition_lists_ops_sorted_with_digests() {
     assert!(ops[0]["digest"].as_str().unwrap().starts_with("sha256:"));
     assert_eq!(ops[0]["params"][0]["type"], "text");
 }
+
+#[test]
+fn duplicate_params_line_is_rejected_even_when_first_is_empty() {
+    let source = "-- ironcrew:op\n-- params:\n-- params: a text\nSELECT $1;\n";
+    let err = OperationRegistry::from_sources(vec![("x".into(), source.into())], &policy())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("duplicate '-- params:'"), "{err}");
+}
