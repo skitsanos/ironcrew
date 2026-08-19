@@ -61,8 +61,9 @@ impl Capture<'_> {
                 )));
             }
 
-            let is_lua = relative.extension().and_then(|value| value.to_str()) == Some("lua");
-            if is_lua {
+            let extension = relative.extension().and_then(|value| value.to_str());
+            let is_source = matches!(extension, Some("lua") | Some("sql"));
+            if is_source {
                 self.capture_lua(directory, &name, relative, display_path, &listed)?;
             } else if file_type.is_dir() {
                 if depth >= MAX_TREE_DEPTH {
@@ -90,7 +91,7 @@ impl Capture<'_> {
         }
         if self.files.len() >= MAX_LUA_FILES {
             return Err(validation(format!(
-                "flow tree exceeds the limit of {MAX_LUA_FILES} Lua files"
+                "flow tree exceeds the limit of {MAX_LUA_FILES} source files"
             )));
         }
         let bytes = read_lua_file(directory, name, &display_path, listed, self.file_limit)?;
