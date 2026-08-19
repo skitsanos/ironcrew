@@ -99,3 +99,16 @@ fn duplicate_params_line_is_rejected_even_when_first_is_empty() {
         .to_string();
     assert!(err.contains("duplicate '-- params:'"), "{err}");
 }
+
+#[tokio::test]
+async fn call_validation_rejects_unknown_op_and_wrong_arity() {
+    use super::AppDb;
+    let registry =
+        OperationRegistry::from_sources(vec![("save".into(), SAVE.into())], &policy()).unwrap();
+    let app = AppDb::new("postgres://invalid.invalid/x".into(), policy(), registry);
+    let err = app.execute("nope", &[]).await.unwrap_err().to_string();
+    assert!(err.contains("unknown postgres operation 'nope'"), "{err}");
+    // Wrong arity fails BEFORE any connection attempt (lazy pool untouched).
+    let err = app.execute("save", &[]).await.unwrap_err().to_string();
+    assert!(err.contains("expects 2 param(s), got 0"), "{err}");
+}
