@@ -46,3 +46,26 @@ fn unterminated_string_is_an_error() {
 fn empty_and_comment_only_input_yields_no_statements() {
     assert!(split_statements("  \n-- nothing\n").unwrap().is_empty());
 }
+
+#[test]
+fn block_comment_only_fragments_yield_no_statement() {
+    assert!(
+        split_statements("/* just a comment */;")
+            .unwrap()
+            .is_empty()
+    );
+    let parts = split_statements("SELECT 1; /* note */ SELECT 2;").unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts[1].sql.contains("SELECT 2"));
+}
+
+#[test]
+fn unterminated_block_comment_is_an_error() {
+    assert!(split_statements("SELECT 1; /* oops").is_err());
+}
+
+#[test]
+fn trailing_line_comment_without_newline_is_ok() {
+    let parts = split_statements("SELECT 1; -- done").unwrap();
+    assert_eq!(parts.len(), 1);
+}
