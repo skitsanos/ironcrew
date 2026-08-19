@@ -31,7 +31,16 @@ pub struct ConversationDefinition<'a> {
     /// Canonical hash of the effective, non-secret provider endpoint and
     /// provider-specific request options. Credentials are intentionally absent.
     pub provider_execution_fingerprint: &'a str,
+    /// Canonical app-database description (policy + operation digests) when
+    /// the postgres.* capability is configured. `None` contributes nothing,
+    /// keeping pre-capability fingerprints bit-identical.
+    pub app_db: Option<&'a serde_json::Value>,
 }
+
+/// Non-secret app-db description (`AppDb::definition()`), stored as Lua
+/// app-data by project setup and read back when a conversation is defined.
+#[derive(Clone)]
+pub struct AppDbFingerprint(pub serde_json::Value);
 
 /// Hash all effective, non-secret inputs that define conversation behavior.
 pub fn conversation_definition_fingerprint(input: &ConversationDefinition<'_>) -> Result<String> {
@@ -81,6 +90,10 @@ pub fn conversation_definition_fingerprint(input: &ConversationDefinition<'_>) -
         b"provider_execution_fingerprint",
         input.provider_execution_fingerprint.as_bytes(),
     );
+    if let Some(app_db) = input.app_db {
+        digest.field(b"app_db_encoding", b"canonical-json-v1");
+        digest.json(app_db);
+    }
     Ok(digest.finish())
 }
 

@@ -10,6 +10,7 @@ pub(crate) mod json_policy;
 pub mod limits;
 pub mod loader;
 pub mod parsers;
+pub mod postgres;
 pub mod require;
 pub mod sandbox;
 pub(crate) mod snapshot_require;

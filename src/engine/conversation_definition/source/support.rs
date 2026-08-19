@@ -46,7 +46,7 @@ pub(super) fn configured_file_limit() -> Result<usize> {
 
 pub(super) fn invalid_lua_path(path: &Path) -> IronCrewError {
     validation(format!(
-        "Lua source must be a regular file, not a symlink or special file: {}",
+        "flow source must be a regular file, not a symlink or special file: {}",
         path.display()
     ))
 }
@@ -60,7 +60,7 @@ pub(super) fn changed_path(path: &Path) -> IronCrewError {
 
 pub(super) fn source_too_large(path: &Path, limit: usize) -> IronCrewError {
     validation(format!(
-        "Lua source '{}' exceeds the configured limit of {} bytes",
+        "flow source '{}' exceeds the configured limit of {} bytes",
         path.display(),
         limit
     ))
