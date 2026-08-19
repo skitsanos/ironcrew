@@ -241,28 +241,8 @@ pub fn cmd_validate(path: &Path) -> Result<()> {
 }
 
 pub fn cmd_nodes() -> Result<()> {
-    // Create a temporary registry to get all built-in tools
-    let mut registry = crate::tools::registry::ToolRegistry::new();
-
-    // Register all built-in tools
-    registry.register(Box::new(crate::tools::file_read::FileReadTool::new(None)));
-    registry.register(Box::new(
-        crate::tools::file_read_glob::FileReadGlobTool::new(None),
-    ));
-    registry.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-        None, None,
-    )));
-    registry.register(Box::new(crate::tools::web_scrape::WebScrapeTool::new(None)));
-    registry.register(Box::new(crate::tools::shell::ShellTool::new()));
-    registry.register(Box::new(crate::tools::http_request::HttpRequestTool::new()));
-    registry.register(Box::new(crate::tools::hash::HashTool::new()));
-    registry.register(Box::new(
-        crate::tools::template_render::TemplateRenderTool::new(),
-    ));
-    registry.register(Box::new(
-        crate::tools::validate_schema::ValidateSchemaTool::new(),
-    ));
-    registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new()));
+    // Shared with `GET /nodes` so the two catalogs cannot drift.
+    let registry = crate::tools::builtin_tool_catalog();
 
     println!("Built-in tools ({}):", registry.list().len());
     println!();

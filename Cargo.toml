@@ -69,6 +69,9 @@ mcp = ["dep:bytes", "dep:rmcp", "dep:sse-stream"]
 [dev-dependencies]
 tempfile = "3.27.0"
 portable-pty = "0.9.0"
-# Used only by the gated `postgres_store_test` for setup/teardown against a live
-# database (the test itself is skipped unless IRONCREW_TEST_PG_URL is set).
+# Used by the `postgres`-gated integration tests (`postgres_store_test`,
+# `multi_replica_http_test`, `two_process_replica_acceptance` and its phase
+# modules) for setup/teardown against a live database. Those tests are skipped
+# unless IRONCREW_TEST_PG_URL is set. Declared unconditionally so the gated
+# suites still compile when the `postgres` feature is toggled off.
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }

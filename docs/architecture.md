@@ -302,7 +302,7 @@ message bus. JSON is the only transfer medium between VMs.
 ### Server-wide Store Singleton
 
 `ironcrew serve` bootstraps a single `Arc<dyn StateStore>` at startup
-(`cmd_serve` in `src/api/mod.rs`) and hands the same handle to every
+(`cmd_serve` in `src/cli/server.rs`) and hands the same handle to every
 request via `AppState.store`. This keeps Postgres migrations and table
 checks one-shot, shares a single connection pool across conversations and
 runs, and ensures all handlers see a consistent view of persisted state.

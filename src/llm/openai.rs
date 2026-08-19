@@ -28,7 +28,9 @@ impl RateLimiter {
         Self {
             min_interval: Duration::from_millis(min_interval_ms),
             last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(std::time::Instant::now),
             )),
         }
     }

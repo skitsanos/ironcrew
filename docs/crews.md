@@ -70,6 +70,14 @@ capped at 4096 bytes; model-route values use the 1024-byte model-name cap.
 Lists must be dense arrays without duplicates. Invalid values fail crew
 construction rather than being silently ignored.
 
+**Unknown keys are rejected.** `Crew.new`, agent tables, and task tables each
+accept a closed set of options. An unrecognized key fails construction with a
+message naming the offending key and listing the supported ones. This is
+deliberate: a silently ignored typo in `require_approval` would disable the
+approval gate without any signal, and a typo in `depends_on` would drop a task
+dependency. Options from a provider you are not using (for example
+`thinking_budget` on OpenAI) are still accepted and simply unused.
+
 ---
 
 ## Project Defaults: `config.lua`

@@ -8,7 +8,11 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| — | — | — | — | No active findings |
+| [IC-029](docs/issues/IC-029.md) | P2 | Open | Async discipline | Blocking filesystem and parse work runs on Tokio workers in several paths |
+| [IC-033](docs/issues/IC-033.md) | P2 | Open | Provider robustness | Provider request timeout is a fixed 120s total deadline |
+| [IC-035](docs/issues/IC-035.md) | P3 | Open | Failure visibility | Silent degradation on malformed tool arguments and failed hooks |
+| [IC-036](docs/issues/IC-036.md) | P3 | Open | API hardening | Residual HTTP hardening gaps in proxy trust, timeouts, CORS, and audit coverage |
+| [IC-037](docs/issues/IC-037.md) | P3 | Open | Provider maintainability | Provider scaffolding is triplicated and RateLimiter::new can panic |
 
 ## Working agreement
 

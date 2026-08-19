@@ -519,7 +519,7 @@ pub async fn run_crew(
                 let after_hook = crew.after_task_hooks.get(&agent.name).map(|v| v.as_slice());
 
                 let task_observation = crate::engine::task_observation::TaskObservation::start();
-                let foreach_result = match execute_foreach_task(
+                let foreach_outcome = match execute_foreach_task(
                     task,
                     agent,
                     provider.as_ref(),
@@ -544,6 +544,9 @@ pub async fn run_crew(
                     }
                 };
 
+                let foreach_wholly_failed = foreach_outcome.is_wholly_failed();
+                let foreach_result = foreach_outcome.result;
+
                 // The foreach executor leaves the agent empty only for its two
                 // explicit skip paths (missing/non-array input and empty input).
                 // Do not derive metric semantics from human-readable output.
@@ -558,17 +561,25 @@ pub async fn run_crew(
                     });
                 }
 
-                if !foreach_result.success && foreach_skipped {
+                // A foreach fails the task when its source was unusable, or
+                // when every item it ran errored — in both cases dependents
+                // would execute with no usable input, so gate them the same
+                // way a failed standard task does.
+                if !foreach_result.success && (foreach_skipped || foreach_wholly_failed) {
                     crew.eventbus.emit(CrewEvent::TaskFailed {
                         task: task.name.clone(),
                         agent: agent.name.clone(),
                         error: foreach_result.output.clone(),
                         duration_ms: foreach_result.duration_ms,
                     });
-                    tracing::warn!(
-                        "foreach source for task '{}' is not an array, skipping",
-                        task.name
-                    );
+                    if foreach_skipped {
+                        tracing::warn!(
+                            "foreach source for task '{}' is not an array, skipping",
+                            task.name
+                        );
+                    } else {
+                        tracing::warn!("every item of foreach task '{}' failed", task.name);
+                    }
                     failed_tasks.insert(task.name.clone());
                 } else {
                     crew.eventbus.emit(CrewEvent::TaskCompleted {
@@ -920,9 +931,20 @@ pub async fn run_crew(
                     "agent": result.agent,
                     "duration_ms": result.duration_ms,
                 });
-                crew.memory
-                    .set(format!("task:{}", task_name), value)
-                    .await?;
+                // Best-effort: a task that already produced output within the
+                // task-result cap must not fail the run because the value
+                // exceeds the (smaller) memory value cap. Report instead.
+                if let Err(e) = crew.memory.set(format!("task:{}", task_name), value).await {
+                    tracing::warn!(
+                        "Task '{}' result was not stored in memory: {}",
+                        task_name,
+                        e
+                    );
+                    crew.eventbus.emit(CrewEvent::Log {
+                        level: "warn".into(),
+                        message: format!("Task '{task_name}' result not stored in memory: {e}"),
+                    });
+                }
             }
         }
     }
@@ -973,86 +995,4 @@ pub async fn run_crew(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{RetainedResultBudget, serialized_result_bytes};
-    use crate::engine::task::TaskResult;
-    use std::collections::HashMap;
-
-    fn result(task: &str, output: &str, reasoning: Option<&str>) -> TaskResult {
-        TaskResult {
-            task: task.into(),
-            agent: "agent".into(),
-            output: output.into(),
-            success: true,
-            duration_ms: 1,
-            token_usage: None,
-            reasoning: reasoning.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn retained_result_budget_rejects_large_output_and_reasoning() {
-        let mut results = HashMap::new();
-        let mut budget = RetainedResultBudget {
-            max_output_bytes: 3,
-            max_reasoning_bytes: 2,
-            max_total_bytes: 1024,
-            total_bytes: 0,
-        };
-
-        let output_error = budget
-            .insert(&mut results, "one".into(), result("one", "four", None))
-            .unwrap_err()
-            .to_string();
-        assert!(output_error.contains("IRONCREW_TASK_RESULT_MAX_OUTPUT_BYTES"));
-        assert!(results.is_empty());
-
-        let reasoning_error = budget
-            .insert(
-                &mut results,
-                "one".into(),
-                result("one", "ok", Some("long")),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(reasoning_error.contains("IRONCREW_TASK_RESULT_MAX_REASONING_BYTES"));
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn retained_result_budget_counts_serialized_bytes_and_replacements() {
-        let first = result("one", "line\nwith escaping", None);
-        let first_bytes = serialized_result_bytes(&first).unwrap();
-        let replacement = result("one", "x", None);
-        let replacement_bytes = serialized_result_bytes(&replacement).unwrap();
-        let second = result("two", "y", None);
-        let second_bytes = serialized_result_bytes(&second).unwrap();
-        let mut results = HashMap::new();
-        let mut budget = RetainedResultBudget {
-            max_output_bytes: 1024,
-            max_reasoning_bytes: 1024,
-            max_total_bytes: first_bytes - 1,
-            total_bytes: 0,
-        };
-
-        budget
-            .insert(&mut results, "one".into(), first)
-            .unwrap_err();
-        assert!(results.is_empty());
-
-        budget.max_total_bytes = replacement_bytes + second_bytes;
-        budget
-            .insert(&mut results, "one".into(), replacement)
-            .unwrap();
-        budget.insert(&mut results, "two".into(), second).unwrap();
-        assert_eq!(budget.total_bytes, replacement_bytes + second_bytes);
-
-        let larger_replacement = result("one", "this no longer fits", None);
-        let error = budget
-            .insert(&mut results, "one".into(), larger_replacement)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("IRONCREW_RUN_RESULTS_MAX_BYTES"));
-        assert_eq!(results["one"].output, "x");
-    }
-}
+mod tests;

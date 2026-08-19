@@ -279,6 +279,11 @@ pub fn register_crew_constructor(
             }
         }
 
+        crate::lua::parsers::reject_unknown_keys(
+            &table,
+            crate::lua::parsers::CREW_KEYS,
+            "Crew.new",
+        )?;
         let goal: String = table.get("goal")?;
         let provider = table
             .get::<Option<String>>("provider")?
