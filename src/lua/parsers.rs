@@ -13,6 +13,8 @@ use crate::utils::error::{IronCrewError, Result};
 
 use super::json::lua_table_to_json;
 
+pub(crate) mod option_keys;
+
 const MAX_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_NAME_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
@@ -21,11 +23,9 @@ const MAX_LIST_ITEM_BYTES: usize = 256;
 const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_AGENT_TOKENS: u32 = 1_000_000;
-
 fn validation_error(message: impl Into<String>) -> mlua::Error {
     mlua::Error::external(IronCrewError::Validation(message.into()))
 }
-
 /// Reject configuration keys the runtime does not read.
 ///
 /// Every option table here is a closed set. Ignoring an unrecognized key makes

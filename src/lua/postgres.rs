@@ -22,9 +22,15 @@ pub const STUB_SUBFLOW: &str = "postgres.* is not available inside run_flow sub-
 pub fn register_postgres_stub(lua: &Lua, reason: &'static str) -> LuaResult<()> {
     let table = lua.create_table()?;
     for method in ["execute", "query", "query_one"] {
+        let capability = match method {
+            "execute" => "postgres.execute",
+            "query" => "postgres.query",
+            _ => "postgres.query_one",
+        };
         table.set(
             method,
-            lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<()> {
+            lua.create_function(move |lua, _: mlua::MultiValue| -> LuaResult<()> {
+                crate::lua::bootstrap::reject_effect(lua, capability)?;
                 Err(mlua::Error::external(reason))
             })?,
         )?;
@@ -82,6 +88,11 @@ fn params_for(
     }
     let mut values = Vec::with_capacity(operation.params.len());
     for (param, _) in &operation.params {
+        if !table.contains_key(param.as_str())? {
+            return Err(mlua::Error::external(format!(
+                "postgres operation '{name}': missing declared param '{param}'"
+            )));
+        }
         let value: Value = table.get(param.as_str())?;
         let json = lua_value_to_json(value)
             .map_err(|e| mlua::Error::external(format!("param '{param}': {e}")))?;
@@ -111,9 +122,10 @@ pub fn register_postgres(
     let db = app_db.clone();
     table.set(
         "execute",
-        lua.create_async_function(move |_, (name, params): (String, Option<Table>)| {
+        lua.create_async_function(move |lua, (name, params): (String, Option<Table>)| {
             let db = db.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "postgres.execute")?;
                 let values = params_for(&db, &name, params)?;
                 let affected = db
                     .execute(&name, &values)
@@ -133,6 +145,7 @@ pub fn register_postgres(
         lua.create_async_function(move |lua, (name, params): (String, Option<Table>)| {
             let db = db.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "postgres.query")?;
                 let values = params_for(&db, &name, params)?;
                 let rows = db
                     .query(&name, &values)
@@ -149,6 +162,7 @@ pub fn register_postgres(
         lua.create_async_function(move |lua, (name, params): (String, Option<Table>)| {
             let db = db.clone();
             async move {
+                crate::lua::bootstrap::reject_effect(&lua, "postgres.query_one")?;
                 let values = params_for(&db, &name, params)?;
                 match db
                     .query_one(&name, &values)
@@ -166,122 +180,5 @@ pub fn register_postgres(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use mlua::Value;
-
-    #[test]
-    fn stub_calls_fail_with_the_configuration_hint() {
-        let lua = Lua::new();
-        register_postgres_stub(&lua, STUB_UNCONFIGURED).unwrap();
-        let error = lua
-            .load("return postgres.query('anything')")
-            .eval::<Value>()
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("IRONCREW_APP_DATABASE_URL"), "{error}");
-    }
-
-    #[test]
-    fn tool_vm_has_no_postgres_namespace() {
-        let lua = crate::lua::sandbox::create_tool_lua().unwrap();
-        let value: Value = lua.globals().get("postgres").unwrap();
-        assert!(
-            matches!(value, Value::Nil),
-            "tool sandbox must not see postgres.*"
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    mod params_for_validation {
-        use super::super::params_for;
-        use crate::engine::app_db::{AppDb, operations::OperationRegistry, policy::AppDbPolicy};
-        use mlua::{Lua, Table};
-
-        fn fixture(max_param_bytes: u64) -> AppDb {
-            let policy =
-                AppDbPolicy::from_values(4, 5_000, 500, 1 << 20, max_param_bytes, 64, 64 * 1024);
-            let sources = vec![
-                (
-                    "save".to_string(),
-                    "-- ironcrew:op\n-- params: run_id text, payload json\nSELECT $1, $2;\n"
-                        .to_string(),
-                ),
-                (
-                    "count".to_string(),
-                    "-- ironcrew:op\nSELECT 1;\n".to_string(),
-                ),
-            ];
-            let registry = OperationRegistry::from_sources(sources, &policy).unwrap();
-            // The URL is never dialed: params_for validates before any connection.
-            AppDb::new("postgres://invalid.invalid/x".into(), policy, registry)
-        }
-
-        fn lua_table(lua: &Lua, entries: &[(&str, &str)]) -> Table {
-            let table = lua.create_table().unwrap();
-            for (key, value) in entries {
-                table.set(*key, *value).unwrap();
-            }
-            table
-        }
-
-        #[test]
-        fn unknown_param_error_lists_declared_params() {
-            let lua = Lua::new();
-            let app = fixture(1 << 20);
-            let table = lua_table(&lua, &[("run_id", "x"), ("bogus", "y")]);
-            let error = params_for(&app, "save", Some(table))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("'bogus'"), "{error}");
-            assert!(error.contains("run_id, payload"), "{error}");
-        }
-
-        #[test]
-        fn zero_param_op_unknown_key_says_none() {
-            let lua = Lua::new();
-            let app = fixture(1 << 20);
-            let table = lua_table(&lua, &[("stray", "y")]);
-            let error = params_for(&app, "count", Some(table))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("Declared params: none"), "{error}");
-        }
-
-        #[test]
-        fn non_string_keys_are_rejected() {
-            let lua = Lua::new();
-            let app = fixture(1 << 20);
-            let table = lua.create_table().unwrap();
-            table.set(1, "positional").unwrap();
-            let error = params_for(&app, "save", Some(table))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("string keys"), "{error}");
-        }
-
-        #[test]
-        fn omitted_declared_param_passes_through_as_null() {
-            let lua = Lua::new();
-            let app = fixture(1 << 20);
-            let table = lua_table(&lua, &[("run_id", "x")]);
-            let values = params_for(&app, "save", Some(table)).unwrap();
-            assert_eq!(values[0], serde_json::json!("x"));
-            assert!(values[1].is_null(), "omitted param must bind as SQL NULL");
-        }
-
-        #[test]
-        fn per_param_byte_budget_is_enforced() {
-            let lua = Lua::new();
-            let app = fixture(8);
-            let table = lua_table(
-                &lua,
-                &[("run_id", "this string serializes past eight bytes")],
-            );
-            let error = params_for(&app, "save", Some(table))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("IRONCREW_APP_DB_MAX_PARAM_BYTES"), "{error}");
-        }
-    }
-}
+#[path = "postgres_tests.rs"]
+mod tests;

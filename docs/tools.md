@@ -536,7 +536,7 @@ IronCrew exposes Lua globals in two distinct sandboxes:
 
 | Sandbox | Where it runs | What's available |
 |---------|---------------|------------------|
-| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, `require` (shared modules from `_lib/`), and the `postgres` namespace (named app-data operations — see [docs/postgres-app-data.md](postgres-app-data.md)) |
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, and `require` (shared modules from `_lib/`). Async `crew.lua` execution also receives `postgres` named app-data operations; effectful calls are rejected while declarative `config.lua` is evaluated. See [docs/postgres-app-data.md](postgres-app-data.md). |
 | **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access, the `http` namespace, and `run_flow` — but **no `require`** |
 
 > **Network access:** custom Lua tools can call `http.*`. Requests are governed
@@ -735,9 +735,10 @@ avoid recompilation.
 
 ### HTTP Namespace (crew sandbox only)
 
-Async HTTP client available in `crew.lua`, `config.lua`, and agent definitions.
-**Not available in custom tool execute functions.** All methods return a
-response table. Uses a shared connection pool (singleton `reqwest::Client`).
+Async HTTP client available during `crew.lua` execution and agent definitions.
+HTTP calls are rejected while declarative `config.lua` is evaluated and are
+not available in custom tool execute functions. All methods return a response
+table. Uses a shared connection pool (singleton `reqwest::Client`).
 
 **Security:** All `http.*` calls enforce SSRF protection — requests to
 private/internal IPs are blocked at DNS resolution, connection, and redirect

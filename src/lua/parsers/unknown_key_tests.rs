@@ -2,6 +2,7 @@
 
 use mlua::{Lua, Table};
 
+use super::option_keys::{CONVERSATION_KEYS, DIALOG_KEYS};
 use super::{AGENT_KEYS, agent_from_lua_table, reject_unknown_keys, task_from_lua_table};
 
 fn base_agent(lua: &Lua) -> Table {
@@ -82,4 +83,26 @@ fn unknown_key_check_ignores_array_parts_and_internal_keys() {
 
     reject_unknown_keys(&table, AGENT_KEYS, "agent")
         .expect("array parts and internal keys are not author options");
+}
+
+#[test]
+fn conversation_and_dialog_tables_are_closed_sets() {
+    let lua = Lua::new();
+    let conversation = lua.create_table().unwrap();
+    conversation.set("agent", "writer").unwrap();
+    conversation.set("max_hstory", 10).unwrap();
+    let error = reject_unknown_keys(&conversation, CONVERSATION_KEYS, "Conversation")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("max_hstory"), "{error}");
+    assert!(error.contains("max_history"), "{error}");
+
+    let dialog = lua.create_table().unwrap();
+    dialog.set("agents", lua.create_table().unwrap()).unwrap();
+    dialog.set("starting_speker", "a").unwrap();
+    let error = reject_unknown_keys(&dialog, DIALOG_KEYS, "Dialog")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("starting_speker"), "{error}");
+    assert!(error.contains("starting_speaker"), "{error}");
 }

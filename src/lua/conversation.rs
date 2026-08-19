@@ -8,8 +8,7 @@
 //! The userdata is a thin handle around an `Arc<LuaConversationInner>`. All
 //! state and behavior lives on the inner type; the outer struct only exists
 //! so callers outside the Lua boundary (HTTP handlers, CLI `chat` REPL) can
-//! grab a clone of the `Arc` and call `run_turn().await` directly without
-//! bouncing back through the Lua VM.
+//! grab the `Arc` and call `run_turn().await` without a Lua VM round-trip.
 
 use std::sync::Arc;
 
@@ -845,6 +844,7 @@ pub async fn build_conversation(
     project_dir: std::path::PathBuf,
     http_client: reqwest::Client,
 ) -> mlua::Result<LuaConversation> {
+    crate::lua::parsers::option_keys::reject_conversation_keys(&table)?;
     // Resolve agent: either by name or inline (Agent table)
     let agent_value: Value = table.get("agent")?;
     let agent: Agent = match agent_value {

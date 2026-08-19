@@ -119,9 +119,10 @@ local crew = Crew.new({
   `server_tools`, `web_search_max_uses`, `reasoning_effort`, `reasoning_summary`,
   `web_search_context_size`, `file_search_vector_store_ids`,
   `file_search_max_results`
-- **Lua-powered** — config.lua runs in the same sandbox as crew.lua, so it can
-  call `env()`, `now_rfc3339()`, etc. (sensitive env vars are blocked, same as
-  crew.lua)
+- **Lua-powered but declarative** — config.lua can call non-effectful helpers
+  such as `env()` and `now_rfc3339()` (with the normal sensitive-env boundary),
+  but network, filesystem, sub-flow, PostgreSQL, and Crew execution effects are
+  rejected while the defaults table is constructed
 
 This keeps `crew.lua` focused on the workflow (goal, agents, tasks) while
 provider/model/limits move to a single project-wide file. Useful for switching

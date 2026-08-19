@@ -24,7 +24,7 @@ don't.
 |---|---|
 | Operator | Grants the capability by setting `IRONCREW_APP_DATABASE_URL` — a URL separate from `DATABASE_URL` (the internal `StateStore`'s PostgreSQL connection string). No URL → every `postgres.*` call fails with a clear "capability not configured" error. The URL is not readable from Lua by default; like every environment value, it becomes readable only if the operator explicitly lists it in `IRONCREW_ENV_ALLOWLIST` — never allowlist `IRONCREW_APP_DATABASE_URL` (or `DATABASE_URL`). The recommended deployment uses a dedicated role with minimal `GRANT`s on a dedicated schema. |
 | Flow author | Declares operations as SQL files in the project (`sql/*.sql`). They control the SQL, so their ceiling is whatever the database role permits. Named operations give reviewability and fingerprintability, not author containment. |
-| Agent | No access in v1. The `postgres` namespace registers only in the crew sandbox (`crew.lua` / `config.lua`), never in the tool VM used by `tools/*.lua`. A follow-up may add an agent-facing tool wrapper gated on an explicit per-operation allowlist plus `require_approval` support. |
+| Agent | No access in v1. The `postgres` namespace registers only in the crew sandbox during `crew.lua` execution, never in `config.lua` or the tool VM used by `tools/*.lua`. A follow-up may add an agent-facing tool wrapper gated on an explicit per-operation allowlist plus `require_approval` support. |
 
 If you need to keep flow authors from doing something the database role would
 otherwise allow, restrict the role's `GRANT`s — not the operation names.
@@ -100,9 +100,10 @@ table looks just like `json_parse()` output. Errors surface as ordinary Lua
 errors carrying the operation name and the PostgreSQL error message — never
 the connection URL, never the full SQL text.
 
-`postgres.*` is available in `crew.lua` and `config.lua` (the same sandbox
-IronCrew calls the "crew sandbox" elsewhere in these docs) and is **not**
-available inside `tools/*.lua`'s `execute` function. See
+`postgres.*` is available during asynchronous `crew.lua` execution. `config.lua`
+is a declarative defaults table: all effectful capabilities, including
+`postgres.*`, fail before physical work while it is evaluated. The namespace is
+also **not** available inside `tools/*.lua`'s `execute` function. See
 [Sub-flow limitation](#sub-flow-limitation-run_flow) below for the one other
 place it is deliberately absent.
 

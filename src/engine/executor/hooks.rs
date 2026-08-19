@@ -1,39 +1,25 @@
-use std::cell::RefCell;
-
 use crate::lua::limits::{LuaExecutionGuard, LuaLimits};
 use crate::lua::sandbox::{create_eval_lua, fresh_eval_environment};
 
-// Thread-local Lua VM reused for hook execution to avoid per-call allocation.
-// Hook bytecode is flow-supplied, so the VM is sandboxed like the crew VM and
-// every call runs in a fresh environment (see `load_hook`).
-thread_local! {
-    static HOOK_LUA: RefCell<Option<std::result::Result<mlua::Lua, String>>> =
-        const { RefCell::new(None) };
-}
-
 fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
-    HOOK_LUA.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let initialized = slot.get_or_insert_with(|| {
-            let limits = LuaLimits::from_env().map_err(|error| error.to_string())?;
-            create_eval_lua(limits).map_err(|error| error.to_string())
-        });
-        let lua = match initialized {
-            Ok(lua) => lua,
-            Err(error) => {
-                tracing::error!(%error, "Hook Lua VM could not be initialized");
-                return fallback;
-            }
-        };
-        let _execution = match LuaExecutionGuard::begin(lua) {
-            Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Hook Lua execution could not start");
-                return fallback;
-            }
-        };
-        operation(lua)
-    })
+    let lua = match LuaLimits::from_env()
+        .map_err(|error| error.to_string())
+        .and_then(|limits| create_eval_lua(limits).map_err(|error| error.to_string()))
+    {
+        Ok(lua) => lua,
+        Err(error) => {
+            tracing::error!(%error, "Hook Lua VM could not be initialized");
+            return fallback;
+        }
+    };
+    let _execution = match LuaExecutionGuard::begin(&lua) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "Hook Lua execution could not start");
+            return fallback;
+        }
+    };
+    operation(&lua)
 }
 
 /// Load hook bytecode into a fresh per-call environment so one hook cannot
@@ -166,6 +152,18 @@ mod tests {
             run_before("return smuggled or 'absent'"),
             "absent",
             "a hook observed a global left by an earlier hook"
+        );
+    }
+
+    #[test]
+    fn hook_shared_global_escape_hatches_do_not_leak() {
+        assert_eq!(
+            run_before("_G.smuggled = 'secret'; os.smuggled = true; return 'first'"),
+            "first"
+        );
+        assert_eq!(
+            run_before("return (_G.smuggled or os.smuggled) and 'leaked' or 'absent'"),
+            "absent"
         );
     }
 

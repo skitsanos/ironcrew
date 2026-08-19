@@ -127,6 +127,30 @@ fn json_schema_response_format_forces_a_schema_tool() {
 }
 
 #[test]
+fn json_schema_allows_real_tools_before_structured_finalization() {
+    let provider = AnthropicProvider::new("k".into(), None, AnthropicConfig::default());
+    let tools = vec![ToolSchema {
+        name: "search".into(),
+        description: "Search for evidence".into(),
+        parameters: json!({"type": "object"}),
+    }];
+    let body = provider.build_body(&schema_request(None), Some(&tools));
+
+    assert!(
+        body.get("tool_choice").is_none(),
+        "forcing the schema tool would prevent the real tool from running"
+    );
+    let names = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"search"));
+    assert!(names.contains(&"verdict"));
+}
+
+#[test]
 fn forced_schema_tool_call_is_returned_as_content_not_a_tool_call() {
     let resp = json!({
         "content": [
@@ -157,4 +181,29 @@ fn real_tool_calls_still_surface_alongside_structured_output() {
     assert_eq!(parsed.tool_calls.len(), 1);
     assert_eq!(parsed.tool_calls[0].function.name, "search");
     assert!(parsed.content.unwrap().contains("false"));
+}
+
+#[test]
+fn real_tool_call_without_schema_output_is_a_valid_intermediate_turn() {
+    let resp = json!({
+        "content": [
+            {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "x"}}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let parsed = parse_anthropic_response(&resp, Some("verdict")).unwrap();
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert!(parsed.content.is_none());
+}
+
+#[test]
+fn prose_cannot_satisfy_a_required_schema_output() {
+    let resp = json!({
+        "content": [{"type": "text", "text": "not structured"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let error = parse_anthropic_response(&resp, Some("verdict"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("required structured-output tool"), "{error}");
 }
