@@ -119,14 +119,20 @@ impl FlowSourceSnapshot {
         Ok(sources)
     }
 
-    /// Stem + source for every captured `sql/*.sql` file, in path order.
+    /// Stem + source for every captured `sql/*.sql` file that is a *direct*
+    /// child of `sql/`, in path order. Flat by design, matching the
+    /// non-recursive filesystem discovery in `read_sql_dir` and the "one
+    /// file per operation under sql/" docs contract — nested files like
+    /// `sql/sub/x.sql` do not qualify (though they still participate in the
+    /// recursive fingerprint capture in `unix.rs`).
     // only called from the postgres-gated wiring
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub fn sql_sources(&self) -> Vec<(String, Arc<str>)> {
         self.files
             .iter()
             .filter(|(path, _)| {
-                path.starts_with("sql") && path.extension().and_then(|e| e.to_str()) == Some("sql")
+                path.parent() == Some(Path::new("sql"))
+                    && path.extension().and_then(|e| e.to_str()) == Some("sql")
             })
             .filter_map(|(path, source)| {
                 path.file_stem()

@@ -22,7 +22,7 @@ don't.
 
 | Actor | Boundary |
 |---|---|
-| Operator | Grants the capability by setting `IRONCREW_APP_DATABASE_URL` — a URL separate from `DATABASE_URL` (the internal `StateStore`'s PostgreSQL connection string). No URL → every `postgres.*` call fails with a clear "capability not configured" error. The URL is never readable through `env()` or any other Lua path. The recommended deployment uses a dedicated role with minimal `GRANT`s on a dedicated schema. |
+| Operator | Grants the capability by setting `IRONCREW_APP_DATABASE_URL` — a URL separate from `DATABASE_URL` (the internal `StateStore`'s PostgreSQL connection string). No URL → every `postgres.*` call fails with a clear "capability not configured" error. The URL is not readable from Lua by default; like every environment value, it becomes readable only if the operator explicitly lists it in `IRONCREW_ENV_ALLOWLIST` — never allowlist `IRONCREW_APP_DATABASE_URL` (or `DATABASE_URL`). The recommended deployment uses a dedicated role with minimal `GRANT`s on a dedicated schema. |
 | Flow author | Declares operations as SQL files in the project (`sql/*.sql`). They control the SQL, so their ceiling is whatever the database role permits. Named operations give reviewability and fingerprintability, not author containment. |
 | Agent | No access in v1. The `postgres` namespace registers only in the crew sandbox (`crew.lua` / `config.lua`), never in the tool VM used by `tools/*.lua`. A follow-up may add an agent-facing tool wrapper gated on an explicit per-operation allowlist plus `require_approval` support. |
 

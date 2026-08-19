@@ -1,7 +1,7 @@
 //! `postgres.*` — flow-facing named-operation access to the app database.
 //! Crew sandbox only; the tool VM never receives this namespace.
 
-use mlua::{Lua, Result as LuaResult, Table, Value};
+use mlua::{Lua, Result as LuaResult};
 
 // Each hint string is referenced from exactly one arm of the `#[cfg(feature =
 // "postgres")]` / `#[cfg(not(...))]` split in `setup_crew_runtime_inner`, so
@@ -38,6 +38,7 @@ pub fn register_postgres(
     app_db: std::sync::Arc<crate::engine::app_db::AppDb>,
 ) -> LuaResult<()> {
     use crate::lua::json::{json_value_to_lua, lua_value_to_json};
+    use mlua::{Table, Value};
 
     fn params_for(
         app_db: &crate::engine::app_db::AppDb,
@@ -153,6 +154,7 @@ pub fn register_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua::Value;
 
     #[test]
     fn stub_calls_fail_with_the_configuration_hint() {

@@ -705,7 +705,7 @@ formula and minimum-TTL example.
 
 | Variable | Description |
 |---|---|
-| `IRONCREW_APP_DATABASE_URL` | Dedicated app-data PostgreSQL URL for the `postgres.*` Lua namespace; separate from `DATABASE_URL` (the internal `StateStore`'s connection string). Never readable from Lua. Unset → `postgres.*` calls fail with a configuration hint |
+| `IRONCREW_APP_DATABASE_URL` | Dedicated app-data PostgreSQL URL for the `postgres.*` Lua namespace; separate from `DATABASE_URL` (the internal `StateStore`'s connection string). Not readable from Lua by default; becomes readable only if explicitly listed in `IRONCREW_ENV_ALLOWLIST` — never allowlist it (or `DATABASE_URL`). Unset → `postgres.*` calls fail with a configuration hint |
 | `IRONCREW_APP_DB_MAX_CONNECTIONS` | Pool size for the app-data database (default: `4`; hard ceiling: `32`) |
 | `IRONCREW_APP_DB_STATEMENT_TIMEOUT_MS` | Server-side `statement_timeout` set for each app-data transaction (default: `5000`; hard ceiling: `60000`) |
 | `IRONCREW_APP_DB_MAX_ROWS` | Maximum rows returned by one `postgres.query` call (default: `500`; hard ceiling: `10000`) |

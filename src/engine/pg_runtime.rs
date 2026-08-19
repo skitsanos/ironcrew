@@ -127,5 +127,11 @@ mod tests {
             retry_backoff(64, 1_000, 30_000),
             Duration::from_millis(30_000)
         );
+        // Attempt count large enough that `checked_shl` overflows (shift
+        // amount >= 64) and falls back to `u64::MAX`; the cap must still win.
+        assert_eq!(
+            retry_backoff(1_000, 1_000, 30_000),
+            Duration::from_millis(30_000)
+        );
     }
 }

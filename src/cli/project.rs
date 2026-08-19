@@ -114,46 +114,13 @@ fn setup_crew_runtime_inner(
             .map_err(IronCrewError::Lua)?;
     }
 
-    // Optionally load config.lua and store the resulting table as a Lua global.
-    // Crew.new() will shallow-merge missing keys from this table at call time.
-    let snapshot_config = snapshot
-        .as_ref()
-        .and_then(|(_, roles)| roles.config.as_ref());
-    let live_config = snapshot
-        .is_none()
-        .then(|| loader.config_lua_path())
-        .flatten();
-    if snapshot_config.is_some() || live_config.is_some() {
-        let cfg_path = snapshot_config
-            .map(|source| source.relative_path().to_path_buf())
-            .or(live_config)
-            .expect("checked config source");
-        let content = match snapshot_config {
-            Some(source) => source.shared_source(),
-            None => Arc::from(crate::lua::source::read_lua_source(&cfg_path)?),
-        };
-        let table: mlua::Table = {
-            let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
-            lua.load(content.as_ref())
-                .set_name(format!("config:{}", cfg_path.display()))
-                .eval()
-                .map_err(|e| {
-                    IronCrewError::Validation(format!(
-                        "config.lua at {} must return a table: {}",
-                        cfg_path.display(),
-                        e
-                    ))
-                })?
-        };
-        lua.globals()
-            .set("__ironcrew_config_defaults", table)
-            .map_err(IronCrewError::Lua)?;
-        tracing::info!("Loaded config.lua from {}", cfg_path.display());
-    }
-
     // postgres.* capability: live database when IRONCREW_APP_DATABASE_URL is
     // set (feature-gated), fail-closed stub otherwise so a flow calling
     // postgres.* always gets a diagnosable error instead of a nil index.
+    // Must run BEFORE config.lua evaluation below: docs promise `postgres.*`
+    // is available from config.lua too, and config.lua touching it before
+    // this block was registered would nil-index instead of getting the
+    // diagnosable stub error.
     #[cfg(feature = "postgres")]
     {
         use crate::engine::app_db::{AppDb, operations, policy::AppDbPolicy};
@@ -194,6 +161,43 @@ fn setup_crew_runtime_inner(
         }
         crate::lua::postgres::register_postgres_stub(&lua, crate::lua::postgres::STUB_NO_FEATURE)
             .map_err(IronCrewError::Lua)?;
+    }
+
+    // Optionally load config.lua and store the resulting table as a Lua global.
+    // Crew.new() will shallow-merge missing keys from this table at call time.
+    let snapshot_config = snapshot
+        .as_ref()
+        .and_then(|(_, roles)| roles.config.as_ref());
+    let live_config = snapshot
+        .is_none()
+        .then(|| loader.config_lua_path())
+        .flatten();
+    if snapshot_config.is_some() || live_config.is_some() {
+        let cfg_path = snapshot_config
+            .map(|source| source.relative_path().to_path_buf())
+            .or(live_config)
+            .expect("checked config source");
+        let content = match snapshot_config {
+            Some(source) => source.shared_source(),
+            None => Arc::from(crate::lua::source::read_lua_source(&cfg_path)?),
+        };
+        let table: mlua::Table = {
+            let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
+            lua.load(content.as_ref())
+                .set_name(format!("config:{}", cfg_path.display()))
+                .eval()
+                .map_err(|e| {
+                    IronCrewError::Validation(format!(
+                        "config.lua at {} must return a table: {}",
+                        cfg_path.display(),
+                        e
+                    ))
+                })?
+        };
+        lua.globals()
+            .set("__ironcrew_config_defaults", table)
+            .map_err(IronCrewError::Lua)?;
+        tracing::info!("Loaded config.lua from {}", cfg_path.display());
     }
 
     // Register globals

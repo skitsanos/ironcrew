@@ -178,7 +178,7 @@ fn sql_files_participate_in_the_source_fingerprint() {
 
 #[cfg(unix)]
 #[test]
-fn sql_sources_scopes_to_the_sql_directory_while_fingerprint_covers_all_sql_files() {
+fn sql_sources_is_flat_while_fingerprint_covers_nested_sql_files() {
     let directory = TempDir::new().unwrap();
     write(directory.path(), "crew.lua", "return 1");
     write(
@@ -198,6 +198,8 @@ fn sql_sources_scopes_to_the_sql_directory_while_fingerprint_covers_all_sql_file
     );
     let snapshot = capture_flow_source(directory.path()).unwrap();
 
+    // sql_sources() must match the non-recursive filesystem discovery in
+    // read_sql_dir: only direct children of sql/ qualify as operations.
     let mut stems: Vec<_> = snapshot
         .sql_sources()
         .into_iter()
@@ -206,25 +208,45 @@ fn sql_sources_scopes_to_the_sql_directory_while_fingerprint_covers_all_sql_file
     stems.sort();
     assert_eq!(
         stems,
-        vec!["nested", "save"],
-        "sql_sources includes sql/ and its nested paths"
+        vec!["save"],
+        "sql_sources() is flat: sql/sub/nested.sql is not a direct child of sql/"
     );
 
     let baseline = snapshot.fingerprint().to_owned();
+
+    // Fingerprint capture stays recursive: an edit to the nested (excluded)
+    // file must still change the fingerprint.
+    write(
+        directory.path(),
+        "sql/sub/nested.sql",
+        "-- ironcrew:op\nSELECT 4;",
+    );
+    let changed_nested = capture_flow_source(directory.path()).unwrap();
+    assert_ne!(
+        baseline,
+        changed_nested.fingerprint(),
+        "sql/sub/nested.sql still participates in the fingerprint though excluded from sql_sources()"
+    );
+    assert_eq!(
+        changed_nested.sql_sources().len(),
+        1,
+        "nested sql files remain excluded from sql_sources() after an edit"
+    );
+
     write(
         directory.path(),
         "queries/outside.sql",
-        "-- ironcrew:op\nSELECT 4;",
+        "-- ironcrew:op\nSELECT 5;",
     );
-    let changed = capture_flow_source(directory.path()).unwrap();
+    let changed_outside = capture_flow_source(directory.path()).unwrap();
     assert_ne!(
         baseline,
-        changed.fingerprint(),
+        changed_outside.fingerprint(),
         "queries/ sql files still participate in the fingerprint"
     );
     assert_eq!(
-        changed.sql_sources().len(),
-        2,
+        changed_outside.sql_sources().len(),
+        1,
         "queries/ sql files are excluded from sql_sources()"
     );
 }
