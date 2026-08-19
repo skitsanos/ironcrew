@@ -34,8 +34,8 @@
     },
     {
       "path": "src/cli/commands.rs",
-      "max_lines": 786,
-      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command."
+      "max_lines": 799,
+      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command. Task 9: cmd_validate gained a feature-gated postgres operations validation step."
     },
     {
       "path": "src/cli/graph_extract.rs",

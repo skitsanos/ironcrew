@@ -120,8 +120,6 @@ impl FlowSourceSnapshot {
     }
 
     /// Stem + source for every captured `sql/*.sql` file, in path order.
-    // wired in src/cli/project.rs (Task 9)
-    #[allow(dead_code)]
     pub fn sql_sources(&self) -> Vec<(String, Arc<str>)> {
         self.files
             .iter()
