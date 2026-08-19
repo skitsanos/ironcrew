@@ -107,7 +107,9 @@ impl FlowSourceSnapshot {
         validate_relative_path(directory, true)?;
         let mut sources = Vec::new();
         for (path, source) in &self.files {
-            if path.parent() == Some(directory) {
+            if path.parent() == Some(directory)
+                && path.extension().and_then(|value| value.to_str()) == Some("lua")
+            {
                 sources.push(SnapshotLuaSource {
                     relative_path: path.clone(),
                     source: source.clone(),
