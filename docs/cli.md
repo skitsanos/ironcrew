@@ -701,6 +701,22 @@ repeated database failures can extend that window; this mechanism records
 [Storage Backends](storage.md#run-ownership-and-terminal-writes) for the exact
 formula and minimum-TTL example.
 
+**App Data (`postgres.*`):**
+
+| Variable | Description |
+|---|---|
+| `IRONCREW_APP_DATABASE_URL` | Dedicated app-data PostgreSQL URL for the `postgres.*` Lua namespace; separate from `DATABASE_URL` (the internal `StateStore`'s connection string). Never readable from Lua. Unset → `postgres.*` calls fail with a configuration hint |
+| `IRONCREW_APP_DB_MAX_CONNECTIONS` | Pool size for the app-data database (default: `4`; hard ceiling: `32`) |
+| `IRONCREW_APP_DB_STATEMENT_TIMEOUT_MS` | Server-side `statement_timeout` set for each app-data transaction (default: `5000`; hard ceiling: `60000`) |
+| `IRONCREW_APP_DB_MAX_ROWS` | Maximum rows returned by one `postgres.query` call (default: `500`; hard ceiling: `10000`) |
+| `IRONCREW_APP_DB_MAX_RESPONSE_BYTES` | Maximum serialized bytes returned by one `postgres.query`/`query_one` call (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_PARAM_BYTES` | Maximum serialized bytes for one bound parameter (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_OPERATIONS` | Maximum `sql/*.sql` operations loaded for one project (load-time; default: `64`; hard ceiling: `256`) |
+| `IRONCREW_APP_DB_MAX_SQL_BYTES` | Maximum bytes in one operation's `.sql` file (load-time; default: `65536` = 64 KiB; hard ceiling: `1048576` = 1 MiB) |
+
+See [PostgreSQL App Data](postgres-app-data.md) for the trust model, operation
+format, Lua API, and the sub-flow limitation.
+
 **Crew memory:**
 
 | Variable | Description |

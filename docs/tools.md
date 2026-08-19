@@ -371,6 +371,12 @@ VM boundary via JSON.
   (including tools invoked during a `crew:conversation()` tool-call loop). This
   is the key feature: **custom tools can delegate to sub-crews in-process**,
   reusing a sub-flow's agents and tasks rather than reimplementing them.
+- **No `postgres.*` capability inside the sub-flow.** In v1, a sub-flow VM
+  (whether reached via `run_flow` or `crew:subworkflow`) never receives the
+  live app-database handle. Calling `postgres.*` there fails closed with a
+  message to perform app-database operations in the parent flow and pass
+  results in via `input`. See
+  [PostgreSQL App Data: sub-flow limitation](postgres-app-data.md#sub-flow-limitation-run_flow).
 
 ### Path validation
 
@@ -530,7 +536,7 @@ IronCrew exposes Lua globals in two distinct sandboxes:
 
 | Sandbox | Where it runs | What's available |
 |---------|---------------|------------------|
-| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, and `require` (shared modules from `_lib/`) |
+| **Crew sandbox** | `crew.lua`, `config.lua`, agent definitions in `agents/` | All globals below **plus the `http` namespace**, `run_flow`, `require` (shared modules from `_lib/`), and the `postgres` namespace (named app-data operations — see [docs/postgres-app-data.md](postgres-app-data.md)) |
 | **Tool sandbox** | The `execute` function inside files in `tools/` | All globals below **plus the `fs` namespace** for sandboxed filesystem access, the `http` namespace, and `run_flow` — but **no `require`** |
 
 > **Network access:** custom Lua tools can call `http.*`. Requests are governed
