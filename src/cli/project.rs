@@ -117,10 +117,8 @@ fn setup_crew_runtime_inner(
     // postgres.* capability: live database when IRONCREW_APP_DATABASE_URL is
     // set (feature-gated), fail-closed stub otherwise so a flow calling
     // postgres.* always gets a diagnosable error instead of a nil index.
-    // Must run BEFORE config.lua evaluation below: docs promise `postgres.*`
-    // is available from config.lua too, and config.lua touching it before
-    // this block was registered would nil-index instead of getting the
-    // diagnosable stub error.
+    // Register before config.lua evaluation so attempted calls fail through
+    // the declarative-config purity marker instead of nil-indexing.
     #[cfg(feature = "postgres")]
     {
         use crate::engine::app_db::{AppDb, operations, policy::AppDbPolicy};
@@ -181,19 +179,21 @@ fn setup_crew_runtime_inner(
             Some(source) => source.shared_source(),
             None => Arc::from(crate::lua::source::read_lua_source(&cfg_path)?),
         };
-        let table: mlua::Table = {
+        lua.set_app_data(crate::lua::bootstrap::ConfigEvaluation);
+        let evaluated = {
             let _execution = LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
             lua.load(content.as_ref())
                 .set_name(format!("config:{}", cfg_path.display()))
                 .eval()
-                .map_err(|e| {
-                    IronCrewError::Validation(format!(
-                        "config.lua at {} must return a table: {}",
-                        cfg_path.display(),
-                        e
-                    ))
-                })?
         };
+        lua.remove_app_data::<crate::lua::bootstrap::ConfigEvaluation>();
+        let table: mlua::Table = evaluated.map_err(|e| {
+            IronCrewError::Validation(format!(
+                "config.lua at {} must return a table: {}",
+                cfg_path.display(),
+                e
+            ))
+        })?;
         lua.globals()
             .set("__ironcrew_config_defaults", table)
             .map_err(IronCrewError::Lua)?;

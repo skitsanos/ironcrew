@@ -856,6 +856,20 @@ describe("repository integration policy", () => {
     expect(immutability).toContain("SEMVER_IMMUTABILITY_RULE");
   });
 
+  test("local Docker tasks cannot publish release image tags", async () => {
+    const source = await Bun.file(join(repository, "Taskfile.yaml")).text();
+    const taskfile = Bun.YAML.parse(source) as {
+      vars: Record<string, unknown>;
+      tasks: Record<string, unknown>;
+    };
+    const commands = JSON.stringify(taskfile.tasks);
+
+    expect(taskfile.vars.DEV_IMAGE).toBe("skitsanos/ironcrew-dev");
+    expect(commands).toContain("{{.DEV_IMAGE}}");
+    expect(commands).not.toContain("{{.IMAGE}}:");
+    expect(commands).not.toContain("{{.DEV_IMAGE}}:latest");
+  });
+
   test("release guidance preserves approval and manual publication boundaries", async () => {
     const sources = await Promise.all([
       Bun.file(join(repository, ".agents/skills/release-ironcrew/SKILL.md")).text(),

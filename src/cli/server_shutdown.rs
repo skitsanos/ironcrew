@@ -51,10 +51,11 @@ pub async fn serve_with_lifecycle(
     tokio::pin!(serve);
 
     let outcome = tokio::select! {
-        result = &mut serve => {
-            coordinator.abort();
-            result.map_err(|error| IronCrewError::Validation(format!("Server error: {error}")))
-        }
+        // The coordinator sends `stopping` immediately before it closes the
+        // listener. If both futures become ready in the same scheduler turn,
+        // teardown must win; aborting the coordinator here could otherwise
+        // leave an active durable run to expire as Abandoned.
+        biased;
         stopping = &mut stopping_rx => {
             if stopping.is_err() {
                 match coordinator.await {
@@ -91,6 +92,10 @@ pub async fn serve_with_lifecycle(
                     }
                 }
             }
+        }
+        result = &mut serve => {
+            coordinator.abort();
+            result.map_err(|error| IronCrewError::Validation(format!("Server error: {error}")))
         }
     };
 

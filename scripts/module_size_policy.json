@@ -139,8 +139,8 @@
     },
     {
       "path": "src/llm/anthropic.rs",
-      "max_lines": 958,
-      "rationale": "IC-011 baseline: Anthropic request construction, image and tool translation, streaming and non-stream response parsing, error handling, and tests share one provider adapter; split response decoding before new API features."
+      "max_lines": 840,
+      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, error handling, and provider dispatch share one adapter; split streaming assembly before new API features. IC-025: real tool calls remain selectable before structured-output finalization."
     },
     {
       "path": "src/llm/metrics.rs",

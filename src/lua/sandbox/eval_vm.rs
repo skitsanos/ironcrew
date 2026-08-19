@@ -18,9 +18,10 @@ use crate::lua::limits::install_lua_limits;
 /// `env`, ...): expression evaluation has no legitimate need for effects, and
 /// hook bytecode is dumped without upvalues so it could not reach them anyway.
 ///
-/// Callers must run each chunk in a fresh environment (see
-/// [`fresh_eval_environment`]) so one evaluation cannot leave globals behind
-/// for the next one on the same worker thread.
+/// Callers must create a new VM for every evaluation and run the chunk in a
+/// fresh environment (see [`fresh_eval_environment`]). A fresh table alone is
+/// insufficient because `_G` and mutable standard-library tables would still
+/// expose a reused VM's globals through the environment metatable.
 pub(crate) fn create_eval_lua(limits: crate::lua::limits::LuaLimits) -> LuaResult<Lua> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::COROUTINE | StdLib::OS,
@@ -49,14 +50,15 @@ pub(crate) fn create_eval_lua(limits: crate::lua::limits::LuaLimits) -> LuaResul
 
 /// Build a per-evaluation environment table for a VM from [`create_eval_lua`].
 ///
-/// Reads fall through to the VM globals so the restricted standard library
-/// stays available, while writes land on the returned table and are discarded
-/// when the evaluation ends. This keeps two flows sharing a thread-local VM
-/// from observing each other's globals.
+/// Reads fall through to this evaluation's VM globals so the restricted
+/// standard library stays available, while ordinary writes land on the
+/// returned table. The VM itself is never reused, so writes through `_G`, the
+/// metatable, or mutable library tables are discarded with the evaluation.
 pub(crate) fn fresh_eval_environment(lua: &Lua) -> LuaResult<mlua::Table> {
     let env = lua.create_table()?;
     let metatable = lua.create_table()?;
     metatable.set("__index", lua.globals())?;
     env.set_metatable(Some(metatable))?;
+    env.set("_G", env.clone())?;
     Ok(env)
 }

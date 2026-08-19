@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::engine::task::TaskResult;
@@ -6,29 +5,18 @@ use crate::lua::json::json_value_to_lua;
 use crate::lua::limits::{LuaExecutionGuard, LuaLimits};
 use crate::lua::sandbox::{create_eval_lua, fresh_eval_environment};
 
-// Thread-local Lua VM reused for condition evaluation. Conditions are
-// flow-supplied expressions, so the VM is sandboxed like the crew VM and each
-// condition runs in a fresh environment.
-thread_local! {
-    static CONDITION_LUA: RefCell<Option<std::result::Result<mlua::Lua, String>>> =
-        const { RefCell::new(None) };
-}
-
 pub fn evaluate_condition(condition: &str, results: &HashMap<String, TaskResult>) -> bool {
-    CONDITION_LUA.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let initialized = slot.get_or_insert_with(|| {
-            let limits = LuaLimits::from_env().map_err(|error| error.to_string())?;
-            create_eval_lua(limits).map_err(|error| error.to_string())
-        });
-        match initialized {
-            Ok(lua) => evaluate_condition_inner(lua, condition, results),
-            Err(error) => {
-                tracing::error!(%error, "Condition Lua VM could not be initialized");
-                false
-            }
+    let lua = match LuaLimits::from_env()
+        .map_err(|error| error.to_string())
+        .and_then(|limits| create_eval_lua(limits).map_err(|error| error.to_string()))
+    {
+        Ok(lua) => lua,
+        Err(error) => {
+            tracing::error!(%error, "Condition Lua VM could not be initialized");
+            return false;
         }
-    })
+    };
+    evaluate_condition_inner(&lua, condition, results)
 }
 
 fn evaluate_condition_inner(
@@ -140,6 +128,18 @@ mod tests {
             !evaluate_condition("return smuggled == true", &results()),
             "a condition observed a global left by an earlier condition"
         );
+    }
+
+    #[test]
+    fn condition_shared_global_escape_hatches_do_not_leak() {
+        assert!(evaluate_condition(
+            "_G.smuggled = true; os.smuggled = true; return true",
+            &results()
+        ));
+        assert!(!evaluate_condition(
+            "return _G.smuggled == true or os.smuggled == true",
+            &results()
+        ));
     }
 
     #[test]
