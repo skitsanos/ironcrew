@@ -276,6 +276,14 @@ source-IP capture. See `docs/rest-api.md`.
   the result size returned from any MCP tool call; oversized results are
   truncated with a marker.
 
+**Provider deadlines.** Keep the provider connection deadline short with
+`IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` (default `10`, maximum `120`), while
+allowing legitimate extended-thinking streams enough total time through
+`IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` (default `900`, maximum `86400`). Both
+values are captured with the provider byte limits and bound into the durable
+conversation fingerprint, so replicas or resumed conversations fail closed if
+their effective request policy differs.
+
 **Request/response size limits.** The server enforces a max request body size
 (`IRONCREW_MAX_BODY_SIZE`, default 10MB). HTTP tools and Lua `http.*` enforce
 a max response body size (`IRONCREW_HTTP_MAX_RESPONSE_BYTES`, default 8 MiB;

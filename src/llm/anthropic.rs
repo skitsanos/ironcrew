@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::BTreeMap;
 
 use super::provider::*;
+use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -27,34 +27,6 @@ pub enum ServerTool {
     CodeExecution,
 }
 
-/// Simple token-bucket rate limiter (same pattern as OpenAI provider).
-struct RateLimiter {
-    min_interval: Duration,
-    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
-}
-
-impl RateLimiter {
-    fn new(min_interval_ms: u64) -> Self {
-        Self {
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now()
-                    .checked_sub(Duration::from_secs(60))
-                    .unwrap_or_else(std::time::Instant::now),
-            )),
-        }
-    }
-
-    async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = std::time::Instant::now();
-    }
-}
-
 pub struct AnthropicProvider {
     client: Client,
     base_url: String,
@@ -66,20 +38,17 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: String, base_url: Option<String>, config: AnthropicConfig) -> Self {
+        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
         // Every request carries the API key in `x-api-key`, which reqwest does
         // not strip across hosts, so a redirect must never leave the origin.
-        let client = crate::utils::network::secure_client_builder(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-        )
-        .redirect(crate::utils::network::same_origin_redirect_policy(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-            crate::utils::network::private_ips_override_enabled(),
-        ))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client");
+        let client = super::provider_http::secure_provider_client_builder(execution_policy)
+            .redirect(crate::utils::network::same_origin_redirect_policy(
+                crate::utils::network::OutboundNetworkPolicy::PublicOnly,
+                crate::utils::network::private_ips_override_enabled(),
+            ))
+            .build()
+            .expect("Failed to build HTTP client");
 
-        let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
         let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
@@ -344,15 +313,22 @@ impl AnthropicProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
-        let response_limit = if status.is_success() {
-            self.execution_policy.response_bytes()
-        } else {
-            self.execution_policy.error_bytes()
-        };
-        let bytes =
-            crate::utils::http::read_response_bytes(resp, response_limit, "Anthropic response")
-                .await
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        if !status.is_success() {
+            return Err(read_error_response(
+                resp,
+                self.execution_policy,
+                "Anthropic error response",
+            )
+            .await?
+            .into_error());
+        }
+        let bytes = crate::utils::http::read_response_bytes(
+            resp,
+            self.execution_policy.response_bytes(),
+            "Anthropic response",
+        )
+        .await
+        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
         let resp_text = String::from_utf8(bytes).map_err(|_| {
             IronCrewError::Provider("Anthropic response was not valid UTF-8".into())
         })?;
@@ -363,16 +339,6 @@ impl AnthropicProvider {
             );
             IronCrewError::Provider(format!("Invalid JSON from Anthropic: {}", e))
         })?;
-
-        if !status.is_success() {
-            let error_msg = resp_body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown Anthropic API error");
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
 
         parse_anthropic_response(&resp_body, structured_output_tool)
     }
@@ -407,41 +373,25 @@ impl AnthropicProvider {
             .map_err(IronCrewError::Http)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let limit = self.execution_policy.error_bytes();
-            let bytes =
-                crate::utils::http::read_response_bytes(resp, limit, "Anthropic error response")
-                    .await
-                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let error_msg = error_body["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let raw = String::from_utf8_lossy(&bytes);
-                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
+            return Err(read_error_response(
+                resp,
+                self.execution_policy,
+                "Anthropic error response",
+            )
+            .await?
+            .into_error());
         }
 
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
         let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
-        let mut block_states: HashMap<usize, BlockState> = HashMap::new();
+        let mut block_states: BTreeMap<usize, BlockState> = BTreeMap::new();
         let mut input_tokens: u32 = 0;
         let mut output_tokens: u32 = 0;
         let mut cached_tokens: u32 = 0;
 
-        // Read SSE stream — Anthropic uses `event: <type>\ndata: <json>` format
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let stream_limit = self.execution_policy.stream_bytes();
-        let mut buffer =
-            crate::utils::http::BoundedLineBuffer::new(stream_limit, "Anthropic stream");
+        let mut lines = ProviderSseLines::new(resp, self.execution_policy, "Anthropic stream");
         let mut current_event_type = String::new();
         // Track terminal delivery so a mid-stream `error` event (e.g.
         // `overloaded_error`) or a connection dropped before `message_stop`
@@ -449,170 +399,157 @@ impl AnthropicProvider {
         let mut stream_error: Option<String> = None;
         let mut saw_message_stop = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(IronCrewError::Http)?;
-            let lines = buffer
-                .push(&chunk)
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        while let Some(raw_line) = lines.next_line().await? {
+            let line = raw_line.trim();
 
-            for raw_line in lines {
-                let line = raw_line.trim();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Track event type from `event:` lines
-                if let Some(event_type) = line.strip_prefix("event: ") {
-                    current_event_type = event_type.trim().to_string();
-                    continue;
-                }
-
-                // Parse `data:` lines
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                let Ok(parsed) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-
-                match current_event_type.as_str() {
-                    "message_start" => {
-                        if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
-                            input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-                            cached_tokens =
-                                usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32;
-                        }
-                    }
-                    "content_block_start" => {
-                        let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                        let block = &parsed["content_block"];
-                        let block_type = block["type"].as_str().unwrap_or("text").to_string();
-
-                        if block_type == "tool_use" {
-                            let id = block["id"].as_str().unwrap_or("").to_string();
-                            let name = block["name"].as_str().unwrap_or("").to_string();
-                            let _ = tx
-                                .send(StreamChunk::ToolCallStart {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await;
-                            block_states.insert(
-                                index,
-                                BlockState {
-                                    block_type,
-                                    id,
-                                    name,
-                                    text: String::new(),
-                                },
-                            );
-                        } else {
-                            block_states.insert(
-                                index,
-                                BlockState {
-                                    block_type,
-                                    id: String::new(),
-                                    name: String::new(),
-                                    text: String::new(),
-                                },
-                            );
-                        }
-                    }
-                    "content_block_delta" => {
-                        let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                        let delta = &parsed["delta"];
-                        let delta_type = delta["type"].as_str().unwrap_or("");
-
-                        match delta_type {
-                            "text_delta" => {
-                                if let Some(text) = delta["text"].as_str() {
-                                    crate::utils::http::bounded_push_str(
-                                        &mut full_content,
-                                        text,
-                                        &mut stored_output_bytes,
-                                        output_limit,
-                                        "Anthropic accumulated output",
-                                    )
-                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                    let _ = tx.send(StreamChunk::Text(text.to_string())).await;
-                                    if let Some(state) = block_states.get_mut(&index) {
-                                        crate::utils::http::bounded_push_str(
-                                            &mut state.text,
-                                            text,
-                                            &mut stored_output_bytes,
-                                            output_limit,
-                                            "Anthropic accumulated output",
-                                        )
-                                        .map_err(
-                                            |error| IronCrewError::Provider(error.to_string()),
-                                        )?;
-                                    }
-                                }
-                            }
-                            "input_json_delta" => {
-                                if let Some(partial) = delta["partial_json"].as_str()
-                                    && let Some(state) = block_states.get_mut(&index)
-                                {
-                                    crate::utils::http::bounded_push_str(
-                                        &mut state.text,
-                                        partial,
-                                        &mut stored_output_bytes,
-                                        output_limit,
-                                        "Anthropic accumulated output",
-                                    )
-                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                    let _ = tx
-                                        .send(StreamChunk::ToolCallDelta {
-                                            id: state.id.clone(),
-                                            arguments_delta: partial.to_string(),
-                                        })
-                                        .await;
-                                }
-                            }
-                            "thinking_delta" => {
-                                if let Some(text) = delta["thinking"].as_str() {
-                                    crate::utils::http::bounded_push_str(
-                                        &mut full_reasoning,
-                                        text,
-                                        &mut stored_output_bytes,
-                                        output_limit,
-                                        "Anthropic accumulated output",
-                                    )
-                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                    let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    "content_block_stop" => {
-                        // Block finalized — state already tracked
-                    }
-                    "message_delta" => {
-                        if let Some(usage) = parsed.get("usage") {
-                            output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
-                        }
-                    }
-                    "message_stop" => {
-                        saw_message_stop = true;
-                        let _ = tx.send(StreamChunk::Done).await;
-                    }
-                    "error" => {
-                        // e.g. {"type":"error","error":{"type":"overloaded_error",
-                        //       "message":"Overloaded"}}
-                        let err = &parsed["error"];
-                        let kind = err["type"].as_str().unwrap_or("error");
-                        let msg = err["message"].as_str().unwrap_or("stream error");
-                        stream_error = Some(format!("{}: {}", kind, msg));
-                        break;
-                    }
-                    _ => {}
-                }
+            if line.is_empty() {
+                continue;
             }
 
-            if stream_error.is_some() {
-                break;
+            // Track event type from `event:` lines
+            if let Some(event_type) = sse_field(line, "event") {
+                current_event_type = event_type.trim().to_string();
+                continue;
+            }
+
+            // Parse `data:` lines
+            let Some(data) = sse_field(line, "data") else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+
+            match current_event_type.as_str() {
+                "message_start" => {
+                    if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
+                        input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
+                        cached_tokens =
+                            usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32;
+                    }
+                }
+                "content_block_start" => {
+                    let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                    let block = &parsed["content_block"];
+                    let block_type = block["type"].as_str().unwrap_or("text").to_string();
+
+                    if block_type == "tool_use" {
+                        let id = block["id"].as_str().unwrap_or("").to_string();
+                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        let _ = tx
+                            .send(StreamChunk::ToolCallStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                            })
+                            .await;
+                        block_states.insert(
+                            index,
+                            BlockState {
+                                block_type,
+                                id,
+                                name,
+                                text: String::new(),
+                            },
+                        );
+                    } else {
+                        block_states.insert(
+                            index,
+                            BlockState {
+                                block_type,
+                                id: String::new(),
+                                name: String::new(),
+                                text: String::new(),
+                            },
+                        );
+                    }
+                }
+                "content_block_delta" => {
+                    let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                    let delta = &parsed["delta"];
+                    let delta_type = delta["type"].as_str().unwrap_or("");
+
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(text) = delta["text"].as_str() {
+                                crate::utils::http::bounded_push_str(
+                                    &mut full_content,
+                                    text,
+                                    &mut stored_output_bytes,
+                                    output_limit,
+                                    "Anthropic accumulated output",
+                                )
+                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                                let _ = tx.send(StreamChunk::Text(text.to_string())).await;
+                                if let Some(state) = block_states.get_mut(&index) {
+                                    crate::utils::http::bounded_push_str(
+                                        &mut state.text,
+                                        text,
+                                        &mut stored_output_bytes,
+                                        output_limit,
+                                        "Anthropic accumulated output",
+                                    )
+                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                                }
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(partial) = delta["partial_json"].as_str()
+                                && let Some(state) = block_states.get_mut(&index)
+                            {
+                                crate::utils::http::bounded_push_str(
+                                    &mut state.text,
+                                    partial,
+                                    &mut stored_output_bytes,
+                                    output_limit,
+                                    "Anthropic accumulated output",
+                                )
+                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                                let _ = tx
+                                    .send(StreamChunk::ToolCallDelta {
+                                        id: state.id.clone(),
+                                        arguments_delta: partial.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(text) = delta["thinking"].as_str() {
+                                crate::utils::http::bounded_push_str(
+                                    &mut full_reasoning,
+                                    text,
+                                    &mut stored_output_bytes,
+                                    output_limit,
+                                    "Anthropic accumulated output",
+                                )
+                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+                                let _ = tx.send(StreamChunk::Thinking(text.to_string())).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_stop" => {
+                    // Block finalized — state already tracked
+                }
+                "message_delta" => {
+                    if let Some(usage) = parsed.get("usage") {
+                        output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+                    }
+                }
+                "message_stop" => {
+                    saw_message_stop = true;
+                    let _ = tx.send(StreamChunk::Done).await;
+                }
+                "error" => {
+                    // e.g. {"type":"error","error":{"type":"overloaded_error",
+                    //       "message":"Overloaded"}}
+                    let err = &parsed["error"];
+                    let kind = err["type"].as_str().unwrap_or("error");
+                    let msg = err["message"].as_str().unwrap_or("stream error");
+                    stream_error = Some(format!("{}: {}", kind, msg));
+                    break;
+                }
+                _ => {}
             }
         }
 
@@ -633,24 +570,29 @@ impl AnthropicProvider {
         // tool carries the answer itself, so its accumulated JSON becomes the
         // response content rather than a tool call.
         let mut structured_output: Option<String> = None;
-        let tool_calls: Vec<ToolCallRequest> = block_states
-            .into_values()
-            .filter(|s| s.block_type == "tool_use" && !s.id.is_empty())
-            .filter_map(|s| {
-                if structured_output_tool == Some(s.name.as_str()) {
-                    structured_output = Some(s.text);
-                    return None;
-                }
-                Some(ToolCallRequest {
-                    id: s.id,
-                    call_type: "function".to_string(),
-                    function: ToolCallFunction {
-                        name: s.name,
-                        arguments: s.text, // accumulated JSON string
-                    },
-                })
-            })
-            .collect();
+        let mut tool_calls = Vec::new();
+        for (index, state) in block_states {
+            if state.block_type != "tool_use" {
+                continue;
+            }
+            if state.id.is_empty() || state.name.is_empty() {
+                return Err(IronCrewError::Provider(format!(
+                    "Anthropic stream ended with incomplete tool call at index {index}"
+                )));
+            }
+            if structured_output_tool == Some(state.name.as_str()) {
+                structured_output = Some(state.text);
+                continue;
+            }
+            tool_calls.push(ToolCallRequest {
+                id: state.id,
+                call_type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: state.name,
+                    arguments: state.text,
+                },
+            });
+        }
 
         if structured_output_tool.is_some() && structured_output.is_none() && tool_calls.is_empty()
         {

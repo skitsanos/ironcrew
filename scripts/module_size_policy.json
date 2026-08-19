@@ -139,8 +139,8 @@
     },
     {
       "path": "src/llm/anthropic.rs",
-      "max_lines": 840,
-      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, error handling, and provider dispatch share one adapter; split streaming assembly before new API features. IC-025: real tool calls remain selectable before structured-output finalization."
+      "max_lines": 782,
+      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, and provider dispatch share one adapter. IC-025: real tool calls remain selectable before structured-output finalization. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http."
     },
     {
       "path": "src/llm/metrics.rs",
@@ -149,13 +149,13 @@
     },
     {
       "path": "src/llm/openai.rs",
-      "max_lines": 636,
-      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions rate limiting, streaming assembly, tool-call normalization, and provider dispatch share one adapter; split stream decoding before adding response modes. IC-037: rate-limiter construction is underflow-safe."
+      "max_lines": 509,
+      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions request/response mapping and provider dispatch share one adapter. IC-033/IC-037: shared HTTP scaffolding and ordered streaming tool-call assembly were extracted."
     },
     {
       "path": "src/llm/openai_responses.rs",
-      "max_lines": 906,
-      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, rate limiting, item-state decoding, and provider dispatch share one adapter; extract response parsing before adding server tools. IC-025/IC-026: structured output and image attachments are mapped instead of dropped."
+      "max_lines": 857,
+      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, ordered item-state decoding, and provider dispatch share one adapter. IC-025/IC-026: structured output and image attachments are mapped instead of dropped. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http."
     },
     {
       "path": "src/llm/provider.rs",
