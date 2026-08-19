@@ -722,6 +722,7 @@ impl UserData for LuaCrew {
             };
 
             let conv = build_conversation(
+                &lua,
                 table,
                 &agents,
                 provider,
