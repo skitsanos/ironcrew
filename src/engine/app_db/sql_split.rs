@@ -5,8 +5,6 @@
 //! semicolon or `$n` inside any of them is never misread. This is not a SQL
 //! parser: anything smarter belongs in PostgreSQL itself.
 
-#![allow(dead_code)]
-
 pub(super) struct SplitStatement {
     pub sql: String,
     pub max_placeholder: usize,
