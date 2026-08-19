@@ -104,7 +104,7 @@
     },
     {
       "path": "src/engine/postgres_store.rs",
-      "max_lines": 8892,
+      "max_lines": 8808,
       "rationale": "IC-011 priority debt: one SQLx implementation still contains schema migration and repositories for runs, idempotency, leases, HITL, journals, conversations, and audit; extract table-focused repositories before extending storage."
     },
     {

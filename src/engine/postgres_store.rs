@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tokio::sync::Semaphore;
 
@@ -234,18 +234,6 @@ fn parse_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::
 
 fn canonical_timestamp(label: &str, value: &str) -> Result<String> {
     Ok(parse_timestamp(label, value)?.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-}
-
-/// Exponential backoff delay before the next connection retry.
-///
-/// `attempt` is 1-based (1 = delay before the first retry). The delay doubles
-/// each attempt, starting from `base_ms`, capped at `cap_ms`. Saturating math
-/// keeps large attempt counts from overflowing.
-fn retry_backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> Duration {
-    let factor = 1u64
-        .checked_shl(attempt.saturating_sub(1))
-        .unwrap_or(u64::MAX);
-    Duration::from_millis(base_ms.saturating_mul(factor).min(cap_ms))
 }
 
 use super::conversation_json::{
@@ -574,37 +562,20 @@ impl PostgresStore {
             )));
         }
 
-        let mut attempt: u32 = 0;
-        let pool = loop {
-            attempt += 1;
-            match PgPoolOptions::new()
-                .max_connections(max_conn)
-                .acquire_timeout(Duration::from_secs(connect_timeout_secs))
-                .connect(database_url)
-                .await
-            {
-                Ok(pool) => break pool,
-                Err(e) => {
-                    if attempt > retries {
-                        return Err(IronCrewError::Validation(format!(
-                            "Failed to connect to PostgreSQL after {} attempt(s): {}",
-                            attempt, e
-                        )));
-                    }
-                    let delay = retry_backoff(attempt, backoff_base_ms, CONNECT_BACKOFF_CAP_MS);
-                    tracing::warn!(
-                        "PostgreSQL connection attempt {}/{} failed: {}; retrying in {:?}",
-                        attempt,
-                        retries + 1,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        };
+        let pool = crate::engine::pg_runtime::connect_pool(
+            database_url,
+            &crate::engine::pg_runtime::PgConnectSettings {
+                max_connections: max_conn,
+                acquire_timeout: Duration::from_secs(connect_timeout_secs),
+                retries,
+                backoff_base_ms,
+                backoff_cap_ms: CONNECT_BACKOFF_CAP_MS,
+            },
+            "state store",
+        )
+        .await?;
 
-        ensure_supported_postgres_version(&pool).await?;
+        crate::engine::pg_runtime::ensure_supported_postgres_version(&pool).await?;
 
         let table_name = format!("{}runs", table_prefix);
         let conversations_table = format!("{}conversations", table_prefix);
@@ -3735,38 +3706,6 @@ impl PostgresStore {
         })?;
         Ok(())
     }
-}
-
-async fn ensure_supported_postgres_version(pool: &PgPool) -> Result<()> {
-    let version_str: String = sqlx::query("SHOW server_version_num")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| {
-            IronCrewError::Validation(format!(
-                "Failed to determine PostgreSQL server version: {}",
-                e
-            ))
-        })?
-        .try_get(0)
-        .map_err(|e| IronCrewError::Validation(format!("Invalid PostgreSQL version row: {}", e)))?;
-
-    let version_num: i32 = version_str.parse().map_err(|e| {
-        IronCrewError::Validation(format!(
-            "Failed to parse PostgreSQL server_version_num '{}': {}",
-            version_str, e
-        ))
-    })?;
-
-    if version_num < 150000 {
-        return Err(IronCrewError::Validation(format!(
-            "PostgreSQL 15+ is required; connected server reports version {}. \
-IronCrew relies on PostgreSQL 15 features for flow-scoped session uniqueness \
-and targets extension-capable deployments such as pgvector-enabled installs.",
-            version_str
-        )));
-    }
-
-    Ok(())
 }
 
 #[async_trait]
@@ -8856,29 +8795,6 @@ fn row_to_idempotency_record(row: &sqlx::postgres::PgRow) -> Result<IdempotencyR
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backoff_grows_exponentially_then_caps() {
-        let base = 1_000;
-        let cap = CONNECT_BACKOFF_CAP_MS;
-        assert_eq!(retry_backoff(1, base, cap), Duration::from_millis(1_000));
-        assert_eq!(retry_backoff(2, base, cap), Duration::from_millis(2_000));
-        assert_eq!(retry_backoff(3, base, cap), Duration::from_millis(4_000));
-        assert_eq!(retry_backoff(4, base, cap), Duration::from_millis(8_000));
-        assert_eq!(retry_backoff(5, base, cap), Duration::from_millis(16_000));
-        // 1_000 * 2^5 = 32_000 -> capped at 30_000
-        assert_eq!(retry_backoff(6, base, cap), Duration::from_millis(cap));
-        assert_eq!(retry_backoff(10, base, cap), Duration::from_millis(cap));
-    }
-
-    #[test]
-    fn backoff_does_not_overflow_on_large_attempts() {
-        // Shift would exceed u64 width; must saturate to the cap, not panic.
-        assert_eq!(
-            retry_backoff(1_000, 1_000, CONNECT_BACKOFF_CAP_MS),
-            Duration::from_millis(CONNECT_BACKOFF_CAP_MS)
-        );
-    }
 
     #[test]
     fn table_prefix_is_lowercase_and_identifier_safe() {
