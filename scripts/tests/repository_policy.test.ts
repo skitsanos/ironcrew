@@ -9,11 +9,11 @@ const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-  "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
+  "anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e",
   "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8",
-  "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5",
+  "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
@@ -59,7 +59,7 @@ describe("repository integration policy", () => {
     expect(policy).toBeDefined();
     expect(
       policy.steps.some(
-        (step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14",
+        (step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.4.0",
       ),
     ).toBeTrue();
     expect(
@@ -181,16 +181,16 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
     expect(commands).toContain("cargo test --all-targets");
     expect(commands).toContain("cargo test --doc");
-    expect(source.match(/dtolnay\/rust-toolchain@1\.97\.1/g)).toHaveLength(8);
-    expect(manifest).toContain('rust-version = "1.97.1"');
-    expect(toolchain).toContain('channel = "1.97.1"');
+    expect(source.match(/dtolnay\/rust-toolchain@1\.98\.0/g)).toHaveLength(8);
+    expect(manifest).toContain('rust-version = "1.98.0"');
+    expect(toolchain).toContain('channel = "1.98.0"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
-    expect(dockerfile).toContain("FROM rust:1.97.1-bookworm AS builder");
+    expect(dockerfile).toContain("FROM rust:1.98.0-bookworm AS builder");
     expect(release).toContain(
-      "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1",
+      "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0",
     );
     expect(release).toContain(
-      "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
+      "anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1",
     );
   });
 
