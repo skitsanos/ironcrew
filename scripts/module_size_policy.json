@@ -19,7 +19,7 @@
     },
     {
       "path": "src/api/conversations.rs",
-      "max_lines": 2320,
+      "max_lines": 2309,
       "rationale": "IC-011 baseline after SSE extraction: conversation start, keyed turns, durable cold rehydration, history, deletion, and lifecycle fencing remain coupled; split idempotency or lifecycle handlers before extending the API. IC-034: server-side failures answer generically instead of echoing backend errors."
     },
     {
@@ -44,7 +44,7 @@
     },
     {
       "path": "src/cli/server.rs",
-      "max_lines": 487,
+      "max_lines": 449,
       "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy."
     },
     {

@@ -1182,7 +1182,7 @@ CORS is configured via the `IRONCREW_CORS_ORIGINS` environment variable:
 | Value | Behavior |
 |-------|----------|
 | Absent (default) | No origins allowed (API not accessible from browsers) |
-| `*` | Permissive — all origins allowed (development only) |
+| `*` | All origins allowed, with the same restricted methods and headers below (development only) |
 | Comma-separated URLs | Only listed origins allowed |
 
 ```bash
