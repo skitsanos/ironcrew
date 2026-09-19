@@ -15,6 +15,12 @@
   "prHourlyLimit": 2,
   "packageRules": [
     {
+      "description": "Keep sse-stream aligned with rmcp 3.4 public transport types",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["sse-stream"],
+      "allowedVersions": "<0.3.0"
+    },
+    {
       "description": "Keep CI on the moving PostgreSQL 15 minimum-version gate",
       "matchManagers": ["github-actions"],
       "matchDatasources": ["docker"],
