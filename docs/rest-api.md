@@ -1210,6 +1210,28 @@ IRONCREW_MAX_BODY_SIZE=8388608  # 8 MiB
 
 Values must be positive and cannot exceed 64 MiB.
 
+## HTTP Transport Limits
+
+The listener bounds slow or stalled clients at three levels:
+
+- `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` defaults to 10 seconds (range 1–300) for
+  the initial protocol preface and every HTTP/1 request-header block. It also
+  controls the HTTP/2 keep-alive interval and response timeout.
+- `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` defaults to 600 seconds (range 1–7200)
+  from request dispatch through response creation, including request-body
+  reads and handler work. Expiry returns `408 Request Timeout` with
+  `Cache-Control: no-store`. Once a streaming response has been created, its
+  body—including an SSE stream—is not wrapped by this deadline. Keep this
+  value above the longest synchronous handler budget, including
+  `IRONCREW_MAX_CONVERSATION_TURN_SECS`.
+- `IRONCREW_MAX_HTTP_CONNECTIONS` defaults to 1024 (range 1–100000) per
+  process. The listener waits for capacity before accepting another
+  connection. SSE connections count toward both this general cap and
+  `IRONCREW_MAX_SSE_CONNECTIONS`.
+
+For multiple replicas, total connection capacity is the per-process cap times
+the replica count; use a trusted gateway when a cluster-wide limit is required.
+
 ## Error Responses
 
 API error responses are sanitized to prevent leaking internal filesystem paths

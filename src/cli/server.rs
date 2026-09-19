@@ -4,7 +4,6 @@ use std::sync::Arc;
 use crate::api;
 use crate::utils::error::{IronCrewError, Result};
 
-const MAX_REQUEST_BODY_HARD_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
 const MAX_SHUTDOWN_ROUTING_GRACE_SECS: u64 = 300;
 const MAX_SHUTDOWN_DRAIN_MS: u64 = 30_000;
@@ -139,8 +138,6 @@ fn require_public_mcp_policy(public_bind: bool) -> Result<()> {
 }
 
 pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
-    use axum::extract::DefaultBodyLimit;
-
     // `.env` is loaded once in `main` before the runtime starts; the server
     // never mutates the environment per-request (that was a data race and a
     // cross-flow secret-bleed source). Flows use the process environment.
@@ -312,17 +309,10 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     // CORS: use IRONCREW_CORS_ORIGINS (comma-separated) or deny all.
     let cors = super::server_cors::from_env()?;
 
-    // Request body size limit (default 10MB, configurable via IRONCREW_MAX_BODY_SIZE)
-    let max_body = bounded_env_u64(
-        "IRONCREW_MAX_BODY_SIZE",
-        10 * 1024 * 1024,
-        1,
-        MAX_REQUEST_BODY_HARD_LIMIT as u64,
-    )? as usize;
-
-    let app = api::create_router(state.clone())
-        .layer(cors)
-        .layer(DefaultBodyLimit::max(max_body));
+    let http_limits = super::http_limits::HttpLimits::from_env()?;
+    let app = http_limits
+        .apply(api::create_router(state.clone()))
+        .layer(cors);
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -378,6 +368,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         state,
         heartbeat_handle,
         idle_eviction_handle,
+        http_limits,
         super::server_shutdown::ShutdownConfig {
             routing_grace: std::time::Duration::from_secs(routing_grace_secs),
             teardown_timeout: std::time::Duration::from_secs(shutdown_timeout_secs),
