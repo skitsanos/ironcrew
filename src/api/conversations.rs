@@ -45,10 +45,13 @@ use crate::utils::error::IronCrewError;
 
 mod events;
 mod image_input;
+mod message_audit;
 pub use events::conversation_events;
 use image_input::load_message_images;
+pub use message_audit::post_message;
 
-type MessageResult = Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
+pub(super) type MessageResult =
+    Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
 
 #[derive(Clone)]
 struct MessageIdempotencyAttempt {
@@ -1468,13 +1471,14 @@ async fn execute_idempotent_message(
     Ok(response)
 }
 
-pub async fn post_message(
+pub(super) async fn post_message_inner(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
     Path((flow, id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<MessageReq>,
+    audit_recorded: Arc<std::sync::atomic::AtomicBool>,
 ) -> MessageResult {
     if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
@@ -1858,6 +1862,7 @@ pub async fn post_message(
         let audit_flow = flow.clone();
         let audit_id = id.clone();
         let audit_headers = crate::api::audit::background_headers(&headers);
+        let audit_recorded = audit_recorded.clone();
         let task = tokio::spawn(async move {
             let result = execute_idempotent_message(
                 task_state,
@@ -1901,6 +1906,7 @@ pub async fn post_message(
                 metadata,
             )
             .await;
+            audit_recorded.store(true, std::sync::atomic::Ordering::Release);
             result
         });
         let response = task.await.map_err(|error| {
@@ -1944,23 +1950,6 @@ pub async fn post_message(
     let turn_count = handle.conv.turn_count().await;
     let turn_index = turn_count.saturating_sub(1);
     let revision = handle.conv.revision().await;
-
-    crate::api::audit::record(
-        &state.store,
-        "conversation.message",
-        Some(&flow),
-        Some(&id),
-        &headers,
-        Some(addr),
-        true,
-        StatusCode::OK.as_u16(),
-        Some(serde_json::json!({
-            "idempotent": false,
-            "turn_index": turn_index,
-            "turn_count": turn_count,
-        })),
-    )
-    .await;
 
     Ok((
         HeaderMap::new(),

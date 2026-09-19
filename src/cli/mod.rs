@@ -8,6 +8,7 @@ pub mod history;
 mod init;
 pub mod project;
 pub mod server;
+mod server_cors;
 mod server_shutdown;
 
 /// Escape a string for safe embedding as a Lua literal. Used by the chat

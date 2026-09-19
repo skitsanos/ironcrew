@@ -140,8 +140,6 @@ fn require_public_mcp_policy(public_bind: bool) -> Result<()> {
 
 pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     use axum::extract::DefaultBodyLimit;
-    use axum::http;
-    use tower_http::cors::{AllowOrigin, CorsLayer};
 
     // `.env` is loaded once in `main` before the runtime starts; the server
     // never mutates the environment per-request (that was a data race and a
@@ -311,44 +309,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     // Background task: evict idle chat session handles.
     let idle_eviction_handle = tokio::spawn(api::conversations::idle_eviction_loop(state.clone()));
 
-    // CORS: use IRONCREW_CORS_ORIGINS env var (comma-separated) or deny all
-    let cors = match std::env::var("IRONCREW_CORS_ORIGINS") {
-        Ok(origins) if origins == "*" => CorsLayer::permissive(),
-        Ok(origins) => {
-            let allowed: Vec<http::HeaderValue> = origins
-                .split(',')
-                .filter(|origin| !origin.trim().is_empty())
-                .map(|origin| {
-                    origin.trim().parse().map_err(|error| {
-                        IronCrewError::Validation(format!(
-                            "Invalid IRONCREW_CORS_ORIGINS entry {:?}: {error}",
-                            origin.trim()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(allowed))
-                .allow_methods([
-                    http::Method::GET,
-                    http::Method::POST,
-                    http::Method::DELETE,
-                    http::Method::OPTIONS,
-                ])
-                .allow_headers([
-                    http::HeaderName::from_static("authorization"),
-                    http::HeaderName::from_static("content-type"),
-                    api::idempotency::IDEMPOTENCY_KEY_HEADER,
-                    api::idempotency::IDEMPOTENCY_RECOVERY_KEY_HEADER,
-                ])
-                .expose_headers([
-                    api::idempotency::IDEMPOTENCY_REPLAYED_HEADER,
-                    api::lifecycle::INSTANCE_ID_HEADER,
-                    http::header::RETRY_AFTER,
-                ])
-        }
-        Err(_) => CorsLayer::new(), // no origins allowed by default
-    };
+    // CORS: use IRONCREW_CORS_ORIGINS (comma-separated) or deny all.
+    let cors = super::server_cors::from_env()?;
 
     // Request body size limit (default 10MB, configurable via IRONCREW_MAX_BODY_SIZE)
     let max_body = bounded_env_u64(
