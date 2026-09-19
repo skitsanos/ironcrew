@@ -46,6 +46,9 @@ regex = "1.13.1"
 futures = "0.3.34"
 async-stream = "0.3.6"
 axum = "0.8.9"
+hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["server-auto", "service", "tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
 sqlx-postgres = { version = "0.9.0", default-features = false, features = ["json"], optional = true }

@@ -513,6 +513,9 @@ be set in the shell or in `.env` files.
 | `PORT` | Platform-provided server port fallback (including Railway). Causes the default host to become `0.0.0.0` |
 | `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). `*` allows every origin but still restricts methods and headers to the documented API surface. Absent = deny all |
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10 MiB; range: 1–67108864) |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | Deadline for the initial protocol preface and each HTTP/1 request-header block (default: `10`; range: 1–300 seconds). The same interval drives HTTP/2 keep-alive probes and their response timeout |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | Deadline from request dispatch through response creation, including request-body reads and handler work (default: `600`; range: 1–7200 seconds). Timeout responses are non-cacheable `408`; an established streaming response body, including SSE, is not wrapped by this deadline |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | Maximum concurrently accepted HTTP connections per process (default: `1024`; range: 1–100000). The listener waits for capacity before accepting another connection; established SSE connections count toward this cap and their separate SSE cap |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | Whole conversation-turn deadline, including provider and tool rounds (default: `300`; hard ceiling: `3600`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min; hard ceiling: `86400`) |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP runs and JSON/SQLite conversation messages (default: `false`; recommended: `true` in production). PostgreSQL conversation messages require the header regardless because it is their shared turn fence |
@@ -538,7 +541,10 @@ replica count; shared PostgreSQL idempotency and global journal budgets do not
 multiply. PostgreSQL's keyed cancellation/HITL coordination does not make
 process admission global. Put any required cluster-wide request or provider
 budget in a trusted shared gateway with bounded queues and idempotency-key
-preservation. Rate-limit breaches return `429` with numeric
+preservation. The HTTP connection cap is also per-process, so aggregate
+connection capacity is `replicas × IRONCREW_MAX_HTTP_CONNECTIONS`. Keep the
+request timeout above the longest synchronous handler budget, including
+`IRONCREW_MAX_CONVERSATION_TURN_SECS`. Rate-limit breaches return `429` with numeric
 `Retry-After` and `Cache-Control: no-store`; the independent control bucket
 keeps abort/answer/delete operations available when work admission is busy,
 and the observation bucket prevents aggressive question-list polling from

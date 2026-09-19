@@ -174,6 +174,9 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` or lower | Byte cap on opaque state echoed during MRTR; hard ceiling `1048576`. |
 | `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` | `1048576` or lower | Pre-JSON cap per stdio line, HTTP JSON message, or SSE event; hard ceiling `16777216`. One transport chunk may temporarily exceed the cap but is rejected before copying into IronCrew-owned assembly/parser buffers. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Bounds the initial protocol preface and each HTTP/1 header block; range 1–300 seconds. Also controls HTTP/2 keep-alive probes. |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Bounds request-body reads and handler work until response creation; range 1–7200 seconds. Keep above the longest synchronous handler budget. Established SSE bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` or lower | Per-process accepted-connection cap; range 1–100000. Size aggregate capacity as replicas times this value. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical in steady state | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. During the controlled rotation overlap, every process must contain both keys even while active ids temporarily differ. Store only in Railway/OpenShift secrets; never bake it into the image. |
 | `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for newly registered question metadata. Answers inherit their authenticated question's key. Both HITL variables must be set together. |
@@ -248,6 +251,9 @@ per-flow read grants.
 |---|---|---|
 | `IRONCREW_MAX_PROMPT_CHARS` | `102400` characters | Caps prompt size per task. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MiB) | Request body cap (hard ceiling 64 MiB). |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Initial protocol/HTTP/1 header deadline and HTTP/2 keep-alive interval/timeout (range 1–300 seconds). |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Request dispatch/body/handler deadline until response creation (range 1–7200 seconds); established stream bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` | Accepted HTTP connection cap per process (range 1–100000); SSE also has its narrower cap below. |
 | `IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES` | `65536` (64 KiB) | Outbound `http_request` header budget (hard ceiling 1 MiB). |
 | `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |

@@ -9,7 +9,6 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
 | [IC-035](docs/issues/IC-035.md) | P3 | Open | Failure visibility | Silent degradation on malformed tool arguments and failed hooks |
-| [IC-036](docs/issues/IC-036.md) | P2 | In progress | API hardening | Residual HTTP hardening gaps in proxy trust, timeouts, CORS, and audit coverage |
 | [IC-040](docs/issues/IC-040.md) | P2 | Open | Maintainability | postgres_store.rs needs domain decomposition |
 
 ## Working agreement
