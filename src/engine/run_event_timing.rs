@@ -57,6 +57,7 @@ impl RunEventWriteTiming {
         self.attempt_timeout
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) const fn database_timeout(self) -> Duration {
         self.database_timeout
     }

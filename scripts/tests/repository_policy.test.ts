@@ -178,6 +178,7 @@ describe("repository integration policy", () => {
       .map((step) => step.run ?? "")
       .join("\n");
     expect(commands).toContain("cargo fmt --all -- --check");
+    expect(commands).toContain("cargo build --no-default-features");
     expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
     expect(commands).toContain("cargo test --all-targets");
     expect(commands).toContain("cargo test --doc");
