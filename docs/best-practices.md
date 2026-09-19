@@ -249,8 +249,9 @@ served via `GET /audit`. Callers can self-label by sending an
 `X-Audit-Actor: alice@example.com` header — the value is voluntary,
 validated for length and control characters, and replaced by the JWT
 `sub` claim when JWT auth lands. Behind a reverse proxy, set
-`IRONCREW_TRUST_PROXY=1` so the recorder uses `X-Forwarded-For` for
-source-IP capture. See `docs/rest-api.md`.
+`IRONCREW_TRUST_PROXY=1` only when that trusted proxy appends its observed
+client address to `X-Forwarded-For`. The recorder uses the rightmost IP and
+ignores client-supplied prefixes. See `docs/rest-api.md`.
 
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
