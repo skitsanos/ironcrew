@@ -227,8 +227,8 @@ citations, and one configuration flag instead of a whole tool implementation.
 
 **CORS.** The API server denies cross-origin requests by default. Set
 `IRONCREW_CORS_ORIGINS` to a comma-separated list of allowed origins, or `*`
-for permissive access (development only). In production, always list specific
-origins.
+to allow every origin while retaining the API's restricted methods and headers
+(development only). In production, always list specific origins.
 
 **SSRF protection.** The `http_request` tool and all Lua `http.*` globals block
 requests to private/internal IP addresses (loopback, RFC1918, link-local, CGNAT)
