@@ -44,7 +44,7 @@
     },
     {
       "path": "src/cli/server.rs",
-      "max_lines": 449,
+      "max_lines": 440,
       "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy."
     },
     {
