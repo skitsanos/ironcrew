@@ -511,7 +511,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_HOST` | Server bind host used when `--host` is absent. If neither is set, `PORT` implies `0.0.0.0`; otherwise the default is `127.0.0.1` |
 | `IRONCREW_PORT` | Server bind port used when `--port` is absent. Takes precedence over platform `PORT` |
 | `PORT` | Platform-provided server port fallback (including Railway). Causes the default host to become `0.0.0.0` |
-| `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). Set to `*` for permissive. Absent = deny all |
+| `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). `*` allows every origin but still restricts methods and headers to the documented API surface. Absent = deny all |
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10 MiB; range: 1–67108864) |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | Whole conversation-turn deadline, including provider and tool rounds (default: `300`; hard ceiling: `3600`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min; hard ceiling: `86400`) |
