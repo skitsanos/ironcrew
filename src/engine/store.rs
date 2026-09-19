@@ -26,11 +26,11 @@ use crate::utils::error::Result;
 pub const DEFAULT_RUN_LEASE_TTL_SECONDS: u64 = 60;
 pub const MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS: u64 = 6;
 pub const MAX_RUN_LEASE_TTL_SECONDS: u64 = 86_400;
+#[cfg(any(feature = "postgres", test))]
 const MAX_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "postgres", test))]
 const MIN_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(100);
-
 static PROCESS_INSTANCE_ID: OnceLock<String> = OnceLock::new();
-
 /// Ownership configuration attached to every store handle in this process.
 ///
 /// The generated id is stable for the lifetime of the process. Deployments can
@@ -127,20 +127,20 @@ fn production_run_lease_ttl(ttl_seconds: u64) -> Result<Duration> {
 pub fn run_lease_heartbeat_interval(ttl: Duration) -> Duration {
     (ttl / 3).max(Duration::from_secs(1))
 }
-
 /// Per-operation outer bound for heartbeat and reconciliation maintenance.
 /// Two sequential operations consume at most two thirds of one cadence, with
 /// a five-second ceiling for long production leases.
+#[cfg(any(feature = "postgres", test))]
 pub fn run_maintenance_timeout(ttl: Duration) -> Duration {
     let milliseconds = (run_lease_heartbeat_interval(ttl).as_millis() / 3)
         .max(MIN_RUN_MAINTENANCE_TIMEOUT.as_millis())
         .min(MAX_RUN_MAINTENANCE_TIMEOUT.as_millis());
     Duration::from_millis(milliseconds as u64)
 }
-
 /// PostgreSQL's per-statement timeout is smaller than the aggregate Tokio
 /// bound. It resolves an individual lock/query stall inside the database;
 /// the outer watchdog still bounds pool acquisition and cumulative statements.
+#[cfg(any(feature = "postgres", test))]
 pub fn run_maintenance_database_timeout(ttl: Duration) -> Duration {
     let milliseconds = (run_maintenance_timeout(ttl).as_millis() * 4 / 5).max(50);
     Duration::from_millis(milliseconds as u64)

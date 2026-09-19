@@ -97,6 +97,7 @@ pub fn resolved_tools_fingerprint(definition: &Value) -> Result<String> {
 
 /// Hash an operator-supplied, non-secret execution identity without retaining
 /// its raw value in provider/tool definitions or durable records.
+#[cfg(feature = "mcp")]
 pub fn explicit_execution_identity_fingerprint(
     domain: &str,
     label: &str,
