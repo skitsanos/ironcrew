@@ -159,6 +159,7 @@ pub struct IdempotencyUsage {
 /// The API monitor must stop any remaining Lua work in both cases, but only a
 /// genuinely lost fence makes the request outcome indeterminate.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub enum RunFenceHeartbeat {
     Owned,
     /// Another API replica durably requested cancellation of this keyed run.
@@ -167,7 +168,6 @@ pub enum RunFenceHeartbeat {
     Terminal(RunStatus),
     Lost,
 }
-
 /// Result of asking the shared state backend to cancel an in-flight run.
 ///
 /// Durable cross-replica cancellation is deliberately limited to keyed runs:
@@ -175,6 +175,7 @@ pub enum RunFenceHeartbeat {
 /// fence needed to deliver the request to exactly the current worker. Local
 /// process cancellation remains available for unkeyed runs.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub enum RunCancellationRequest {
     Requested {
         owner_instance_id: String,
@@ -187,7 +188,6 @@ pub enum RunCancellationRequest {
     NotFound,
     NotDurable,
 }
-
 /// Process-local notification that the run intent exists and its linked
 /// durable idempotency claim is publishable. SQL backends cross that boundary
 /// atomically; the single-process JSON backend performs both writes under its
