@@ -9,8 +9,8 @@
     },
     {
       "path": "src/api/audit.rs",
-      "max_lines": 409,
-      "rationale": "IC-011 baseline: HTTP audit identity extraction, bounded metadata normalization, persistence, and their inline security tests form the current audit boundary; extract tests before adding another metadata source."
+      "max_lines": 399,
+      "rationale": "IC-011 baseline: audit persistence, actor extraction, bounded metadata normalization, and legacy StateStore test scaffolding form the current boundary; forwarded proxy attribution is isolated in its own focused module."
     },
     {
       "path": "src/api/auth.rs",

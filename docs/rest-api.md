@@ -1041,11 +1041,15 @@ themselves audited.
 ### Trust-proxy mode
 
 When running behind a reverse proxy (Nginx, Envoy, AWS ALB, etc.),
-set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the first hop
-of `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
-Without the env var set, an attacker hitting the server directly could
-forge their IP by sending an `X-Forwarded-For` header; the gate
-prevents that.
+set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the rightmost
+IP in `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
+IronCrew treats only that append position as trusted; client-supplied
+prefixes are ignored, and an invalid rightmost value falls back to the
+TCP peer. Enable this only behind a trusted proxy that appends the address
+it observed. In a multi-proxy topology, the recorded value is the
+immediately preceding hop unless the final proxy rewrites the header to a
+validated client address. Without the env var set, IronCrew always uses the
+direct TCP peer, so a direct client cannot forge its audit IP with this header.
 
 ## GET /metrics
 

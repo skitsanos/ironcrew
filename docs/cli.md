@@ -594,7 +594,7 @@ provider response and are not billing data.
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` or `true` to allow protected HTTP clients to reach private/internal addresses. Unset keeps DNS resolution, actual connections, and redirect targets restricted to public addresses |
 | `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read (matched case-insensitively, but names must match in full). Fail-closed: every name not listed returns `nil`. |
-| `IRONCREW_TRUST_PROXY` | Set to `1` to honor `X-Forwarded-For` for source-IP capture in audit events (only enable when running behind a trusted reverse proxy) |
+| `IRONCREW_TRUST_PROXY` | Set to `1` only behind a trusted append-style reverse proxy. Audit capture uses the rightmost valid `X-Forwarded-For` IP, ignores client-supplied prefixes, and falls back to the TCP peer when that entry is invalid. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | Default page size on `GET /audit` (default `50`) |
 | `IRONCREW_AUDIT_MAX_LIMIT` | Hard cap on `GET /audit?limit=` (default `500`) |
 
