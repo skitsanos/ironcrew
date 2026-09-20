@@ -40,6 +40,10 @@ const MAX_WEB_SEARCH_USES: u32 = 100;
 const MAX_FILE_SEARCH_RESULTS: u32 = 1_000;
 const MAX_THINKING_BUDGET: u32 = 1_000_000;
 
+use crate::lua::config_choices::{
+    REASONING_EFFORTS, REASONING_SUMMARIES, WEB_SEARCH_CONTEXT_SIZES, validate_config_choice,
+};
+
 fn config_limit(name: &str, default: usize, hard_max: usize) -> LuaResult<usize> {
     match std::env::var(name) {
         Ok(raw) => {
@@ -416,18 +420,10 @@ pub fn register_crew_constructor(
                 let reasoning_effort: Option<String> = table.get("reasoning_effort")?;
                 let reasoning_summary: Option<String> = table.get("reasoning_summary")?;
                 if let Some(value) = reasoning_effort.as_deref() {
-                    validate_config_string(
-                        "reasoning_effort",
-                        value,
-                        MAX_CONFIG_ITEM_BYTES,
-                    )?;
+                    validate_config_choice("reasoning_effort", value, REASONING_EFFORTS)?;
                 }
                 if let Some(value) = reasoning_summary.as_deref() {
-                    validate_config_string(
-                        "reasoning_summary",
-                        value,
-                        MAX_CONFIG_ITEM_BYTES,
-                    )?;
+                    validate_config_choice("reasoning_summary", value, REASONING_SUMMARIES)?;
                 }
 
                 let max_server_tools = config_limit(
@@ -474,10 +470,10 @@ pub fn register_crew_constructor(
                 let web_search_context_size: Option<String> =
                     table.get("web_search_context_size")?;
                 if let Some(value) = web_search_context_size.as_deref() {
-                    validate_config_string(
+                    validate_config_choice(
                         "web_search_context_size",
                         value,
-                        MAX_CONFIG_ITEM_BYTES,
+                        WEB_SEARCH_CONTEXT_SIZES,
                     )?;
                 }
 
