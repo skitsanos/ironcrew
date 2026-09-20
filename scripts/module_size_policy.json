@@ -169,8 +169,8 @@
     },
     {
       "path": "src/lua/api.rs",
-      "max_lines": 787,
-      "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys."
+      "max_lines": 783,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys. Option-choice validation lives in src/lua/config_choices.rs."
     },
     {
       "path": "src/lua/conversation.rs",
