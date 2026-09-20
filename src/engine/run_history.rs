@@ -515,10 +515,7 @@ pub struct RunRecord {
     pub task_results: Vec<TaskResult>,
     pub agent_count: usize,
     pub task_count: usize,
-    #[serde(default)]
-    pub total_tokens: u32,
-    #[serde(default)]
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Runtime instance that currently owns this in-flight run. Empty for
@@ -614,10 +611,7 @@ pub struct RunSummary {
     pub duration_ms: u64,
     pub agent_count: usize,
     pub task_count: usize,
-    #[serde(default)]
-    pub total_tokens: u32,
-    #[serde(default)]
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -634,8 +628,7 @@ impl From<&RunRecord> for RunSummary {
             duration_ms: record.duration_ms,
             agent_count: record.agent_count,
             task_count: record.task_count,
-            total_tokens: record.total_tokens,
-            cached_tokens: record.cached_tokens,
+            usage: record.usage.clone(),
             tags: record.tags.clone(),
         }
     }
@@ -684,8 +677,7 @@ pub struct RunCompletion {
     pub finished_at: String,
     pub duration_ms: u64,
     pub task_results: Vec<TaskResult>,
-    pub total_tokens: u32,
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
 }
 
 /// Result of an atomic terminal transition. A second finalizer can observe
@@ -698,6 +690,14 @@ pub enum RunTransition {
 
 impl RunCompletion {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.usage
+            .validate()
+            .map_err(|error| IronCrewError::Validation(error.into()))?;
+        for task in &self.task_results {
+            task.usage
+                .validate()
+                .map_err(|error| IronCrewError::Validation(error.into()))?;
+        }
         if !self.status.is_terminal() {
             return Err(IronCrewError::Validation(format!(
                 "Run completion status must be terminal, got '{}'",
@@ -1159,8 +1159,7 @@ impl StateStore for JsonFileStoreCore {
             task_results: Vec::new(),
             agent_count: intent.agent_count,
             task_count: intent.task_count,
-            total_tokens: 0,
-            cached_tokens: 0,
+            usage: crate::usage::UsageSnapshot::unavailable(),
             tags: intent.tags,
             owner_instance_id: self.lease.instance_id().to_string(),
             lease_expires_at: proposed_lease,
@@ -1226,8 +1225,7 @@ impl StateStore for JsonFileStoreCore {
             record.finished_at = completion.finished_at;
             record.duration_ms = completion.duration_ms;
             record.task_results = completion.task_results;
-            record.total_tokens = completion.total_tokens;
-            record.cached_tokens = completion.cached_tokens;
+            record.usage = completion.usage;
             record.lease_expires_at.clear();
             write_run_record_atomic(&path, &record)?;
             RunTransition::Applied
@@ -1403,8 +1401,7 @@ impl StateStore for JsonFileStoreCore {
                         task_results: Vec::new(),
                         agent_count: 0,
                         task_count: 0,
-                        total_tokens: 0,
-                        cached_tokens: 0,
+                        usage: crate::usage::UsageSnapshot::unavailable(),
                         tags: Vec::new(),
                         owner_instance_id: idempotency.owner_instance_id.clone(),
                         lease_expires_at: String::new(),

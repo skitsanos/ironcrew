@@ -1,3 +1,7 @@
+#[path = "support/usage.rs"]
+mod usage_fixture;
+use usage_fixture::fixture_usage;
+
 use std::sync::Arc;
 
 use ironcrew::api::{AppState, create_router};
@@ -1064,8 +1068,7 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
                 finished_at: "2026-07-19T12:00:30Z".into(),
                 duration_ms: 30_000,
                 task_results: Vec::new(),
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -1427,8 +1430,7 @@ async fn exercise_idempotent_run_heartbeat(store: Arc<dyn StateStore>) {
                 finished_at: "2099-07-19T12:05:10Z".into(),
                 duration_ms: 10,
                 task_results: Vec::new(),
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await

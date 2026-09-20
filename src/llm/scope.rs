@@ -13,7 +13,7 @@ pub fn with_usage_tracker(
     tracker: UsageTracker,
 ) -> Arc<dyn LlmProvider> {
     Arc::new(ScopedProvider {
-        inner: provider,
+        inner: ProviderRef::Owned(provider),
         tracker,
     })
 }
@@ -34,12 +34,50 @@ pub(crate) fn tool_context(provider: &dyn LlmProvider) -> crate::tools::ToolCall
     }
 }
 
-struct ScopedProvider {
-    inner: Arc<dyn LlmProvider>,
+pub(crate) fn borrow_with_usage_tracker(
+    provider: &dyn LlmProvider,
+    tracker: UsageTracker,
+) -> impl LlmProvider + '_ {
+    ScopedProvider {
+        inner: ProviderRef::Borrowed(provider),
+        tracker,
+    }
+}
+
+pub(crate) fn child_scope(provider: &dyn LlmProvider) -> Result<UsageTracker> {
+    match provider.usage_tracker() {
+        Some(parent) => parent
+            .child()
+            .map_err(|error| IronCrewError::Provider(error.to_string())),
+        None => Ok(UsageTracker::default()),
+    }
+}
+
+pub(crate) fn snapshot(tracker: &UsageTracker) -> Result<crate::usage::UsageSnapshot> {
+    tracker.snapshot().map_err(accounting_error)
+}
+
+enum ProviderRef<'a> {
+    Owned(Arc<dyn LlmProvider>),
+    Borrowed(&'a dyn LlmProvider),
+}
+
+impl<'a> std::ops::Deref for ProviderRef<'a> {
+    type Target = dyn LlmProvider + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(provider) => provider.as_ref(),
+            Self::Borrowed(provider) => *provider,
+        }
+    }
+}
+
+struct ScopedProvider<'a> {
+    inner: ProviderRef<'a>,
     tracker: UsageTracker,
 }
 
-impl ScopedProvider {
+impl ScopedProvider<'_> {
     fn prepare(
         &self,
         mut request: ChatRequest,
@@ -76,7 +114,7 @@ fn settle(result: Result<ChatResponse>, attempt: Option<UsageAttempt>) -> Result
 }
 
 #[async_trait]
-impl LlmProvider for ScopedProvider {
+impl LlmProvider for ScopedProvider<'_> {
     fn usage_tracker(&self) -> Option<UsageTracker> {
         Some(self.tracker.clone())
     }

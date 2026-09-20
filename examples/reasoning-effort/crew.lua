@@ -54,13 +54,13 @@ print("")
 print(string.format("%-8s %10s %8s %12s %8s  %s", "effort", "duration", "prompt", "completion", "answer", "(correct: 36)"))
 for _, effort in ipairs({ "low", "medium", "high" }) do
     local r = by_task["solve_" .. effort]
-    local usage = r.token_usage or {}
+    local usage = r.usage.settled
     print(string.format(
-        "%-8s %8d ms %8d %12d %8s",
+        "%-8s %8d ms %8s %12s %8s",
         effort,
         r.duration_ms,
-        usage.prompt_tokens or 0,
-        usage.completion_tokens or 0,
+        type(usage.prompt_tokens.known) == "string" and usage.prompt_tokens.known or "unknown",
+        type(usage.completion_tokens.known) == "string" and usage.completion_tokens.known or "unknown",
         final_answer(r.output)
     ))
 end

@@ -47,7 +47,7 @@ impl LlmProvider for NoopProvider {
 /// Suppress a dead_code lint on TokenUsage which is imported through the
 /// provider prelude but not referenced directly in tests.
 #[allow(dead_code)]
-fn _unused_token_usage() -> TokenUsage {
+fn _unused_usage() -> TokenUsage {
     TokenUsage::default()
 }
 

@@ -48,8 +48,8 @@ impl PostgresStore {
         }
 
         // Add flow_path column for schemas predating Phase-1 HITL support.
-        // Guarded with IF NOT EXISTS for idempotency (matches the pattern
-        // used for total_tokens / cached_tokens / tags above).
+        // Guarded with IF NOT EXISTS for idempotency, matching the run-history
+        // migrations in the same schema transaction.
         let session_migrations: &[(&str, String)] = &[
             (
                 "conversations.flow_path",

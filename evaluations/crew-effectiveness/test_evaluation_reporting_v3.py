@@ -5,27 +5,53 @@ import unittest
 from evaluation_reporting_v3 import pricing_receipt, successful_run_usage
 
 
+def fixture_usage(prompt, completion, total, cached, requests=1):
+    fields = dict(prompt_tokens=prompt, completion_tokens=completion,
+                  total_tokens=total, cached_tokens=cached)
+    return {
+        "coverage": "complete", "in_flight": "0",
+        "settled": {
+            "coverage": "complete", "requests": str(requests),
+            **{key: {"known": str(value), "complete": True} for key, value in fields.items()},
+            "cache_write_tokens": {"known": None, "complete": False},
+            "reasoning_tokens": {"known": None, "complete": False},
+        },
+    }
+
+
 class EvaluationReportingV3Tests(unittest.TestCase):
+    def test_untrusted_checked_usage_fails_closed(self):
+        import copy
+        baseline = fixture_usage(10, 2, 12, 0)
+        for path, value in [
+            (("in_flight",), "1"),
+            (("coverage",), "partial"),
+            (("settled", "requests"), "2"),
+            (("settled", "total_tokens", "known"), 12),
+            (("settled", "total_tokens", "known"), "012"),
+            (("settled", "total_tokens", "known"), str(2**64)),
+            (("settled", "cached_tokens", "complete"), False),
+            (("settled", "cached_tokens", "known"), None),
+            (("settled", "reasoning_tokens", "known"), "3"),
+        ]:
+            snapshot = copy.deepcopy(baseline)
+            target = snapshot
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path, value=value), self.assertRaises(ValueError):
+                successful_run_usage([{"task": "final", "usage": snapshot}], {"final": 1}, {"final": 20})
+
     def test_task_usage_is_complete_and_conservatively_priced(self) -> None:
         usage = successful_run_usage(
             [
                 {
                     "task": "first",
-                    "token_usage": {
-                        "prompt_tokens": 100,
-                        "completion_tokens": 20,
-                        "total_tokens": 120,
-                        "cached_tokens": 10,
-                    },
+                    "usage": fixture_usage(100, 20, 120, 10),
                 },
                 {
                     "task": "final",
-                    "token_usage": {
-                        "prompt_tokens": 200,
-                        "completion_tokens": 40,
-                        "total_tokens": 240,
-                        "cached_tokens": 0,
-                    },
+                    "usage": fixture_usage(200, 40, 240, 0),
                 },
             ],
             {"first": 1, "final": 1},
@@ -46,19 +72,14 @@ class EvaluationReportingV3Tests(unittest.TestCase):
     def test_incomplete_or_over_cap_usage_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "incomplete token usage"):
             successful_run_usage(
-                [{"task": "final", "token_usage": {}}], {"final": 1}, {"final": 800}
+                [{"task": "final", "usage": {}}], {"final": 1}, {"final": 800}
             )
         with self.assertRaisesRegex(ValueError, "planned-call costing allowance"):
             successful_run_usage(
                 [
                     {
                         "task": "final",
-                        "token_usage": {
-                            "prompt_tokens": 20_001,
-                            "completion_tokens": 1,
-                            "total_tokens": 20_002,
-                            "cached_tokens": 0,
-                        },
+                        "usage": fixture_usage(20_001, 1, 20_002, 0),
                     }
                 ],
                 {"final": 1},
@@ -72,21 +93,11 @@ class EvaluationReportingV3Tests(unittest.TestCase):
             [
                 {
                     "task": "discussion",
-                    "token_usage": {
-                        "prompt_tokens": 40_000,
-                        "completion_tokens": 1_500,
-                        "total_tokens": 41_500,
-                        "cached_tokens": 0,
-                    },
+                    "usage": fixture_usage(40_000, 1_500, 41_500, 0, 3),
                 },
                 {
                     "task": "final",
-                    "token_usage": {
-                        "prompt_tokens": 100,
-                        "completion_tokens": 20,
-                        "total_tokens": 120,
-                        "cached_tokens": 0,
-                    },
+                    "usage": fixture_usage(100, 20, 120, 0),
                 },
             ],
             {"discussion": 3, "final": 1},
@@ -102,12 +113,7 @@ class EvaluationReportingV3Tests(unittest.TestCase):
     def test_zero_or_missing_planned_task_usage_fails_closed(self) -> None:
         zero = {
             "task": "final",
-            "token_usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "cached_tokens": 0,
-            },
+            "usage": fixture_usage(0, 0, 0, 0),
         }
         with self.assertRaisesRegex(ValueError, "zero prompt, completion, or total"):
             successful_run_usage([zero], {"final": 1}, {"final": 800})

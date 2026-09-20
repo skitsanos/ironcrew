@@ -4,5 +4,7 @@ mod fixture;
 mod lua;
 #[path = "execution_usage/public.rs"]
 mod public;
+#[path = "execution_usage/results.rs"]
+mod results;
 #[path = "execution_usage/scopes.rs"]
 mod scopes;

@@ -641,8 +641,8 @@ results.
 | `crew_started`       | `goal`, `agent_count`, `task_count`, `model`                  | Crew execution begins                        |
 | `phase_start`        | `phase`, `tasks`                                              | A new execution phase starts                 |
 | `task_assigned`      | `task`, `agent`, `phase`                                      | Task assigned to an agent                    |
-| `task_completed`     | `task`, `agent`, `duration_ms`, `success`, `output`, `token_usage` | Task finished successfully              |
-| `task_failed`        | `task`, `agent`, `error`, `duration_ms`                       | Task execution failed                        |
+| `task_completed`     | `task`, `agent`, `duration_ms`, `success`, `output`, `usage` | Task finished successfully              |
+| `task_failed`        | `task`, `agent`, `error`, `duration_ms`, `usage`                       | Task execution failed                        |
 | `task_skipped`       | `task`, `reason`                                              | Task skipped (condition evaluated false)     |
 | `task_thinking`      | `task`, `agent`, `content`                                    | Model reasoning/thinking (Anthropic, OpenAI Responses, DeepSeek, Kimi) |
 | `task_retry`         | `task`, `attempt`, `max_retries`, `backoff_secs`, `error`     | Task being retried after failure             |
@@ -664,16 +664,26 @@ results.
 | `human_input_received` | `question_id`, `outcome`                                    | The question resolved (`outcome`: `"answered"` or `"timeout"`). Never carries the answer content — answers may contain secrets |
 | `journal_gap`        | `first_sequence`, `last_sequence`, `reason`                  | PostgreSQL replay omitted/evicted a sequence range. Its SSE id advances through `last_sequence`; do not infer events inside the gap. |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
-| `run_complete`       | `run_id`, `status`, `duration_ms`, `total_tokens`             | Run finished (terminal event)                |
+| `run_complete`       | `run_id`, `status`, `duration_ms`, `usage`             | Run finished (terminal event)                |
 
-The `token_usage` field in `task_completed` contains:
+The `usage` field in task/run results and terminal events contains a checked
+snapshot. Counts are decimal strings or null, and completeness is explicit.
+See [usage accounting](usage-accounting.md) for scope and persistence boundaries:
 
 ```json
 {
-  "prompt_tokens": 150,
-  "completion_tokens": 42,
-  "total_tokens": 192,
-  "cached_tokens": 0
+  "coverage": "complete",
+  "in_flight": "0",
+  "settled": {
+    "requests": "1",
+    "coverage": "complete",
+    "prompt_tokens": { "known": "150", "complete": true },
+    "completion_tokens": { "known": "42", "complete": true },
+    "total_tokens": { "known": "192", "complete": true },
+    "cached_tokens": { "known": "0", "complete": true },
+    "cache_write_tokens": { "known": null, "complete": false },
+    "reasoning_tokens": { "known": null, "complete": false }
+  }
 }
 ```
 
@@ -785,8 +795,18 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
       "duration_ms": 80000,
       "agent_count": 2,
       "task_count": 3,
-      "total_tokens": 1200,
-      "cached_tokens": 400,
+      "usage": {
+        "coverage": "complete", "in_flight": "0",
+        "settled": {
+          "requests": "3", "coverage": "complete",
+          "prompt_tokens": { "known": "1000", "complete": true },
+          "completion_tokens": { "known": "200", "complete": true },
+          "total_tokens": { "known": "1200", "complete": true },
+          "cached_tokens": { "known": "400", "complete": true },
+          "cache_write_tokens": { "known": null, "complete": false },
+          "reasoning_tokens": { "known": null, "complete": false }
+        }
+      },
       "tags": ["prod"]
     }
   ],

@@ -4,10 +4,10 @@ This page describes the Rust `ironcrew::usage` contract, built-in HTTP capture,
 and process-local execution ownership. OpenAI Chat, Responses and Anthropic
 retain checked receipts independently of their output return value.
 
-**`ChatResponse.usage`, task/run result fields, CLI/HTTP output fields, events and
-stored run/session records have not yet migrated.** Those still have the gaps
-tracked by [IC-046](issues/IC-046.md). New Lua `:usage()` accessors expose checked
-process-local snapshots separately from those existing fields.
+Task results, run records/summaries, CLI/HTTP outputs and task/run events now
+expose checked `usage` snapshots. JSON, SQLite and PostgreSQL persist these
+snapshots without narrowing counts. **Direct `ChatResponse.usage` and persisted
+conversation/dialog history still await migration** in [IC-046](issues/IC-046.md).
 The old usage fields are not a fallback source for the new tracker. Do not use
 transport tests as proof of end-to-end billing observability or an IC-047 budget.
 
@@ -34,7 +34,10 @@ adding child task results again. Failed output validation and transcript rollbac
 do not roll back provider usage. Separate top-level VMs remain isolated even
 when they share one `Runtime` and its provider. No task-local or global counter
 is used. A flow with multiple `crew:run()` calls shares a flow total while each
-run has its own subtotal. Independent per-task subtotals remain pending.
+run has its own subtotal. Each task has a disjoint subtotal including its retries,
+tool calls and delegated work. Foreach includes every item; collaboration includes
+discussion and synthesis. Error-handler attempts belong to the handler result,
+not the recovered task's subtotal. Failed handlers retain their receipts too.
 
 For Rust embedding, bind a tracker with
 `ironcrew::llm::scope::with_usage_tracker(provider, tracker.clone())` and pass
@@ -60,9 +63,8 @@ fields are deliberately not converted into checked receipts. This opaque
 invocation boundary cannot reveal internal HTTP retries or billing details.
 Forwarding wrappers must preserve both `records_usage()` and `usage_tracker()`.
 
-These snapshots are not durable recovery, migrated task/API result fields,
-per-task attribution, token-budget enforcement, or proof of replica behavior.
-Those acceptance boundaries remain open.
+Terminal run snapshots are durable; in-flight attempts are not checkpointed.
+These snapshots are not token-budget enforcement or execution failover.
 
 Built-in HTTP attempts start after local validation and rate-limit waiting, immediately
 before HTTP dispatch. Invalid credentials/options/URLs rejected before dispatch
@@ -111,8 +113,34 @@ entire `u64` range in JSON, JavaScript and Lua without narrowing. Unknown counts
 are `null`, not `"0"`. Numeric JSON values, leading zeros, signs, fractions,
 overflow, unknown fields and inconsistent coverage are rejected on read. Raw
 provider parsers still consume the provider's numeric protocol; there is no
-compatibility adapter from the old public usage fields. HTTP and SQL migration
-remains pending; the old PostgreSQL `INTEGER` columns cannot store this range.
+compatibility adapter from the old public usage fields. PostgreSQL stores the
+snapshot as JSONB and SQLite as JSON text, not signed token-count columns.
+SQL readers reject usage payloads above 4 KiB before client-side materialization;
+the fixed checked snapshot shape fits comfortably below this bound.
+
+## Result and persistence boundaries
+
+`TaskResult.usage` replaces `token_usage`; run records/summaries and `run_complete`
+replace the old top-level `total_tokens`/`cached_tokens` counters with `usage`.
+`task_completed` and `task_failed` include the same checked task snapshot.
+Known subtotals are retained even when coverage is partial or unavailable for
+other fields. Do not add child snapshots to an already inclusive parent.
+
+CLI run records finish at `crew:run()` and contain that crew's subtotal. HTTP
+runs own the complete Lua entrypoint: their terminal snapshot includes calls
+before/after the crew and sessions within the entrypoint, including cancellation.
+The API monitor waits for worker cancellation before reading usage. A different
+durable terminal writer remains authoritative; its snapshot is not overwritten.
+Use `crew:flow_usage()` for the wider process-local CLI flow view.
+
+Intents and owner-death reconciliation have no trustworthy terminal checkpoint:
+their unavailable snapshot has zero **observed** requests and null counts, not
+evidence of zero cost. SQL schema upgrades add this explicit unavailable marker
+to rows without a checkpoint; they never infer receipts from old integer columns.
+Old columns are left untouched, but are no longer read or written. Old JSON run
+records and old task-result payloads without `usage` are unsupported and fail
+decoding; export/archive them before upgrading. No legacy result adapter exists.
+Resumed conversation/dialog handles still do not recover historical usage.
 
 ## Lua snapshots
 

@@ -106,11 +106,11 @@ impl PostgresStore {
              ) \
              INSERT INTO {runs} (\
                  run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
+                 task_results, agent_count, task_count, tags, \
                  owner_instance_id, lease_expires_at\
              ) \
              SELECT resource_id, scope, scope, 'abandoned', created_at, $1, 0, \
-                    '[]'::jsonb, 0, 0, 0, 0, '[]'::jsonb, owner_instance_id, '' \
+                    '[]'::jsonb, 0, 0, '[]'::jsonb, owner_instance_id, '' \
              FROM candidates \
              ON CONFLICT (run_id) DO NOTHING \
              RETURNING run_id",

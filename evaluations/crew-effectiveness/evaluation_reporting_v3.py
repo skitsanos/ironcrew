@@ -8,12 +8,7 @@ from typing import Any
 
 from pairwise_analysis import summarize_runs
 from pricing_budget import estimate_cost_usd, pricing_metadata
-
-
-def _integer(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return value
+from usage_receipts import costing_counts
 
 
 def successful_run_usage(
@@ -47,15 +42,7 @@ def successful_run_usage(
         completion_limit = task_maximum_output_tokens[task_name]
         if isinstance(planned_calls, bool) or not isinstance(planned_calls, int) or planned_calls < 1:
             raise ValueError(f"task {task_name} has an invalid planned call count")
-        usage = task.get("token_usage")
-        if not isinstance(usage, dict) or set(usage) != {
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "cached_tokens",
-        }:
-            raise ValueError(f"task_results[{index}] has incomplete token usage")
-        values = {key: _integer(value, f"task_results[{index}].{key}") for key, value in usage.items()}
+        values = costing_counts(task.get("usage"), planned_calls)
         if (
             values["prompt_tokens"] == 0
             or values["completion_tokens"] == 0

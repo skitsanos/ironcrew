@@ -6,6 +6,8 @@ impl PostgresStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<()> {
         let t = &self.table_name;
+        let unknown_usage = serde_json::to_string(&crate::usage::UsageSnapshot::unavailable())
+            .expect("scalar usage snapshot serializes");
         // 1. Create table if not exists
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS {t} (
@@ -19,8 +21,7 @@ impl PostgresStore {
                 task_results  JSONB NOT NULL DEFAULT '[]',
                 agent_count   INTEGER NOT NULL,
                 task_count    INTEGER NOT NULL,
-                total_tokens  INTEGER DEFAULT 0,
-                cached_tokens INTEGER DEFAULT 0,
+                usage JSONB NOT NULL DEFAULT '{unknown_usage}',
                 tags          JSONB DEFAULT '[]',
                 owner_instance_id TEXT NOT NULL DEFAULT '',
                 lease_expires_at TEXT NOT NULL DEFAULT '',
@@ -39,13 +40,9 @@ impl PostgresStore {
                 &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS flow TEXT NOT NULL DEFAULT ''"),
             ),
             (
-                "total_tokens",
-                &format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0"),
-            ),
-            (
-                "cached_tokens",
+                "usage",
                 &format!(
-                    "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS cached_tokens INTEGER DEFAULT 0"
+                    "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS usage JSONB NOT NULL DEFAULT '{unknown_usage}'"
                 ),
             ),
             (

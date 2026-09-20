@@ -12,8 +12,7 @@ pub(in crate::engine::postgres_store) fn run_record(row: &PgRow) -> Result<RunRe
     let duration_ms: i64 = column(row, "duration_ms")?;
     let agent_count: i32 = column(row, "agent_count")?;
     let task_count: i32 = column(row, "task_count")?;
-    let total_tokens: i32 = column(row, "total_tokens")?;
-    let cached_tokens: i32 = column(row, "cached_tokens")?;
+    let usage: sqlx::types::Json<crate::usage::UsageSnapshot> = column(row, "usage")?;
 
     Ok(RunRecord {
         run_id: column(row, "run_id")?,
@@ -26,8 +25,7 @@ pub(in crate::engine::postgres_store) fn run_record(row: &PgRow) -> Result<RunRe
         task_results: decode_stored_json(&task_results_str, "runs.task_results")?,
         agent_count: agent_count as usize,
         task_count: task_count as usize,
-        total_tokens: total_tokens as u32,
-        cached_tokens: cached_tokens as u32,
+        usage: usage.0,
         tags: decode_stored_json(&tags_str, "runs.tags")?,
         owner_instance_id: column(row, "owner_instance_id")?,
         lease_expires_at: column(row, "lease_expires_at")?,
@@ -41,8 +39,7 @@ pub(in crate::engine::postgres_store) fn run_summary(row: &PgRow) -> Result<RunS
     let duration_ms: i64 = column(row, "duration_ms")?;
     let agent_count: i32 = column(row, "agent_count")?;
     let task_count: i32 = column(row, "task_count")?;
-    let total_tokens: i32 = column(row, "total_tokens")?;
-    let cached_tokens: i32 = column(row, "cached_tokens")?;
+    let usage: sqlx::types::Json<crate::usage::UsageSnapshot> = column(row, "usage")?;
 
     Ok(RunSummary {
         run_id: column(row, "run_id")?,
@@ -54,8 +51,7 @@ pub(in crate::engine::postgres_store) fn run_summary(row: &PgRow) -> Result<RunS
         duration_ms: duration_ms as u64,
         agent_count: agent_count as usize,
         task_count: task_count as usize,
-        total_tokens: total_tokens as u32,
-        cached_tokens: cached_tokens as u32,
+        usage: usage.0,
         tags: decode_stored_json(&tags_str, "runs.tags")?,
     })
 }

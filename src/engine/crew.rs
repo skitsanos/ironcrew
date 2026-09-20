@@ -269,6 +269,7 @@ impl Crew {
         started_at: &str,
         finished_at: &str,
         duration_ms: u64,
+        usage: crate::usage::UsageSnapshot,
     ) -> RunRecord {
         let all_success = results.iter().all(|r| r.success);
         let any_success = results.iter().any(|r| r.success);
@@ -279,19 +280,6 @@ impl Crew {
         } else {
             RunStatus::Failed
         };
-
-        let total_tokens = results
-            .iter()
-            .filter_map(|r| r.token_usage.as_ref())
-            .fold(0u32, |total, usage| {
-                total.saturating_add(usage.total_tokens)
-            });
-        let cached_tokens = results
-            .iter()
-            .filter_map(|r| r.token_usage.as_ref())
-            .fold(0u32, |total, usage| {
-                total.saturating_add(usage.cached_tokens)
-            });
 
         RunRecord {
             run_id: run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -307,8 +295,7 @@ impl Crew {
             task_results: results.to_vec(),
             agent_count: self.agents.len(),
             task_count: self.tasks.len(),
-            total_tokens,
-            cached_tokens,
+            usage,
             tags: Vec::new(), // set by caller (CLI --tag or API input.tags)
             // Ownership is assigned by the StateStore when the run intent is
             // persisted. This in-memory completion record is never a lease

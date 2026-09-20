@@ -273,8 +273,7 @@ CREATE TABLE runs (
     task_results  TEXT NOT NULL,    -- JSON array
     agent_count   INTEGER NOT NULL,
     task_count    INTEGER NOT NULL,
-    total_tokens  INTEGER DEFAULT 0,
-    cached_tokens INTEGER DEFAULT 0,
+    usage         TEXT NOT NULL, -- checked snapshot JSON; unavailable default installed by migration
     tags          TEXT DEFAULT '[]', -- JSON array
     created_at    TEXT DEFAULT (datetime('now'))
 );
@@ -451,8 +450,7 @@ CREATE TABLE IF NOT EXISTS runs (
     task_results  JSONB NOT NULL DEFAULT '[]',
     agent_count   INTEGER NOT NULL,
     task_count    INTEGER NOT NULL,
-    total_tokens  INTEGER DEFAULT 0,
-    cached_tokens INTEGER DEFAULT 0,
+    usage         JSONB NOT NULL, -- checked snapshot; unavailable default installed by bootstrap
     tags          JSONB DEFAULT '[]',
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
@@ -472,9 +470,11 @@ WHERE tags @> '["v2-prompt"]';
 SELECT run_id FROM runs
 WHERE task_results @> '[{"task":"research","success":false}]';
 
--- Count tokens per flow
-SELECT flow_name, SUM(total_tokens) as total
-FROM runs GROUP BY flow_name;
+-- Sum complete known totals without narrowing unsigned decimal strings
+SELECT flow_name, SUM((usage #>> '{settled,total_tokens,known}')::numeric) AS total
+FROM runs WHERE usage ->> 'coverage' = 'complete'
+GROUP BY flow_name;
+-- Report incomplete runs separately; the filtered sum is not an invoice.
 
 -- Get runs from the last 24 hours
 SELECT * FROM runs

@@ -35,7 +35,7 @@ pub struct RunCrewResponse {
     pub status: String,
     pub duration_ms: u64,
     /// Aggregate token usage across all tasks in this run.
-    pub total_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     pub results: Vec<TaskResultResponse>,
 }
 
@@ -46,6 +46,7 @@ pub struct TaskResultResponse {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    pub usage: crate::usage::UsageSnapshot,
 }
 
 /// Query params for listing runs.

@@ -13,7 +13,12 @@
 //! Each test uses its own table prefix and drops those tables first, so they
 //! are isolated and can run in parallel against one database. Stop the named
 //! container after the gate; `--rm` removes it.
+
 #![cfg(feature = "postgres")]
+
+#[path = "support/usage.rs"]
+mod usage_fixture;
+use usage_fixture::fixture_usage;
 
 use ironcrew::api::idempotency::RunLeaseHeartbeat;
 use ironcrew::engine::audit::{AuditEvent, AuditFilter};
@@ -319,7 +324,7 @@ fn terminal_run_event(
     run_id: &str,
     status: RunStatus,
     duration_ms: u64,
-    total_tokens: u32,
+    usage: ironcrew::usage::UsageSnapshot,
 ) -> RunEventAppendEntry {
     RunEventAppendEntry::new(
         sequence,
@@ -330,7 +335,7 @@ fn terminal_run_event(
                 "run_id": run_id,
                 "status": status.to_string(),
                 "duration_ms": duration_ms,
-                "total_tokens": total_tokens,
+                "usage": usage,
             }
         }),
         1024,
@@ -955,11 +960,10 @@ async fn pg_intent_completion_roundtrip() {
                     output: "hi".into(),
                     success: true,
                     duration_ms: 4500,
-                    token_usage: None,
+                    usage: Default::default(),
                     reasoning: None,
                 }],
-                total_tokens: 100,
-                cached_tokens: 20,
+                usage: fixture_usage(100, 20),
             },
         )
         .await
@@ -969,7 +973,7 @@ async fn pg_intent_completion_roundtrip() {
     assert_eq!(r.status, RunStatus::Success);
     assert_eq!(r.duration_ms, 5000);
     assert_eq!(r.task_results.len(), 1);
-    assert_eq!(r.total_tokens, 100);
+    assert_eq!(r.usage.settled.total_tokens().known(), Some(100));
 
     // A racing finalizer observes the winner without overwriting it.
     let again = store
@@ -980,8 +984,7 @@ async fn pg_intent_completion_roundtrip() {
                 finished_at: "2026-04-23T10:00:06Z".into(),
                 duration_ms: 6000,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await;
@@ -1013,8 +1016,7 @@ async fn pg_persists_abort_once() {
         finished_at: "2026-07-18T10:00:01Z".into(),
         duration_ms: 1_000,
         task_results: vec![],
-        total_tokens: 0,
-        cached_tokens: 0,
+        usage: fixture_usage(0, 0),
     };
     assert_eq!(
         store
@@ -1483,8 +1485,7 @@ async fn pg_update_run_status_waiting_round_trip() {
                 finished_at: "2026-07-07T10:01:00Z".into(),
                 duration_ms: 60_000,
                 task_results: Vec::new(),
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -1604,8 +1605,7 @@ async fn pg_multi_instance_lease_prevents_live_run_sweep() {
                 finished_at: "9999-07-18T10:00:00Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -1950,11 +1950,11 @@ async fn pg_run_maintenance_high_cardinality_reconciliation_makes_bounded_progre
         let insert_runs = format!(
             "INSERT INTO {prefix}runs (\
                  run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-                 task_results, agent_count, task_count, total_tokens, cached_tokens, tags, \
+                 task_results, agent_count, task_count, tags, \
                  owner_instance_id, lease_expires_at\
              ) \
              SELECT $2 || '-' || fixture.number::text, 'flow-a', 'flow-a', 'running', \
-                    '2026-08-07T10:00:00Z', '', 0, '[]'::jsonb, 1, 1, 0, 0, \
+                    '2026-08-07T10:00:00Z', '', 0, '[]'::jsonb, 1, 1, \
                     '[]'::jsonb, 'dead-owner', $3 \
              FROM generate_series(1, $1::bigint) AS fixture(number)"
         );
@@ -3685,8 +3685,7 @@ async fn pg_run_claim_enforces_aggregate_response_budget_before_terminalization(
                     finished_at: finished_at.into(),
                     duration_ms: 1,
                     task_results: vec![],
-                    total_tokens: 0,
-                    cached_tokens: 0,
+                    usage: fixture_usage(0, 0),
                 },
             )
             .await
@@ -3790,8 +3789,7 @@ async fn pg_run_mappings_progress_and_expired_claim_gets_abandoned_fallback() {
                 finished_at: "2026-07-19T12:01:00Z".into(),
                 duration_ms: 59_000,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -4218,8 +4216,7 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
                 finished_at: "9999-01-01T00:00:00Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -4398,8 +4395,7 @@ async fn pg_keyed_run_cancellation_crosses_instance_boundary() {
                 finished_at: "2026-07-19T12:01:00Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -5009,8 +5005,7 @@ async fn pg_human_input_rows_follow_run_lifecycle_cleanup() {
                 finished_at: "2026-07-19T12:01:00Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -5534,8 +5529,7 @@ async fn pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascade
                 finished_at: "2026-07-19T12:01:00Z".into(),
                 duration_ms: 321,
                 task_results: vec![],
-                total_tokens: 42,
-                cached_tokens: 7,
+                usage: fixture_usage(42, 7),
             },
         )
         .await
@@ -5548,9 +5542,26 @@ async fn pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascade
             "terminal-run",
             RunStatus::Success,
             321,
-            42,
+            fixture_usage(42, 7),
         )],
     );
+    for usage in [
+        fixture_usage(42, 6),
+        ironcrew::usage::UsageSnapshot::unavailable(),
+    ] {
+        let mismatch = run_event_batch(
+            "terminal-run",
+            "owner-a",
+            vec![terminal_run_event(
+                1,
+                "terminal-run",
+                RunStatus::Success,
+                321,
+                usage,
+            )],
+        );
+        assert!(owner.append_run_events(&mismatch).await.is_err());
+    }
     owner.append_run_events(&terminal_batch).await.unwrap();
     let duplicate = owner.append_run_events(&terminal_batch).await.unwrap();
     assert_eq!(duplicate.appended_events, 0);
@@ -5563,7 +5574,7 @@ async fn pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascade
     let terminal = page.terminal.unwrap();
     assert_eq!(terminal.status, RunStatus::Success);
     assert_eq!(terminal.duration_ms, 321);
-    assert_eq!(terminal.total_tokens, 42);
+    assert_eq!(terminal.usage.settled.total_tokens().known(), Some(42));
     assert_eq!(terminal.event_sequence, Some(1));
 
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -5610,8 +5621,7 @@ async fn pg_run_event_journal_retains_terminal_metadata_after_expiry_and_cascade
                 finished_at: "2026-07-19T12:03:00Z".into(),
                 duration_ms: 5,
                 task_results: vec![],
-                total_tokens: 2,
-                cached_tokens: 0,
+                usage: fixture_usage(2, 0),
             },
         )
         .await
@@ -5681,7 +5691,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
             "premature-terminal",
             RunStatus::Success,
             1,
-            1,
+            fixture_usage(1, 0),
         )],
     );
     let error = store.append_run_events(&premature).await.unwrap_err();
@@ -5730,8 +5740,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
                 finished_at: "2026-07-19T12:01:00Z".into(),
                 duration_ms: 12,
                 task_results: vec![],
-                total_tokens: 34,
-                cached_tokens: 0,
+                usage: fixture_usage(34, 0),
             },
         )
         .await
@@ -5751,7 +5760,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
             "sealed-run",
             RunStatus::Failed,
             12,
-            34,
+            fixture_usage(34, 0),
         )],
     );
     let error = store.append_run_events(&mismatched).await.unwrap_err();
@@ -5765,7 +5774,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
             "sealed-run",
             RunStatus::Success,
             12,
-            34,
+            fixture_usage(34, 0),
         )],
     );
     let appended = store.append_run_events(&terminal).await.unwrap();
@@ -5780,7 +5789,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
             "sealed-run",
             RunStatus::Success,
             12,
-            34,
+            fixture_usage(34, 0),
         )],
     );
     let error = store.append_run_events(&second_terminal).await.unwrap_err();
@@ -5815,7 +5824,7 @@ async fn pg_run_event_journal_rejects_stale_and_post_terminal_writes() {
             "abandoned-run",
             RunStatus::Abandoned,
             0,
-            0,
+            ironcrew::usage::UsageSnapshot::unavailable(),
         )],
     );
     let error = store.append_run_events(&abandoned).await.unwrap_err();

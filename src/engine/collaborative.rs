@@ -4,14 +4,11 @@ use std::sync::Arc;
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::interpolate::prompt_char_limit;
-use crate::engine::task::{TaskResult, TaskTokenUsage};
+use crate::engine::task::TaskResult;
 use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
+use crate::usage::UsageSnapshot;
 use crate::utils::error::{IronCrewError, Result};
-
-mod usage;
-
-use usage::UsageAccumulator;
 
 const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const HARD_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -125,7 +122,9 @@ pub async fn execute_collaborative_task(
     model: &str,
     synthesis_model: &str,
     eventbus: &EventBus,
-) -> Result<(String, Option<TaskTokenUsage>)> {
+) -> Result<(String, UsageSnapshot)> {
+    let tracker = crate::llm::scope::child_scope(provider.as_ref())?;
+    let provider = crate::llm::scope::with_usage_tracker(provider, tracker.clone());
     if agents.len() < 2 {
         return Err(IronCrewError::Validation(
             "Collaborative task requires at least 2 agents".into(),
@@ -159,8 +158,6 @@ pub async fn execute_collaborative_task(
     )
     .min(transcript_limit);
     let prompt_limit = prompt_char_limit();
-
-    let mut total_usage = UsageAccumulator::default();
 
     let mut conversation = Transcript::new(transcript_limit);
     conversation.push(task_name, "Task: ", task_description)?;
@@ -213,7 +210,6 @@ pub async fn execute_collaborative_task(
             let request = agent.chat_request(agent_model, messages);
 
             let response = provider.chat(request).await?;
-            total_usage.observe(response.usage.as_ref());
             let content = require_final_content(response.content)?;
             if content.len() > turn_limit {
                 return Err(IronCrewError::Task {
@@ -277,9 +273,8 @@ pub async fn execute_collaborative_task(
     validate_chat_history(&request.messages, 1, chat_history_max_bytes(), true)?;
 
     let response = provider.chat(request).await?;
-    total_usage.observe(response.usage.as_ref());
     let content = require_final_content(response.content)?;
-    Ok((content, total_usage.finish()))
+    Ok((content, crate::llm::scope::snapshot(&tracker)?))
 }
 
 #[cfg(test)]

@@ -17,8 +17,8 @@ impl PostgresStore {
         let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
             .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
         let sql = format!(
-            "INSERT INTO {} (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
-             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, 0, 0, $8::jsonb, $9, $10)
+            "INSERT INTO {} (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, tags, owner_instance_id, lease_expires_at)
+             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, $8::jsonb, $9, $10)
              ON CONFLICT (run_id) DO NOTHING",
             self.table_name
         );

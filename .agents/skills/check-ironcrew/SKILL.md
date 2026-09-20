@@ -98,6 +98,7 @@ script runs these CI integration targets serially when that variable is set:
 ```bash
 cargo test --locked --all-features \
   --test postgres_store_test \
+  --test usage_storage_test \
   --test multi_replica_http_test \
   --test two_process_replica_acceptance_test \
   -- --test-threads=1

@@ -54,7 +54,7 @@ impl TryFrom<AggregateWire> for UsageAggregate {
 }
 
 impl UsageAggregate {
-    fn validate(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
         let primary = [
             &self.prompt_tokens,
             &self.completion_tokens,

@@ -177,6 +177,7 @@ describe("repository integration policy", () => {
     expect(guard).toContain("evaluations/crew-effectiveness/evaluate.py");
     expect(guard).toContain("IRONCREW_TEST_PG_URL");
     expect(guard).toContain("--test two_process_replica_acceptance_test");
+    expect(guard).toContain("--test usage_storage_test");
     expect(guard).toContain("evaluations/replica-soak/soak.py");
     expect(guard).toContain("PostgreSQL integration not run");
     expect(guard).toContain("GitHub CI remains authoritative for macOS, Windows");
@@ -384,6 +385,7 @@ describe("repository integration policy", () => {
     ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test two_process_replica_acceptance_test");
+    expect(commands).toContain("--test usage_storage_test");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
     expect(agents).toContain("Pull the moving `postgres:15` tag");
     expect(agents).toContain("Do not substitute `postgres:latest`");

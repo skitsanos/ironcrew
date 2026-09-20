@@ -208,11 +208,10 @@ pub enum ConversationCoordinationScope {
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
 
-    /// Called when a run starts. Writes a RunRecord with status=Running,
-    /// empty task_results, finished_at="", duration_ms=0, total_tokens=0,
-    /// cached_tokens=0. Returns the generated run_id (or `intent.suggested_id`
-    /// if `Some` — used by the HTTP handler to pre-allocate an id before
-    /// the flow runs so SSE subscribers can join mid-flight).
+    /// Called when a run starts. Writes a Running record with empty results,
+    /// finished_at="", duration_ms=0 and unavailable usage. Returns the generated
+    /// run_id or `intent.suggested_id` when present, allowing HTTP callers to
+    /// pre-allocate an id so SSE subscribers can join mid-flight.
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
 
     /// Called when a run completes (success, partial failure, or hard

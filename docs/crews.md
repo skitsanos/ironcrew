@@ -1021,9 +1021,11 @@ These values are passed through to the LLM provider.
 
 ## Token Usage Tracking
 
-Each task result includes a `token_usage` table with `prompt_tokens`,
-`completion_tokens`, `total_tokens`, and `cached_tokens`. Totals are persisted
-in run history and visible via `ironcrew inspect`.
+Each task result includes a checked `usage` snapshot with request count,
+coverage, and primary/reasoning/cache token subtotals. Counts are decimal strings
+or explicit nulls, never guessed zeros. Retries and failed attempts are included.
+Run history and `ironcrew inspect` expose the same snapshot contract; see
+[usage accounting](usage-accounting.md) for inclusive scope and storage boundaries.
 
 ---
 

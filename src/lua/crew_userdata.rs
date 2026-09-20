@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::engine::crew::Crew;
 use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
-use crate::engine::run_history::{RunCompletion, RunTransition};
+use crate::engine::run_history::RunCompletion;
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
@@ -839,7 +839,15 @@ impl UserData for LuaCrew {
             }
 
             *this.last_run_usage.lock().expect("usage lock poisoned") = provider.usage_tracker();
-            let run_outcome = crew.run(provider, &tool_registry).await;
+            let tracker = provider.usage_tracker().expect("run provider is scoped");
+            let mut run_outcome = crew.run(provider, &tool_registry).await;
+            let usage = match crate::llm::scope::snapshot(&tracker) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    run_outcome = Err(error);
+                    crate::usage::UsageSnapshot::unavailable()
+                }
+            };
 
             let run_end = chrono::Utc::now();
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
@@ -853,6 +861,7 @@ impl UserData for LuaCrew {
                         &run_start.to_rfc3339(),
                         &run_end.to_rfc3339(),
                         total_ms,
+                        usage.clone(),
                     );
                     record.tags = tags.clone();
                     let completion = RunCompletion {
@@ -864,51 +873,16 @@ impl UserData for LuaCrew {
                         // Transfer that owned copy into persistence instead of
                         // deep-cloning every TaskResult a second time.
                         task_results: std::mem::take(&mut record.task_results),
-                        total_tokens: record.total_tokens,
-                        cached_tokens: record.cached_tokens,
+                        usage: record.usage,
                     };
-                    if let Some(lifecycle) = api_lifecycle.as_ref() {
-                        lifecycle.stage(run_id.clone(), completion).await;
-                    } else {
-                        // CLI-owned runs finish at `crew:run()`, so preserve
-                        // their historical immediate persistence behavior.
-                        let status = completion.status.clone();
-                        let transition = store
-                            .update_run_completion(&run_id, completion)
-                            .await
-                            .map_err(|error| {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Error,
-                                );
-                                crate::metrics::record_store_failure(
-                                    crate::metrics::StoreOperation::TerminalPersistence,
-                                );
-                                mlua::Error::external(error)
-                            })?;
-                        match transition {
-                            RunTransition::Applied => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Success,
-                                );
-                                if let Some(outcome) =
-                                    crate::metrics::RunOutcome::from_status(&status)
-                                {
-                                    crate::metrics::record_run(
-                                        outcome,
-                                        Some(std::time::Duration::from_millis(total_ms)),
-                                    );
-                                }
-                            }
-                            RunTransition::AlreadyTerminal(_) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Fenced,
-                                );
-                            }
-                        }
-                    }
+                    run_lifecycle::complete_run(
+                        &store,
+                        api_lifecycle.as_ref(),
+                        &run_id,
+                        completion,
+                    )
+                    .await
+                    .map_err(mlua::Error::external)?;
                     results
                 }
                 Err(e) => {
@@ -917,43 +891,16 @@ impl UserData for LuaCrew {
                         finished_at: run_end.to_rfc3339(),
                         duration_ms: total_ms,
                         task_results: Vec::new(),
-                        total_tokens: 0,
-                        cached_tokens: 0,
+                        usage,
                     };
-                    if let Some(lifecycle) = api_lifecycle.as_ref() {
-                        lifecycle.stage(run_id.clone(), completion).await;
-                    } else {
-                        // Best-effort completion on the error path: swallow
-                        // persistence errors because the crew failure takes
-                        // precedence for CLI callers.
-                        match store.update_run_completion(&run_id, completion).await {
-                            Ok(RunTransition::Applied) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Success,
-                                );
-                                crate::metrics::record_run(
-                                    crate::metrics::RunOutcome::Failed,
-                                    Some(std::time::Duration::from_millis(total_ms)),
-                                );
-                            }
-                            Ok(RunTransition::AlreadyTerminal(_)) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Fenced,
-                                );
-                            }
-                            Err(_) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Error,
-                                );
-                                crate::metrics::record_store_failure(
-                                    crate::metrics::StoreOperation::TerminalPersistence,
-                                );
-                            }
-                        }
-                    }
+                    // Retain the execution error if best-effort persistence fails.
+                    let _ = run_lifecycle::complete_run(
+                        &store,
+                        api_lifecycle.as_ref(),
+                        &run_id,
+                        completion,
+                    )
+                    .await;
                     return Err(mlua::Error::external(e));
                 }
             };
