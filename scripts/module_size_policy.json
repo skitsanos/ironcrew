@@ -104,8 +104,8 @@
     },
     {
       "path": "src/engine/postgres_store.rs",
-      "max_lines": 8358,
-      "rationale": "IC-040 pass 1 ratchet: row decoding and codecs moved to focused child modules; this SQLx implementation still contains schema migration and repositories for runs, idempotency, leases, HITL, journals, conversations, and audit, which must be extracted domain-by-domain before extending storage."
+      "max_lines": 7992,
+      "rationale": "IC-040 pass 2 ratchet: row codecs and the run-history repository moved to focused child modules; this SQLx implementation still contains schema migration and repositories for idempotency, leases, HITL, journals, conversations, and audit, which must be extracted domain-by-domain before extending storage."
     },
     {
       "path": "src/engine/run_events.rs",
