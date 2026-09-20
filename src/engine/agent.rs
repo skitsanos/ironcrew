@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::llm::provider::{ChatMessage, ChatRequest};
 use crate::utils::error::IronCrewError;
 
 /// Validate a single entry in an agent's `tools` list. Returns an error for
@@ -71,6 +72,29 @@ pub struct Agent {
     pub model: Option<String>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// Per-agent reasoning effort (Responses API `reasoning.effort`; forwarded
+    /// as `reasoning_effort` on Chat Completions). Skipped when unset so the
+    /// canonical agent JSON — and every existing conversation fingerprint —
+    /// stays bit-identical for agents that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Agent {
+    /// Build a provider request carrying this agent's per-request overrides.
+    /// Cache keys are left unset; callers that thread them set them afterwards.
+    pub fn chat_request(&self, model: String, messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            messages,
+            model,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            response_format: self.response_format.clone(),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning_effort: self.reasoning_effort.clone(),
+        }
+    }
 }
 
 pub struct AgentSelector;

@@ -420,10 +420,10 @@ pub fn register_crew_constructor(
                 let reasoning_effort: Option<String> = table.get("reasoning_effort")?;
                 let reasoning_summary: Option<String> = table.get("reasoning_summary")?;
                 if let Some(value) = reasoning_effort.as_deref() {
-                    validate_config_choice("reasoning_effort", value, REASONING_EFFORTS)?;
+                    validate_config_choice("Crew.new reasoning_effort", value, REASONING_EFFORTS)?;
                 }
                 if let Some(value) = reasoning_summary.as_deref() {
-                    validate_config_choice("reasoning_summary", value, REASONING_SUMMARIES)?;
+                    validate_config_choice("Crew.new reasoning_summary", value, REASONING_SUMMARIES)?;
                 }
 
                 let max_server_tools = config_limit(
@@ -471,7 +471,7 @@ pub fn register_crew_constructor(
                     table.get("web_search_context_size")?;
                 if let Some(value) = web_search_context_size.as_deref() {
                     validate_config_choice(
-                        "web_search_context_size",
+                        "Crew.new web_search_context_size",
                         value,
                         WEB_SEARCH_CONTEXT_SIZES,
                     )?;

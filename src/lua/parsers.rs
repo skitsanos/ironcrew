@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::lua::config_choices::{REASONING_EFFORTS, validate_config_choice};
 use mlua::{Function, Result as LuaResult, Table, Value};
 
 use crate::engine::agent::{Agent, ResponseFormat, validate_agent_tool_name};
@@ -114,6 +115,7 @@ pub(crate) const AGENT_KEYS: &[&str] = &[
     "capabilities",
     "tools",
     "response_format",
+    "reasoning_effort",
 ];
 
 /// Options accepted on a task table (`crew:add_task` / `add_foreach_task`).
@@ -313,12 +315,18 @@ pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
     let temperature: Option<f32> = table.raw_get::<Option<f32>>("temperature")?.or(None);
     let max_tokens: Option<u32> = table.raw_get::<Option<u32>>("max_tokens")?.or(None);
     let model: Option<String> = table.raw_get::<Option<String>>("model")?.or(None);
+    let reasoning_effort: Option<String> = table
+        .raw_get::<Option<String>>("reasoning_effort")?
+        .or(None);
 
     validate_name(&name, "agent.name")?;
     validate_text(&goal, "agent.goal")?;
     validate_optional_text(expected_output.as_deref(), "agent.expected_output")?;
     validate_optional_text(system_prompt.as_deref(), "agent.system_prompt")?;
     validate_optional_control_free(model.as_deref(), "agent.model", MAX_MODEL_BYTES)?;
+    if let Some(effort) = reasoning_effort.as_deref() {
+        validate_config_choice("agent.reasoning_effort", effort, REASONING_EFFORTS)?;
+    }
     if let Some(temperature) = temperature
         && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
     {
@@ -353,6 +361,7 @@ pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
         temperature,
         max_tokens,
         model,
+        reasoning_effort,
         response_format,
     })
 }
@@ -727,6 +736,8 @@ fn parse_agent_source(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod agent_effort_tests;
 #[cfg(test)]
 mod parser_agent_tool_validation;
 #[cfg(test)]

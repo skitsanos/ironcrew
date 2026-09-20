@@ -66,6 +66,7 @@ fn build_body_replays_thinking_before_tool_use() {
         response_format: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        reasoning_effort: None,
     };
     let body = provider.build_body(&req, None);
     let messages = body["messages"].as_array().unwrap();
@@ -103,6 +104,7 @@ fn schema_request(images: Option<Vec<ImageInput>>) -> ChatRequest {
         }),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        reasoning_effort: None,
     }
 }
 
@@ -206,4 +208,15 @@ fn prose_cannot_satisfy_a_required_schema_output() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("required structured-output tool"), "{error}");
+}
+
+#[test]
+fn reasoning_effort_is_rejected_with_a_thinking_budget_hint() {
+    let mut req = schema_request(None);
+    req.reasoning_effort = Some("high".into());
+    let error = reject_reasoning_effort(&req).unwrap_err().to_string();
+    assert!(error.contains("reasoning_effort"), "{error}");
+    assert!(error.contains("thinking_budget"), "{error}");
+    req.reasoning_effort = None;
+    assert!(reject_reasoning_effort(&req).is_ok());
 }

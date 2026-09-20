@@ -537,6 +537,8 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<String>,
+    /// Per-request reasoning effort (agent-level override; see `Agent`).
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
