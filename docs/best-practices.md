@@ -227,8 +227,8 @@ citations, and one configuration flag instead of a whole tool implementation.
 
 **CORS.** The API server denies cross-origin requests by default. Set
 `IRONCREW_CORS_ORIGINS` to a comma-separated list of allowed origins, or `*`
-for permissive access (development only). In production, always list specific
-origins.
+to allow every origin while retaining the API's restricted methods and headers
+(development only). In production, always list specific origins.
 
 **SSRF protection.** The `http_request` tool and all Lua `http.*` globals block
 requests to private/internal IP addresses (loopback, RFC1918, link-local, CGNAT)
@@ -249,8 +249,9 @@ served via `GET /audit`. Callers can self-label by sending an
 `X-Audit-Actor: alice@example.com` header — the value is voluntary,
 validated for length and control characters, and replaced by the JWT
 `sub` claim when JWT auth lands. Behind a reverse proxy, set
-`IRONCREW_TRUST_PROXY=1` so the recorder uses `X-Forwarded-For` for
-source-IP capture. See `docs/rest-api.md`.
+`IRONCREW_TRUST_PROXY=1` only when that trusted proxy appends its observed
+client address to `X-Forwarded-For`. The recorder uses the rightmost IP and
+ignores client-supplied prefixes. See `docs/rest-api.md`.
 
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
@@ -423,7 +424,7 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile pins Rust `1.98.0`, builds with
+**Multi-arch builds.** The Dockerfile pins Rust `1.98.1`, builds with
 `--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
 architectures with:
 

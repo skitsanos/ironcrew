@@ -174,11 +174,14 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` or lower | Byte cap on opaque state echoed during MRTR; hard ceiling `1048576`. |
 | `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` | `1048576` or lower | Pre-JSON cap per stdio line, HTTP JSON message, or SSE event; hard ceiling `16777216`. One transport chunk may temporarily exceed the cap but is rejected before copying into IronCrew-owned assembly/parser buffers. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Bounds the initial protocol preface and each HTTP/1 header block; range 1–300 seconds. Also controls HTTP/2 keep-alive probes. |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Bounds request-body reads and handler work until response creation; range 1–7200 seconds. Keep above the longest synchronous handler budget. Established SSE bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` or lower | Per-process accepted-connection cap; range 1–100000. Size aggregate capacity as replicas times this value. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical in steady state | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. During the controlled rotation overlap, every process must contain both keys even while active ids temporarily differ. Store only in Railway/OpenShift secrets; never bake it into the image. |
 | `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for newly registered question metadata. Answers inherit their authenticated question's key. Both HITL variables must be set together. |
 | `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist shared by Lua `env()` and `${env.NAME}` interpolation. Opt in only the exact vars a crew needs. See [docs/sandbox.md](sandbox.md). |
-| `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
+| `IRONCREW_TRUST_PROXY` | unset | Set to `1` only behind a trusted reverse proxy that appends its observed client address to `X-Forwarded-For`. Audit capture uses the rightmost valid IP and ignores client-supplied prefixes; an invalid rightmost entry falls back to the TCP peer. Leave unset for direct exposure. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
 | `IRONCREW_AUDIT_MAX_LIMIT` | `500` | Hard cap on `GET /audit?limit=`. |
 
@@ -248,6 +251,9 @@ per-flow read grants.
 |---|---|---|
 | `IRONCREW_MAX_PROMPT_CHARS` | `102400` characters | Caps prompt size per task. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MiB) | Request body cap (hard ceiling 64 MiB). |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Initial protocol/HTTP/1 header deadline and HTTP/2 keep-alive interval/timeout (range 1–300 seconds). |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Request dispatch/body/handler deadline until response creation (range 1–7200 seconds); established stream bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` | Accepted HTTP connection cap per process (range 1–100000); SSE also has its narrower cap below. |
 | `IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES` | `65536` (64 KiB) | Outbound `http_request` header budget (hard ceiling 1 MiB). |
 | `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |
@@ -838,6 +844,7 @@ Execution and storage instrumentation uses only closed label vocabularies:
 | `ironcrew_runs_total`; `ironcrew_run_duration_seconds` | counter; histogram | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total`; `ironcrew_task_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total`; `ironcrew_tool_call_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` | counter | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total`; `ironcrew_provider_request_duration_seconds` | counter; histogram | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
 | `ironcrew_sse_connections_total` | counter | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
@@ -957,7 +964,11 @@ thresholds from measured traffic:
    `provider,operation` only after a minimum request volume, and use the success
    histogram for a separately tuned p95 latency threshold. Treat cancellations
    as their own signal rather than silently folding them into provider errors.
-4. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
+4. **Hook health:** investigate any sustained increase in
+   `ironcrew_hook_failures_total`, grouped by `hook,stage`. The affected task
+   continues with its original description or output, so this signal means the
+   run degraded rather than failed closed.
+5. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
    on sustained admission `limited` outcomes, and at the existing durable
    idempotency 80/90/100-percent thresholds.
 
@@ -1525,7 +1536,7 @@ memory file.
 
 ### Source Dockerfile
 
-The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.98.0` builder that
+The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.98.1` builder that
 matches `Cargo.toml`'s minimum supported Rust version, builds with
 `cargo build --release --locked`, and copies the executable into
 `debian:13-slim`. The runtime is intentionally glibc-based and dynamically
@@ -1540,7 +1551,7 @@ The runtime stage:
 - supplies a runnable server `CMD`
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
-with GNU/Linux artifacts built by the release workflow using Rust `1.98.0` and
+with GNU/Linux artifacts built by the release workflow using Rust `1.98.1` and
 `--locked`. The exact tag workflow assembles one `linux/amd64` plus
 `linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
 source and OCI object hashes in a signed receipt, and publishes both as release

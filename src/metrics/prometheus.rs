@@ -3,9 +3,9 @@ use std::fmt::Write;
 use super::histogram::{DURATION_BUCKET_LABELS, Histogram};
 use super::state::Metrics;
 use super::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, TokenKind, ToolOutcome,
 };
 
 pub(crate) fn append(body: &mut String, metrics: &Metrics) {
@@ -39,6 +39,20 @@ pub(crate) fn append(body: &mut String, metrics: &Metrics) {
             .zip(metrics.tool_counts.iter().map(Metrics::counter))
             .zip(metrics.tool_durations.iter()),
     );
+
+    writeln!(body, "# TYPE ironcrew_hook_failures_total counter").unwrap();
+    for &hook in HookKind::ALL {
+        for &stage in HookFailureStage::ALL {
+            let value = Metrics::counter(&metrics.hook_failures[hook.index()][stage.index()]);
+            writeln!(
+                body,
+                "ironcrew_hook_failures_total{{hook=\"{}\",stage=\"{}\"}} {value}",
+                hook.as_str(),
+                stage.as_str()
+            )
+            .unwrap();
+        }
+    }
 
     writeln!(body, "# TYPE ironcrew_provider_requests_total counter").unwrap();
     writeln!(

@@ -14,9 +14,10 @@
 //! Extracted from the original `LuaConversationInner::run_turn` body
 //! so both paths share tool-loop logic without duplication.
 
+mod tool_dispatch;
+
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::CrewEvent;
@@ -239,60 +240,8 @@ pub async fn run_single_agent_turn(
         ));
         enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
 
-        // Execute each tool call and append its result.
         for tool_call in &response.tool_calls {
-            let started = std::time::Instant::now();
-            if let Some(bus) = &ctx.eventbus {
-                bus.emit(CrewEvent::ToolCall {
-                    task: scope.clone(),
-                    tool: tool_call.function.name.clone(),
-                });
-            }
-
-            let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(serde_json::Value::Null);
-
-            // A call may extend its own dispatch deadline (ask_human waits
-            // on a person; approval-gated tools wait for a sign-off);
-            // everything else gets the global timeout.
-            let timeout = ctx.tool_registry.as_ref().map_or_else(
-                || Duration::from_secs(tool_timeout_secs()),
-                |registry| {
-                    registry
-                        .dispatch_timeout(&tool_call.function.name, &args)
-                        .unwrap_or_else(|| registry.default_dispatch_timeout())
-                },
-            );
-            let (result_text, ok) = match &ctx.tool_registry {
-                Some(reg) => {
-                    let dispatch = reg.execute(&tool_call.function.name, args, ctx);
-                    match tokio::time::timeout(timeout, dispatch).await {
-                        Ok(Ok(s)) => (s, true),
-                        Ok(Err(e)) => (format!("Tool error: {}", e), false),
-                        Err(_) => (
-                            format!("Tool error: Tool timed out after {}s", timeout.as_secs()),
-                            false,
-                        ),
-                    }
-                }
-                None => (
-                    format!(
-                        "Tool error: no tool registry available to dispatch {}",
-                        tool_call.function.name
-                    ),
-                    false,
-                ),
-            };
-
-            if let Some(bus) = &ctx.eventbus {
-                bus.emit(CrewEvent::ToolResult {
-                    task: scope.clone(),
-                    tool: tool_call.function.name.clone(),
-                    success: ok,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-
+            let result_text = tool_dispatch::execute(tool_call, &scope, ctx).await;
             history.push(ChatMessage::tool(&tool_call.id, &result_text));
             enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
         }
@@ -304,6 +253,7 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
