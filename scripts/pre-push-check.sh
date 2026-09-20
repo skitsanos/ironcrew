@@ -4,6 +4,14 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
+# Git exports repository-local variables to hooks. They override `cwd` for
+# nested Git commands, so temporary-repository tests would otherwise operate on
+# this worktree. The gate is already anchored at the repository root and can
+# safely rediscover the worktree from `.git` after clearing them.
+while IFS= read -r git_environment_name; do
+  unset "$git_environment_name"
+done < <(git rev-parse --local-env-vars)
+
 require_command() {
   local command_name=$1
   local install_hint=$2

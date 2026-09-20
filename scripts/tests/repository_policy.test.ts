@@ -130,6 +130,8 @@ describe("repository integration policy", () => {
     expect(taskfile).toContain("./scripts/pre-push-check.sh");
     expect(taskfile).toContain("./scripts/refresh-develop-dependencies.sh");
     expect(guard).toContain("./scripts/refresh-develop-dependencies.sh");
+    expect(guard).toContain("git rev-parse --local-env-vars");
+    expect(guard).toContain('unset "$git_environment_name"');
     expect(refresh).toContain("latest immutable GitHub Action releases");
     expect(refresh).toContain('Path(".github/workflows").glob("*.yml")');
     expect(refresh).toContain('["git", "ls-remote", "--tags", remote]');
