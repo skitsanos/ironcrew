@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use super::histogram::{Histogram, saturating_add};
 use super::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, TokenKind, ToolOutcome,
 };
 
 pub(crate) struct Metrics {
@@ -15,6 +15,7 @@ pub(crate) struct Metrics {
     pub(crate) task_durations: [Histogram; TaskOutcome::COUNT],
     pub(crate) tool_counts: [AtomicU64; ToolOutcome::COUNT],
     pub(crate) tool_durations: [Histogram; ToolOutcome::COUNT],
+    pub(crate) hook_failures: [[AtomicU64; HookFailureStage::COUNT]; HookKind::COUNT],
     pub(crate) provider_counts:
         [[[AtomicU64; ProviderOutcome::COUNT]; ProviderOperation::COUNT]; ProviderFamily::COUNT],
     pub(crate) provider_durations:
@@ -37,6 +38,7 @@ impl Default for Metrics {
             task_durations: std::array::from_fn(|_| Histogram::default()),
             tool_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             tool_durations: std::array::from_fn(|_| Histogram::default()),
+            hook_failures: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             provider_counts: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
             }),
@@ -74,6 +76,10 @@ impl Metrics {
     pub(crate) fn record_tool(&self, outcome: ToolOutcome, duration: Duration) {
         saturating_add(&self.tool_counts[outcome.index()], 1);
         self.tool_durations[outcome.index()].record(duration);
+    }
+
+    pub(crate) fn record_hook_failure(&self, hook: HookKind, stage: HookFailureStage) {
+        saturating_add(&self.hook_failures[hook.index()][stage.index()], 1);
     }
 
     pub(crate) fn record_provider(

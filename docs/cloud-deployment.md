@@ -844,6 +844,7 @@ Execution and storage instrumentation uses only closed label vocabularies:
 | `ironcrew_runs_total`; `ironcrew_run_duration_seconds` | counter; histogram | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total`; `ironcrew_task_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total`; `ironcrew_tool_call_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` | counter | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total`; `ironcrew_provider_request_duration_seconds` | counter; histogram | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
 | `ironcrew_sse_connections_total` | counter | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
@@ -963,7 +964,11 @@ thresholds from measured traffic:
    `provider,operation` only after a minimum request volume, and use the success
    histogram for a separately tuned p95 latency threshold. Treat cancellations
    as their own signal rather than silently folding them into provider errors.
-4. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
+4. **Hook health:** investigate any sustained increase in
+   `ironcrew_hook_failures_total`, grouped by `hook,stage`. The affected task
+   continues with its original description or output, so this signal means the
+   run degraded rather than failed closed.
+5. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
    on sustained admission `limited` outcomes, and at the existing durable
    idempotency 80/90/100-percent thresholds.
 

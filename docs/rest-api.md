@@ -1072,6 +1072,7 @@ families; every label value is from the closed vocabulary shown here:
 | `ironcrew_runs_total` (counter), `ironcrew_run_duration_seconds` (histogram) | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total` (counter), `ironcrew_task_duration_seconds` (histogram) | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total` (counter), `ironcrew_tool_call_duration_seconds` (histogram) | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` (counter) | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total` (counter), `ironcrew_provider_request_duration_seconds` (histogram) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
 | `ironcrew_sse_connections_total` (counter) | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
@@ -1093,7 +1094,10 @@ series. A reconciler can count multiple abandoned runs without fabricating
 durations, so `ironcrew_runs_total{outcome="abandoned"}` may exceed the matching
 histogram `_count`. Skipped tasks record a zero-second duration. Provider token
 counters advance only when a successful provider response reports usage; they
-are usage telemetry, not invoice or billing data.
+are usage telemetry, not invoice or billing data. Hook failures retain the
+original task description or output while incrementing the counter, so an
+operator can detect a hook that is failing without exposing its source, task
+name, returned value, or error as a metric label.
 
 These counters and histograms are in-memory, process-local, saturating, and
 reset on every process start. They are not persisted or cluster-global. Record

@@ -61,6 +61,20 @@ fixed_labels!(ToolOutcome {
     Cancelled => "cancelled",
 });
 
+fixed_labels!(HookKind {
+    BeforeTask => "before_task",
+    AfterTask => "after_task",
+});
+
+fixed_labels!(HookFailureStage {
+    VmInitialization => "vm_initialization",
+    ExecutionStart => "execution_start",
+    Environment => "environment",
+    Load => "load",
+    Run => "run",
+    ReturnValue => "return_value",
+});
+
 fixed_labels!(ProviderFamily {
     OpenAi => "openai",
     OpenAiResponses => "openai_responses",
