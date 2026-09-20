@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exception_budget": 48,
+  "exception_budget": 47,
   "exceptions": [
     {
       "path": "src/api/admission.rs",
@@ -101,11 +101,6 @@
       "path": "src/engine/orchestrator.rs",
       "max_lines": 998,
       "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode."
-    },
-    {
-      "path": "src/engine/postgres_store.rs",
-      "max_lines": 3076,
-      "rationale": "IC-040 pass 7 ratchet: row codecs plus the run-history, run-event journal, idempotency, conversation, durable human-input, and audit repositories moved to focused child modules; this SQLx implementation still contains schema migration and lease maintenance, which must be extracted before extending storage."
     },
     {
       "path": "src/engine/run_events.rs",
