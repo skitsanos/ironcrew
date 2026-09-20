@@ -37,12 +37,17 @@ local crew = Crew.new({
 ```
 
 GPT-5.6 Luna accepts only its provider-default temperature. Omit explicit
-`temperature` values when Luna is effective; IronCrew forwards configured
-values and the provider rejects unsupported non-default settings.
+`temperature` values (or use `1`) when Luna is effective; IronCrew rejects
+unsupported non-default settings during construction and request building.
+With no explicit effort, Luna uses `low`.
 For Chat Completions requests with function tools, IronCrew explicitly sends
 `reasoning_effort = "none"` because Luna rejects that combination under its
 default reasoning mode. Use `provider = "openai-responses"` when explicit
 reasoning is required.
+
+These defaults apply to the official OpenAI endpoint. See the
+[model capability policy](model-capabilities.md) for custom endpoints,
+unknown model IDs, validation boundaries, and evidence sources.
 
 ### Google Gemini
 
@@ -235,19 +240,20 @@ local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
     model = "gpt-5.6-luna",
-    reasoning_effort = "medium",      -- "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    reasoning_effort = "low",         -- Luna: "none" | "low" | "medium" | "high" | "xhigh" | "max"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
 })
 ```
 
-Both values (and `web_search_context_size`) are validated against these sets
-when the crew is constructed, so a typo fails at `Crew.new` rather than as a
-provider error on the first request.
+Both values (and `web_search_context_size`) are validated when the crew is
+constructed. Effort is also checked against the effective model policy;
+Luna rejects `minimal`. Omitted Luna effort defaults to `low`.
 
 Individual agents can override the effort for their own requests with
-`reasoning_effort` on the agent table (same value set, validated when the agent
-is parsed); a complex-analysis agent can run at `"high"` while a formatter runs
+`reasoning_effort` on the agent table (syntax checked at parse time, effective
+model checked when added to the crew); a complex-analysis agent can run at
+`"high"` while a formatter runs
 at `"low"` inside one crew. See [docs/agents.md](agents.md) for the provider
 matrix.
 

@@ -1,4 +1,54 @@
 use super::*;
+use crate::engine::agent::ResponseFormat;
+
+#[test]
+fn thinking_temperature_is_preserved_or_rejected_not_silently_removed() {
+    let provider = AnthropicProvider::new(
+        String::new(),
+        None,
+        AnthropicConfig {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        },
+    );
+    let mut request = schema_request(None);
+    request.response_format = None;
+    for temperature in [None, Some(1.0), Some(0.7)] {
+        request.temperature = temperature;
+        let body = provider.build_body(&request, None);
+        assert_eq!(
+            provider.validate_request(&request, false).is_ok(),
+            body.is_ok()
+        );
+        if let Ok(body) = body {
+            assert_eq!(body["temperature"], json!(temperature));
+            assert_eq!(body["max_tokens"], 6144);
+        }
+    }
+}
+
+#[test]
+fn thinking_rejects_forced_schema_tools_but_allows_auto_tool_choice() {
+    let provider = AnthropicProvider::new(
+        String::new(),
+        None,
+        AnthropicConfig {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        },
+    );
+    let request = schema_request(None);
+    assert!(provider.build_body(&request, None).is_err());
+    assert!(provider.validate_request(&request, false).is_err());
+    let tools = [ToolSchema {
+        name: "lookup".into(),
+        description: "lookup".into(),
+        parameters: json!({}),
+    }];
+    assert!(provider.validate_request(&request, true).is_ok());
+    let body = provider.build_body(&request, Some(&tools)).unwrap();
+    assert!(body.get("tool_choice").is_none());
+}
 
 #[test]
 fn parse_captures_thinking_blocks_verbatim() {
@@ -68,7 +118,7 @@ fn build_body_replays_thinking_before_tool_use() {
         prompt_cache_retention: None,
         reasoning_effort: None,
     };
-    let body = provider.build_body(&req, None);
+    let body = provider.build_body(&req, None).unwrap();
     let messages = body["messages"].as_array().unwrap();
     let asst = messages
         .iter()
@@ -111,7 +161,7 @@ fn schema_request(images: Option<Vec<ImageInput>>) -> ChatRequest {
 #[test]
 fn json_schema_response_format_forces_a_schema_tool() {
     let provider = AnthropicProvider::new("k".into(), None, AnthropicConfig::default());
-    let body = provider.build_body(&schema_request(None), None);
+    let body = provider.build_body(&schema_request(None), None).unwrap();
 
     let tools = body["tools"]
         .as_array()
@@ -136,7 +186,9 @@ fn json_schema_allows_real_tools_before_structured_finalization() {
         description: "Search for evidence".into(),
         parameters: json!({"type": "object"}),
     }];
-    let body = provider.build_body(&schema_request(None), Some(&tools));
+    let body = provider
+        .build_body(&schema_request(None), Some(&tools))
+        .unwrap();
 
     assert!(
         body.get("tool_choice").is_none(),
@@ -214,9 +266,13 @@ fn prose_cannot_satisfy_a_required_schema_output() {
 fn reasoning_effort_is_rejected_with_a_thinking_budget_hint() {
     let mut req = schema_request(None);
     req.reasoning_effort = Some("high".into());
-    let error = reject_reasoning_effort(&req).unwrap_err().to_string();
+    let provider = AnthropicProvider::new("k".into(), None, AnthropicConfig::default());
+    let error = provider
+        .validate_request(&req, false)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("reasoning_effort"), "{error}");
     assert!(error.contains("thinking_budget"), "{error}");
     req.reasoning_effort = None;
-    assert!(reject_reasoning_effort(&req).is_ok());
+    assert!(provider.validate_request(&req, false).is_ok());
 }

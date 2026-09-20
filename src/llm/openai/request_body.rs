@@ -1,54 +1,117 @@
-use serde_json::{Value, json};
+use super::*;
+use crate::engine::agent::ResponseFormat;
 
-use crate::llm::provider::ToolSchema;
+impl OpenAiProvider {
+    pub(super) fn build_body(
+        &self,
+        request: &ChatRequest,
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<Value> {
+        let options =
+            self.resolve_options(request, tools.is_some_and(|tools| !tools.is_empty()))?;
+        let messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let mut msg = json!({"role": m.role});
+                // When images are attached, serialize content as an array of
+                // content parts (text + image_url blocks). This is the OpenAI
+                // vision format, also used by Gemini and other OpenAI-compatible
+                // endpoints.
+                if let Some(ref images) = m.images {
+                    if !images.is_empty() {
+                        let mut parts: Vec<serde_json::Value> = Vec::new();
+                        if let Some(ref text) = m.content {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for img in images {
+                            let data_uri = format!("data:{};base64,{}", img.mime_type, img.data);
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": data_uri }
+                            }));
+                        }
+                        msg["content"] = json!(parts);
+                    } else if let Some(ref content) = m.content {
+                        msg["content"] = json!(content);
+                    }
+                } else if let Some(ref content) = m.content {
+                    msg["content"] = json!(content);
+                }
+                if let Some(ref tool_call_id) = m.tool_call_id {
+                    msg["tool_call_id"] = json!(tool_call_id);
+                }
+                if let Some(ref tool_calls) = m.tool_calls {
+                    msg["tool_calls"] = serde_json::to_value(tool_calls).unwrap_or_default();
+                }
+                msg
+            })
+            .collect();
 
-/// Adds the Chat Completions output-token limit using the field supported by
-/// the selected model.
-///
-/// OpenAI's GPT-5 family rejects the legacy `max_tokens` field. Other model
-/// IDs retain that field because this provider also targets third-party
-/// OpenAI-compatible endpoints whose request contracts must not change
-/// implicitly.
-pub(super) fn insert_completion_token_limit(
-    body: &mut Value,
-    model: &str,
-    max_tokens: Option<u32>,
-) {
-    let Some(max_tokens) = max_tokens else {
-        return;
-    };
+        let mut body = json!({
+            "model": request.model,
+            "messages": messages,
+        });
 
-    let field = if model.starts_with("gpt-5") {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-    body[field] = json!(max_tokens);
+        if let Some(temp) = request.temperature {
+            body["temperature"] = json!(temp);
+        }
+        if let Some(max) = request.max_tokens {
+            body[options.token_field] = json!(max);
+        }
+
+        if let Some(ref fmt) = request.response_format {
+            match fmt {
+                ResponseFormat::Text => {
+                    body["response_format"] = json!({"type": "text"});
+                }
+                ResponseFormat::JsonObject => {
+                    body["response_format"] = json!({"type": "json_object"});
+                }
+                ResponseFormat::JsonSchema { name, schema } => {
+                    body["response_format"] = json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": name,
+                            "schema": schema,
+                            "strict": true,
+                        }
+                    });
+                }
+            }
+        }
+
+        insert_tools(&mut body, tools);
+        if let Some(effort) = options.effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+
+        if let Some(ref key) = request.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if let Some(ref retention) = request.prompt_cache_retention {
+            body["prompt_cache_retention"] = json!(retention);
+        }
+
+        Ok(body)
+    }
+
+    pub(super) fn resolve_options<'a>(
+        &self,
+        request: &'a ChatRequest,
+        has_tools: bool,
+    ) -> Result<super::super::capabilities::Resolved<'a>> {
+        super::super::capabilities::openai(
+            super::super::capabilities::Transport::ChatCompletions,
+            &self.base_url,
+            request,
+            has_tools,
+            None,
+        )
+    }
 }
 
-/// Keeps Luna's Chat Completions tool calls on its supported execution path.
-/// Luna defaults to reasoning when the field is omitted, but the API rejects
-/// function tools unless reasoning effort is explicitly disabled.
-pub(super) fn insert_tool_reasoning_compatibility(
-    body: &mut Value,
-    model: &str,
-    has_tools: bool,
-    explicit_effort: Option<&str>,
-) {
-    if let Some(effort) = explicit_effort {
-        body["reasoning_effort"] = json!(effort);
-    }
-    if has_tools && super::reasoning_effort::is_luna(model) {
-        body["reasoning_effort"] = json!("none");
-    }
-}
-
-pub(super) fn insert_tools(
-    body: &mut Value,
-    model: &str,
-    tools: Option<&[ToolSchema]>,
-    explicit_effort: Option<&str>,
-) {
+fn insert_tools(body: &mut Value, tools: Option<&[ToolSchema]>) {
     if let Some(schemas) = tools {
         body["tools"] = json!(
             schemas
@@ -64,12 +127,6 @@ pub(super) fn insert_tools(
                 .collect::<Vec<_>>()
         );
     }
-    insert_tool_reasoning_compatibility(
-        body,
-        model,
-        tools.is_some_and(|schemas| !schemas.is_empty()),
-        explicit_effort,
-    );
 }
 
 #[cfg(test)]
@@ -78,7 +135,6 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{insert_completion_token_limit, insert_tool_reasoning_compatibility};
     use crate::llm::execution_policy::ProviderExecutionPolicy;
     use crate::llm::openai::OpenAiProvider;
     use crate::llm::provider::LlmProvider;
@@ -96,74 +152,6 @@ mod tests {
             ],
             [10, 900],
         )
-    }
-
-    #[test]
-    fn luna_uses_max_completion_tokens() {
-        let mut body = json!({});
-
-        insert_completion_token_limit(&mut body, "gpt-5.6-luna", Some(128));
-
-        assert_eq!(body["max_completion_tokens"], 128);
-        assert!(body.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn other_gpt_5_models_use_max_completion_tokens() {
-        for model in ["gpt-5.6-terra", "gpt-5.4"] {
-            let mut body = json!({});
-
-            insert_completion_token_limit(&mut body, model, Some(128));
-
-            assert_eq!(body["max_completion_tokens"], 128, "model: {model}");
-            assert!(body.get("max_tokens").is_none(), "model: {model}");
-        }
-    }
-
-    #[test]
-    fn other_models_keep_max_tokens() {
-        let mut body = json!({});
-
-        insert_completion_token_limit(&mut body, "gpt-4.1-mini", Some(128));
-
-        assert_eq!(body["max_tokens"], 128);
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn omitted_limit_adds_no_token_field() {
-        let mut body = json!({});
-
-        insert_completion_token_limit(&mut body, "gpt-5.6-luna", None);
-
-        assert!(body.get("max_tokens").is_none());
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn luna_function_tools_explicitly_disable_reasoning() {
-        for model in ["gpt-5.6-luna", "gpt-5.6-luna-2026-08-01"] {
-            let mut body = json!({});
-
-            insert_tool_reasoning_compatibility(&mut body, model, true, None);
-
-            assert_eq!(body["reasoning_effort"], "none", "model: {model}");
-        }
-    }
-
-    #[test]
-    fn tool_free_luna_and_other_models_keep_provider_defaults() {
-        for (model, has_tools) in [
-            ("gpt-5.6-luna", false),
-            ("gpt-5.6-lunatic", true),
-            ("gpt-5.6-terra", true),
-        ] {
-            let mut body = json!({});
-
-            insert_tool_reasoning_compatibility(&mut body, model, has_tools, None);
-
-            assert!(body.get("reasoning_effort").is_none(), "model: {model}");
-        }
     }
 
     #[tokio::test]
@@ -244,24 +232,5 @@ mod tests {
                 limit: 18_000,
             } if actual > 18_000
         ));
-    }
-
-    #[test]
-    fn explicit_agent_effort_is_forwarded_on_chat_completions() {
-        let mut body = json!({});
-        insert_tool_reasoning_compatibility(&mut body, "gpt-5.6-luna", false, Some("low"));
-        assert_eq!(body["reasoning_effort"], "low");
-
-        // Non-Luna models forward it even alongside tools.
-        let mut body = json!({});
-        insert_tool_reasoning_compatibility(&mut body, "gpt-5.4", true, Some("high"));
-        assert_eq!(body["reasoning_effort"], "high");
-    }
-
-    #[test]
-    fn luna_with_tools_still_forces_none_over_an_explicit_none() {
-        let mut body = json!({});
-        insert_tool_reasoning_compatibility(&mut body, "gpt-5.6-luna", true, Some("none"));
-        assert_eq!(body["reasoning_effort"], "none");
     }
 }

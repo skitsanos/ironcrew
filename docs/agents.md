@@ -63,8 +63,8 @@ not need to call `crew:add_agent()` for file-based agents.
 
 > **GPT-5.6 Luna temperature:** Luna accepts only its provider-default
 > temperature. Omit `temperature` whenever `gpt-5.6-luna` is the effective
-> model. IronCrew forwards explicit values; it does not silently discard them,
-> so a non-default value is rejected by the provider.
+> model, or use its default `1`. IronCrew rejects non-default values locally;
+> it does not silently discard them.
 
 > **GPT-5.6 Luna tools:** Chat Completions rejects Luna function tools while
 > reasoning is enabled. When an agent has tools, IronCrew explicitly sends
@@ -74,10 +74,16 @@ not need to call `crew:add_agent()` for file-based agents.
 > **Per-agent `reasoning_effort`:** overrides the crew-level value for that
 > agent's requests. On `openai-responses` it maps to `reasoning.effort`; on the
 > plain `openai` provider it is forwarded as `reasoning_effort`, except that an
-> agent with tools on Luna may only set `"none"` (any other value fails the
-> request with a message pointing at `openai-responses`). The `anthropic`
+> agent with tools on Luna may only set `"none"` (any other value fails
+> construction or the request, pointing at `openai-responses`). The `anthropic`
 > provider rejects it outright — its equivalent is the crew-level
 > `thinking_budget`. Nothing is ever silently dropped.
+
+On the official OpenAI endpoint, omitted Luna effort is `low` (`none` when
+Chat Completions function tools require it). `minimal` is not supported by
+Luna. Model-aware validation runs when the agent is attached to a crew and
+again for the final request, including model overrides. See the
+[capability policy](model-capabilities.md) for custom-endpoint behavior.
 
 ## Response Format
 

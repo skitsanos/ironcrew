@@ -9,7 +9,7 @@ local crew = Crew.new({
     provider = "openai-responses",
     model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
-    reasoning_effort = "medium",
+    reasoning_effort = "low",
     reasoning_summary = "auto",
     stream = true,
 })

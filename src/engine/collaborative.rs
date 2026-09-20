@@ -5,6 +5,7 @@ use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::interpolate::prompt_char_limit;
 use crate::engine::task::{TaskResult, TaskTokenUsage};
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -213,7 +214,7 @@ pub async fn execute_collaborative_task(
 
             let response = provider.chat(request).await?;
             total_usage.observe(response.usage.as_ref());
-            let content = response.content.unwrap_or_default();
+            let content = require_final_content(response.content)?;
             if content.len() > turn_limit {
                 return Err(IronCrewError::Task {
                     task: task_name.to_string(),
@@ -277,10 +278,8 @@ pub async fn execute_collaborative_task(
 
     let response = provider.chat(request).await?;
     total_usage.observe(response.usage.as_ref());
-    response
-        .content
-        .map(|content| (content, total_usage.finish()))
-        .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
+    let content = require_final_content(response.content)?;
+    Ok((content, total_usage.finish()))
 }
 
 #[cfg(test)]

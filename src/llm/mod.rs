@@ -1,5 +1,7 @@
 pub mod anthropic;
+pub(crate) mod capabilities;
 pub(crate) mod execution_policy;
+pub(crate) mod final_response;
 pub mod image;
 pub(crate) mod metrics;
 pub mod openai;

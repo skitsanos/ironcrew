@@ -12,6 +12,7 @@ pub mod limits;
 pub mod loader;
 pub mod parsers;
 pub mod postgres;
+mod provider_validation;
 pub mod require;
 pub mod sandbox;
 pub(crate) mod snapshot_require;

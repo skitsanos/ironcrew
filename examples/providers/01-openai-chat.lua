@@ -1,5 +1,6 @@
 -- OpenAI Chat Completions API — baseline test
 -- Model: gpt-5.6-luna (cost-effective)
+-- Omitted effort defaults to low; function tools select none on Chat Completions.
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({

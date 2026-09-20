@@ -37,10 +37,10 @@ local crew = Crew.new({
 |--------------------------|----------|--------------------|-------------|
 | `goal`                   | string   | *required*         | Non-empty high-level objective shown in the system prompt; capped by `IRONCREW_CREW_GOAL_MAX_BYTES` (default 64 KiB) |
 | `provider`               | string   | `"openai"`         | LLM provider: `"openai"`, `"anthropic"`, or `"openai-responses"`; maximum 128 bytes |
-| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking; `1..=1000000` |
+| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for manual extended thinking; `1024..=1000000`, below explicit `max_tokens`, on supported models |
 | `server_tools`           | table    | `{}`               | (Anthropic/Responses) dense, duplicate-free server-side tool list; count capped by `IRONCREW_MAX_SERVER_TOOLS` |
 | `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task; `1..=100` |
-| `reasoning_effort`       | string   | `nil`              | (openai-responses) `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` — validated at construction (model support varies; gpt-5.6-luna accepts all but `minimal`) |
+| `reasoning_effort`       | string   | `nil` (`low` for official Luna) | (openai-responses) model-aware construction validation; Luna supports `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, not `minimal`; see [capability policy](model-capabilities.md) |
 | `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` — validated at construction |
 | `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` — validated at construction |
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
@@ -198,6 +198,15 @@ conv:reset()
 **Limitations (current):**
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
+
+An absent, empty, or whitespace-only final model reply fails `send`/`ask`,
+including streaming and tool-assisted turns. The failed turn is not committed
+to history, does not advance the durable revision, and emits no
+`conversation_turn` event. Reasoning alone is not a final answer. Already-run
+tools and already-streamed deltas cannot be undone; IronCrew does not
+automatically replay the turn. A later explicit call starts a new turn from
+the last committed history. Dialogs retain their separate graceful
+`empty_response` stop behavior.
 
 ### Image input
 

@@ -9,6 +9,7 @@ use prompt::BoundedPrompt;
 use crate::engine::agent::Agent;
 use crate::engine::interpolate::{interpolate_bounded, prompt_char_limit};
 use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
@@ -195,9 +196,7 @@ impl<'a> TaskExecutionContext<'a> {
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
                 let has_usage = total_usage.total_tokens > 0;
-                let content = response
-                    .content
-                    .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+                let content = require_final_content(response.content)?;
 
                 // Run after_task hook if present
                 let final_output = if let Some(bytecode) = self.after_task_hook {

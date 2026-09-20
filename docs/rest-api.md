@@ -921,6 +921,13 @@ Text and image inputs are independently bounded; see the
 [chat environment table](chat.md#environment-variables) for the exact defaults
 and hard ceilings.
 
+A missing, empty, or whitespace-only final provider reply fails the message
+request through the server-error response path; it is not a successful empty
+assistant message. The candidate turn is discarded without publishing history,
+advancing the conversation revision, or emitting `conversation_turn`. Tool
+effects may already have happened and are not rolled back or automatically
+replayed. Existing idempotency and indeterminate-outcome rules still apply.
+
 A dead owner can be recovered only at a committed turn boundary. After owner
 death between turns, another replica can accept the next keyed message and
 rehydrate the exact stored revision. Death during provider/tool work or commit

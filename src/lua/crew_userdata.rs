@@ -289,31 +289,7 @@ pub(crate) async fn finalize_agent_tools(
 
 impl UserData for LuaCrew {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // Use add_async_method for all methods to avoid block_on inside Tokio
-        methods.add_async_method("add_agent", |_, this, table: Table| async move {
-            let agent = agent_from_lua_table(&table)?;
-            let agent_name = agent.name.clone();
-
-            let mut crew = this.crew.lock().await;
-
-            // Validate uniqueness/count before mutating hook maps so a
-            // rejected agent leaves the existing crew unchanged.
-            crew.add_agent(agent).map_err(mlua::Error::external)?;
-
-            // Extract before_task hook if present and store as bytecode
-            if let Ok(func) = table.get::<mlua::Function>("before_task") {
-                let bytecode = func.dump(false);
-                crew.before_task_hooks.insert(agent_name.clone(), bytecode);
-            }
-
-            // Extract after_task hook if present and store as bytecode
-            if let Ok(func) = table.get::<mlua::Function>("after_task") {
-                let bytecode = func.dump(false);
-                crew.after_task_hooks.insert(agent_name.clone(), bytecode);
-            }
-
-            Ok(())
-        });
+        agent_construction::register(methods);
 
         methods.add_async_method("add_task", |_, this, table: Table| async move {
             let task = task_from_lua_table(&table)?;
@@ -1048,3 +1024,5 @@ impl UserData for LuaCrew {
         });
     }
 }
+
+mod agent_construction;

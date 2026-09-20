@@ -1,5 +1,6 @@
 -- OpenAI Responses API — basic
 -- Model: gpt-5.6-luna
+-- Omitted effort defaults to low, including when function tools are present.
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({
