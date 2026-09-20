@@ -231,9 +231,14 @@ impl OpenAiResponsesProvider {
         }
 
         // Reasoning config
-        if self.config.reasoning_effort.is_some() || self.config.reasoning_summary.is_some() {
+        // Per-agent effort (request) wins over the crew-level config.
+        let reasoning_effort = request
+            .reasoning_effort
+            .as_ref()
+            .or(self.config.reasoning_effort.as_ref());
+        if reasoning_effort.is_some() || self.config.reasoning_summary.is_some() {
             let mut reasoning = json!({});
-            if let Some(ref effort) = self.config.reasoning_effort {
+            if let Some(effort) = reasoning_effort {
                 reasoning["effort"] = json!(effort);
             }
             if let Some(ref summary) = self.config.reasoning_summary {

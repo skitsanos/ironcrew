@@ -5,10 +5,12 @@ use mlua::Result as LuaResult;
 
 use crate::utils::error::IronCrewError;
 
-/// Responses API `reasoning.effort` values (OpenAI's documented set; `xhigh`
-/// exists on the newest reasoning models).
+/// Responses API `reasoning.effort` values — the union across OpenAI model
+/// families (`minimal` on older reasoning models; `xhigh`/`max` on the newest,
+/// e.g. gpt-5.6-luna). Validation catches typos; the API arbitrates which
+/// values a given model honours.
 pub(crate) const REASONING_EFFORTS: &[&str] =
-    &["none", "minimal", "low", "medium", "high", "xhigh"];
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Responses API `reasoning.summary` values.
 pub(crate) const REASONING_SUMMARIES: &[&str] = &["auto", "concise", "detailed"];
 /// Responses API web-search `search_context_size` values.
@@ -22,7 +24,7 @@ pub(crate) fn validate_config_choice(field: &str, value: &str, allowed: &[&str])
         return Ok(());
     }
     Err(mlua::Error::external(IronCrewError::Validation(format!(
-        "Crew.new {field} must be one of: {} (got '{value}')",
+        "{field} must be one of: {} (got '{value}')",
         allowed.join(", ")
     ))))
 }

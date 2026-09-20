@@ -53,6 +53,7 @@ Provider keys are read directly by IronCrew. Values accessed from Lua with
 | [`subworkflow`](subworkflow/) | Nested sub-workflow execution |
 | [`agent-as-tool`](agent-as-tool/) | Specialist agents exposed as tools |
 | [`model-router`](model-router/) | Purpose-based model routing |
+| [`reasoning-effort`](reasoning-effort/) | Per-agent `reasoning_effort` overrides compared side by side at low/medium/high |
 | [`postgres-checkpoints`](postgres-checkpoints/) | Named `postgres.*` SQL operations, upsert checkpoints |
 | [`streaming`](streaming/) | Streamed model output |
 | [`vision`](vision/) | Image input to a vision-capable model |

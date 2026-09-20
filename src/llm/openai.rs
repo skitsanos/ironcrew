@@ -7,6 +7,7 @@ use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, s
 use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
+mod reasoning_effort;
 mod request_body;
 mod stream_tools;
 
@@ -115,7 +116,12 @@ impl OpenAiProvider {
             }
         }
 
-        request_body::insert_tools(&mut body, &request.model, tools);
+        request_body::insert_tools(
+            &mut body,
+            &request.model,
+            tools,
+            request.reasoning_effort.as_deref(),
+        );
 
         if let Some(ref key) = request.prompt_cache_key {
             body["prompt_cache_key"] = json!(key);
@@ -450,6 +456,11 @@ impl LlmProvider for OpenAiProvider {
             tools = 0,
             "LLM request metadata"
         );
+        reasoning_effort::validate_reasoning_effort(
+            request.reasoning_effort.as_deref(),
+            &request.model,
+            false,
+        )?;
         let body = self.build_body(&request, None);
         let response = self.send_request(body).await?;
         tracing::debug!(
@@ -480,6 +491,11 @@ impl LlmProvider for OpenAiProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
+        reasoning_effort::validate_reasoning_effort(
+            request.reasoning_effort.as_deref(),
+            &request.model,
+            !tools.is_empty(),
+        )?;
         let body = self.build_body(&request, Some(tools));
         let response = self.send_request(body).await?;
         tracing::debug!(
@@ -502,6 +518,11 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
+        reasoning_effort::validate_reasoning_effort(
+            request.reasoning_effort.as_deref(),
+            &request.model,
+            false,
+        )?;
         let body = self.build_body(&request, None);
         tracing::debug!("LLM streaming request");
         self.send_request_stream(body, tx).await
