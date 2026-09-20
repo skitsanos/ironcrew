@@ -1105,19 +1105,18 @@ impl AgentDialog {
         caller_agent: &str,
         turn_idx: usize,
     ) -> String {
-        let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let args = match crate::llm::tool_arguments::parse(&tool_call.function.arguments) {
+            Ok(args) => args,
+            Err(result) => return result.to_string(),
+        };
 
         let tool_timeout = self
             .tool_registry
             .dispatch_timeout(&tool_call.function.name, &args)
             .unwrap_or_else(|| Duration::from_secs(crate::lua::agent_turn::tool_timeout_secs()));
 
-        // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
-        // tools can see them on their sandbox VMs (needed for sandbox-level
-        // primitives like `run_flow`). `caller_scope` uses the
-        // `<dialog_id>:t<turn_idx>` shape so nested events (agent-as-tool,
-        // run_flow, etc.) attribute to the exact turn that triggered them.
+        // Pass the dialog store and event bus to custom tools. The scoped turn
+        // identifier attributes nested agent and sub-flow events precisely.
         let tool_ctx = ToolCallContext {
             store: self.store.clone(),
             eventbus: Some(self.eventbus.clone()),
