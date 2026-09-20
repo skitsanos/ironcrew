@@ -156,6 +156,13 @@ impl Drop for ProviderObservation {
 
 #[async_trait]
 impl LlmProvider for ObservedProvider {
+    fn usage_tracker(&self) -> Option<crate::usage::UsageTracker> {
+        self.inner.usage_tracker()
+    }
+    fn records_usage(&self) -> bool {
+        self.inner.records_usage()
+    }
+
     fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
         self.inner.validate_request(request, has_tools)
     }

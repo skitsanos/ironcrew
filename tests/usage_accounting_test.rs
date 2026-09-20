@@ -2,8 +2,12 @@
 use ironcrew::usage::{ProviderUsage, StreamUsage, UsageAggregate, UsageCoverage, UsageReceipt};
 use serde_json::json;
 
+#[path = "usage_accounting/hierarchy.rs"]
+mod hierarchy;
 #[path = "usage_accounting/tracker.rs"]
 mod tracker;
+#[path = "usage_accounting/wire.rs"]
+mod wire;
 
 fn receipt(prompt: u64, output: u64) -> UsageReceipt {
     ProviderUsage::OpenAiResponses.parse(

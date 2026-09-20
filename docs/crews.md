@@ -632,6 +632,15 @@ event includes a stable `dialog_id` and `turn_index`. See
 
 ---
 
+## Usage snapshots
+
+For process-local token accounting, use `crew:usage()` for the latest executing
+run and `crew:flow_usage()` for the enclosing flow total. Conversations and
+dialogs expose their own `:usage()` snapshots. Counts are decimal strings, with
+explicit coverage and unknown values; these snapshots include failed/retried
+provider attempts but are not yet persisted. See [usage accounting](usage-accounting.md#lua-snapshots)
+for the wire contract and resume/ownership boundaries.
+
 ## Memory System
 
 Every crew has a key-value memory store. Agents can read and write shared state

@@ -1,4 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+mod validation;
+use validation::{AggregateWire, CountWire};
 
 use super::{UsageCoverage, UsageReceipt};
 
@@ -10,8 +12,10 @@ pub struct UsageOverflow;
 
 /// Known subtotal plus its own coverage. Optional detail coverage is separate
 /// from primary usage coverage. An unavailable subtotal serializes as null.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CountWire")]
 pub struct CountTotal {
+    #[serde(with = "super::wire::optional")]
     known: Option<u64>,
     complete: bool,
 }
@@ -56,8 +60,10 @@ impl CountTotal {
 /// Bounded aggregate of disjoint provider attempts. Add ONE final snapshot per
 /// attempt, including failed/cancelled attempts. Merge only disjoint scopes;
 /// merging a child and its inclusive parent would count the child twice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AggregateWire")]
 pub struct UsageAggregate {
+    #[serde(with = "super::wire")]
     requests: u64,
     coverage: UsageCoverage,
     prompt_tokens: CountTotal,
@@ -84,6 +90,23 @@ impl Default for UsageAggregate {
 }
 
 impl UsageAggregate {
+    pub(crate) fn unavailable() -> Self {
+        let unknown = CountTotal {
+            known: None,
+            complete: false,
+        };
+        Self {
+            requests: 0,
+            coverage: UsageCoverage::Unavailable,
+            prompt_tokens: unknown.clone(),
+            completion_tokens: unknown.clone(),
+            total_tokens: unknown.clone(),
+            cached_tokens: unknown.clone(),
+            cache_write_tokens: unknown.clone(),
+            reasoning_tokens: unknown,
+        }
+    }
+
     pub fn requests(&self) -> u64 {
         self.requests
     }
@@ -127,10 +150,10 @@ impl UsageAggregate {
     /// Checked and atomic: neither a token overflow nor a request-count
     /// overflow can wrap, saturate, or partially mutate this aggregate.
     pub fn merge(&mut self, other: &Self) -> Result<(), UsageOverflow> {
-        if other.requests == 0 {
+        if *other == Self::default() {
             return Ok(());
         }
-        if self.requests == 0 {
+        if *self == Self::default() {
             *self = other.clone();
             return Ok(());
         }

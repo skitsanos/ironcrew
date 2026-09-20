@@ -91,23 +91,8 @@ fn validate_api_key_value(value: &str) -> LuaResult<()> {
     Ok(())
 }
 
-fn trusted_provider_key_env_name(base_url: &str) -> Option<&'static str> {
-    let parsed = reqwest::Url::parse(base_url).ok()?;
-    if parsed.scheme() != "https" {
-        return None;
-    }
-    match parsed.host_str()?.to_ascii_lowercase().as_str() {
-        "api.openai.com" => Some("OPENAI_API_KEY"),
-        "generativelanguage.googleapis.com" => Some("GEMINI_API_KEY"),
-        "api.groq.com" => Some("GROQ_API_KEY"),
-        "api.moonshot.ai" | "api.moonshot.cn" => Some("MOONSHOT_API_KEY"),
-        "api.deepseek.com" => Some("DEEPSEEK_API_KEY"),
-        "api.x.ai" => Some("XAI_API_KEY"),
-        "api.openrouter.ai" => Some("OPENROUTER_API_KEY"),
-        "api.anthropic.com" => Some("ANTHROPIC_API_KEY"),
-        _ => None,
-    }
-}
+mod provider_key;
+use provider_key::trusted_provider_key_env_name;
 
 fn resolve_custom_provider_key(
     base_url: Option<&str>,
@@ -675,6 +660,7 @@ pub fn register_crew_constructor(
             custom_provider,
             project_dir,
             store: store_cell,
+            last_run_usage: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_config,
             #[cfg(feature = "mcp")]

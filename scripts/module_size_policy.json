@@ -99,7 +99,7 @@
     },
     {
       "path": "src/engine/orchestrator.rs",
-      "max_lines": 998,
+      "max_lines": 857,
       "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode."
     },
     {
@@ -134,37 +134,37 @@
     },
     {
       "path": "src/llm/provider.rs",
-      "max_lines": 633,
+      "max_lines": 590,
       "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: request configuration extracted before adding explicit usage scope."
     },
     {
       "path": "src/lua/agent_turn.rs",
-      "max_lines": 585,
+      "max_lines": 536,
       "rationale": "IC-035 ratchet after extracting tool dispatch: active-turn cleanup, provider interaction, bounded tool-call rounds, and transcript updates form the Lua agent-turn lifecycle; extract provider-round handling before adding turn phases. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/api.rs",
-      "max_lines": 713,
+      "max_lines": 699,
       "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys. Option-choice validation lives in src/lua/config_choices.rs. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {
       "path": "src/lua/conversation.rs",
-      "max_lines": 821,
+      "max_lines": 740,
       "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {
       "path": "src/lua/crew_userdata.rs",
-      "max_lines": 1028,
+      "max_lines": 966,
       "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods. Task 8: passes the `lua` handle into build_conversation for app-db fingerprint lookup. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {
       "path": "src/lua/dialog.rs",
-      "max_lines": 1338,
+      "max_lines": 1275,
       "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection and IC-042 stop-test extraction: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {
       "path": "src/lua/json.rs",
-      "max_lines": 473,
+      "max_lines": 434,
       "rationale": "IC-011 baseline: cycle-aware Lua table classification and bounded bidirectional JSON conversion share depth, item, and byte-limit enforcement with inline tests; extract tests before adding conversion shapes."
     },
     {

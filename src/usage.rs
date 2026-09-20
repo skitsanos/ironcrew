@@ -1,15 +1,18 @@
 //! Checked usage-receipt foundation for IC-046.
 //!
-//! Built-in HTTP providers can capture into an explicit request scope. Runtime
-//! task results and durable stores have not yet migrated to these types.
+//! Built-in providers and Lua execution expose checked, hierarchical snapshots.
+//! Runtime task result fields and durable stores have not yet migrated.
 //! Counts describe provider receipts, not invoices or inferred text lengths.
 mod aggregate;
 mod parsing;
+mod snapshot;
 mod tracker;
+mod wire;
 
 pub use aggregate::{CountTotal, UsageAggregate, UsageOverflow};
 pub use parsing::{ProviderUsage, StreamUsage};
-pub use tracker::{UsageAttempt, UsageSnapshot, UsageTracker};
+pub use snapshot::UsageSnapshot;
+pub use tracker::{UsageAttempt, UsageScopeDepth, UsageTracker};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,11 +30,17 @@ pub enum UsageCoverage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageCounts {
+    #[serde(with = "wire::optional")]
     pub prompt_tokens: Option<u64>,
+    #[serde(with = "wire::optional")]
     pub completion_tokens: Option<u64>,
+    #[serde(with = "wire::optional")]
     pub total_tokens: Option<u64>,
+    #[serde(with = "wire::optional")]
     pub cached_tokens: Option<u64>,
+    #[serde(with = "wire::optional")]
     pub cache_write_tokens: Option<u64>,
+    #[serde(with = "wire::optional")]
     pub reasoning_tokens: Option<u64>,
 }
 

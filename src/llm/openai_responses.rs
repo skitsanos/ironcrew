@@ -163,6 +163,10 @@ use response::parse_responses_response;
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn records_usage(&self) -> bool {
+        true
+    }
+
     fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
         self.resolve_options(request, has_tools).map(|_| ())
     }

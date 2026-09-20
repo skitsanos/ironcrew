@@ -30,6 +30,9 @@ use async_trait::async_trait;
 /// built-in tools ignore the whole thing.
 #[derive(Default, Clone)]
 pub struct ToolCallContext {
+    /// Shared execution accounting, inherited unchanged through delegation.
+    pub usage_tracker: Option<crate::usage::UsageTracker>,
+
     /// Persistent session store (conversation/dialog records). `None`
     /// in CLI one-shot paths that don't need persistence.
     pub store: Option<Arc<dyn StateStore>>,

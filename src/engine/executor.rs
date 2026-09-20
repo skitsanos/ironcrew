@@ -293,7 +293,7 @@ impl<'a> TaskExecutionContext<'a> {
                     caller_agent: Some(self.agent.name.clone()),
                     caller_scope: Some(self.task.name.clone()),
                     ask_human: self.ask_human.cloned(),
-                    ..ToolCallContext::default()
+                    ..crate::llm::scope::tool_context(self.provider)
                 };
                 let tool_result = match tokio::time::timeout(
                     tool_timeout,

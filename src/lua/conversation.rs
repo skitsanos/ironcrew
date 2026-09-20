@@ -11,6 +11,7 @@
 //! grab the `Arc` and call `run_turn().await` without a Lua VM round-trip.
 
 use std::sync::Arc;
+mod stream;
 
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -32,20 +33,8 @@ use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
-/// Resolve the default max_history cap when no explicit Lua-side value is
-/// provided. Honors a positive `IRONCREW_CONVERSATION_MAX_HISTORY` up to the
-/// process hard ceiling, falling back to a safe 50-message cap. Shared with non-conversation
-/// consumers (e.g. `AgentAsTool` finalization) so they apply the same
-/// policy as the user-facing `crew:conversation()` path.
-pub(crate) fn default_max_history() -> Option<usize> {
-    let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.min(HARD_CHAT_HISTORY_MAX_MESSAGES))
-        .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
-    Some(env_default)
-}
+mod history_limit;
+pub(crate) use history_limit::default_max_history;
 
 /// Precomputed canonical flow identity injected by HTTP/CLI runtimes before
 /// Lua executes. Keeping it in app data avoids a second blocking filesystem
@@ -189,6 +178,7 @@ impl LuaConversationInner {
         source_fingerprint: String,
         definition_fingerprint: String,
     ) -> Result<Self, IronCrewError> {
+        let provider = crate::llm::scope::ensure_scope(provider);
         provider.validate_request(
             &agent.chat_request(model.clone(), vec![]),
             !tool_registry.schemas_for(&agent.tools).is_empty(),
@@ -442,6 +432,10 @@ impl LuaConversationInner {
         let execution_guard = self.turn_execution_lock.clone().lock_owned().await;
         let has_tools = !self.agent.tools.is_empty();
         let helper_ctx = ToolCallContext {
+            usage_tracker: caller_ctx
+                .usage_tracker
+                .clone()
+                .or_else(|| self.provider.usage_tracker()),
             store: caller_ctx.store.clone().or_else(|| self.store.clone()),
             eventbus: Some(
                 caller_ctx
@@ -482,7 +476,8 @@ impl LuaConversationInner {
         //    scope), so when the caller opted into streaming and the agent
         //    has no tools, we keep the original inline branch.
         let (content, reasoning) = if self.stream && !has_tools {
-            self.run_turn_streaming_no_tools(&mut history).await?
+            self.run_turn_streaming_no_tools(&mut history, helper_ctx.usage_tracker.clone())
+                .await?
         } else {
             // 3. Non-streaming (or tools-present) path: delegate to the
             //    shared helper against the private candidate.
@@ -561,85 +556,6 @@ impl LuaConversationInner {
         Ok((prepared.assistant, prepared.reasoning))
     }
 
-    /// Streaming no-tools turn. The user message has already been pushed
-    /// by the caller; this method issues one streaming provider call,
-    /// appends the assistant reply, and returns (content, reasoning).
-    ///
-    /// Tool-call rounds are not supported here by design — the shared
-    /// helper owns that path and does not stream. Callers must check
-    /// `has_tools` before dispatching to this method.
-    async fn run_turn_streaming_no_tools(
-        &self,
-        history: &mut Vec<ChatMessage>,
-    ) -> Result<(String, Option<String>), IronCrewError> {
-        let mut active_turn = ActiveTurnGuard::new(history);
-        let messages_snapshot: Vec<ChatMessage> = active_turn.clone();
-
-        let request = self
-            .agent
-            .chat_request(self.model.clone(), messages_snapshot);
-
-        let response = self.call_streaming(request).await?;
-
-        let content = crate::llm::final_response::require_final_content(response.content)?;
-
-        active_turn.push(ChatMessage::assistant(Some(content.clone()), None));
-        enforce_conversation_history_limits(
-            &mut active_turn,
-            self.max_history
-                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
-            self.history_max_bytes,
-        )?;
-        active_turn.commit();
-
-        let reasoning = response.reasoning.map(|reasoning| {
-            let limit = self.tool_registry.max_reasoning_bytes();
-            let mut bounded = String::new();
-            if append_text_bounded(&mut bounded, &reasoning, limit) {
-                tracing::warn!(
-                    conversation = %self.id,
-                    limit,
-                    "Reasoning text was truncated to the configured byte limit"
-                );
-            }
-            bounded
-        });
-
-        Ok((content, reasoning))
-    }
-
-    /// Stream a request to stderr (with dim reasoning) and return the response.
-    async fn call_streaming(&self, request: ChatRequest) -> Result<ChatResponse, IronCrewError> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-
-        let print_handle = tokio::spawn(async move {
-            use std::io::Write;
-            while let Some(chunk) = rx.recv().await {
-                match chunk {
-                    StreamChunk::Text(text) => {
-                        eprint!("{}", text);
-                        std::io::stderr().flush().ok();
-                    }
-                    StreamChunk::Thinking(text) => {
-                        eprint!("\x1b[90m{}\x1b[0m", text);
-                        std::io::stderr().flush().ok();
-                    }
-                    StreamChunk::Done => {
-                        eprintln!();
-                    }
-                    StreamChunk::Error(e) => {
-                        eprintln!("\n[Stream error: {}]", e);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        let result = self.provider.chat_stream(request, tx).await;
-        print_handle.await.ok();
-        result
-    }
-
     /// Delete the persisted record (if any) for this session. Flow-scoped
     /// so a conversation can only delete its own flow's record.
     pub async fn delete(&self) -> Result<(), IronCrewError> {
@@ -667,6 +583,9 @@ impl LuaConversation {
 
 impl UserData for LuaConversation {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("usage", |lua, this, ()| {
+            super::usage::provider_snapshot(lua, this.0.provider.as_ref())
+        });
         // conv:send(message[, opts]) → returns plain text
         // opts may include: { images = { "path/to/img.png", "https://..." } }
         methods.add_async_method("send", |_, this, args: mlua::MultiValue| async move {
