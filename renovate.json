@@ -1,18 +1,19 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:best-practices"
   ],
-  "baseBranches": [
+  "baseBranchPatterns": [
     "develop"
   ],
   "labels": [
     "dependencies"
   ],
   "dependencyDashboard": true,
+  "minimumReleaseAge": "0 days",
   "rangeStrategy": "bump",
-  "prConcurrentLimit": 5,
-  "prHourlyLimit": 2,
+  "prConcurrentLimit": 1,
+  "prHourlyLimit": 1,
   "packageRules": [
     {
       "description": "Keep sse-stream aligned with rmcp 3.4 public transport types",
@@ -29,13 +30,19 @@
       "enabled": false
     },
     {
-      "matchUpdateTypes": ["minor", "patch"],
-      "groupName": "non-major updates"
-    },
-    {
-      "matchCurrentVersion": "<1.0.0",
-      "matchUpdateTypes": ["minor"],
-      "groupName": "breaking sub-1.0 bumps"
+      "description": "Present one dependency refresh for develop instead of a PR queue",
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest",
+        "lockFileMaintenance",
+        "replacement"
+      ],
+      "groupName": "dependency refresh",
+      "groupSlug": "dependency-refresh"
     }
   ]
 }
