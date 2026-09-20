@@ -59,8 +59,8 @@
     },
     {
       "path": "src/engine/executor.rs",
-      "max_lines": 484,
-      "rationale": "IC-011 post-extraction baseline: bounded prompt assembly, task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract prompt construction or provider-round handling before adding another responsibility."
+      "max_lines": 405,
+      "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility."
     },
     {
       "path": "src/engine/foreach.rs",
@@ -159,8 +159,8 @@
     },
     {
       "path": "src/lua/agent_turn.rs",
-      "max_lines": 644,
-      "rationale": "IC-011 baseline: active-turn cleanup, provider interaction, bounded tool-call rounds, approval, timeout, and transcript updates form one Lua agent-turn lifecycle; extract tool dispatch before adding turn phases."
+      "max_lines": 594,
+      "rationale": "IC-035 ratchet after extracting tool dispatch: active-turn cleanup, provider interaction, bounded tool-call rounds, and transcript updates form the Lua agent-turn lifecycle; extract provider-round handling before adding turn phases."
     },
     {
       "path": "src/lua/api.rs",
@@ -179,8 +179,8 @@
     },
     {
       "path": "src/lua/dialog.rs",
-      "max_lines": 1626,
-      "rationale": "IC-011 baseline: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes."
+      "max_lines": 1625,
+      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes."
     },
     {
       "path": "src/lua/json.rs",

@@ -287,6 +287,7 @@ async fn metrics_require_authentication_and_keep_the_existing_contract() {
         ("ironcrew_runs_total", 6),
         ("ironcrew_tasks_total", 4),
         ("ironcrew_tool_calls_total", 3),
+        ("ironcrew_hook_failures_total", 12),
         ("ironcrew_provider_requests_total", 36),
         ("ironcrew_provider_tokens_total", 12),
         ("ironcrew_sse_connections_total", 6),
