@@ -235,11 +235,15 @@ local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
     model = "gpt-5.4-nano",
-    reasoning_effort = "medium",      -- "low" | "medium" | "high"
+    reasoning_effort = "medium",      -- "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
 })
 ```
+
+Both values (and `web_search_context_size`) are validated against these sets
+when the crew is constructed, so a typo fails at `Crew.new` rather than as a
+provider error on the first request.
 
 Reasoning summaries are streamed dim to stderr and persisted to the run record.
 
