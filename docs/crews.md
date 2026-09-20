@@ -40,9 +40,9 @@ local crew = Crew.new({
 | `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking; `1..=1000000` |
 | `server_tools`           | table    | `{}`               | (Anthropic/Responses) dense, duplicate-free server-side tool list; count capped by `IRONCREW_MAX_SERVER_TOOLS` |
 | `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task; `1..=100` |
-| `reasoning_effort`       | string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
-| `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` |
-| `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
+| `reasoning_effort`       | string   | `nil`              | (openai-responses) `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` — validated at construction (model support varies; gpt-5.6-luna accepts all but `minimal`) |
+| `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` — validated at construction |
+| `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` — validated at construction |
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
 | `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results; `1..=1000` |
 | `model`                  | string   | `"gpt-5.6-luna"`    | Non-empty default model for task execution; maximum 1024 bytes |

@@ -895,15 +895,7 @@ impl AgentDialog {
                 self.history_max_bytes,
                 true,
             )?;
-            let request = ChatRequest {
-                messages: working_messages.clone(),
-                model: self.model.clone(),
-                temperature: agent.temperature,
-                max_tokens: agent.max_tokens,
-                response_format: agent.response_format.clone(),
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-            };
+            let request = agent.chat_request(self.model.clone(), working_messages.clone());
 
             let response: ChatResponse = if self.stream && !has_tools {
                 self.call_streaming(request).await?

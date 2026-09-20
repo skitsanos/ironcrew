@@ -22,8 +22,8 @@ use std::sync::Arc;
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::CrewEvent;
 use crate::llm::provider::{
-    ChatMessage, ChatRequest, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES,
-    LlmProvider, append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
+    ChatMessage, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider,
+    append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
     max_reasoning_bytes, validate_chat_history,
 };
 use crate::tools::ToolCallContext;
@@ -171,15 +171,7 @@ pub async fn run_single_agent_turn(
     loop {
         validate_chat_history(&history, max_history, max_history_bytes, true)?;
         let messages_snapshot: Vec<ChatMessage> = history.clone();
-        let request = ChatRequest {
-            messages: messages_snapshot,
-            model: model.to_string(),
-            temperature: agent.temperature,
-            max_tokens: agent.max_tokens,
-            response_format: agent.response_format.clone(),
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
+        let request = agent.chat_request(model.to_string(), messages_snapshot);
 
         let response = if has_tools {
             provider.chat_with_tools(request, &tool_schemas).await?

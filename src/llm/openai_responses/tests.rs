@@ -15,6 +15,7 @@ fn request(images: Option<Vec<ImageInput>>, format: Option<ResponseFormat>) -> C
         response_format: format,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        reasoning_effort: None,
     }
 }
 
@@ -82,4 +83,24 @@ fn text_only_messages_keep_a_single_text_part() {
         .expect("content parts");
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["type"], "input_text");
+}
+
+#[test]
+fn request_reasoning_effort_overrides_the_crew_level_config() {
+    let crew_level = OpenAiResponsesProvider::new(
+        "k".into(),
+        None,
+        ResponsesConfig {
+            reasoning_effort: Some("low".into()),
+            ..ResponsesConfig::default()
+        },
+    );
+    let mut per_agent = request(None, None);
+    per_agent.reasoning_effort = Some("high".into());
+    let body = crew_level.build_body(&per_agent, None);
+    assert_eq!(body["reasoning"]["effort"], "high");
+
+    // Without an agent value the crew-level config still applies.
+    let body = crew_level.build_body(&request(None, None), None);
+    assert_eq!(body["reasoning"]["effort"], "low");
 }
