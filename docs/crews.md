@@ -542,12 +542,18 @@ debate has converged). The `max_turns` value still acts as a hard safety
 ceiling — it bounds the worst case if the callback never returns a stop
 signal.
 
+IronCrew also stops a dialog when the model returns a blank final reply. This
+includes whitespace-only content and applies after zero or more tool rounds.
+The blank reply is not appended to the transcript or counted as a turn, and
+the dialog stops with reason `"empty_response"`. A missing final reply
+(`content: nil`) remains a provider error.
+
 **Querying state from Lua:**
 
 | Method                   | Returns |
 |--------------------------|---------|
-| `dialog:stopped()`       | `true` if `should_stop` requested termination |
-| `dialog:stop_reason()`   | The reason string, or `nil` for normal completion |
+| `dialog:stopped()`       | `true` if any early-stop condition ended the dialog |
+| `dialog:stop_reason()`   | The early-stop reason, or `nil` for normal completion |
 
 When the dialog stops early, the `dialog_completed` SSE event carries the
 reason:
