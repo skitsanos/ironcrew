@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validatePlainMappingKeys } from "../validate_skills";
@@ -59,12 +59,26 @@ describe("repository integration policy", () => {
     expect(policy).toBeDefined();
     expect(
       policy.steps.some(
-        (step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.4.2",
+        (step) =>
+          step.uses ===
+            "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6" &&
+          step.with?.["bun-version"] === "latest",
       ),
     ).toBeTrue();
     expect(
-      policy.steps.find((step) => step.uses === "actions/checkout@v7")?.with,
+      policy.steps.find(
+        (step) =>
+          step.uses ===
+          "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      )?.with,
     ).toEqual({ "fetch-depth": 0 });
+    for (const job of Object.values(workflow.jobs)) {
+      for (const step of job.steps) {
+        if (step.uses) {
+          expect(step.uses).toMatch(/@[0-9a-f]{40}$/);
+        }
+      }
+    }
     const registry = policy.steps.find(
       (step) => step.name === "Validate issue registry against trusted history",
     );
@@ -81,7 +95,79 @@ describe("repository integration policy", () => {
     expect(commands).toContain("bun run scripts/issues_registry.ts check");
     expect(commands).toContain("bun test scripts/tests/*.test.ts");
     expect(commands).toContain("bun run scripts/check_worktree.ts");
+    expect(commands).toContain("bun install --frozen-lockfile --cwd=examples/chat-ui");
+    expect(commands).toContain(
+      "bun build examples/chat-ui/src/index.html --outdir=/tmp/ironcrew-chat-ui",
+    );
     expect(commands).toMatch(/actionlint"? \.github\/workflows\/\*\.yml/);
+  });
+
+  test("the tracked pre-push hook mirrors every locally reproducible CI job", async () => {
+    const hook = await Bun.file(join(repository, ".githooks/pre-push")).text();
+    const guard = await Bun.file(join(repository, "scripts/pre-push-check.sh")).text();
+    const refresh = await Bun.file(
+      join(repository, "scripts/refresh-develop-dependencies.sh"),
+    ).text();
+    const taskfile = await Bun.file(join(repository, "Taskfile.yaml")).text();
+
+    expect((await stat(join(repository, ".githooks/pre-push"))).mode & 0o111).not.toBe(0);
+    expect((await stat(join(repository, "scripts/pre-push-check.sh"))).mode & 0o111).not.toBe(0);
+    expect(
+      (await stat(join(repository, "scripts/refresh-develop-dependencies.sh"))).mode & 0o111,
+    ).not.toBe(0);
+    expect(hook).toContain('exec "$repo_root/scripts/pre-push-check.sh"');
+    expect(taskfile).toContain("core.hooksPath .githooks");
+    expect(taskfile).toContain("./scripts/pre-push-check.sh");
+    expect(taskfile).toContain("./scripts/refresh-develop-dependencies.sh");
+    expect(guard).toContain("./scripts/refresh-develop-dependencies.sh");
+    expect(refresh).toContain("latest immutable GitHub Action releases");
+    expect(refresh).toContain('Path(".github/workflows").glob("*.yml")');
+    expect(refresh).toContain('["git", "ls-remote", "--tags", remote]');
+    expect(refresh).toContain('f"refs/heads/{version}"');
+    expect(guard).not.toContain('require_exact_version "Bun"');
+    expect(guard).toContain('require_exact_version "Rust" "$expected_rust"');
+    expect(guard).toContain('require_exact_version "Cargo" "$expected_rust"');
+    expect(guard).toContain('require_exact_version "cargo-audit" "$expected_audit"');
+    expect(guard).toContain('require_exact_version "actionlint" "$expected_actionlint"');
+    expect(refresh).toContain('bun upgrade --stable');
+    expect(refresh).toContain('rustup update stable --no-self-update');
+    expect(refresh).toContain('cargo upgrade --incompatible --exclude sse-stream');
+    expect(refresh).toContain('cargo outdated --root-deps-only --ignore sse-stream --exit-code 1');
+    expect(refresh).toContain('bun update --latest --cwd="$repo_root/examples/chat-ui"');
+    expect(guard).toContain("at least 4 GiB of free disk");
+    expect(guard).toContain("export CARGO_INCREMENTAL=0");
+    expect(guard).toContain("export CARGO_PROFILE_DEV_DEBUG=0");
+
+    for (const command of [
+      "python3 -B scripts/check_module_size.py",
+      "python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'",
+      "bun run scripts/validate_skills.ts",
+      "bun run scripts/issues_registry.ts check",
+      "bun test scripts/tests/*.test.ts",
+      "actionlint .github/workflows/*.yml",
+      "bun run scripts/check_worktree.ts",
+      "bun install --frozen-lockfile",
+      "bun build",
+      "cargo fmt --all -- --check",
+      "cargo build --no-default-features",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test --all-targets",
+      "cargo test --doc",
+      "cargo audit --deny warnings",
+      "cargo build --locked --bin ironcrew",
+      "./scripts/check-lua-examples.sh",
+      "python3 -m unittest discover -s evaluations/crew-effectiveness -p 'test_*.py'",
+      "cargo build --release --locked",
+    ]) {
+      expect(guard).toContain(command);
+    }
+
+    expect(guard).toContain("evaluations/crew-effectiveness/evaluate.py");
+    expect(guard).toContain("IRONCREW_TEST_PG_URL");
+    expect(guard).toContain("--test two_process_replica_acceptance_test");
+    expect(guard).toContain("evaluations/replica-soak/soak.py");
+    expect(guard).toContain("PostgreSQL integration not run");
+    expect(guard).toContain("GitHub CI remains authoritative for macOS, Windows");
   });
 
   test("worktree validation covers untracked, staged, and committed whitespace", async () => {
@@ -182,7 +268,11 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
     expect(commands).toContain("cargo test --all-targets");
     expect(commands).toContain("cargo test --doc");
-    expect(source.match(/dtolnay\/rust-toolchain@1\.98\.1/g)).toHaveLength(8);
+    expect(
+      source.match(
+        /dtolnay\/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e/g,
+      ),
+    ).toHaveLength(8);
     expect(manifest).toContain('rust-version = "1.98.1"');
     expect(toolchain).toContain('channel = "1.98.1"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
@@ -200,9 +290,32 @@ describe("repository integration policy", () => {
     const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
 
     expect(workflow).toContain("cargo audit --deny warnings");
-    expect(workflow).toContain("cargo-audit --version 0.22.1 --locked");
+    expect(workflow).toContain("cargo-audit --version 0.22.2 --locked");
     expect(lockfile).toContain('name = "event-listener"\nversion = "5.4.2"');
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
+  });
+
+  test("Renovate consolidates latest dependency and immutable pin refreshes", async () => {
+    const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
+      extends: string[];
+      baseBranchPatterns: string[];
+      minimumReleaseAge: string;
+      prConcurrentLimit: number;
+      prHourlyLimit: number;
+      packageRules: Array<Record<string, unknown>>;
+    };
+
+    expect(renovate.extends).toEqual(["config:best-practices"]);
+    expect(renovate.baseBranchPatterns).toEqual(["develop"]);
+    expect(renovate.minimumReleaseAge).toBe("0 days");
+    expect(renovate.prConcurrentLimit).toBe(1);
+    expect(renovate.prHourlyLimit).toBe(1);
+    expect(renovate.packageRules).toContainEqual(
+      expect.objectContaining({
+        groupName: "dependency refresh",
+        groupSlug: "dependency-refresh",
+      }),
+    );
   });
 
   test("the release documents one strict current MCP revision", async () => {

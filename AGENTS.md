@@ -111,11 +111,21 @@
   `actionlint .github/workflows/*.yml` after workflow changes when available.
 - Run `cargo test --doc` after public Rust API documentation changes and
   `cargo audit --deny warnings` after dependency or security-sensitive changes.
-- Before a requested commit or push, run every locally reproducible CI gate for
-  the affected surfaces. Run `bun run scripts/check_worktree.ts`, inspect
-  `git status --short`, and review the complete tracked and untracked diff.
-  Report platform-only jobs such as Windows as CI evidence rather than claiming
-  they ran locally.
+- Before committing work intended for `develop`, run `task develop-refresh`.
+  It upgrades Bun to the latest stable release, refreshes managed Cargo and Bun
+  dependencies, and verifies the current Rust, cargo-audit, actionlint,
+  direct-dependency, and immutable GitHub Action freshness boundaries. Review
+  and commit every resulting manifest, lockfile, workflow, or policy change
+  before validation.
+- Before a requested push, run every locally reproducible CI gate through
+  `./scripts/pre-push-check.sh`. Enable the tracked fail-closed hook once per
+  clone with `task hooks-install`; do not bypass it with `--no-verify`. The gate
+  starts clean, reruns the latest-stable refresh, and stops if refresh changes
+  repository files. Supply a disposable `IRONCREW_TEST_PG_URL` when storage,
+  HITL, journal, lease, or replica behavior changed. Run
+  `bun run scripts/check_worktree.ts`, inspect `git status --short`, and review
+  the complete tracked and untracked diff. Report platform-only jobs such as
+  Windows as CI evidence rather than claiming they ran locally.
 
 ## Issue lifecycle and completion
 
