@@ -179,8 +179,8 @@
     },
     {
       "path": "src/lua/dialog.rs",
-      "max_lines": 1617,
-      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
+      "max_lines": 1527,
+      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection and IC-042 stop-test extraction: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/json.rs",

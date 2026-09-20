@@ -205,9 +205,9 @@ pub enum CrewEvent {
         dialog_id: String,
         total_turns: usize,
         /// Why the dialog ended. `None` means it ran to `max_turns` normally.
-        /// When the dialog was stopped early by a `should_stop` callback, this
-        /// carries the reason string that the callback returned (or a generic
-        /// marker if the callback returned `true` without a reason).
+        /// For an early stop, this carries either the reason returned by a
+        /// `should_stop` callback (or its generic marker) or
+        /// `"empty_response"` for a blank final model reply.
         #[serde(skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
     },
