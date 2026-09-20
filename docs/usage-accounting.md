@@ -1,13 +1,13 @@
 # Usage accounting (IC-046, in progress)
 
-This page describes the Rust `ironcrew::usage` contract and the built-in HTTP
-provider capture layer. Rust callers can explicitly attach a shared tracker to
-`ChatRequest.usage_tracker`; OpenAI Chat, Responses and Anthropic then retain
-checked receipts independently of their output return value.
+This page describes the Rust `ironcrew::usage` contract, built-in HTTP capture,
+and process-local execution ownership. OpenAI Chat, Responses and Anthropic
+retain checked receipts independently of their output return value.
 
-**Automatic run/task/conversation scope propagation, `ChatResponse.usage`,
-task results, CLI, Lua, HTTP events and stored run/session records have not yet
-migrated.** Those still have the gaps tracked by [IC-046](issues/IC-046.md).
+**`ChatResponse.usage`, task/run result fields, CLI/HTTP output fields, events and
+stored run/session records have not yet migrated.** Those still have the gaps
+tracked by [IC-046](issues/IC-046.md). New Lua `:usage()` accessors expose checked
+process-local snapshots separately from those existing fields.
 The old usage fields are not a fallback source for the new tracker. Do not use
 transport tests as proof of end-to-end billing observability or an IC-047 budget.
 
@@ -19,9 +19,52 @@ any built-in provider's `chat`, `chat_with_tools` or `chat_stream`, and read
 across retries or concurrent calls includes each dispatched attempt once.
 `Agent::chat_request` leaves the scope unset; callers must choose its ownership
 explicitly. The scope is never serialized into the provider request or retained
-globally. Custom `LlmProvider` implementations do not automatically participate.
+globally. Direct custom-provider calls follow their implementation's contract;
+the execution wrapper described below accounts for non-reporting providers.
 
-An attempt starts after local validation and rate-limit waiting, immediately
+## Execution scopes
+
+The runtime automatically creates an enclosing scope for each executing Lua VM,
+with disjoint child scopes for each crew run and each conversation/dialog handle.
+Agent delegation, `run_flow`, `crew:subworkflow`, and Lua-tool child VMs inherit
+their caller's scope explicitly. Descendants update inclusive ancestors directly.
+Task retries, parallel/foreach tasks and collaborative discussion/synthesis
+therefore settle individual provider attempts into the same flow total, without
+adding child task results again. Failed output validation and transcript rollback
+do not roll back provider usage. Separate top-level VMs remain isolated even
+when they share one `Runtime` and its provider. No task-local or global counter
+is used. A flow with multiple `crew:run()` calls shares a flow total while each
+run has its own subtotal. Independent per-task subtotals remain pending.
+
+For Rust embedding, bind a tracker with
+`ironcrew::llm::scope::with_usage_tracker(provider, tracker.clone())` and pass
+the returned provider into crew/conversation/dialog execution. Retain the
+tracker to inspect it after success, error or cancellation. Unbound crew runs,
+conversation/dialog handles and agent turns create an isolated scope themselves.
+Lua embedders can inspect the VM's `UsageTracker` app data after execution or
+preinstall a tracker to retain access after dropping the VM. A reused VM or
+conversation handle accumulates its process-local lifetime, not historical
+usage recovered from persistent storage.
+
+An explicit `ChatRequest.usage_tracker` takes precedence over a provider's
+bound scope. `ToolCallContext.usage_tracker` likewise chooses the scope for
+delegated agent/conversation calls, including no-tools streaming. Wrapping a
+provider twice does not double-count requests or merge unrelated scopes.
+
+Custom `LlmProvider` implementations opt into checked receipt ownership by
+returning `true` from `records_usage()` and settling the supplied request tracker
+once per actual dispatch, including errors and cancellation. Providers without
+that contract have each invocation counted as **unavailable** by the execution
+wrapper after its offline validation hook succeeds. Their old `TokenUsage`
+fields are deliberately not converted into checked receipts. This opaque
+invocation boundary cannot reveal internal HTTP retries or billing details.
+Forwarding wrappers must preserve both `records_usage()` and `usage_tracker()`.
+
+These snapshots are not durable recovery, migrated task/API result fields,
+per-task attribution, token-budget enforcement, or proof of replica behavior.
+Those acceptance boundaries remain open.
+
+Built-in HTTP attempts start after local validation and rate-limit waiting, immediately
 before HTTP dispatch. Invalid credentials/options/URLs rejected before dispatch
 do not invent a request. A dispatched attempt without a receipt settles as
 unavailable; timeout or cancellation does not prove zero provider cost.
@@ -43,7 +86,7 @@ Truncation and missing terminal receipts preserve partial or unavailable usage.
 ## Receipt contract
 
 `UsageReceipt` describes one provider attempt, independently of task success.
-`UsageCounts` uses unsigned 64-bit integers and explicit `None`/JSON `null` for
+`UsageCounts` uses unsigned 64-bit integers in Rust and explicit `None`/JSON `null` for
 unknown fields. Zero is known only when actually reported or derived entirely
 from known zero categories. Missing reasoning/cache detail is never guessed.
 
@@ -62,10 +105,51 @@ and out-of-range subsets become unknown. Arithmetic never narrows to 32 bits.
 Serialized receipts round-trip with explicit unknowns, and deserialization
 rejects contradictory counts or forged coverage.
 
-The JSON numbers preserve the Rust `u64` range. Consumers must use a lossless
-integer decoder for values above JavaScript's safe-integer range. Public Lua,
-HTTP and SQL encoding choices remain part of the pending runtime integration;
-the old signed PostgreSQL `INTEGER` columns cannot store this full range.
+The checked receipt/aggregate/snapshot wire format uses canonical unsigned
+decimal **strings**, including request and in-flight counts. This preserves the
+entire `u64` range in JSON, JavaScript and Lua without narrowing. Unknown counts
+are `null`, not `"0"`. Numeric JSON values, leading zeros, signs, fractions,
+overflow, unknown fields and inconsistent coverage are rejected on read. Raw
+provider parsers still consume the provider's numeric protocol; there is no
+compatibility adapter from the old public usage fields. HTTP and SQL migration
+remains pending; the old PostgreSQL `INTEGER` columns cannot store this range.
+
+## Lua snapshots
+
+| Method | Scope |
+|---|---|
+| `crew:usage()` | Latest run that entered execution; `nil` before any such run |
+| `crew:flow_usage()` | Inclusive enclosing VM/caller scope, including all its crews and sessions |
+| `conversation:usage()` | Calls owned by this conversation handle since construction/resume |
+| `dialog:usage()` | Calls owned by this dialog handle since construction/resume |
+
+Each call returns a detached snapshot, not a live mutable view. A new run replaces
+the crew's last-run view; earlier returned snapshots stay unchanged. Nested calls
+are already included in ancestors: never add `crew:usage()` to `crew:flow_usage()`.
+Explicit Rust request/tool-context scope overrides choose a different owner and
+are intentionally excluded from a handle's default scope. Resuming a persisted
+session creates an empty process-local scope; it does not recover historical usage.
+
+```lua
+local ok, result = pcall(function() return crew:run() end)
+local usage = crew:usage()
+if usage then
+    print(json_stringify(usage)) -- also inspect after failure/cancellation
+    local total = usage.settled.total_tokens
+    if type(total.known) == "string" then
+        print(total.known, total.complete, usage.coverage)
+    end
+end
+```
+
+Shape: `{ settled = { requests, coverage, prompt_tokens, completion_tokens,
+total_tokens, cached_tokens, cache_write_tokens, reasoning_tokens }, in_flight,
+coverage }`. Every token field is `{ known, complete }`. In Lua, unknown `known`
+values use the serializer's null sentinel so `json_stringify` emits explicit
+`null` instead of dropping the field. Test `type(count.known) == "string"` for
+a known subtotal. Do not convert large counts with `tonumber`; arithmetic and
+budget enforcement belong in checked Rust code. Snapshot reads fail visibly
+after accounting overflow. These accessors neither persist data nor enforce budgets.
 
 ## Provider mapping
 
@@ -112,10 +196,14 @@ is distinct from one request with an unavailable receipt. Checked addition is
 atomic: overflow returns `UsageOverflow` without partially modifying totals.
 It must never be ignored or converted into a successful zero count.
 
-`UsageTracker` is a process-local, constant-space shared accounting scope. Its
+`UsageTracker` is a process-local shared accounting scope with constant-size
+counters per node and a maximum of 64 child levels. Its
 attempt guard settles exactly once on completion or drop, including cancellation
 of a polled async request. Clones share a scope; separately created trackers do
-not. Retries and delegated calls must use separate guards on the same run scope.
+not. `child()` creates a disjoint child view and updates its inclusive ancestors
+atomically, with root-first locks. A nesting-limit failure rejects the new scope
+before dispatch. Retries and delegated calls use separate guards on the run scope
+or a descendant.
 Do not add child results again to a tracker that already includes child requests.
 Explicit aggregate merges are only for disjoint scopes.
 
@@ -134,13 +222,11 @@ visible through the upcoming CLI/Lua/HTTP/store integration.
 
 ## Remaining integration
 
-1. Propagate scopes automatically through task retries, conversations and
-   nested/delegated execution, including custom providers. Replace the old
-   response/task usage types rather than adding a compatibility fallback.
-   Prove actual executor ownership with mock providers; the loopback HTTP tests
-   cover transport capture, not automatic runtime propagation.
-2. Carry the same coverage contract through Lua, CLI, HTTP/events, run/session
+1. Replace the old response/task usage types and add per-task views without
+   double-counting inclusive run/flow totals. Do not add a compatibility
+   fallback to old receipt fields.
+2. Carry the same coverage contract through result fields, CLI, HTTP/events, run/session
    persistence and JSON/SQLite/PostgreSQL. Preserve owner fencing and terminal
-   compare-and-set behavior; select lossless storage/wire representations.
+   compare-and-set behavior and the lossless decimal-string wire representation.
 3. Run durable-backend acceptance against disposable PostgreSQL 15 and the
    complete affected gates before resolving IC-046 or implementing IC-047.

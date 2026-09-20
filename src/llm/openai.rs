@@ -186,6 +186,10 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn records_usage(&self) -> bool {
+        true
+    }
+
     fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
         self.resolve_options(request, has_tools).map(|_| ())
     }

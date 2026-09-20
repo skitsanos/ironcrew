@@ -153,7 +153,7 @@ pub async fn build_dialog(
 
     AgentDialog::new_or_resume(
         dialog_agents,
-        provider,
+        crate::lua::usage::bind(lua, provider)?,
         tool_registry,
         model,
         starter,

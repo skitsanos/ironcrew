@@ -16,7 +16,6 @@
 
 mod tool_dispatch;
 
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::engine::agent::Agent;
@@ -30,62 +29,8 @@ use crate::llm::provider::{
 use crate::tools::ToolCallContext;
 use crate::utils::error::{IronCrewError, Result};
 
-/// Rolls back the currently-active user turn if the future is cancelled or
-/// returns before `commit`. Keeping this guard alive across provider/tool
-/// awaits makes Tokio timeout and shutdown cancellation history-safe.
-pub(crate) struct ActiveTurnGuard<'a> {
-    history: &'a mut Vec<ChatMessage>,
-    /// Exact transcript that existed before the active user message. History
-    /// limiting can drain old turn groups while a provider/tool request is in
-    /// flight, so remembering only the active user's index is not sufficient:
-    /// cancellation would otherwise keep the drain and silently lose older
-    /// persisted context.
-    rollback_snapshot: Option<Vec<ChatMessage>>,
-    committed: bool,
-}
-
-impl<'a> ActiveTurnGuard<'a> {
-    pub(crate) fn new(history: &'a mut Vec<ChatMessage>) -> Self {
-        let rollback_snapshot = history
-            .iter()
-            .rposition(|message| message.role == "user")
-            .map(|active_start| history[..active_start].to_vec());
-        Self {
-            history,
-            rollback_snapshot,
-            committed: false,
-        }
-    }
-
-    pub(crate) fn commit(&mut self) {
-        self.committed = true;
-        self.rollback_snapshot = None;
-    }
-}
-
-impl Deref for ActiveTurnGuard<'_> {
-    type Target = Vec<ChatMessage>;
-
-    fn deref(&self) -> &Self::Target {
-        self.history
-    }
-}
-
-impl DerefMut for ActiveTurnGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.history
-    }
-}
-
-impl Drop for ActiveTurnGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed
-            && let Some(snapshot) = self.rollback_snapshot.take()
-        {
-            *self.history = snapshot;
-        }
-    }
-}
+mod guard;
+pub(crate) use guard::ActiveTurnGuard;
 
 /// Returns the per-tool-call timeout in seconds.
 ///
@@ -133,6 +78,12 @@ pub async fn run_single_agent_turn(
     history_buffer: &mut Vec<ChatMessage>,
     ctx: &ToolCallContext,
 ) -> Result<(String, Option<String>)> {
+    let provider = match &ctx.usage_tracker {
+        Some(tracker) => crate::llm::scope::with_usage_tracker(provider.clone(), tracker.clone()),
+        None => crate::llm::scope::ensure_scope(provider.clone()),
+    };
+    let mut ctx = ctx.clone();
+    ctx.usage_tracker = provider.usage_tracker();
     let mut history = ActiveTurnGuard::new(history_buffer);
     let max_history = match max_history {
         Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
@@ -240,7 +191,7 @@ pub async fn run_single_agent_turn(
         enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
 
         for tool_call in &response.tool_calls {
-            let result_text = tool_dispatch::execute(tool_call, &scope, ctx).await;
+            let result_text = tool_dispatch::execute(tool_call, &scope, &ctx).await;
             history.push(ChatMessage::tool(&tool_call.id, &result_text));
             enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
         }

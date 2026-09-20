@@ -107,6 +107,7 @@ fn finish_vm(
     agents: Vec<crate::engine::agent::Agent>,
 ) -> mlua::Result<()> {
     lua.set_app_data(context.runtime.clone());
+    lua.set_app_data(context.usage_tracker.clone());
     lua.set_app_data(Arc::new(sub_dir.to_path_buf()));
     lua.set_app_data(SubflowDepth(context.depth + 1));
     if let Some(source_context) = source_context {

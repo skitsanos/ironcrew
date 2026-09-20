@@ -122,7 +122,7 @@ pub async fn build_conversation(
 
     let inner = LuaConversationInner::new_or_resume(
         agent,
-        provider,
+        crate::lua::usage::bind(lua, provider)?,
         tool_registry,
         model,
         system_prompt,
