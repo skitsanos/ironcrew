@@ -1,5 +1,5 @@
 -- OpenAI Responses API — with reasoning and streaming
--- Model: gpt-5.4-nano (cheapest reasoning-capable model)
+-- Model: gpt-5.6-luna (cheap, fast, reasoning-capable)
 -- Reasoning summary is captured in the run record under `reasoning`.
 -- With stream=true, reasoning summary deltas appear dim on stderr.
 -- Requires: OPENAI_API_KEY
@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal = "Verify OpenAI Responses reasoning + streaming",
     provider = "openai-responses",
-    model = "gpt-5.4-nano",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
     reasoning_effort = "medium",
     reasoning_summary = "auto",

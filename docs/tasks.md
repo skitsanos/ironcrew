@@ -289,7 +289,7 @@ tools (names starting with `mcp__`).
 ## Per-Task Model Override
 
 ```lua
-crew:add_task({ name = "complex", description = "...", model = "gpt-4o" })
+crew:add_task({ name = "complex", description = "...", model = "gpt-5.6-terra" })
 ```
 
 The model resolution priority is: agent model > task model > model router > crew default.

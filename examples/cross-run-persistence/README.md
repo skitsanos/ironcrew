@@ -150,7 +150,7 @@ debate:delete()
 ## Prerequisites
 
 - An OpenAI API key in `.env` (`OPENAI_API_KEY=sk-...`)
-- Default provider `gpt-5.4-mini` — change the `model` field in `crew.lua`
+- Default provider `gpt-5.6-luna` — change the `model` field in `crew.lua`
   if you want to use a different one
 
 ## Gotchas
