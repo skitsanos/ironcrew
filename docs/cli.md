@@ -75,7 +75,7 @@ ironcrew chat examples/chat-cli --agent tutor --id onboarding-2026-04
 
 - The Lua VM has `IRONCREW_MODE = "chat"` set before `crew.lua` executes,
   so guard any top-level one-shot `crew:run()` with
-  `if IRONCREW_MODE ~= "chat" then ... end`.
+  `if IRONCREW_MODE == "run" then ... end` (also safe for construction validation).
 - Slash commands: `/help`, `/exit`, `/quit`, `/reset`, `/id`, `/save`,
   `/history`.
 - See [docs/chat.md](chat.md) for the full reference and
@@ -83,15 +83,80 @@ ironcrew chat examples/chat-cli --agent tutor --id onboarding-2026-04
 
 ### validate
 
-Check project structure and Lua syntax without executing anything.
+Choose declaration/syntax checks or bounded construction evaluation.
 
 ```
 ironcrew validate .
 ironcrew validate path/to/project
+ironcrew validate --evaluate path/to/project
 ```
 
-Validates agent/tool file syntax, entrypoint Lua syntax, and reference
-integrity (agent tool arrays vs. known tools).
+Without `--evaluate`, this evaluates separate agent/tool declarations, compiles
+the entrypoint, and checks agent tool references. It does **not** evaluate
+inline crew construction and is not a no-effects guarantee for untrusted
+project code. The HTTP `/flows/{flow}/validate` contract is unchanged.
+
+With `--evaluate`, IronCrew uses the real constructors and model capability
+policy to evaluate `config.lua`, agent/tool declarations, snapshot-backed
+`_lib` imports, and the selected entrypoint. It checks constructed task graphs,
+unknown references, cycles, task model overrides, and evaluated conversation
+and dialog options. Credentials are not required or validated; `.env` is not
+loaded. Provider credentials used internally are inert validation placeholders.
+Default model/effort rules remain `gpt-5.6-luna` with `low`, or `none` for Luna
+Chat Completions function tools.
+
+| Exit | Meaning in `--evaluate` mode |
+|---|---|
+| `0` | The evaluated construction path passed |
+| `1` | Invalid construction, source/resource limit, or worker failure |
+| `2` | Invalid CLI arguments |
+| `3` | Incomplete: execution/external state required, or no crew constructed |
+
+CI must require exit `0`; do not tolerate `3`. No fake task results, empty
+stored histories, or synthetic human answers are returned to Lua. Calling
+`crew:run`, session methods, memory/message access, HTTP, PostgreSQL, filesystem,
+process, environment, or nested-flow operations stops evaluation. MCP syntax
+is parsed, but tool discovery requires external work and is incomplete. SQL
+declarations are parsed without a connection when the postgres feature is
+enabled (otherwise they are incomplete). A declared persistent crew or session
+does not open or resume its store.
+
+Keep construction separate from execution:
+
+```lua
+local crew = Crew.new({ goal = "Answer a question" })
+crew:add_agent({ name = "assistant", goal = "Answer concisely" })
+crew:add_task({ name = "answer", description = "Explain Rust ownership" })
+if IRONCREW_MODE == "validate" then return end
+local results = crew:run()
+```
+
+This checks only the path reached with `IRONCREW_MODE = "validate"` and no
+`input`. Callback bodies and untaken branches are compiled, not invoked;
+execution-dependent construction after the boundary cannot be checked. A guard
+must come **after all construction intended for validation**. Passing is not
+proof of credentials, model availability, provider behavior, output quality,
+persisted-state compatibility, or runtime-only branches.
+
+The restricted VM supports pure Lua string/table/math operations and the
+bounded JSON helpers. `env`, clocks, random UUIDs, protected calls (`pcall`,
+`xpcall`), coroutines, dynamic code loading, `setmetatable` (including finalizers),
+crypto and regex helpers are unsupported and report incomplete; `print` is
+suppressed. Agent/tool file
+declarations use separate VMs, as they do at runtime. Their budgets are shared
+with the entrypoint and config evaluation.
+
+Limits are fixed for this mode: 32 MiB per Lua VM; two million aggregate Lua
+instructions; 64 stack frames; a five-second hook deadline; 256 declarations,
+16 crews, 16,384 option-table entries and 8 MiB of admitted strings/bytecode.
+A supervised worker enforces a **10-second hard deadline**, including native
+Lua calls and source loading; cancellation closes its lifetime channel and
+terminates it. Worker stdout/stderr are capped at 64 KiB each. Source capture
+uses no-follow reads, rejects symlinks/special source files, and caps traversal
+at depth 32, 16,384 entries, 1,024 Lua/SQL files and 64 MiB total. Individual
+files default to 1 MiB (`IRONCREW_LUA_MAX_SOURCE_BYTES`, maximum 16 MiB).
+Only captured Lua/SQL sources are read; arbitrary data files and `.env` are not.
+Secure capture currently requires Unix; unsupported platforms fail closed.
 
 ### list
 

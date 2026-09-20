@@ -37,10 +37,11 @@ helpers that live alongside `Crew.new` / `Agent.new`:
   `tools/*.lua` custom tools, conversational agents' tool-call handlers —
   without going through a `Crew` instance.
 - **`IRONCREW_MODE`** — Lua global set to `"run"` by `ironcrew run` and
-  `"chat"` by `ironcrew chat` before the entrypoint script executes. Flows
+  `"chat"` by `ironcrew chat`, and `"validate"` by `validate --evaluate`
+  before the entrypoint script executes. Flows
   that mix task-based and conversational use should guard their top-level
-  `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so
-  chat-mode boot-up doesn't trigger a full task execution.
+  `crew:run()` with `if IRONCREW_MODE == "run" then crew:run() end` so
+  chat boot-up and construction validation do not trigger task execution.
 - **`IRONCREW_MAX_FLOW_DEPTH`** — environment variable (default `5`) that
   caps recursive `run_flow`/`crew:subworkflow` nesting. Each child VM
   inherits `depth + 1`; exceeding the cap fails fast with a validation

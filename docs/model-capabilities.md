@@ -48,8 +48,10 @@ is a no-op, and the metrics wrapper forwards it. The policy revision is included
 in built-in provider execution fingerprints, preventing silent reuse of a
 persistent conversation under changed defaults.
 
-`ironcrew validate` remains compile-only. No-effect evaluation is tracked by
-[IC-045](issues/IC-045.md); these checks run when Lua constructors are evaluated.
+`ironcrew validate --evaluate` runs these checks during bounded, effect-free
+construction. Plain `validate` only compiles the entrypoint and checks separate
+declarations. See [construction validation](cli.md#validate) for exit statuses
+and the limits of evaluating dynamic Lua.
 
 ## Unknown models and custom endpoints
 

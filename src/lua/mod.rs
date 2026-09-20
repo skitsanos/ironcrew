@@ -2,6 +2,7 @@ pub mod agent_turn;
 pub mod api;
 pub(crate) mod bootstrap;
 pub(crate) mod config_choices;
+pub(crate) mod construction;
 pub mod conversation;
 pub mod crew_userdata;
 pub mod crypto;

@@ -31,7 +31,8 @@ idempotency rules; the CLI reports the error and can accept a new user turn.
 
 IronCrew exposes `IRONCREW_MODE` as a Lua global. It is `"run"` during a
 normal `ironcrew run` or API run, and `"chat"` while the CLI REPL or the
-HTTP `start` handler is building a session. Write your top-level script so
+HTTP `start` handler is building a session, and `"validate"` during
+`ironcrew validate --evaluate`. Write your top-level script so
 the crew is always declared, but any one-shot `crew:run()` only fires in
 run mode:
 
@@ -39,14 +40,14 @@ run mode:
 local crew = Crew.new({ goal = "...", provider = "openai", model = "gpt-5.6-luna" })
 crew:add_agent(Agent.new({ name = "tutor", goal = "..." }))
 
-if IRONCREW_MODE ~= "chat" then
-    crew:add_task({ name = "demo", agent = "tutor", description = "..." })
+crew:add_task({ name = "demo", agent = "tutor", description = "..." })
+if IRONCREW_MODE == "run" then
     crew:run()
 end
 ```
 
 That way the same `crew.lua` works for both `ironcrew run` and
-`ironcrew chat`.
+`ironcrew chat`, and its task declarations are visible to construction validation.
 
 HTTP conversation bootstrap also enforces this rule in the host. While the
 entrypoint is being evaluated to discover its declarative Crew, Agent, task,

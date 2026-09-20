@@ -109,6 +109,11 @@ ironcrew run .
 | [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
 
+Construction can be checked before a paid run with `ironcrew validate --evaluate`.
+It uses the real Lua constructors without provider, tool, or storage effects;
+execution-dependent paths return an explicit nonzero incomplete result. See
+[validation boundaries and exit codes](docs/cli.md#validate).
+
 ## Examples
 
 See the [`examples` catalog](examples/README.md) for working demos. Most ship a `.env.example` —

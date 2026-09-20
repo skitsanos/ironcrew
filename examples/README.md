@@ -14,6 +14,14 @@ Provider keys are read directly by IronCrew. Values accessed from Lua with
 `env()` must also appear in `IRONCREW_ENV_ALLOWLIST`; the checked-in
 `.env.example` files show the required names.
 
+For effect-free construction checks, run
+`ironcrew validate --evaluate examples/providers/02-openai-responses.lua`.
+The first three provider examples, `config-lua`, and `conversation` explicitly
+separate construction from execution and are checked this way in CI. No key or
+paid provider call is needed. Other flows may return exit `3` when they require
+external state or execution; that is incomplete, not a pass. See the
+[validation contract](../docs/cli.md#validate).
+
 ## Start here
 
 | Example | Demonstrates |
