@@ -571,15 +571,9 @@ impl LuaConversationInner {
         let mut active_turn = ActiveTurnGuard::new(history);
         let messages_snapshot: Vec<ChatMessage> = active_turn.clone();
 
-        let request = ChatRequest {
-            messages: messages_snapshot,
-            model: self.model.clone(),
-            temperature: self.agent.temperature,
-            max_tokens: self.agent.max_tokens,
-            response_format: self.agent.response_format.clone(),
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
+        let request = self
+            .agent
+            .chat_request(self.model.clone(), messages_snapshot);
 
         let response = self.call_streaming(request).await?;
 

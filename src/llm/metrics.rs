@@ -258,6 +258,7 @@ mod tests {
             response_format: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            reasoning_effort: None,
         };
         let first = tokio::spawn({
             let provider = Arc::clone(&provider);
@@ -348,6 +349,7 @@ mod tests {
             response_format: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            reasoning_effort: None,
         };
 
         provider.chat_with_tools(request, &[]).await.unwrap();
@@ -397,6 +399,7 @@ mod tests {
             response_format: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            reasoning_effort: None,
         };
 
         provider.chat(request).await.expect_err("provider fails");

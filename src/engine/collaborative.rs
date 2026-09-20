@@ -209,15 +209,7 @@ pub async fn execute_collaborative_task(
 
             let agent_model = agent.model.clone().unwrap_or_else(|| model.to_string());
 
-            let request = ChatRequest {
-                messages,
-                model: agent_model,
-                temperature: agent.temperature,
-                max_tokens: agent.max_tokens,
-                response_format: agent.response_format.clone(),
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-            };
+            let request = agent.chat_request(agent_model, messages);
 
             let response = provider.chat(request).await?;
             total_usage.observe(response.usage.as_ref());
@@ -270,21 +262,16 @@ pub async fn execute_collaborative_task(
         );
     }
 
-    let request = ChatRequest {
-        messages: vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&synthesis_prompt),
-        ],
-        model: synth_agent
+    let request = synth_agent.chat_request(
+        synth_agent
             .model
             .clone()
             .unwrap_or_else(|| synthesis_model.to_string()),
-        temperature: synth_agent.temperature,
-        max_tokens: synth_agent.max_tokens,
-        response_format: synth_agent.response_format.clone(),
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-    };
+        vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&synthesis_prompt),
+        ],
+    );
 
     validate_chat_history(&request.messages, 1, chat_history_max_bytes(), true)?;
 
