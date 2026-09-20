@@ -11,6 +11,22 @@ vars:
     sh: grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'
 
 tasks:
+  hooks-install:
+    desc: Enable the tracked IronCrew Git hooks in this clone
+    cmds:
+      - git config --local core.hooksPath .githooks
+      - test "$(git config --local --get core.hooksPath)" = .githooks
+
+  develop-refresh:
+    desc: Refresh managed tools and dependencies to their latest stable versions
+    cmds:
+      - ./scripts/refresh-develop-dependencies.sh
+
+  pre-push:
+    desc: Refresh dependencies and run every locally reproducible CI gate
+    cmds:
+      - ./scripts/pre-push-check.sh
+
   docker-build:
     desc: Build the Docker image locally (current platform, never pushed)
     cmds:
