@@ -276,7 +276,7 @@ pub struct AgentDialog {
     /// runs until `max_turns` is reached.
     pub should_stop_key: Option<mlua::RegistryKey>,
 
-    /// Set to true once a `should_stop` callback has requested termination.
+    /// Set to true once an early-stop condition has requested termination.
     /// `has_turns_remaining` consults this flag so manual `next_turn` loops
     /// also respect the stop condition.
     pub stopped: Mutex<bool>,
@@ -545,8 +545,8 @@ impl AgentDialog {
         Ok(())
     }
 
-    /// Returns `true` if the dialog has not reached `max_turns` yet AND no
-    /// `should_stop` callback has requested termination.
+    /// Returns `true` if the dialog has not reached `max_turns` yet and no
+    /// early-stop condition has requested termination.
     async fn has_turns_remaining(&self) -> bool {
         if *self.stopped.lock().await {
             return false;
@@ -631,6 +631,12 @@ impl AgentDialog {
             return Ok(());
         };
 
+        self.stop_with_reason(reason).await;
+        Ok(())
+    }
+
+    /// Record an early-stop condition and emit `DialogCompleted` exactly once.
+    async fn stop_with_reason(&self, reason: String) {
         *self.stopped.lock().await = true;
         *self.stop_reason.lock().await = Some(reason.clone());
 
@@ -644,7 +650,6 @@ impl AgentDialog {
                 stop_reason: Some(reason),
             });
         }
-        Ok(())
     }
 
     /// Default round-robin speaker selection.
@@ -811,14 +816,17 @@ impl AgentDialog {
     }
 
     /// Run a single turn with automatic speaker selection (round-robin or callback).
-    /// Returns `None` if the dialog has already reached max_turns or was
-    /// stopped by a `should_stop` callback on a previous turn.
+    /// Returns `None` if the dialog has already reached max_turns, was stopped
+    /// previously, or the provider returns a blank final reply.
     pub async fn run_one_turn(&self, lua: &mlua::Lua) -> Result<Option<DialogTurn>, IronCrewError> {
         if !self.has_turns_remaining().await {
             return Ok(None);
         }
         let speaker_index = self.select_speaker(lua).await?;
-        let turn = self.execute_turn(speaker_index).await?;
+        let Some(turn) = self.execute_turn(speaker_index).await? else {
+            self.autosave_if_enabled().await?;
+            return Ok(None);
+        };
         self.maybe_stop_after_turn(lua, &turn).await?;
         self.autosave_if_enabled().await?;
         Ok(Some(turn))
@@ -826,7 +834,8 @@ impl AgentDialog {
 
     /// Run a turn for a specific agent by name. Useful for moderator-driven
     /// loops where the caller picks who speaks next.
-    /// Returns `None` if max_turns is reached or a prior turn triggered stop.
+    /// Returns `None` if max_turns is reached, a prior turn triggered stop, or
+    /// the provider returns a blank final reply.
     pub async fn run_turn_for(
         &self,
         lua: &mlua::Lua,
@@ -836,7 +845,10 @@ impl AgentDialog {
             return Ok(None);
         }
         let speaker_index = self.agent_index(agent_name)?;
-        let turn = self.execute_turn(speaker_index).await?;
+        let Some(turn) = self.execute_turn(speaker_index).await? else {
+            self.autosave_if_enabled().await?;
+            return Ok(None);
+        };
         self.maybe_stop_after_turn(lua, &turn).await?;
         self.autosave_if_enabled().await?;
         Ok(Some(turn))
@@ -854,7 +866,10 @@ impl AgentDialog {
 
     /// Execute a turn for the agent at `speaker_index`. Increments the turn
     /// counter and emits SSE events.
-    async fn execute_turn(&self, speaker_index: usize) -> Result<DialogTurn, IronCrewError> {
+    async fn execute_turn(
+        &self,
+        speaker_index: usize,
+    ) -> Result<Option<DialogTurn>, IronCrewError> {
         let agent = self.agents[speaker_index].clone();
         let messages = self.build_messages(speaker_index).await?;
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
@@ -959,6 +974,19 @@ impl AgentDialog {
             }
         }
 
+        // A blank final reply cannot advance a dialog meaningfully. This
+        // applies after zero or more tool rounds: tool calls may have side
+        // effects, but their blank final response is not recorded as a turn.
+        if accumulated_content.trim().is_empty() {
+            tracing::warn!(
+                dialog = %self.id,
+                agent = %agent.name,
+                "Dialog stopped: the model returned an empty final reply"
+            );
+            self.stop_with_reason("empty_response".into()).await;
+            return Ok(None);
+        }
+
         let turn = DialogTurn {
             index: turn_idx,
             speaker_index,
@@ -1044,9 +1072,9 @@ impl AgentDialog {
         }
 
         // If this turn was the last one, emit dialog_completed for the
-        // natural max-turns path. Early `should_stop` termination is handled
-        // in `maybe_stop_after_turn`, and `completed_emitted` guarantees only
-        // one of the two paths actually fires the event.
+        // natural max-turns path. Early termination is handled by
+        // `stop_with_reason`, and `completed_emitted` guarantees only one of
+        // the paths actually fires the event.
         if turn_idx + 1 >= self.max_turns {
             let mut emitted = self.completed_emitted.lock().await;
             if !*emitted {
@@ -1059,7 +1087,7 @@ impl AgentDialog {
             }
         }
 
-        Ok(turn)
+        Ok(Some(turn))
     }
 
     async fn call_streaming(&self, request: ChatRequest) -> Result<ChatResponse, IronCrewError> {
@@ -1240,7 +1268,7 @@ impl UserData for AgentDialog {
         // dialog:max_turns() — configured turn limit
         methods.add_method("max_turns", |_, this, ()| Ok(this.max_turns));
 
-        // dialog:stopped() — true if a should_stop callback has requested termination
+        // dialog:stopped() — true if an early-stop condition ended the dialog
         methods.add_async_method("stopped", |_, this, ()| async move {
             Ok(*this.stopped.lock().await)
         });
@@ -1495,123 +1523,5 @@ fn resolve_agent(value: Value, agents: &[Agent], field: &str) -> mlua::Result<Ag
 }
 
 #[cfg(test)]
-mod interpret_stop_tests {
-    use super::*;
-    use crate::llm::provider::{ToolCallFunction, ToolCallRequest};
-
-    fn lua() -> mlua::Lua {
-        mlua::Lua::new()
-    }
-
-    #[test]
-    fn nil_means_continue() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Nil).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn false_means_continue() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(false)).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn true_means_stop_with_default_reason() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(true)).unwrap();
-        assert_eq!(result.as_deref(), Some("custom_stop"));
-    }
-
-    #[test]
-    fn string_means_stop_with_that_reason() {
-        let lua = lua();
-        let s = lua.create_string("consensus reached").unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
-        assert_eq!(result.as_deref(), Some("consensus reached"));
-    }
-
-    #[test]
-    fn empty_string_falls_back_to_default_reason() {
-        let lua = lua();
-        let s = lua.create_string("").unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
-        assert_eq!(result.as_deref(), Some("custom_stop"));
-    }
-
-    #[test]
-    fn number_is_rejected_as_usage_error() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Integer(42));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("must return nil, bool, or string"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn table_is_rejected_as_usage_error() {
-        let lua = lua();
-        let t = lua.create_table().unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Table(t));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn dialog_tool_history_evicts_only_prior_transcript_messages() {
-        let tool_call = ToolCallRequest {
-            id: "call-1".into(),
-            call_type: "function".into(),
-            function: ToolCallFunction {
-                name: "lookup".into(),
-                arguments: "{}".into(),
-            },
-        };
-        let protected = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("starter"),
-            ChatMessage::assistant(None, Some(vec![tool_call.clone()])),
-            ChatMessage::tool("call-1", "result"),
-        ];
-        let max_bytes = chat_history_estimated_bytes(&protected);
-        let mut working = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("starter"),
-            ChatMessage::user(&"old".repeat(1_000)),
-            ChatMessage::assistant(None, Some(vec![tool_call])),
-            ChatMessage::tool("call-1", "result"),
-        ];
-
-        let active = enforce_dialog_working_history(&mut working, 3, max_bytes).unwrap();
-
-        assert_eq!(active, 2);
-        assert_eq!(working.len(), 4);
-        assert_eq!(working[2].role, "assistant");
-        assert_eq!(working[3].role, "tool");
-    }
-
-    #[test]
-    fn resumed_dialog_indices_must_match_retained_window() {
-        let agents = vec![
-            Agent {
-                name: "a".into(),
-                ..Default::default()
-            },
-            Agent {
-                name: "b".into(),
-                ..Default::default()
-            },
-        ];
-        let transcript = VecDeque::from([DialogTurn {
-            index: 7,
-            speaker_index: 0,
-            agent_name: "a".into(),
-            content: "hello".into(),
-            reasoning: None,
-        }]);
-
-        let error = validate_transcript(&transcript, &agents, 10, 10, 1024 * 1024, 7)
-            .expect_err("turn index must precede next_index");
-        assert!(error.to_string().contains("expected"));
-    }
-}
+#[path = "dialog_stop_tests.rs"]
+mod interpret_stop_tests;
