@@ -97,14 +97,7 @@ for _, result in ipairs(results) do
             print(result.output)
         end
 
-        if result.token_usage then
-            print(string.format(
-                "  [tokens: %d prompt, %d completion, %d total]",
-                result.token_usage.prompt_tokens,
-                result.token_usage.completion_tokens,
-                result.token_usage.total_tokens
-            ))
-        end
+        print("  [usage: " .. json_stringify(result.usage) .. "]")
     else
         print("[FAIL] " .. result.task .. " - " .. result.output)
     end

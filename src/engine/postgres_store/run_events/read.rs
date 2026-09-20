@@ -25,24 +25,29 @@ impl PostgresStore {
             ))
         })?;
         let run_sql = format!(
-            "SELECT flow, status, duration_ms, total_tokens, \
+            "SELECT flow, status, duration_ms, CASE WHEN octet_length(usage::text) <= 4096 THEN usage ELSE NULL END AS usage, \
                     to_char(clock_timestamp() AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS snapshot_at \
              FROM {} \
              WHERE run_id = $1 FOR SHARE",
             self.table_name
         );
-        let run: Option<(String, String, i64, i32, String)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
-                .bind(run_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| {
-                    IronCrewError::Validation(format!(
-                        "PostgreSQL run-event run lookup failed: {error}"
-                    ))
-                })?;
-        let (stored_flow, status, duration_ms, total_tokens, snapshot_at) =
+        let run: Option<(
+            String,
+            String,
+            i64,
+            sqlx::types::Json<crate::usage::UsageSnapshot>,
+            String,
+        )> = sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event run lookup failed: {error}"
+                ))
+            })?;
+        let (stored_flow, status, duration_ms, usage, snapshot_at) =
             run.ok_or_else(|| IronCrewError::Validation(format!("Run '{run_id}' not found")))?;
         if stored_flow != flow {
             return Err(IronCrewError::Conflict(format!(
@@ -269,11 +274,7 @@ impl PostgresStore {
             Some(RunEventTerminalState {
                 status,
                 duration_ms: nonnegative_u64("terminal duration", duration_ms)?,
-                total_tokens: u32::try_from(total_tokens).map_err(|_| {
-                    IronCrewError::Validation(
-                        "PostgreSQL run-event terminal token count is negative".into(),
-                    )
-                })?,
+                usage: usage.0,
                 event_sequence: terminal_event_sequence,
             })
         } else {

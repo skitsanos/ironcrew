@@ -1,6 +1,9 @@
 //! Production-safety regression tests for API admission, lifecycle, probes,
-//! flow isolation, and terminal SSE delivery. Fixtures suspend before any LLM
-//! call, so the suite is deterministic and provider-free.
+//! flow isolation, and terminal SSE delivery. Usage fixtures use only a local
+//! mock provider; no paid or external provider calls are made.
+
+#[path = "api_safety/usage.rs"]
+mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -916,113 +916,20 @@ impl TerminalResultRetention {
     }
 }
 
-/// Persist one terminal transition for an HTTP-owned run. A normal
-/// `crew:run()` contributes its staged, result-bearing completion only after
-/// the enclosing Lua entrypoint ends. If a task failed before Lua could create
-/// the intent, create a minimal fallback record only after confirming the run
-/// is genuinely absent.
-struct TerminalPersistence<'a> {
-    run_id: &'a str,
-    flow: &'a str,
-    started_at: &'a str,
-    tags: &'a [String],
-    status: RunStatus,
-    duration_ms: u64,
-    total_tokens: u32,
-    /// Full crew completion retained by the API lifecycle until the enclosing
-    /// Lua entrypoint has returned. Absent for pre-crew failures, aborts,
-    /// timeouts, and flows that never call `crew:run()`.
-    completion: Option<&'a RunCompletion>,
-}
-
-async fn persist_terminal_outcome(
-    store: &Arc<dyn crate::engine::store::StateStore>,
-    terminal: TerminalPersistence<'_>,
-) -> Result<(RunStatus, bool), IronCrewError> {
-    let synthesized;
-    let completion = match terminal.completion {
-        Some(completion) => completion,
-        None => {
-            synthesized = RunCompletion {
-                status: terminal.status.clone(),
-                finished_at: chrono::Utc::now().to_rfc3339(),
-                duration_ms: terminal.duration_ms,
-                task_results: Vec::new(),
-                total_tokens: terminal.total_tokens,
-                cached_tokens: 0,
-            };
-            &synthesized
-        }
-    };
-    let completion_status = completion.status.clone();
-
-    match store
-        .update_run_completion(terminal.run_id, completion.clone())
-        .await
-    {
-        Ok(RunTransition::Applied) => return Ok((completion_status.clone(), true)),
-        Ok(RunTransition::AlreadyTerminal(status)) => return Ok((status, false)),
-        Err(update_error) => match store.get_run(terminal.run_id).await {
-            Ok(record) if record.status.is_terminal() => return Ok((record.status, false)),
-            Ok(record) => {
-                return Err(IronCrewError::Validation(format!(
-                    "Failed to persist terminal outcome for run '{}': {}; durable status remains '{}'",
-                    terminal.run_id, update_error, record.status
-                )));
-            }
-            Err(get_error) if run_not_found(&get_error, terminal.run_id) => {}
-            Err(get_error) => {
-                return Err(IronCrewError::Validation(format!(
-                    "Could not verify run '{}' after terminal update failed (update: {}; read: {})",
-                    terminal.run_id, update_error, get_error
-                )));
-            }
-        },
-    }
-
-    let fallback = RunIntent {
-        suggested_id: Some(terminal.run_id.to_string()),
-        flow_name: terminal.flow.to_string(),
-        flow: terminal.flow.to_string(),
-        started_at: terminal.started_at.to_string(),
-        agent_count: 0,
-        task_count: 0,
-        tags: terminal.tags.to_vec(),
-    };
-    if let Err(error) = store.save_run_intent(fallback).await {
-        if matches!(error, IronCrewError::OwnerDraining { .. }) {
-            return Err(error);
-        }
-        return Err(IronCrewError::Validation(format!(
-            "Failed to create fallback intent for terminal run '{}': {}",
-            terminal.run_id, error
-        )));
-    }
-
-    match store
-        .update_run_completion(terminal.run_id, completion.clone())
-        .await
-    {
-        Ok(RunTransition::Applied) => Ok((completion_status, true)),
-        Ok(RunTransition::AlreadyTerminal(status)) => Ok((status, false)),
-        Err(error) => Err(IronCrewError::Validation(format!(
-            "Failed to persist terminal outcome for fallback run '{}': {}",
-            terminal.run_id, error
-        ))),
-    }
-}
+mod terminal_persistence;
+use terminal_persistence::{TerminalPersistence, persist_terminal_outcome};
 
 struct WorkOutcome {
     status: RunStatus,
     duration_ms: u64,
-    total_tokens: u32,
+    usage: crate::usage::UsageSnapshot,
     error_message: Option<String>,
 }
 
 struct RunWorkResult {
     status: String,
     duration_ms: u64,
-    total_tokens: u32,
+    usage: crate::usage::UsageSnapshot,
 }
 
 struct RunExecutionContext {
@@ -1030,6 +937,7 @@ struct RunExecutionContext {
     input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
     run_intent_signal: Option<RunIntentSignal>,
     api_lifecycle: crate::lua::crew_userdata::ApiRunLifecycle,
+    usage_tracker: crate::usage::UsageTracker,
 }
 
 /// Tokio detaches a task when its `JoinHandle` is dropped. The run monitor is
@@ -1086,7 +994,7 @@ fn classify_work_result(
             let RunWorkResult {
                 status: response_status,
                 duration_ms: response_duration_ms,
-                total_tokens: response_total_tokens,
+                usage: response_usage,
             } = work;
             let status = response_status
                 .parse::<RunStatus>()
@@ -1096,26 +1004,26 @@ fn classify_work_result(
             WorkOutcome {
                 status,
                 duration_ms: response_duration_ms,
-                total_tokens: response_total_tokens,
+                usage: response_usage,
                 error_message: None,
             }
         }
         Ok(Err(error)) => WorkOutcome {
             status: RunStatus::Failed,
             duration_ms: elapsed_ms,
-            total_tokens: 0,
+            usage: crate::usage::UsageSnapshot::unavailable(),
             error_message: Some(error.to_string()),
         },
         Err(join_error) if join_error.is_cancelled() => WorkOutcome {
             status: RunStatus::Aborted,
             duration_ms: elapsed_ms,
-            total_tokens: 0,
+            usage: crate::usage::UsageSnapshot::unavailable(),
             error_message: None,
         },
         Err(join_error) => WorkOutcome {
             status: RunStatus::Failed,
             duration_ms: elapsed_ms,
-            total_tokens: 0,
+            usage: crate::usage::UsageSnapshot::unavailable(),
             error_message: Some(format!("Task panicked: {join_error}")),
         },
     }
@@ -1414,6 +1322,8 @@ pub async fn run_flow(
     // times out after `crew:run()` completed, the monitor can still preserve
     // those task results while applying the authoritative terminal status.
     let api_lifecycle = crate::lua::crew_userdata::ApiRunLifecycle::default();
+    let usage_tracker = crate::usage::UsageTracker::default();
+    let usage_for_work = usage_tracker.clone();
 
     // Prepare the work task, then register it while holding the active-map
     // write lock. Rechecking readiness under that lock closes the race where
@@ -1480,6 +1390,7 @@ pub async fn run_flow(
                         input_bridge: Some(bridge_for_work),
                         run_intent_signal,
                         api_lifecycle: lifecycle_for_work,
+                        usage_tracker: usage_for_work,
                     },
                 )
                 .await
@@ -1572,7 +1483,7 @@ pub async fn run_flow(
             (None, None) => None,
         };
 
-        let (requested_status, duration_ms, total_tokens, error_message, fence_result) = tokio::select! {
+        let (mut requested_status, duration_ms, usage, mut error_message, fence_result) = tokio::select! {
             biased;
             outcome = async {
                 match immediate_fence_outcome {
@@ -1591,7 +1502,7 @@ pub async fn run_flow(
                         (
                             RunStatus::Aborted,
                             started.elapsed().as_millis() as u64,
-                            0,
+                            crate::usage::UsageSnapshot::unavailable(),
                             None,
                             Some(RunFenceHeartbeat::CancelRequested),
                         )
@@ -1599,13 +1510,13 @@ pub async fn run_flow(
                     RunFenceHeartbeat::Terminal(status) => {
                         tracing::debug!(run_id = %run_id_clone, %status, "Run worker stopped after its durable record became terminal");
                         let terminal_result = RunFenceHeartbeat::Terminal(status.clone());
-                        let (duration_ms, total_tokens) = match state_clone
+                        let (duration_ms, usage) = match state_clone
                             .store
                             .get_run(&run_id_clone)
                             .await
                         {
                             Ok(record) if record.status.is_terminal() => {
-                                (record.duration_ms, record.total_tokens)
+                                (record.duration_ms, record.usage)
                             }
                             Ok(record) => {
                                 tracing::warn!(
@@ -1613,7 +1524,7 @@ pub async fn run_flow(
                                     durable_status = %record.status,
                                     "Run-fence heartbeat reported a terminal status but the follow-up read was in-flight"
                                 );
-                                (started.elapsed().as_millis() as u64, 0)
+                                (started.elapsed().as_millis() as u64, crate::usage::UsageSnapshot::unavailable())
                             }
                             Err(error) => {
                                 crate::metrics::record_store_failure(
@@ -1624,13 +1535,13 @@ pub async fn run_flow(
                                     %error,
                                     "Failed to read terminal run metrics after a run-fence heartbeat"
                                 );
-                                (started.elapsed().as_millis() as u64, 0)
+                                (started.elapsed().as_millis() as u64, crate::usage::UsageSnapshot::unavailable())
                             }
                         };
                         (
                             status,
                             duration_ms,
-                            total_tokens,
+                            usage,
                             None,
                             Some(terminal_result),
                         )
@@ -1640,7 +1551,7 @@ pub async fn run_flow(
                         (
                             RunStatus::Abandoned,
                             started.elapsed().as_millis() as u64,
-                            0,
+                            crate::usage::UsageSnapshot::unavailable(),
                             Some("Run stopped after its durable execution fence was lost".into()),
                             Some(RunFenceHeartbeat::Lost),
                         )
@@ -1655,7 +1566,7 @@ pub async fn run_flow(
                 (
                     outcome.status,
                     outcome.duration_ms,
-                    outcome.total_tokens,
+                    outcome.usage,
                     outcome.error_message,
                     None,
                 )
@@ -1669,10 +1580,22 @@ pub async fn run_flow(
                 (
                     RunStatus::TimedOut,
                     started.elapsed().as_millis() as u64,
-                    0,
+                    crate::usage::UsageSnapshot::unavailable(),
                     None,
                     None,
                 )
+            }
+        };
+        let usage = if matches!(&fence_result, Some(RunFenceHeartbeat::Terminal(_))) {
+            usage
+        } else {
+            match usage_tracker.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    requested_status = RunStatus::Failed;
+                    error_message = Some(error.to_string());
+                    crate::usage::UsageSnapshot::unavailable()
+                }
             }
         };
         if matches!(fence_result, Some(RunFenceHeartbeat::Lost)) {
@@ -1688,6 +1611,7 @@ pub async fn run_flow(
                 staged.completion.status = requested_status.clone();
                 staged.completion.finished_at = chrono::Utc::now().to_rfc3339();
                 staged.completion.duration_ms = started.elapsed().as_millis() as u64;
+                staged.completion.usage = usage.clone();
                 staged.completion
             })
         };
@@ -1695,10 +1619,6 @@ pub async fn run_flow(
             .as_ref()
             .map(|completion| completion.duration_ms)
             .unwrap_or(duration_ms);
-        let total_tokens = run_completion
-            .as_ref()
-            .map(|completion| completion.total_tokens)
-            .unwrap_or(total_tokens);
         let mut terminal_results = TerminalResultRetention::new(run_completion);
         let expired_questions = bridge_for_monitor.expire_all();
         if expired_questions > 0 {
@@ -1737,7 +1657,7 @@ pub async fn run_flow(
         let mut persistence_degraded = false;
         let mut retry_delay = std::time::Duration::from_millis(250);
         let mut owner_drain_rejected_intent = false;
-        let terminal_status = loop {
+        let _terminal_status = loop {
             match persist_terminal_outcome(
                 &state_clone.store,
                 TerminalPersistence {
@@ -1747,7 +1667,7 @@ pub async fn run_flow(
                     tags: &tags_for_terminal,
                     status: requested_status.clone(),
                     duration_ms,
-                    total_tokens,
+                    usage: usage.clone(),
                     completion: terminal_results.completion(),
                 },
             )
@@ -1838,14 +1758,26 @@ pub async fn run_flow(
         }
         drop(run_heartbeat);
 
-        let event_persistence = eventbus
-            .emit_terminal(CrewEvent::RunComplete {
-                run_id: run_id_clone.clone(),
-                status: terminal_status.to_string(),
-                duration_ms,
-                total_tokens,
-            })
-            .await;
+        // Read the winning terminal payload: another writer may have won the
+        // completion CAS after our worker snapshot. Never publish local usage
+        // as if it were that writer's authoritative durable checkpoint.
+        let event_persistence = match state_clone.store.get_run(&run_id_clone).await {
+            Ok(record) if record.status.is_terminal() => {
+                eventbus
+                    .emit_terminal(CrewEvent::RunComplete {
+                        run_id: run_id_clone.clone(),
+                        status: record.status.to_string(),
+                        duration_ms: record.duration_ms,
+                        usage: record.usage,
+                    })
+                    .await
+            }
+            _ => {
+                crate::metrics::record_store_failure(crate::metrics::StoreOperation::Run);
+                tracing::warn!(run_id = %run_id_clone, "Terminal checkpoint could not be read; omitting unverified terminal event");
+                DurableEventPersistence::Failed
+            }
+        };
         if matches!(
             event_persistence,
             DurableEventPersistence::Dropped
@@ -1909,6 +1841,7 @@ async fn execute_crew_from_path_with_events(
         input_bridge,
         run_intent_signal,
         api_lifecycle,
+        usage_tracker,
     } = context;
 
     // A Lua entrypoint may perform asynchronous setup (including
@@ -1974,6 +1907,7 @@ async fn execute_crew_from_path_with_events(
     // remains in-flight. The API monitor performs the terminal write after
     // this worker returns.
     lua.set_app_data(api_lifecycle.clone());
+    lua.set_app_data(usage_tracker.clone());
 
     // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
     lua.set_app_data(eventbus.clone());
@@ -2048,14 +1982,11 @@ async fn execute_crew_from_path_with_events(
             .as_ref()
             .map(|staged| staged.duration_ms)
             .unwrap_or(run.duration_ms);
-        let total_tokens = staged_completion
-            .as_ref()
-            .map(|staged| staged.total_tokens)
-            .unwrap_or(run.total_tokens);
+        let usage = crate::llm::scope::snapshot(&usage_tracker)?;
         return Ok(RunWorkResult {
             status,
             duration_ms,
-            total_tokens,
+            usage,
         });
     }
 
@@ -2067,7 +1998,7 @@ async fn execute_crew_from_path_with_events(
     Ok(RunWorkResult {
         status: "completed".into(),
         duration_ms: 0,
-        total_tokens: 0,
+        usage: crate::llm::scope::snapshot(&usage_tracker)?,
     })
 }
 
@@ -2099,7 +2030,7 @@ pub async fn execute_crew_from_path(
             flow_name: run.flow_name.clone(),
             status: run.status.to_string(),
             duration_ms: run.duration_ms,
-            total_tokens: run.total_tokens,
+            usage: run.usage,
             results: run
                 .task_results
                 .iter()
@@ -2109,6 +2040,7 @@ pub async fn execute_crew_from_path(
                     output: r.output.clone(),
                     success: r.success,
                     duration_ms: r.duration_ms,
+                    usage: r.usage.clone(),
                 })
                 .collect(),
         });
@@ -2119,7 +2051,7 @@ pub async fn execute_crew_from_path(
         flow_name: "unknown".into(),
         status: "completed".into(),
         duration_ms: 0,
-        total_tokens: 0,
+        usage: crate::usage::UsageSnapshot::unavailable(),
         results: vec![],
     })
 }
@@ -2609,7 +2541,7 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
             duration_ms,
             success,
             output,
-            token_usage,
+            usage,
         } if output.len() > max => Some(CrewEvent::TaskCompleted {
             task: task.clone(),
             agent: agent.clone(),
@@ -2620,7 +2552,7 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
                 truncate_utf8(output, max),
                 output.len()
             ),
-            token_usage: token_usage.clone(),
+            usage: usage.clone(),
         }),
         CrewEvent::CollaborationTurn {
             task,
@@ -2937,7 +2869,7 @@ pub async fn flow_events(
                                     "run_id": run_id_for_stream.clone(),
                                     "status": terminal.status.to_string(),
                                     "duration_ms": terminal.duration_ms,
-                                    "total_tokens": terminal.total_tokens,
+                                    "usage": terminal.usage,
                                     "journal_complete": false,
                                     "synthesized_from_run_record": true,
                                 }
@@ -3003,7 +2935,7 @@ pub async fn flow_events(
                     run_id: record.run_id,
                     status: record.status.to_string(),
                     duration_ms: record.duration_ms,
-                    total_tokens: record.total_tokens,
+                    usage: record.usage,
                 })],
                 None,
             ),
@@ -3592,11 +3524,18 @@ mod truncate_tests {
                 output: "x".repeat(output_bytes),
                 success: true,
                 duration_ms: 100,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: Some("reasoning".into()),
             }],
-            total_tokens: 42,
-            cached_tokens: 7,
+            usage: crate::usage::UsageSnapshot::from_receipt(
+                crate::usage::UsageReceipt::from_counts(
+                    crate::usage::UsageCounts {
+                        total_tokens: Some(42),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+            ),
         }
     }
 
@@ -3617,8 +3556,7 @@ mod truncate_tests {
         assert!(completion.task_results.is_empty());
         assert_eq!(completion.status, RunStatus::Success);
         assert_eq!(completion.duration_ms, 123);
-        assert_eq!(completion.total_tokens, 42);
-        assert_eq!(completion.cached_tokens, 7);
+        assert_eq!(completion.usage.settled.total_tokens().known(), Some(42));
     }
 
     #[test]
@@ -3661,7 +3599,7 @@ mod truncate_tests {
                 tags: &[],
                 status: outcome.status,
                 duration_ms: outcome.duration_ms,
-                total_tokens: outcome.total_tokens,
+                usage: outcome.usage,
                 completion: None,
             },
         )

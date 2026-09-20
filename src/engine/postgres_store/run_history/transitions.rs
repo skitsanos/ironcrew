@@ -28,10 +28,10 @@ impl PostgresStore {
         let sql = format!(
             "UPDATE {}
              SET status = $1, finished_at = $2, duration_ms = $3,
-                 task_results = $4::jsonb, total_tokens = $5, cached_tokens = $6,
+                 task_results = $4::jsonb, usage = $5,
                  lease_expires_at = ''
-             WHERE run_id = $7 AND status IN ('running', 'waiting_for_input')
-               AND owner_instance_id = $8",
+             WHERE run_id = $6 AND status IN ('running', 'waiting_for_input')
+               AND owner_instance_id = $7",
             self.table_name
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
@@ -39,8 +39,7 @@ impl PostgresStore {
             .bind(&completion.finished_at)
             .bind(completion.duration_ms as i64)
             .bind(&task_results_json)
-            .bind(completion.total_tokens as i32)
-            .bind(completion.cached_tokens as i32)
+            .bind(sqlx::types::Json(&completion.usage))
             .bind(run_id)
             .bind(self.lease.instance_id())
             .execute(&mut *tx)

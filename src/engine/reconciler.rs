@@ -233,8 +233,7 @@ mod tests {
                     finished_at: "2026-07-07T10:01:00Z".into(),
                     duration_ms: 60_000,
                     task_results: Vec::new(),
-                    total_tokens: 0,
-                    cached_tokens: 0,
+                    usage: crate::usage::UsageSnapshot::unavailable(),
                 },
             )
             .await

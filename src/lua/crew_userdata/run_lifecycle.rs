@@ -1,4 +1,4 @@
-use crate::engine::run_history::RunCompletion;
+use crate::engine::run_history::{RunCompletion, RunTransition};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -24,7 +24,6 @@ pub(crate) struct StagedRunSummary {
     pub(crate) run_id: String,
     pub(crate) status: crate::engine::run_history::RunStatus,
     pub(crate) duration_ms: u64,
-    pub(crate) total_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,7 +49,42 @@ impl ApiRunLifecycle {
                 run_id: staged.run_id.clone(),
                 status: staged.completion.status.clone(),
                 duration_ms: staged.completion.duration_ms,
-                total_tokens: staged.completion.total_tokens,
             })
     }
+}
+
+/// Stage HTTP completion; persist CLI completion at the crew boundary.
+pub(super) async fn complete_run(
+    store: &Arc<dyn crate::engine::store::StateStore>,
+    lifecycle: Option<&ApiRunLifecycle>,
+    run_id: &str,
+    completion: RunCompletion,
+) -> crate::utils::error::Result<()> {
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.stage(run_id.to_owned(), completion).await;
+        return Ok(());
+    }
+    let status = completion.status.clone();
+    let duration_ms = completion.duration_ms;
+    let transition = store.update_run_completion(run_id, completion).await;
+    let outcome = match &transition {
+        Ok(RunTransition::Applied) => {
+            if let Some(outcome) = crate::metrics::RunOutcome::from_status(&status) {
+                crate::metrics::record_run(
+                    outcome,
+                    Some(std::time::Duration::from_millis(duration_ms)),
+                );
+            }
+            crate::metrics::TerminalOutcome::Success
+        }
+        Ok(RunTransition::AlreadyTerminal(_)) => crate::metrics::TerminalOutcome::Fenced,
+        Err(_) => {
+            crate::metrics::record_store_failure(
+                crate::metrics::StoreOperation::TerminalPersistence,
+            );
+            crate::metrics::TerminalOutcome::Error
+        }
+    };
+    crate::metrics::record_terminal_persistence(crate::metrics::TerminalScope::RunRecord, outcome);
+    transition.map(|_| ())
 }

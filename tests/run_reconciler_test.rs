@@ -145,6 +145,7 @@ async fn test_04_full_lifecycle_writes_success_record() {
         &run_start.to_rfc3339(),
         &run_end.to_rfc3339(),
         total_ms,
+        ironcrew::usage::UsageSnapshot::unavailable(),
     );
     store
         .update_run_completion(
@@ -154,8 +155,7 @@ async fn test_04_full_lifecycle_writes_success_record() {
                 finished_at: run_end.to_rfc3339(),
                 duration_ms: total_ms,
                 task_results: record.task_results.clone(),
-                total_tokens: record.total_tokens,
-                cached_tokens: record.cached_tokens,
+                usage: record.usage.clone(),
             },
         )
         .await

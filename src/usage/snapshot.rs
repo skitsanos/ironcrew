@@ -19,6 +19,27 @@ impl Default for UsageSnapshot {
 }
 
 impl UsageSnapshot {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.settled.validate()?;
+        self.settled
+            .requests()
+            .checked_add(self.in_flight)
+            .ok_or("usage request count overflow")?;
+        if Self::new(self.settled.clone(), self.in_flight).coverage != self.coverage {
+            return Err("inconsistent usage snapshot coverage");
+        }
+        Ok(())
+    }
+
+    /// A settled snapshot of exactly one checked provider receipt.
+    pub fn from_receipt(receipt: super::UsageReceipt) -> Self {
+        let mut settled = UsageAggregate::default();
+        settled
+            .add(&receipt)
+            .expect("one checked receipt fits an empty aggregate");
+        Self::new(settled, 0)
+    }
+
     pub(crate) fn new(settled: UsageAggregate, in_flight: u64) -> Self {
         let coverage = if in_flight == 0 {
             settled.coverage()

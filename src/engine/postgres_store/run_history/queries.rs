@@ -14,7 +14,7 @@ impl PostgresStore {
         run_id: &str,
     ) -> Result<RunRecord> {
         let sql = format!(
-            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text, owner_instance_id, lease_expires_at
+            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, CASE WHEN octet_length(usage::text) <= 4096 THEN usage ELSE NULL END AS usage, tags::text, owner_instance_id, lease_expires_at
              FROM {} WHERE run_id = $1",
             self.table_name
         );
@@ -45,7 +45,7 @@ impl PostgresStore {
         } = store_sql::runs_where(filter, Dialect::Postgres);
         let mut sql = format!(
             "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-             agent_count, task_count, total_tokens, cached_tokens, tags::text \
+             agent_count, task_count, CASE WHEN octet_length(usage::text) <= 4096 THEN usage ELSE NULL END AS usage, tags::text \
              FROM {}{}",
             self.table_name, where_sql
         );

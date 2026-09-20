@@ -9,7 +9,7 @@ fn result(task: &str, output: &str, reasoning: Option<&str>) -> TaskResult {
         output: output.into(),
         success: true,
         duration_ms: 1,
-        token_usage: None,
+        usage: Default::default(),
         reasoning: reasoning.map(str::to_string),
     }
 }

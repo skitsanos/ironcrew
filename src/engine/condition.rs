@@ -153,7 +153,7 @@ mod tests {
                 output: r#"{"hasUnknowns": true}"#.to_string(),
                 success: true,
                 duration_ms: 0,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: None,
             },
         );

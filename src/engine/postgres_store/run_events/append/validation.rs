@@ -23,24 +23,29 @@ impl PostgresStore {
                     CASE WHEN lease_expires_at = '' THEN FALSE ELSE \
                         lease_expires_at::timestamptz > clock_timestamp() \
                     END AS lease_active, \
-                    duration_ms, total_tokens \
+                    duration_ms, CASE WHEN octet_length(usage::text) <= 4096 THEN usage ELSE NULL END AS usage \
              FROM {} WHERE run_id = $1 FOR UPDATE",
             self.table_name
         );
-        let run: Option<(String, String, String, bool, i64, i32)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
-                .bind(&batch.run_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|error| {
-                    IronCrewError::Validation(format!(
-                        "PostgreSQL run-event run fence lookup failed: {error}"
-                    ))
-                })?;
-        let (flow, owner, status, lease_active, duration_ms, total_tokens) =
-            run.ok_or_else(|| {
-                IronCrewError::Validation(format!("Run '{}' not found", batch.run_id))
+        let run: Option<(
+            String,
+            String,
+            String,
+            bool,
+            i64,
+            sqlx::types::Json<crate::usage::UsageSnapshot>,
+        )> = sqlx::query_as(sqlx::AssertSqlSafe(run_sql))
+            .bind(&batch.run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                IronCrewError::Validation(format!(
+                    "PostgreSQL run-event run fence lookup failed: {error}"
+                ))
             })?;
+        let (flow, owner, status, lease_active, duration_ms, usage) = run.ok_or_else(|| {
+            IronCrewError::Validation(format!("Run '{}' not found", batch.run_id))
+        })?;
         if flow != batch.flow {
             return Err(IronCrewError::Conflict(format!(
                 "Run-event flow '{}' does not match run '{}'",
@@ -57,7 +62,7 @@ impl PostgresStore {
             status: status.parse::<RunStatus>()?,
             lease_active,
             duration_ms,
-            total_tokens,
+            usage: usage.0,
         })
     }
 
@@ -240,11 +245,6 @@ impl PostgresStore {
             )));
         }
         let expected_duration_ms = nonnegative_u64("terminal duration", target.duration_ms)?;
-        let expected_total_tokens = u32::try_from(target.total_tokens).map_err(|_| {
-            IronCrewError::Validation(
-                "PostgreSQL run-event terminal token count is negative".into(),
-            )
-        })?;
         let expected_status = target.status.to_string();
         let terminal_data = terminal_entry
             .payload
@@ -256,8 +256,13 @@ impl PostgresStore {
                     == Some(expected_status.as_str())
                 && data.get("duration_ms").and_then(serde_json::Value::as_u64)
                     == Some(expected_duration_ms)
-                && data.get("total_tokens").and_then(serde_json::Value::as_u64)
-                    == Some(u64::from(expected_total_tokens))
+                && data
+                    .get("usage")
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::usage::UsageSnapshot>(value.clone()).ok()
+                    })
+                    .as_ref()
+                    == Some(&target.usage)
         });
         if !terminal_matches {
             return Err(IronCrewError::Conflict(format!(

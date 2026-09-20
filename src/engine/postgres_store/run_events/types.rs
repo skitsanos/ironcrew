@@ -108,7 +108,7 @@ pub(in crate::engine::postgres_store) struct RunEventAppendTarget {
     pub(in crate::engine::postgres_store) status: RunStatus,
     pub(in crate::engine::postgres_store) lease_active: bool,
     pub(in crate::engine::postgres_store) duration_ms: i64,
-    pub(in crate::engine::postgres_store) total_tokens: i32,
+    pub(in crate::engine::postgres_store) usage: crate::usage::UsageSnapshot,
 }
 
 pub(in crate::engine::postgres_store) struct AccountedRunEventBatch {

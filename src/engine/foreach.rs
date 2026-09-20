@@ -5,7 +5,7 @@ use crate::engine::agent::Agent;
 use crate::engine::executor::execute_task_standalone_with_hooks;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
-use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::engine::task::{Task, TaskResult};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::Result;
@@ -342,6 +342,9 @@ pub async fn execute_foreach_task(
     after_task_hook: Option<&[u8]>,
     ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
 ) -> Result<ForeachOutcome> {
+    let tracker = crate::llm::scope::child_scope(provider)?;
+    let scoped = crate::llm::scope::borrow_with_usage_tracker(provider, tracker.clone());
+    let provider: &dyn LlmProvider = &scoped;
     let item_var = task.foreach_as.as_deref().unwrap_or("item");
     validate_item_var(task, item_var)?;
 
@@ -369,7 +372,7 @@ pub async fn execute_foreach_task(
                 output: format!("Skipped: foreach source '{}' is not an array", source_key),
                 success: false,
                 duration_ms: 0,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: None,
             }));
         }
@@ -382,7 +385,7 @@ pub async fn execute_foreach_task(
             output: "Skipped: foreach source is empty".into(),
             success: true,
             duration_ms: 0,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         }));
     }
@@ -431,7 +434,6 @@ pub async fn execute_foreach_task(
     let mut encoded_output_bytes = 2usize;
     let mut all_success = true;
     let mut failed_items = 0usize;
-    let mut accumulated_usage = TaskTokenUsage::default();
     let start = Instant::now();
     let item_count = items.len();
 
@@ -489,21 +491,7 @@ pub async fn execute_foreach_task(
         let mut idx = 0usize;
         while let Some(result) = parallel_results.next().await {
             match result {
-                Ok((output, _reasoning, item_usage)) => {
-                    if let Some(u) = &item_usage {
-                        accumulated_usage.prompt_tokens = accumulated_usage
-                            .prompt_tokens
-                            .saturating_add(u.prompt_tokens);
-                        accumulated_usage.completion_tokens = accumulated_usage
-                            .completion_tokens
-                            .saturating_add(u.completion_tokens);
-                        accumulated_usage.total_tokens = accumulated_usage
-                            .total_tokens
-                            .saturating_add(u.total_tokens);
-                        accumulated_usage.cached_tokens = accumulated_usage
-                            .cached_tokens
-                            .saturating_add(u.cached_tokens);
-                    }
+                Ok((output, _reasoning, _item_usage)) => {
                     reserve_foreach_output(
                         &task.name,
                         &output,
@@ -570,21 +558,7 @@ pub async fn execute_foreach_task(
             )
             .await
             {
-                Ok((output, _reasoning, item_usage)) => {
-                    if let Some(u) = &item_usage {
-                        accumulated_usage.prompt_tokens = accumulated_usage
-                            .prompt_tokens
-                            .saturating_add(u.prompt_tokens);
-                        accumulated_usage.completion_tokens = accumulated_usage
-                            .completion_tokens
-                            .saturating_add(u.completion_tokens);
-                        accumulated_usage.total_tokens = accumulated_usage
-                            .total_tokens
-                            .saturating_add(u.total_tokens);
-                        accumulated_usage.cached_tokens = accumulated_usage
-                            .cached_tokens
-                            .saturating_add(u.cached_tokens);
-                    }
+                Ok((output, _reasoning, _item_usage)) => {
                     reserve_foreach_output(
                         &task.name,
                         &output,
@@ -639,7 +613,6 @@ pub async fn execute_foreach_task(
         );
     }
 
-    let has_usage = accumulated_usage.total_tokens > 0;
     Ok(ForeachOutcome {
         result: TaskResult {
             task: task.name.clone(),
@@ -647,11 +620,7 @@ pub async fn execute_foreach_task(
             output: combined,
             success: all_success,
             duration_ms,
-            token_usage: if has_usage {
-                Some(accumulated_usage)
-            } else {
-                None
-            },
+            usage: crate::llm::scope::snapshot(&tracker)?,
             reasoning: None,
         },
         executed_items: foreach_outputs.len(),

@@ -663,10 +663,9 @@ def run_one(
                 input_token_costing_allowance_per_request,
                 max_completion_tokens_per_request,
             )
-            if (
-                record.get("total_tokens") != usage["total_tokens"]
-                or record.get("cached_tokens") != usage["cached_tokens"]
-            ):
+            from usage_receipts import costing_counts
+            run_counts = costing_counts(record.get("usage"), sum(task_llm_calls.values()))
+            if any(run_counts[key] != usage[key] for key in run_counts):
                 raise ValueError("aggregate run and task token accounting differ")
             result.update(usage)
         except ValueError as error:

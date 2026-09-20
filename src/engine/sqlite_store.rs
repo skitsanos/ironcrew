@@ -33,6 +33,8 @@ use super::store::{RunLeaseConfig, StateStore};
 use super::store_sql::{self, Dialect, SqlParam};
 use crate::utils::error::{IronCrewError, Result};
 
+mod usage_schema;
+
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     lease: RunLeaseConfig,
@@ -207,8 +209,6 @@ impl SqliteStore {
                 task_results TEXT NOT NULL,
                 agent_count INTEGER NOT NULL,
                 task_count INTEGER NOT NULL,
-                total_tokens INTEGER DEFAULT 0,
-                cached_tokens INTEGER DEFAULT 0,
                 tags TEXT DEFAULT '[]',
                 owner_instance_id TEXT NOT NULL DEFAULT '',
                 lease_expires_at TEXT NOT NULL DEFAULT '',
@@ -338,6 +338,7 @@ impl SqliteStore {
         // history). Detected via PRAGMA so we only ALTER when absent — mirrors
         // `migrate_sessions_to_composite_unique`'s "check first" style.
         migrate_runs_add_flow(&conn)?;
+        usage_schema::migrate(&conn)?;
         migrate_runs_add_lease_columns(&conn)?;
 
         // Enforce the documented `(flow_path, id)` uniqueness on sessions.
@@ -1281,8 +1282,8 @@ impl StateStore for SqliteStore {
                 }
 
                 tx.execute(
-                    "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
-                     VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, 0, 0, ?7, ?8, ?9)",
+                    "INSERT INTO runs (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count,  tags, owner_instance_id, lease_expires_at)
+                     VALUES (?1, ?2, ?3, 'running', ?4, '', 0, '[]', ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         &run_id,
                         &intent.flow_name,
@@ -1360,10 +1361,10 @@ impl StateStore for SqliteStore {
                     .execute(
                         "UPDATE runs
                          SET status = ?1, finished_at = ?2, duration_ms = ?3,
-                             task_results = ?4, total_tokens = ?5, cached_tokens = ?6,
+                             task_results = ?4, usage = ?5,
                              lease_expires_at = ''
-                         WHERE run_id = ?7 AND status IN ('running', 'waiting_for_input')
-                           AND owner_instance_id = ?8",
+                         WHERE run_id = ?6 AND status IN ('running', 'waiting_for_input')
+                           AND owner_instance_id = ?7",
                         rusqlite::params![
                             completion.status.to_string(),
                             &completion.finished_at,
@@ -1371,8 +1372,8 @@ impl StateStore for SqliteStore {
                                 IronCrewError::Validation("Run duration is out of range".into())
                             })?,
                             &task_results_json,
-                            i64::from(completion.total_tokens),
-                            i64::from(completion.cached_tokens),
+                            serde_json::to_string(&completion.usage)
+                                .map_err(|error| IronCrewError::Validation(error.to_string()))?,
                             &run_id,
                             &owner_instance_id,
                         ],
@@ -1573,9 +1574,9 @@ impl StateStore for SqliteStore {
                     .execute(
                         "INSERT OR IGNORE INTO runs (run_id, flow_name, flow, status, started_at, \
                          finished_at, duration_ms, task_results, agent_count, task_count, \
-                         total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at) \
+                          tags, owner_instance_id, lease_expires_at) \
                          SELECT resource_id, scope, scope, 'abandoned', created_at, ?1, 0, '[]', \
-                                0, 0, 0, 0, '[]', owner_instance_id, '' \
+                                0, 0, '[]', owner_instance_id, '' \
                          FROM idempotency AS idem \
                          WHERE operation = ?2 AND state = 'claimed' \
                            AND julianday(lease_expires_at) <= julianday(?3) \
@@ -1621,7 +1622,7 @@ impl StateStore for SqliteStore {
 
                 let mut stmt = conn
                     .prepare(
-                        "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at FROM runs WHERE run_id = ?1",
+                        "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, CASE WHEN length(CAST(usage AS BLOB)) <= 4096 THEN usage ELSE NULL END AS usage, tags, owner_instance_id, lease_expires_at FROM runs WHERE run_id = ?1",
                     )
                     .map_err(|e| IronCrewError::Validation(format!("SQLite prepare error: {}", e)))?;
 
@@ -1629,7 +1630,7 @@ impl StateStore for SqliteStore {
                     .query_row(rusqlite::params![run_id], |row| {
                         let status_str: String = row.get(3)?;
                         let task_results_json: String = row.get(7)?;
-                        let tags_json: String = row.get(12)?;
+                        let tags_json: String = row.get(11)?;
 
                         Ok((
                             RunRecord {
@@ -1644,11 +1645,10 @@ impl StateStore for SqliteStore {
                                 task_results: decode_stored_json(&task_results_json, 7)?,
                                 agent_count: row.get::<_, i64>(8)? as usize,
                                 task_count: row.get::<_, i64>(9)? as usize,
-                                total_tokens: row.get::<_, i64>(10)? as u32,
-                                cached_tokens: row.get::<_, i64>(11)? as u32,
-                                tags: decode_stored_json(&tags_json, 12)?,
-                                owner_instance_id: row.get(13)?,
-                                lease_expires_at: row.get(14)?,
+                                usage: decode_stored_json(&row.get::<_, String>(10)?, 10)?,
+                                tags: decode_stored_json(&tags_json, 11)?,
+                                owner_instance_id: row.get(12)?,
+                                lease_expires_at: row.get(13)?,
                             },
                             status_str,
                         ))
@@ -1688,7 +1688,7 @@ impl StateStore for SqliteStore {
                 // undisturbed.
                 let mut sql = format!(
                     "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-                     agent_count, task_count, total_tokens, cached_tokens, tags \
+                     agent_count, task_count, CASE WHEN length(CAST(usage AS BLOB)) <= 4096 THEN usage ELSE NULL END AS usage, tags \
                      FROM runs{}",
                     wc.sql
                 );
@@ -1711,7 +1711,7 @@ impl StateStore for SqliteStore {
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(refs), |row| {
                         let status_str: String = row.get(3)?;
-                        let tags_json: String = row.get(11)?;
+                        let tags_json: String = row.get(10)?;
                         Ok((
                             RunSummary {
                                 run_id: row.get(0)?,
@@ -1724,9 +1724,8 @@ impl StateStore for SqliteStore {
                                 duration_ms: row.get::<_, i64>(6)? as u64,
                                 agent_count: row.get::<_, i64>(7)? as usize,
                                 task_count: row.get::<_, i64>(8)? as usize,
-                                total_tokens: row.get::<_, i64>(9)? as u32,
-                                cached_tokens: row.get::<_, i64>(10)? as u32,
-                                tags: decode_stored_json(&tags_json, 11)?,
+                                usage: decode_stored_json(&row.get::<_, String>(9)?, 9)?,
+                                tags: decode_stored_json(&tags_json, 10)?,
                             },
                             status_str,
                         ))

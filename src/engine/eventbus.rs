@@ -12,27 +12,8 @@ use crate::engine::run_events::{
 use crate::engine::store::StateStore;
 use crate::utils::error::IronCrewError;
 
-const DEFAULT_EVENT_MAX_BYTES: usize = 256 * 1024;
-const HARD_EVENT_MAX_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_REPLAY_MAX_EVENTS: usize = 1_000;
-const HARD_REPLAY_MAX_EVENTS: usize = 10_000;
-const DEFAULT_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
-const HARD_REPLAY_MAX_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_LIVE_CHANNEL_CAPACITY: usize = 32;
-const HARD_LIVE_CHANNEL_CAPACITY: usize = 256;
-const DEFAULT_DURABLE_QUEUE_MAX_EVENTS: usize = 64;
-const DEFAULT_DURABLE_QUEUE_MAX_BYTES: usize = 1024 * 1024;
-const DEFAULT_DURABLE_BATCH_MAX_EVENTS: usize = 32;
-const TRUNCATION_MARKER: &str = "... [truncated]";
-
-fn bounded_env(name: &str, default: usize, min: usize, max: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= min)
-        .map(|value| value.min(max))
-        .unwrap_or(default)
-}
+mod config;
+use config::*;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -66,7 +47,7 @@ pub enum CrewEvent {
         duration_ms: u64,
         success: bool,
         output: String,
-        token_usage: Option<TokenUsageSummary>,
+        usage: crate::usage::UsageSnapshot,
     },
 
     #[serde(rename = "task_failed")]
@@ -75,6 +56,7 @@ pub enum CrewEvent {
         agent: String,
         error: String,
         duration_ms: u64,
+        usage: crate::usage::UsageSnapshot,
     },
 
     #[serde(rename = "task_skipped")]
@@ -247,7 +229,7 @@ pub enum CrewEvent {
         run_id: String,
         status: String,
         duration_ms: u64,
-        total_tokens: u32,
+        usage: crate::usage::UsageSnapshot,
     },
 }
 
@@ -283,14 +265,6 @@ impl CrewEvent {
             Self::RunComplete { .. } => "run_complete",
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TokenUsageSummary {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
-    pub cached_tokens: u32,
 }
 
 /// One entry in the replay buffer — an event plus its approximate serialized size.
@@ -1311,7 +1285,7 @@ mod event_shape_tests {
             duration_ms: 1,
             success: true,
             output: "🦀".repeat(100_000),
-            token_usage: None,
+            usage: Default::default(),
         };
         let bounded = bound_event(event, 4096);
         assert!(estimate_event_size(&bounded) <= 4096);
@@ -1672,7 +1646,15 @@ mod durable_producer_tests {
                     run_id: "run-123".into(),
                     status: "completed".into(),
                     duration_ms: 10,
-                    total_tokens: 20,
+                    usage: crate::usage::UsageSnapshot::from_receipt(
+                        crate::usage::UsageReceipt::from_counts(
+                            crate::usage::UsageCounts {
+                                total_tokens: Some(20),
+                                ..Default::default()
+                            },
+                            true,
+                        ),
+                    ),
                 })
                 .await
         });
@@ -1732,7 +1714,7 @@ mod durable_producer_tests {
                 run_id: "run-123".into(),
                 status: "failed".into(),
                 duration_ms: 1,
-                total_tokens: 0,
+                usage: crate::usage::UsageSnapshot::unavailable(),
             })
             .await
         });

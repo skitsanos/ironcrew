@@ -8,11 +8,12 @@ use prompt::BoundedPrompt;
 
 use crate::engine::agent::Agent;
 use crate::engine::interpolate::{interpolate_bounded, prompt_char_limit};
-use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::engine::task::{Task, TaskResult};
 use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
+use crate::usage::UsageSnapshot;
 use crate::utils::error::{IronCrewError, Result};
 
 pub struct TaskExecutionContext<'a> {
@@ -35,7 +36,9 @@ pub struct TaskExecutionContext<'a> {
 }
 
 impl<'a> TaskExecutionContext<'a> {
-    pub async fn execute(&self) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+    pub async fn execute(&self) -> Result<(String, Option<String>, UsageSnapshot)> {
+        let tracker = crate::llm::scope::child_scope(self.provider)?;
+        let provider = crate::llm::scope::borrow_with_usage_tracker(self.provider, tracker.clone());
         let max_prompt_chars = prompt_char_limit();
         // Run before_task hook if present
         let raw_description = interpolate_bounded(
@@ -51,7 +54,6 @@ impl<'a> TaskExecutionContext<'a> {
         };
 
         let mut messages = Vec::new();
-        let mut total_usage = TaskTokenUsage::default();
         let mut accumulated_reasoning = String::new();
         let reasoning_limit = max_reasoning_bytes();
         let mut reasoning_truncated = false;
@@ -157,31 +159,14 @@ impl<'a> TaskExecutionContext<'a> {
                     }
                 });
 
-                let result = self.provider.chat_stream(request, tx).await;
+                let result = provider.chat_stream(request, tx).await;
                 print_handle.await.ok();
                 result?
             } else if has_tools {
-                self.provider
-                    .chat_with_tools(request, &tool_schemas)
-                    .await?
+                provider.chat_with_tools(request, &tool_schemas).await?
             } else {
-                self.provider.chat(request).await?
+                provider.chat(request).await?
             };
-
-            // Accumulate token usage
-            if let Some(usage) = &response.usage {
-                total_usage.prompt_tokens = total_usage
-                    .prompt_tokens
-                    .saturating_add(usage.prompt_tokens);
-                total_usage.completion_tokens = total_usage
-                    .completion_tokens
-                    .saturating_add(usage.completion_tokens);
-                total_usage.total_tokens =
-                    total_usage.total_tokens.saturating_add(usage.total_tokens);
-                total_usage.cached_tokens = total_usage
-                    .cached_tokens
-                    .saturating_add(usage.cached_tokens);
-            }
 
             // Accumulate reasoning content across tool-call rounds
             if let Some(ref reasoning) = response.reasoning {
@@ -195,7 +180,6 @@ impl<'a> TaskExecutionContext<'a> {
 
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
-                let has_usage = total_usage.total_tokens > 0;
                 let content = require_final_content(response.content)?;
 
                 // Run after_task hook if present
@@ -221,7 +205,7 @@ impl<'a> TaskExecutionContext<'a> {
                 return Ok((
                     final_output,
                     reasoning,
-                    if has_usage { Some(total_usage) } else { None },
+                    crate::llm::scope::snapshot(&tracker)?,
                 ));
             }
 
@@ -293,7 +277,7 @@ impl<'a> TaskExecutionContext<'a> {
                     caller_agent: Some(self.agent.name.clone()),
                     caller_scope: Some(self.task.name.clone()),
                     ask_human: self.ask_human.cloned(),
-                    ..crate::llm::scope::tool_context(self.provider)
+                    ..crate::llm::scope::tool_context(&provider)
                 };
                 let tool_result = match tokio::time::timeout(
                     tool_timeout,
@@ -339,7 +323,7 @@ pub async fn execute_task_standalone(
     memory_context: &str,
     messages_context: &str,
     should_stream: bool,
-) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, UsageSnapshot)> {
     execute_task_standalone_with_hooks(
         task,
         agent,
@@ -378,7 +362,7 @@ pub async fn execute_task_standalone_with_hooks(
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
     ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
-) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, UsageSnapshot)> {
     let ctx = TaskExecutionContext {
         task,
         agent,

@@ -378,16 +378,12 @@ Individual agents and tasks can also override the model with a `model` field.
 
 ## Token Usage and Prompt Caching
 
-Task results may include provider-reported token usage: `prompt_tokens`,
-`completion_tokens`, `total_tokens`, and `cached_tokens`. Current run totals
-aggregate retained task receipts, not every attempted provider call. Missing
-receipts and failed/retried attempts are not fully represented yet; these
-numbers are not invoices or proof of zero cost. [IC-046's accounting foundation](usage-accounting.md)
-defines the replacement contract, capture in the three built-in HTTP providers,
-and automatic process-local scope propagation. Lua now exposes checked
-`crew:usage()`, `crew:flow_usage()`, `conversation:usage()` and `dialog:usage()`
-snapshots, including reasoning detail and explicit unknowns. Existing response,
-task/run output fields and storage still need migration to those checked totals.
+Task and run results expose checked `usage` snapshots, including failed/retried
+attempts, reasoning/cache detail and explicit unknowns. Counts are decimal strings
+or null; inspect coverage before treating a subtotal as complete. These are not
+invoices. See [usage accounting](usage-accounting.md) for scope boundaries,
+provider semantics, Lua accessors and durable storage. Direct Rust
+`ChatResponse.usage` and persisted session history remain pending migrations.
 
 For providers that support prompt caching, enable it at the crew level:
 

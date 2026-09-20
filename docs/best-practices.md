@@ -459,7 +459,9 @@ as a promise that every long-running crew execution will finish.
 **Prompt caching.** Enable `prompt_cache_key` on crews with repetitive system
 prompts. Cached tokens are tracked in run records.
 
-**Token tracking.** Monitor `total_tokens` and `cached_tokens` in run records.
+**Token tracking.** Monitor `usage.coverage` and `usage.settled` in run records.
+Token subtotals have decimal-string `known` values (or null) and a `complete`
+flag. Unknown usage is not zero cost; see [usage accounting](usage-accounting.md).
 Use the SSE `task_completed` event for per-task breakdowns.
 
 **Model routing.** Route cheap tasks to fast models and expensive tasks to

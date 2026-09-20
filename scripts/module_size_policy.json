@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exception_budget": 42,
+  "exception_budget": 41,
   "exceptions": [
     {
       "path": "src/api/admission.rs",
@@ -24,7 +24,7 @@
     },
     {
       "path": "src/api/handlers.rs",
-      "max_lines": 3745,
+      "max_lines": 3683,
       "rationale": "IC-011 baseline, ratcheted by IC-029 flow-inspection extraction: run HTTP handlers still combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized."
     },
     {
@@ -49,22 +49,22 @@
     },
     {
       "path": "src/engine/crew.rs",
-      "max_lines": 343,
+      "max_lines": 330,
       "rationale": "IC-011 baseline: crew and provider configuration models share bounded validation of agents, tasks, tools, goals, and model settings; split provider validation before extending the crew schema."
     },
     {
       "path": "src/engine/eventbus.rs",
-      "max_lines": 1763,
+      "max_lines": 1745,
       "rationale": "IC-011 baseline: event definitions, bounded in-memory replay, live broadcast, durable batching, sequence allocation, flush barriers, and metrics remain coupled; extract the durable writer before new journal behavior."
     },
     {
       "path": "src/engine/executor.rs",
-      "max_lines": 400,
+      "max_lines": 384,
       "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/engine/foreach.rs",
-      "max_lines": 663,
+      "max_lines": 632,
       "rationale": "IC-011 baseline: bounded item serialization, template substitution, child-task construction, and foreach execution share resource-limit invariants; extract bounded encoding before adding expansion formats."
     },
     {
@@ -99,38 +99,33 @@
     },
     {
       "path": "src/engine/orchestrator.rs",
-      "max_lines": 857,
+      "max_lines": 753,
       "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode."
     },
     {
       "path": "src/engine/run_events.rs",
-      "max_lines": 1304,
+      "max_lines": 1297,
       "rationale": "IC-011 baseline: durable run-event models, cursor parsing, bounded paging, retention gaps, terminal fallback, and store-facing journal rules share one replay contract; split cursor and paging logic before new event semantics."
     },
     {
       "path": "src/engine/run_history.rs",
-      "max_lines": 2544,
+      "max_lines": 2541,
       "rationale": "IC-011 priority debt, ratcheted by IC-029 async-adapter extraction: the synchronous JSON core still combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family."
     },
     {
       "path": "src/engine/sqlite_store.rs",
-      "max_lines": 3840,
+      "max_lines": 3839,
       "rationale": "IC-011 priority debt: the SQLite StateStore combines migrations and repositories for runs, idempotency, conversations, HITL, journals, audit, and leases; extract table-focused repositories before extending storage."
     },
     {
       "path": "src/engine/store.rs",
-      "max_lines": 767,
+      "max_lines": 766,
       "rationale": "IC-011 baseline, ratcheted by IC-029 local-backend bootstrap extraction: the StateStore contract owns lease and instance configuration, backend capability defaults, all durable protocol methods, and backend selection; split the trait's protocol families before adding another store capability."
     },
     {
       "path": "src/engine/task.rs",
-      "max_lines": 374,
+      "max_lines": 365,
       "rationale": "IC-011 baseline: task configuration, execution modes, dependency and retry fields, output state, and bounded validation form one domain model; extract validation or tests before expanding the task schema."
-    },
-    {
-      "path": "src/engine/task_runner.rs",
-      "max_lines": 336,
-      "rationale": "IC-011 baseline: task attempt execution, retry and timeout handling, cancellation, tool-finalization, and result construction share one lifecycle; split attempt policy before adding another completion phase."
     },
     {
       "path": "src/llm/provider.rs",
@@ -154,7 +149,7 @@
     },
     {
       "path": "src/lua/crew_userdata.rs",
-      "max_lines": 966,
+      "max_lines": 913,
       "rationale": "IC-011 baseline: Lua Crew userdata combines agent-tool finalization, run lifecycle staging, orchestration entry points, cancellation, event publication, and result conversion; split run lifecycle before adding userdata methods. Task 8: passes the `lua` handle into build_conversation for app-db fingerprint lookup. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {

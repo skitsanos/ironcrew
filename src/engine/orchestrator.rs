@@ -9,13 +9,10 @@ use crate::engine::agent::{Agent, AgentSelector};
 use crate::engine::collaborative::execute_collaborative_task;
 use crate::engine::condition::evaluate_condition;
 use crate::engine::crew::Crew;
-use crate::engine::eventbus::{CrewEvent, TokenUsageSummary};
-use crate::engine::executor::execute_task_standalone;
+use crate::engine::eventbus::CrewEvent;
 use crate::engine::foreach::execute_foreach_task;
 use crate::engine::interpolate::interpolate;
-use crate::engine::task::{
-    Task, TaskResult, TaskTokenUsage, topological_phases, validate_dependency_graph,
-};
+use crate::engine::task::{Task, TaskResult, topological_phases, validate_dependency_graph};
 use crate::engine::task_runner::{handle_task_error, run_single_task};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
@@ -82,7 +79,7 @@ fn filter_eligible_tasks<'a>(
                 output: format!("Skipped: {}", reason),
                 success: false,
                 duration_ms: 0,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: None,
             };
             failed_tasks.insert(task.name.clone());
@@ -111,7 +108,7 @@ fn filter_eligible_tasks<'a>(
                     output: format!("Skipped: condition '{}' evaluated to false", condition),
                     success: true,
                     duration_ms: 0,
-                    token_usage: None,
+                    usage: Default::default(),
                     reasoning: None,
                 };
                 result_budget.insert(results, task.name.clone(), result)?;
@@ -131,13 +128,13 @@ fn filter_eligible_tasks<'a>(
 }
 
 /// The result type from each concurrent task future.
-/// Fields: task_name, agent_name, output_result, duration_ms, token_usage, reasoning
+/// Fields: task_name, agent_name, output_result, duration_ms, usage, reasoning
 type TaskFutureResult = (
     String,
     String,
     Result<String>,
     u64,
-    Option<TaskTokenUsage>,
+    crate::usage::UsageSnapshot,
     Option<String>,
 );
 
@@ -152,7 +149,7 @@ async fn process_phase_result(
     result_budget: &mut RetainedResultBudget,
     failed_tasks: &mut HashSet<String>,
 ) -> Result<()> {
-    let (task_name, agent_name, output, duration_ms, token_usage, reasoning) = phase_result;
+    let (task_name, agent_name, output, duration_ms, usage, reasoning) = phase_result;
     match output {
         Ok(out) => {
             let result = TaskResult {
@@ -161,7 +158,7 @@ async fn process_phase_result(
                 output: out,
                 success: true,
                 duration_ms,
-                token_usage,
+                usage,
                 reasoning,
             };
             result_budget.insert(results, task_name.clone(), result)?;
@@ -181,12 +178,7 @@ async fn process_phase_result(
                 duration_ms,
                 success: true,
                 output: retained.output.clone(),
-                token_usage: retained.token_usage.as_ref().map(|u| TokenUsageSummary {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
-                    total_tokens: u.total_tokens,
-                    cached_tokens: u.cached_tokens,
-                }),
+                usage: retained.usage.clone(),
             });
             tracing::info!("Task '{}' completed in {}ms", task_name, duration_ms);
         }
@@ -197,7 +189,7 @@ async fn process_phase_result(
             let task_def = crew.tasks.iter().find(|t| t.name == task_name);
             if let Some(task_def) = task_def
                 && task_def.on_error.is_some()
-                && let Some((mut recovered, handler_result)) = handle_task_error(
+                && let Some(handler_result) = handle_task_error(
                     task_def,
                     &agent_name,
                     &error_msg,
@@ -207,17 +199,33 @@ async fn process_phase_result(
                     tool_registry,
                     results,
                     &crew.memory,
-                    &crew.provider_config.model,
+                    &crew
+                        .model_router
+                        .resolve("task_execution", &crew.provider_config.model),
                     crew.max_tool_rounds,
                 )
                 .await
             {
-                recovered.duration_ms = duration_ms;
-                result_budget.insert(results, task_name, recovered)?;
-                if let Some(hr) = handler_result {
-                    result_budget.insert(results, hr.task.clone(), hr)?;
+                let recovered = handler_result.success.then(|| TaskResult {
+                    task: task_name.clone(),
+                    agent: agent_name.clone(),
+                    output: format!(
+                        "Recovered via '{}': {}",
+                        handler_result.task, handler_result.output
+                    ),
+                    success: true,
+                    duration_ms,
+                    usage: usage.clone(),
+                    reasoning: None,
+                });
+                if !handler_result.success {
+                    failed_tasks.insert(handler_result.task.clone());
                 }
-                return Ok(());
+                result_budget.insert(results, handler_result.task.clone(), handler_result)?;
+                if let Some(recovered) = recovered {
+                    result_budget.insert(results, task_name, recovered)?;
+                    return Ok(());
+                }
             }
 
             // Original failure path (no handler or handler failed)
@@ -226,6 +234,7 @@ async fn process_phase_result(
                 agent: agent_name.clone(),
                 error: error_msg.clone(),
                 duration_ms,
+                usage: usage.clone(),
             });
             let result = TaskResult {
                 task: task_name.clone(),
@@ -233,7 +242,7 @@ async fn process_phase_result(
                 output: error_msg,
                 success: false,
                 duration_ms,
-                token_usage: None,
+                usage,
                 reasoning: None,
             };
             tracing::error!("Task '{}' failed: {}", task_name, e);
@@ -433,6 +442,7 @@ pub async fn run_crew(
                         agent: agent.name.clone(),
                         error: foreach_result.output.clone(),
                         duration_ms: foreach_result.duration_ms,
+                        usage: foreach_result.usage.clone(),
                     });
                     if foreach_skipped {
                         tracing::warn!(
@@ -450,14 +460,7 @@ pub async fn run_crew(
                         duration_ms: foreach_result.duration_ms,
                         success: foreach_result.success,
                         output: foreach_result.output.clone(),
-                        token_usage: foreach_result.token_usage.as_ref().map(|u| {
-                            TokenUsageSummary {
-                                prompt_tokens: u.prompt_tokens,
-                                completion_tokens: u.completion_tokens,
-                                total_tokens: u.total_tokens,
-                                cached_tokens: u.cached_tokens,
-                            }
-                        }),
+                        usage: foreach_result.usage.clone(),
                     });
                 }
 
@@ -509,13 +512,16 @@ pub async fn run_crew(
                 };
 
                 let start = Instant::now();
+                let collab_tracker = crate::llm::scope::child_scope(provider.as_ref())?;
+                let collab_provider =
+                    crate::llm::scope::with_usage_tracker(provider.clone(), collab_tracker.clone());
                 let task_observation = crate::engine::task_observation::TaskObservation::start();
                 match execute_collaborative_task(
                     &collab_agents,
                     &task.name,
                     &interpolate(&task.description, &results),
                     max_turns,
-                    provider.clone(),
+                    collab_provider,
                     &results,
                     &memory_context,
                     &collab_model,
@@ -533,12 +539,7 @@ pub async fn run_crew(
                             duration_ms,
                             success: true,
                             output: output.clone(),
-                            token_usage: collab_usage.as_ref().map(|u| TokenUsageSummary {
-                                prompt_tokens: u.prompt_tokens,
-                                completion_tokens: u.completion_tokens,
-                                total_tokens: u.total_tokens,
-                                cached_tokens: u.cached_tokens,
-                            }),
+                            usage: collab_usage.clone(),
                         });
                         tracing::info!(
                             "Collaborative task '{}' completed in {}ms",
@@ -554,7 +555,7 @@ pub async fn run_crew(
                                 output,
                                 success: true,
                                 duration_ms,
-                                token_usage: collab_usage,
+                                usage: collab_usage,
                                 reasoning: None,
                             },
                         )?;
@@ -562,129 +563,24 @@ pub async fn run_crew(
                     Err(e) => {
                         task_observation.finish(crate::metrics::TaskOutcome::Error);
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        let error_msg = e.to_string();
 
-                        // Check for on_error handler
-                        if let Some(ref error_handler_name) = task.on_error {
-                            tracing::info!(
-                                "Collaborative task '{}' failed, routing to error handler '{}'",
-                                task.name,
-                                error_handler_name
-                            );
-                            if let Some(error_handler) =
-                                crew.tasks.iter().find(|t| t.name == *error_handler_name)
-                            {
-                                let mut error_task = error_handler.clone();
-                                let error_context = format!(
-                                    "Error from collaborative task '{}': {}",
-                                    task.name, error_msg
-                                );
-                                error_task.context = Some(
-                                    error_task
-                                        .context
-                                        .as_ref()
-                                        .map_or(error_context.clone(), |existing| {
-                                            format!("{}\n\n{}", existing, error_context)
-                                        }),
-                                );
-
-                                let error_agent = if let Some(ref ea_name) = error_task.agent {
-                                    crew.agents
-                                        .iter()
-                                        .find(|a| a.name == *ea_name)
-                                        .unwrap_or(&crew.agents[0])
-                                } else {
-                                    AgentSelector::select(&crew.agents, &error_task)
-                                };
-
-                                let error_model =
-                                    resolve_model(&error_task, error_agent, crew, "task_execution");
-                                let error_start = Instant::now();
-                                let handler_observation =
-                                    crate::engine::task_observation::TaskObservation::start();
-                                match execute_task_standalone(
-                                    &error_task,
-                                    error_agent,
-                                    provider.as_ref(),
-                                    tool_registry,
-                                    &results,
-                                    &error_model,
-                                    crew.max_tool_rounds,
-                                    "",
-                                    "",
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok((output, handler_reasoning, handler_usage)) => {
-                                        handler_observation
-                                            .finish(crate::metrics::TaskOutcome::Success);
-                                        result_budget.insert(
-                                            &mut results,
-                                            task.name.clone(),
-                                            TaskResult {
-                                                task: task.name.clone(),
-                                                agent: task.collaborative_agents.join("+"),
-                                                output: format!(
-                                                    "Recovered via '{}': {}",
-                                                    error_handler_name, output
-                                                ),
-                                                success: true,
-                                                duration_ms,
-                                                token_usage: None,
-                                                reasoning: None,
-                                            },
-                                        )?;
-                                        result_budget.insert(
-                                            &mut results,
-                                            error_handler_name.clone(),
-                                            TaskResult {
-                                                task: error_handler_name.clone(),
-                                                agent: error_agent.name.clone(),
-                                                output,
-                                                success: true,
-                                                duration_ms: error_start.elapsed().as_millis()
-                                                    as u64,
-                                                token_usage: handler_usage,
-                                                reasoning: handler_reasoning,
-                                            },
-                                        )?;
-                                        continue;
-                                    }
-                                    Err(handler_err) => {
-                                        handler_observation
-                                            .finish(crate::metrics::TaskOutcome::Error);
-                                        tracing::error!(
-                                            "Error handler '{}' also failed: {}",
-                                            error_handler_name,
-                                            handler_err
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        crew.eventbus.emit(CrewEvent::TaskFailed {
-                            task: task.name.clone(),
-                            agent: task.collaborative_agents.join("+"),
-                            error: error_msg.clone(),
-                            duration_ms,
-                        });
-                        tracing::error!("Collaborative task '{}' failed: {}", task.name, e);
-                        failed_tasks.insert(task.name.clone());
-                        result_budget.insert(
-                            &mut results,
-                            task.name.clone(),
-                            TaskResult {
-                                task: task.name.clone(),
-                                agent: task.collaborative_agents.join("+"),
-                                output: error_msg,
-                                success: false,
+                        process_phase_result(
+                            (
+                                task.name.clone(),
+                                task.collaborative_agents.join("+"),
+                                Err(e),
                                 duration_ms,
-                                token_usage: None,
-                                reasoning: None,
-                            },
-                        )?;
+                                crate::llm::scope::snapshot(&collab_tracker)?,
+                                None,
+                            ),
+                            crew,
+                            &provider,
+                            tool_registry,
+                            &mut results,
+                            &mut result_budget,
+                            &mut failed_tasks,
+                        )
+                        .await?;
                     }
                 }
             } else {
@@ -829,7 +725,7 @@ pub async fn run_crew(
                     output: "Skipped: error handler not triggered".into(),
                     success: true,
                     duration_ms: 0,
-                    token_usage: None,
+                    usage: Default::default(),
                     reasoning: None,
                 },
             )?;
