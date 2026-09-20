@@ -15,7 +15,7 @@
 local crew = Crew.new({
     goal = "Cross-run persistence demo",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 
 -- Single agent for the conversation side of the demo

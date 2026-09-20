@@ -1,6 +1,6 @@
 -- OpenAI Responses API — reasoning models
 --
--- Uses reasoning_effort to enable deep thinking on gpt-5.4; the crew sets the
+-- Uses reasoning_effort to enable deep thinking on gpt-5.6-luna; the crew sets the
 -- default and the solver agent raises it for its own requests.
 -- The reasoning summary is captured in the run record under `reasoning`.
 -- With stream = true, reasoning summary deltas appear dim on stderr.
@@ -8,7 +8,7 @@
 local crew = Crew.new({
     goal = "Solve a logic puzzle using reasoning",
     provider = "openai-responses",
-    model = "gpt-5.4",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
     reasoning_effort = "medium",
     reasoning_summary = "auto",

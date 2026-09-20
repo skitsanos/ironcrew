@@ -1,11 +1,11 @@
 -- OpenAI Chat Completions API — baseline test
--- Model: gpt-5.4-mini (cost-effective)
+-- Model: gpt-5.6-luna (cost-effective)
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({
     goal = "Verify OpenAI Chat Completions API works",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
 })
 

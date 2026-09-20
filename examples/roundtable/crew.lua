@@ -10,12 +10,12 @@
 --   * pessimist — focuses on risks, costs, sunk costs, opportunity cost
 --   * realist   — focuses on data, falsifiable claims, what can be tested
 --
--- Cheap defaults: gpt-5.4-mini.
+-- Cheap defaults: gpt-5.6-luna.
 
 local crew = Crew.new({
     goal = "3-way engineering decision roundtable",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

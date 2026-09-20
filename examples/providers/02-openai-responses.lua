@@ -1,11 +1,11 @@
 -- OpenAI Responses API — basic
--- Model: gpt-5.4-mini
+-- Model: gpt-5.6-luna
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({
     goal = "Verify OpenAI Responses API works",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
 })
 

@@ -224,7 +224,7 @@ built-in server-side tools, and cleaner streaming semantics. Also supported by
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 ```
 
@@ -234,7 +234,7 @@ local crew = Crew.new({
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
-    model = "gpt-5.4-nano",
+    model = "gpt-5.6-luna",
     reasoning_effort = "medium",      -- "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
@@ -259,7 +259,7 @@ Reasoning summaries are streamed dim to stderr and persisted to the run record.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
     server_tools = { "web_search", "file_search", "code_interpreter" },
     web_search_context_size = "medium",           -- "low" | "medium" | "high"
     file_search_vector_store_ids = { "vs_abc" },  -- required for file_search
