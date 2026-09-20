@@ -152,7 +152,7 @@ pub async fn run_single_task(
         match timeout_excluding_human_wait(timeout_dur, ask_human.as_ref(), result).await {
             Ok(Ok((out, reas, usage))) => break (Ok(out), reas, usage),
             Ok(Err(e)) => {
-                if attempt >= max_retries {
+                if !e.allows_task_retry() || attempt >= max_retries {
                     break (Err(e), None, None);
                 }
                 let backoff = retry_backoff(attempt, base_backoff);

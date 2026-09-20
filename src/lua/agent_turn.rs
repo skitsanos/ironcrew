@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::CrewEvent;
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::{
     ChatMessage, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider,
     append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
@@ -200,9 +201,7 @@ pub async fn run_single_agent_turn(
 
         // No tool calls → final assistant reply, append + return.
         if response.tool_calls.is_empty() {
-            let content = response
-                .content
-                .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+            let content = require_final_content(response.content)?;
 
             history.push(ChatMessage::assistant(Some(content.clone()), None));
             enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;

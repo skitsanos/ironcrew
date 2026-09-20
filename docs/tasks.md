@@ -263,8 +263,19 @@ crew:add_task({
 ```
 
 The backoff formula is `retry_backoff_secs * 2^attempt` (1s, 2s, 4s, ...).
-Both LLM errors and timeouts trigger retries. The total number of attempts is
-`max_retries + 1` (the initial attempt plus retries).
+LLM errors and timeouts normally trigger retries, up to `max_retries + 1`
+attempts (the initial attempt plus retries).
+
+A missing, empty, or whitespace-only final model reply is a task failure, not
+a successful empty result. This also applies to collaborative participant and
+synthesis replies. Reasoning text alone does not count as a final answer;
+intermediate tool-call messages may legitimately have no text.
+
+These empty-final-response failures are **not automatically retried**, even
+when `max_retries` is set: completed tool effects cannot be rolled back, and
+restarting the task could repeat them. An explicit `on_error` handler may
+recover the failure; otherwise dependent tasks are skipped. This guard checks
+model replies, not intentionally empty values returned by a Lua task or hook.
 
 ## Per-Task Timeout
 

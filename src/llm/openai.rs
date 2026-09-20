@@ -4,10 +4,10 @@ use serde_json::{Value, json};
 
 use super::provider::*;
 use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
-use crate::engine::agent::ResponseFormat;
 use crate::utils::error::{IronCrewError, Result};
 
-mod reasoning_effort;
+#[cfg(test)]
+mod capability_tests;
 mod request_body;
 mod stream_tools;
 
@@ -43,94 +43,6 @@ impl OpenAiProvider {
             rate_limit,
             execution_policy,
         }
-    }
-
-    fn build_body(&self, request: &ChatRequest, tools: Option<&[ToolSchema]>) -> Value {
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let mut msg = json!({"role": m.role});
-                // When images are attached, serialize content as an array of
-                // content parts (text + image_url blocks). This is the OpenAI
-                // vision format, also used by Gemini and other OpenAI-compatible
-                // endpoints.
-                if let Some(ref images) = m.images {
-                    if !images.is_empty() {
-                        let mut parts: Vec<serde_json::Value> = Vec::new();
-                        if let Some(ref text) = m.content {
-                            parts.push(json!({"type": "text", "text": text}));
-                        }
-                        for img in images {
-                            let data_uri = format!("data:{};base64,{}", img.mime_type, img.data);
-                            parts.push(json!({
-                                "type": "image_url",
-                                "image_url": { "url": data_uri }
-                            }));
-                        }
-                        msg["content"] = json!(parts);
-                    } else if let Some(ref content) = m.content {
-                        msg["content"] = json!(content);
-                    }
-                } else if let Some(ref content) = m.content {
-                    msg["content"] = json!(content);
-                }
-                if let Some(ref tool_call_id) = m.tool_call_id {
-                    msg["tool_call_id"] = json!(tool_call_id);
-                }
-                if let Some(ref tool_calls) = m.tool_calls {
-                    msg["tool_calls"] = serde_json::to_value(tool_calls).unwrap_or_default();
-                }
-                msg
-            })
-            .collect();
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-        });
-
-        if let Some(temp) = request.temperature {
-            body["temperature"] = json!(temp);
-        }
-        request_body::insert_completion_token_limit(&mut body, &request.model, request.max_tokens);
-
-        if let Some(ref fmt) = request.response_format {
-            match fmt {
-                ResponseFormat::Text => {
-                    body["response_format"] = json!({"type": "text"});
-                }
-                ResponseFormat::JsonObject => {
-                    body["response_format"] = json!({"type": "json_object"});
-                }
-                ResponseFormat::JsonSchema { name, schema } => {
-                    body["response_format"] = json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": name,
-                            "schema": schema,
-                            "strict": true,
-                        }
-                    });
-                }
-            }
-        }
-
-        request_body::insert_tools(
-            &mut body,
-            &request.model,
-            tools,
-            request.reasoning_effort.as_deref(),
-        );
-
-        if let Some(ref key) = request.prompt_cache_key {
-            body["prompt_cache_key"] = json!(key);
-        }
-        if let Some(ref retention) = request.prompt_cache_retention {
-            body["prompt_cache_retention"] = json!(retention);
-        }
-
-        body
     }
 
     fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
@@ -433,6 +345,10 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
+        self.resolve_options(request, has_tools).map(|_| ())
+    }
+
     fn metrics_family(&self) -> crate::metrics::ProviderFamily {
         crate::metrics::ProviderFamily::OpenAi
     }
@@ -442,6 +358,7 @@ impl LlmProvider for OpenAiProvider {
             "openai",
             &self.base_url,
             &serde_json::json!({
+                "capability_policy": super::capabilities::REVISION,
                 "execution_policy": self.execution_policy.definition(),
             }),
         )
@@ -456,12 +373,7 @@ impl LlmProvider for OpenAiProvider {
             tools = 0,
             "LLM request metadata"
         );
-        reasoning_effort::validate_reasoning_effort(
-            request.reasoning_effort.as_deref(),
-            &request.model,
-            false,
-        )?;
-        let body = self.build_body(&request, None);
+        let body = self.build_body(&request, None)?;
         let response = self.send_request(body).await?;
         tracing::debug!(
             provider = "openai",
@@ -491,12 +403,7 @@ impl LlmProvider for OpenAiProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
-        reasoning_effort::validate_reasoning_effort(
-            request.reasoning_effort.as_deref(),
-            &request.model,
-            !tools.is_empty(),
-        )?;
-        let body = self.build_body(&request, Some(tools));
+        let body = self.build_body(&request, Some(tools))?;
         let response = self.send_request(body).await?;
         tracing::debug!(
             provider = "openai",
@@ -518,12 +425,7 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        reasoning_effort::validate_reasoning_effort(
-            request.reasoning_effort.as_deref(),
-            &request.model,
-            false,
-        )?;
-        let body = self.build_body(&request, None);
+        let body = self.build_body(&request, None)?;
         tracing::debug!("LLM streaming request");
         self.send_request_stream(body, tx).await
     }

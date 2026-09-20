@@ -5,12 +5,9 @@ use mlua::Result as LuaResult;
 
 use crate::utils::error::IronCrewError;
 
-/// Responses API `reasoning.effort` values — the union across OpenAI model
-/// families (`minimal` on older reasoning models; `xhigh`/`max` on the newest,
-/// e.g. gpt-5.6-luna). Validation catches typos; the API arbitrates which
-/// values a given model honours.
-pub(crate) const REASONING_EFFORTS: &[&str] =
-    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+// Syntax validation first; the effective provider checks model capabilities
+// once an agent is attached to a crew or a conversation is constructed.
+pub(crate) use crate::llm::capabilities::EFFORT_NAMES as REASONING_EFFORTS;
 /// Responses API `reasoning.summary` values.
 pub(crate) const REASONING_SUMMARIES: &[&str] = &["auto", "concise", "detailed"];
 /// Responses API web-search `search_context_size` values.

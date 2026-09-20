@@ -20,6 +20,13 @@ turns must enter through the keyed HTTP `/messages` endpoint. Direct Lua/CLI
 `send()` and `ask()` calls do not acquire the shared durable turn fence and
 therefore fail closed for a persistent PostgreSQL conversation.
 
+Missing, empty, and whitespace-only final model replies fail the turn rather
+than recording an empty assistant answer. The last committed transcript and
+revision remain unchanged; no completed `conversation_turn` event is emitted.
+Earlier tool effects or streamed text cannot be undone, and the failed turn is
+not automatically replayed. HTTP reports a server error under the existing
+idempotency rules; the CLI reports the error and can accept a new user turn.
+
 ## Canonical mode-guard pattern
 
 IronCrew exposes `IRONCREW_MODE` as a Lua global. It is `"run"` during a

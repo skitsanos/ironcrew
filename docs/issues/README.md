@@ -6,8 +6,8 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 42
-- Active findings: 0
+- Total findings: 48
+- Active findings: 4
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -55,3 +55,9 @@ priority, area, and title. The registry is generated with
 | [IC-040](./IC-040.md) | P2 | Resolved | Maintainability | postgres_store.rs needs domain decomposition |
 | [IC-041](./IC-041.md) | P2 | Resolved | Build hygiene | No-default-features build regressed after provider HTTP extraction |
 | [IC-042](./IC-042.md) | P2 | Resolved | Dialog robustness | Dialog turns accept blank model replies and burn the turn budget |
+| [IC-043](./IC-043.md) | P2 | Resolved | Provider robustness | Non-dialog execution accepts blank final model replies as success |
+| [IC-044](./IC-044.md) | P2 | Resolved | Provider compatibility | Provider and model capability rules lack one shared policy |
+| [IC-045](./IC-045.md) | P2 | Open | Configuration safety | Validate does not evaluate crew construction without effects |
+| [IC-046](./IC-046.md) | P2 | Open | Usage observability | Token accounting omits reasoning detail and incomplete-attempt coverage |
+| [IC-047](./IC-047.md) | P2 | Open | Execution budgets | Runs lack a shared token budget across provider requests |
+| [IC-048](./IC-048.md) | P2 | Open | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |
