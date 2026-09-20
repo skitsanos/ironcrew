@@ -79,3 +79,21 @@ fn app_db_definition_changes_the_fingerprint_only_when_present() {
     .unwrap();
     assert_ne!(with, with_changed);
 }
+
+#[test]
+fn agent_reasoning_effort_is_absent_from_json_when_unset_and_changes_the_fingerprint_when_set() {
+    let base = agent();
+    let json = serde_json::to_value(&base).unwrap();
+    assert!(
+        json.get("reasoning_effort").is_none(),
+        "unset effort must not appear in the canonical agent JSON (fingerprint stability): {json}"
+    );
+    let source = format!("sha256:{}", "a".repeat(64));
+    let without = conversation_definition_fingerprint(&definition(&source, &base)).unwrap();
+    let with_effort = Agent {
+        reasoning_effort: Some("high".into()),
+        ..agent()
+    };
+    let with = conversation_definition_fingerprint(&definition(&source, &with_effort)).unwrap();
+    assert_ne!(without, with);
+}

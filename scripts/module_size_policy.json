@@ -59,8 +59,8 @@
     },
     {
       "path": "src/engine/executor.rs",
-      "max_lines": 405,
-      "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility."
+      "max_lines": 401,
+      "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/engine/foreach.rs",
@@ -134,43 +134,43 @@
     },
     {
       "path": "src/llm/anthropic.rs",
-      "max_lines": 782,
-      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, and provider dispatch share one adapter. IC-025: real tool calls remain selectable before structured-output finalization. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http."
+      "max_lines": 787,
+      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, and provider dispatch share one adapter. IC-025: real tool calls remain selectable before structured-output finalization. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/llm/metrics.rs",
-      "max_lines": 410,
-      "rationale": "IC-011 baseline: the provider wrapper owns call counters, latency and token snapshots, cancellation-safe guards, stream observation, and inline tests; extract tests before adding another metric family."
+      "max_lines": 413,
+      "rationale": "IC-011 baseline: the provider wrapper owns call counters, latency and token snapshots, cancellation-safe guards, stream observation, and inline tests; extract tests before adding another metric family. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/llm/openai.rs",
-      "max_lines": 509,
-      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions request/response mapping and provider dispatch share one adapter. IC-033/IC-037: shared HTTP scaffolding and ordered streaming tool-call assembly were extracted."
+      "max_lines": 530,
+      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions request/response mapping and provider dispatch share one adapter. IC-033/IC-037: shared HTTP scaffolding and ordered streaming tool-call assembly were extracted. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/llm/openai_responses.rs",
-      "max_lines": 857,
-      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, ordered item-state decoding, and provider dispatch share one adapter. IC-025/IC-026: structured output and image attachments are mapped instead of dropped. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http."
+      "max_lines": 862,
+      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, ordered item-state decoding, and provider dispatch share one adapter. IC-025/IC-026: structured output and image attachments are mapped instead of dropped. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/llm/provider.rs",
-      "max_lines": 748,
-      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol."
+      "max_lines": 750,
+      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/agent_turn.rs",
-      "max_lines": 594,
-      "rationale": "IC-035 ratchet after extracting tool dispatch: active-turn cleanup, provider interaction, bounded tool-call rounds, and transcript updates form the Lua agent-turn lifecycle; extract provider-round handling before adding turn phases."
+      "max_lines": 586,
+      "rationale": "IC-035 ratchet after extracting tool dispatch: active-turn cleanup, provider interaction, bounded tool-call rounds, and transcript updates form the Lua agent-turn lifecycle; extract provider-round handling before adding turn phases. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/api.rs",
-      "max_lines": 787,
-      "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys."
+      "max_lines": 783,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys. Option-choice validation lives in src/lua/config_choices.rs."
     },
     {
       "path": "src/lua/conversation.rs",
-      "max_lines": 969,
-      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting."
+      "max_lines": 963,
+      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/crew_userdata.rs",
@@ -179,8 +179,8 @@
     },
     {
       "path": "src/lua/dialog.rs",
-      "max_lines": 1625,
-      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes."
+      "max_lines": 1617,
+      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/json.rs",
@@ -189,8 +189,8 @@
     },
     {
       "path": "src/lua/parsers.rs",
-      "max_lines": 733,
-      "rationale": "IC-011 baseline: Agent, Task, and Tool Lua-table parsing shares bounded field validation plus snapshot-backed source loading; split definition parsers from file loading before extending the DSL."
+      "max_lines": 744,
+      "rationale": "IC-011 baseline: Agent, Task, and Tool Lua-table parsing shares bounded field validation plus snapshot-backed source loading; split definition parsers from file loading before extending the DSL. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
     },
     {
       "path": "src/lua/sandbox.rs",

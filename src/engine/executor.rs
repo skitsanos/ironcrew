@@ -122,15 +122,11 @@ impl<'a> TaskExecutionContext<'a> {
                 history_max_bytes,
                 true,
             )?;
-            let request = ChatRequest {
-                messages: messages.clone(),
-                model: self.model.to_string(),
-                temperature: self.agent.temperature,
-                max_tokens: self.agent.max_tokens,
-                response_format: self.agent.response_format.clone(),
-                prompt_cache_key: self.prompt_cache_key.clone(),
-                prompt_cache_retention: self.prompt_cache_retention.clone(),
-            };
+            let mut request = self
+                .agent
+                .chat_request(self.model.to_string(), messages.clone());
+            request.prompt_cache_key = self.prompt_cache_key.clone();
+            request.prompt_cache_retention = self.prompt_cache_retention.clone();
 
             let response = if self.should_stream && !has_tools {
                 // Stream mode: print chunks to stderr as they arrive

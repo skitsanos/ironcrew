@@ -10,6 +10,8 @@ use crate::utils::error::{IronCrewError, Result};
 
 mod response;
 use response::{parse_anthropic_response, structured_output_tool_name};
+mod request_guard;
+use request_guard::reject_reasoning_effort;
 
 /// Anthropic-specific configuration (server-side tools, extended thinking).
 #[derive(Debug, Clone, Default)]
@@ -716,6 +718,7 @@ impl LlmProvider for AnthropicProvider {
             tools = 0,
             "LLM request metadata"
         );
+        reject_reasoning_effort(&request)?;
         let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, None);
         let response = self.send_request(body, structured_output_tool).await?;
@@ -747,6 +750,7 @@ impl LlmProvider for AnthropicProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
+        reject_reasoning_effort(&request)?;
         let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, Some(tools));
         let response = self.send_request(body, structured_output_tool).await?;
@@ -770,6 +774,7 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
+        reject_reasoning_effort(&request)?;
         let structured_output_tool = structured_output_tool_name(&request);
         let body = self.build_body(&request, None);
         tracing::debug!("Anthropic streaming request");
