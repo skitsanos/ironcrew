@@ -58,6 +58,6 @@ priority, area, and title. The registry is generated with
 | [IC-043](./IC-043.md) | P2 | Resolved | Provider robustness | Non-dialog execution accepts blank final model replies as success |
 | [IC-044](./IC-044.md) | P2 | Resolved | Provider compatibility | Provider and model capability rules lack one shared policy |
 | [IC-045](./IC-045.md) | P2 | Resolved | Configuration safety | Validate does not evaluate crew construction without effects |
-| [IC-046](./IC-046.md) | P2 | Open | Usage observability | Token accounting omits reasoning detail and incomplete-attempt coverage |
+| [IC-046](./IC-046.md) | P2 | In progress | Usage observability | Token accounting omits reasoning detail and incomplete-attempt coverage |
 | [IC-047](./IC-047.md) | P2 | Open | Execution budgets | Runs lack a shared token budget across provider requests |
 | [IC-048](./IC-048.md) | P2 | Open | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |

@@ -378,8 +378,13 @@ Individual agents and tasks can also override the model with a `model` field.
 
 ## Token Usage and Prompt Caching
 
-Every task result includes token usage: `prompt_tokens`, `completion_tokens`,
-`total_tokens`, and `cached_tokens`. Run records aggregate these across all tasks.
+Task results may include provider-reported token usage: `prompt_tokens`,
+`completion_tokens`, `total_tokens`, and `cached_tokens`. Current run totals
+aggregate retained task receipts, not every attempted provider call. Missing
+receipts and failed/retried attempts are not fully represented yet; these
+numbers are not invoices or proof of zero cost. [IC-046's accounting foundation](usage-accounting.md)
+defines the replacement contract; its runtime and storage integration is still
+in progress.
 
 For providers that support prompt caching, enable it at the crew level:
 
