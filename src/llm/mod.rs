@@ -1,3 +1,4 @@
+pub(crate) mod accounting;
 pub mod anthropic;
 pub(crate) mod capabilities;
 pub(crate) mod execution_policy;

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exception_budget": 46,
+  "exception_budget": 42,
   "exceptions": [
     {
       "path": "src/api/admission.rs",
@@ -133,24 +133,9 @@
       "rationale": "IC-011 baseline: task attempt execution, retry and timeout handling, cancellation, tool-finalization, and result construction share one lifecycle; split attempt policy before adding another completion phase."
     },
     {
-      "path": "src/llm/anthropic.rs",
-      "max_lines": 578,
-      "rationale": "IC-011 ratchet after extracting response decoding: Anthropic request construction, image and tool translation, streaming assembly, and provider dispatch share one adapter. IC-025: real tool calls remain selectable before structured-output finalization. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
-    },
-    {
-      "path": "src/llm/openai.rs",
-      "max_lines": 432,
-      "rationale": "IC-011 ratchet after extracting tool request construction: OpenAI Chat Completions request/response mapping and provider dispatch share one adapter. IC-033/IC-037: shared HTTP scaffolding and ordered streaming tool-call assembly were extracted. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
-    },
-    {
-      "path": "src/llm/openai_responses.rs",
-      "max_lines": 639,
-      "rationale": "IC-011 baseline: Responses API configuration, server-tool mapping, request construction, ordered item-state decoding, and provider dispatch share one adapter. IC-025/IC-026: structured output and image attachments are mapped instead of dropped. IC-033/IC-037: shared timeout, rate-limit, error-body, and SSE transport scaffolding moved to provider_http. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
-    },
-    {
       "path": "src/llm/provider.rs",
-      "max_lines": 643,
-      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
+      "max_lines": 633,
+      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: request configuration extracted before adding explicit usage scope."
     },
     {
       "path": "src/lua/agent_turn.rs",
@@ -191,11 +176,6 @@
       "path": "src/lua/sandbox.rs",
       "max_lines": 1761,
       "rationale": "IC-011 priority debt: sandbox global registration still combines bounded regex, JSON, Base64, logging, templates, filesystem, HTTP, and schema helpers; extract capability families before adding another global. IC-021: sandboxed evaluation VM wired in (implementation lives in sandbox/eval_vm.rs)."
-    },
-    {
-      "path": "src/main.rs",
-      "max_lines": 373,
-      "rationale": "IC-045 ratchet after extracting binary tests: the entry point retains Clap definitions, serve address validation and command dispatch; construction validation and process supervision are separate modules. Move command definitions before adding more CLI options."
     },
     {
       "path": "src/mcp/config.rs",

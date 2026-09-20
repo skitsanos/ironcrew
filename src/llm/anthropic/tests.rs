@@ -116,6 +116,7 @@ fn build_body_replays_thinking_before_tool_use() {
         response_format: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     };
     let body = provider.build_body(&req, None).unwrap();
@@ -154,6 +155,7 @@ fn schema_request(images: Option<Vec<ImageInput>>) -> ChatRequest {
         }),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     }
 }

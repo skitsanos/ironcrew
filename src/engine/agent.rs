@@ -92,6 +92,7 @@ impl Agent {
             response_format: self.response_format.clone(),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            usage_tracker: None,
             reasoning_effort: self.reasoning_effort.clone(),
         }
     }

@@ -1,0 +1,7 @@
+//! Real loopback HTTP/SSE transport tests. No credentials or paid providers.
+#[path = "provider_usage/fixture.rs"]
+mod fixture;
+#[path = "provider_usage/receipts.rs"]
+mod receipts;
+#[path = "provider_usage/streams.rs"]
+mod streams;

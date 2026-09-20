@@ -54,6 +54,19 @@ pub(crate) struct ProviderErrorResponse {
 }
 
 impl ProviderErrorResponse {
+    pub(crate) fn into_accounted_error(
+        self,
+        accounting: &mut super::accounting::ProviderAttempt,
+    ) -> IronCrewError {
+        if let Ok(body) = serde_json::from_slice::<Value>(&self.bytes) {
+            let usage = body
+                .get("usage")
+                .or_else(|| body.pointer("/response/usage"));
+            accounting.observe(usage, usage.is_some_and(Value::is_object));
+        }
+        self.into_error()
+    }
+
     pub(crate) fn into_error(self) -> IronCrewError {
         let parsed = serde_json::from_slice::<Value>(&self.bytes).ok();
         let root = parsed.as_ref().and_then(|body| {

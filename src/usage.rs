@@ -1,6 +1,7 @@
 //! Checked usage-receipt foundation for IC-046.
 //!
-//! These types are not yet wired into runtime task results or durable stores.
+//! Built-in HTTP providers can capture into an explicit request scope. Runtime
+//! task results and durable stores have not yet migrated to these types.
 //! Counts describe provider receipts, not invoices or inferred text lengths.
 mod aggregate;
 mod parsing;

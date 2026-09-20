@@ -528,18 +528,8 @@ pub fn append_text_bounded(target: &mut String, value: &str, max_bytes: usize) -
     true
 }
 
-#[derive(Debug, Clone)]
-pub struct ChatRequest {
-    pub messages: Vec<ChatMessage>,
-    pub model: String,
-    pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
-    pub response_format: Option<ResponseFormat>,
-    pub prompt_cache_key: Option<String>,
-    pub prompt_cache_retention: Option<String>,
-    /// Per-request reasoning effort (agent-level override; see `Agent`).
-    pub reasoning_effort: Option<String>,
-}
+mod request;
+pub use request::ChatRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRequest {

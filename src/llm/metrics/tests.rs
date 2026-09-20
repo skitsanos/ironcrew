@@ -57,6 +57,7 @@ async fn cancellation_releases_active_call_and_peak_is_monotonic() {
         response_format: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     };
     let first = tokio::spawn({
@@ -146,6 +147,7 @@ async fn successful_calls_record_fixed_operation_and_token_totals() {
         response_format: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     };
 
@@ -196,6 +198,7 @@ async fn errors_record_only_the_fixed_outcome() {
         response_format: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     };
 
