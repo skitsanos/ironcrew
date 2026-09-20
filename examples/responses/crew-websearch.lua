@@ -5,7 +5,7 @@
 local crew = Crew.new({
     goal = "Research current information using built-in web search",
     provider = "openai-responses",
-    model = "gpt-5.4",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
     server_tools = { "web_search" },
     web_search_context_size = "medium",

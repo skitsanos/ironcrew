@@ -22,10 +22,10 @@ local crew = Crew.new({
 
     -- Model router (see below)
     models = {
-        task_execution         = "gpt-4o",
+        task_execution         = "gpt-5.6-terra",
         tool_synthesis         = "gpt-5.6-luna",
-        final_response         = "gpt-4o",
-        collaboration          = "gpt-4o",
+        final_response         = "gpt-5.6-terra",
+        collaboration          = "gpt-5.6-terra",
         collaboration_synthesis = "gpt-5.6-luna",
     },
 })
@@ -951,10 +951,10 @@ local crew = Crew.new({
     goal  = "Multi-model workflow",
     model = "gpt-5.6-luna",         -- fallback for unrouted purposes
     models = {
-        task_execution          = "gpt-4o",
+        task_execution          = "gpt-5.6-terra",
         tool_synthesis          = "gpt-5.6-luna",
-        final_response          = "gpt-4o",
-        collaboration           = "gpt-4o",
+        final_response          = "gpt-5.6-terra",
+        collaboration           = "gpt-5.6-terra",
         collaboration_synthesis = "gpt-5.6-luna",
     },
 })
