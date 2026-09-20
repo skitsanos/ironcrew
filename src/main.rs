@@ -46,11 +46,16 @@ enum Commands {
         #[arg(short, long)]
         tag: Vec<String>,
     },
-    /// Validate Lua files without executing
+    /// Validate declarations, or evaluate construction without external effects
     Validate {
         /// Path to project directory or crew.lua file
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Evaluate construction; exit 3 if execution or external state is required
+        #[arg(long)]
+        evaluate: bool,
+        #[arg(long, hide = true, requires = "evaluate")]
+        construction_worker: bool,
     },
     /// List discovered agents, tools, and tasks
     List {
@@ -254,7 +259,7 @@ fn resolve_serve_address(
 fn command_path(command: &Commands) -> Option<&std::path::Path> {
     match command {
         Commands::Run { path, .. }
-        | Commands::Validate { path }
+        | Commands::Validate { path, .. }
         | Commands::List { path }
         | Commands::Fmt { path }
         | Commands::Doctor { path }
@@ -276,7 +281,9 @@ fn main() {
     // is single-threaded — doing it here (before any Tokio worker thread exists)
     // avoids the data race that per-request loading caused. Loading before the
     // logger also lets `IRONCREW_LOG` be set from `.env`.
-    cli::project::load_dotenv(command_path(&cli.command));
+    if !matches!(cli.command, Commands::Validate { evaluate: true, .. }) {
+        cli::project::load_dotenv(command_path(&cli.command));
+    }
     utils::logger::init(cli.verbose);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -292,7 +299,17 @@ fn main() {
                 json,
                 tag,
             } => cli::commands::cmd_run(&path, input.as_deref(), json, tag).await,
-            Commands::Validate { path } => cli::commands::cmd_validate(&path),
+            Commands::Validate {
+                path,
+                evaluate,
+                construction_worker,
+            } => {
+                if evaluate {
+                    cli::validation::cmd_evaluate(&path, construction_worker).await
+                } else {
+                    cli::commands::cmd_validate(&path)
+                }
+            }
             Commands::List { path } => cli::commands::cmd_list(&path),
             Commands::Init { name } => cli::commands::cmd_init(&name),
             Commands::Nodes => cli::commands::cmd_nodes(),
@@ -341,83 +358,16 @@ fn main() {
 
     if let Err(e) = result {
         tracing::error!("{}", e);
-        std::process::exit(1);
+        std::process::exit(
+            if matches!(e, utils::error::IronCrewError::ValidationIncomplete(_)) {
+                3
+            } else {
+                1
+            },
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ServeEnvironment, resolve_serve_address};
-
-    fn environment(
-        host: Option<&str>,
-        ironcrew_port: Option<&str>,
-        platform_port: Option<&str>,
-    ) -> ServeEnvironment {
-        ServeEnvironment {
-            host: host.map(str::to_owned),
-            ironcrew_port: ironcrew_port.map(str::to_owned),
-            platform_port: platform_port.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn serve_defaults_remain_local() {
-        let address = resolve_serve_address(None, None, environment(None, None, None)).unwrap();
-        assert_eq!(address, ("127.0.0.1".to_owned(), 3000));
-    }
-
-    #[test]
-    fn railway_port_binds_all_interfaces() {
-        let address =
-            resolve_serve_address(None, None, environment(None, None, Some("48123"))).unwrap();
-        assert_eq!(address, ("0.0.0.0".to_owned(), 48123));
-    }
-
-    #[test]
-    fn ironcrew_environment_takes_precedence_over_platform_port() {
-        let address = resolve_serve_address(
-            None,
-            None,
-            environment(Some("::"), Some("4100"), Some("48123")),
-        )
-        .unwrap();
-        assert_eq!(address, ("::".to_owned(), 4100));
-    }
-
-    #[test]
-    fn explicit_arguments_take_precedence_over_environment() {
-        let address = resolve_serve_address(
-            Some("127.0.0.2".to_owned()),
-            Some(4200),
-            environment(Some("::"), Some("4100"), Some("48123")),
-        )
-        .unwrap();
-        assert_eq!(address, ("127.0.0.2".to_owned(), 4200));
-    }
-
-    #[test]
-    fn invalid_ironcrew_port_fails_loudly() {
-        let error = resolve_serve_address(
-            None,
-            None,
-            environment(None, Some("not-a-port"), Some("48123")),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("IRONCREW_PORT"));
-    }
-
-    #[test]
-    fn invalid_platform_port_fails_loudly() {
-        let error =
-            resolve_serve_address(None, None, environment(None, None, Some("70000"))).unwrap_err();
-        assert!(error.to_string().contains("PORT"));
-    }
-
-    #[test]
-    fn zero_port_is_rejected() {
-        let error =
-            resolve_serve_address(None, Some(0), environment(None, None, None)).unwrap_err();
-        assert!(error.to_string().contains("--port"));
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;

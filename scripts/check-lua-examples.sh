@@ -28,6 +28,18 @@ done < <(
   git ls-files -- 'examples/**/*.lua' | LC_ALL=C sort -u
 )
 
+# Strict construction checks execute the real parsers with no effects. These
+# flows explicitly separate construction from execution; exit 3 is a FAILURE,
+# never a tolerated partial pass. The separate probes below still test runtime.
+for flow in \
+  examples/providers/01-openai-chat.lua \
+  examples/providers/02-openai-responses.lua \
+  examples/providers/03-openai-responses-reasoning.lua \
+  examples/config-lua \
+  examples/conversation; do
+  "$ironcrew_bin" validate --evaluate "$flow" >/dev/null
+done
+
 probe_root=$(mktemp -d "${TMPDIR:-/tmp}/ironcrew-lua-probes.XXXXXX")
 cleanup() {
   rm -rf -- "$probe_root"
@@ -82,4 +94,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 \
 grep -Fq '"flows_executed":4' "$probe_root/platform-canary-smoke.json"
 grep -Fq '"effect_calls":2' "$probe_root/platform-canary-smoke.json"
 
-printf 'Lua examples: %d files validated; 5 offline probes passed.\n' "$validated"
+printf 'Lua examples: %d declaration/syntax checks; 5 construction evaluations; 5 offline probes passed.\n' "$validated"

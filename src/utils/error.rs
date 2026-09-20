@@ -2,6 +2,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum IronCrewError {
+    #[error("Construction validation INCOMPLETE: {0}")]
+    ValidationIncomplete(String),
+
     #[error("LLM provider error: {0}")]
     Provider(String),
 

@@ -8,7 +8,6 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-045](docs/issues/IC-045.md) | P2 | Open | Configuration safety | Validate does not evaluate crew construction without effects |
 | [IC-046](docs/issues/IC-046.md) | P2 | Open | Usage observability | Token accounting omits reasoning detail and incomplete-attempt coverage |
 | [IC-047](docs/issues/IC-047.md) | P2 | Open | Execution budgets | Runs lack a shared token budget across provider requests |
 | [IC-048](docs/issues/IC-048.md) | P2 | Open | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |

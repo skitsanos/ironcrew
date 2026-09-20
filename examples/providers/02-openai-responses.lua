@@ -7,7 +7,6 @@ local crew = Crew.new({
     goal = "Verify OpenAI Responses API works",
     provider = "openai-responses",
     model = "gpt-5.6-luna",
-    api_key = env("OPENAI_API_KEY"),
 })
 
 crew:add_agent(Agent.new({
@@ -22,4 +21,6 @@ crew:add_task({
     agent = "assistant",
 })
 
+-- Construction validation needs no credential and stops before paid execution.
+if IRONCREW_MODE == "validate" then return end
 crew:run()

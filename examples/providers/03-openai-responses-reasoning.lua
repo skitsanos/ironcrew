@@ -8,7 +8,6 @@ local crew = Crew.new({
     goal = "Verify OpenAI Responses reasoning + streaming",
     provider = "openai-responses",
     model = "gpt-5.6-luna",
-    api_key = env("OPENAI_API_KEY"),
     reasoning_effort = "low",
     reasoning_summary = "auto",
     stream = true,
@@ -25,4 +24,6 @@ crew:add_task({
     agent = "solver",
 })
 
+-- Construction validation needs no credential and stops before paid execution.
+if IRONCREW_MODE == "validate" then return end
 crew:run()

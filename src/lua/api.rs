@@ -208,7 +208,7 @@ pub struct ChatMode;
 pub const CHAT_CREW_REGISTRY_KEY: &str = "__ironcrew_chat_crew";
 
 /// Set the canonical `IRONCREW_MODE` Lua global. Users guard top-level
-/// `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so the
+/// `crew:run()` with `if IRONCREW_MODE == "run" then crew:run() end` so the
 /// same `crew.lua` works for both `ironcrew run` and `ironcrew chat`.
 pub fn set_ironcrew_mode(lua: &Lua, mode: &str) -> LuaResult<()> {
     lua.globals().set("IRONCREW_MODE", mode.to_string())
@@ -269,16 +269,7 @@ pub fn register_crew_constructor(
 
         // Shallow-merge defaults from config.lua (if present) into the user's
         // table. Only keys not already present are added — user values win.
-        if let Ok(defaults) = lua.globals().get::<Table>("__ironcrew_config_defaults") {
-            for pair in defaults.pairs::<mlua::Value, mlua::Value>() {
-                let (key, value) = pair?;
-                if let mlua::Value::String(ref s) = key
-                    && !table.contains_key(s.clone())?
-                {
-                    table.set(key, value)?;
-                }
-            }
-        }
+        construction_support::merge_defaults(&lua, &table)?;
 
         crate::lua::parsers::reject_unknown_keys(
             &table,
@@ -314,8 +305,11 @@ pub fn register_crew_constructor(
         if let Some(key) = api_key.as_deref() {
             validate_api_key_value(key)?;
         }
-        let custom_provider_key =
-            resolve_custom_provider_key(base_url.as_deref(), api_key.as_deref())?;
+        let custom_provider_key = if crate::lua::construction::active(&lua) {
+            Some("validation-only".to_owned())
+        } else {
+            resolve_custom_provider_key(base_url.as_deref(), api_key.as_deref())?
+        };
 
         if !matches!(
             normalized_provider.as_str(),
@@ -580,16 +574,7 @@ pub fn register_crew_constructor(
             }),
         };
 
-        let memory = match memory_mode.as_str() {
-            "persistent" => {
-                let memory_path = project_dir.join(".ironcrew").join("memory.json");
-                MemoryStore::persistent_with_config_async(memory_path, memory_config)
-                    .await
-                    .map_err(mlua::Error::external)?
-            }
-            "ephemeral" => MemoryStore::ephemeral_with_config(memory_config),
-            _ => unreachable!("memory mode was validated above"),
-        };
+        let memory = construction_support::memory(&lua, &memory_mode, &project_dir, memory_config).await?;
 
         let stream = table.get::<Option<bool>>("stream")?.unwrap_or(false);
 
@@ -699,6 +684,10 @@ pub fn register_crew_constructor(
             agent_tools_finalized: tokio::sync::OnceCell::new(),
         };
 
+        if crate::lua::construction::active(&lua) {
+            return crate::lua::construction::capture(&lua, lua_crew);
+        }
+
         // In chat mode, stash the userdata in the registry so the CLI/HTTP
         // harness can pick it back up once the entrypoint script returns.
         // We do this by constructing an AnyUserData and retrieving it via
@@ -719,5 +708,6 @@ pub fn register_crew_constructor(
     Ok(())
 }
 
+mod construction_support;
 #[cfg(test)]
 mod tests;

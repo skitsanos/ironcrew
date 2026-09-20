@@ -410,6 +410,10 @@ describe("repository integration policy", () => {
 
     expect(luaGate).toContain("evaluations/platform-canary/runtime_smoke.py");
     expect(luaGate).toContain('"flows_executed":4');
+    expect(luaGate).toContain('validate --evaluate "$flow"');
+    expect(luaGate).toContain("examples/providers/03-openai-responses-reasoning.lua");
+    expect(luaGate).toContain("examples/config-lua");
+    expect(luaGate).toContain("examples/conversation");
     expect(canaryGuide).toContain("Static Lua validation does not execute");
   });
 

@@ -12,6 +12,7 @@ pub mod project;
 pub mod server;
 mod server_cors;
 mod server_shutdown;
+pub mod validation;
 
 /// Escape a string for safe embedding as a Lua literal. Used by the chat
 /// CLI and the HTTP conversation start handler to drive `crew:conversation`

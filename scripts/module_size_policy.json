@@ -159,7 +159,7 @@
     },
     {
       "path": "src/lua/api.rs",
-      "max_lines": 723,
+      "max_lines": 713,
       "rationale": "IC-011 baseline, ratcheted by IC-029 async memory loading: Lua Agent and Crew constructors share provider, model, memory, server-tool, and routing configuration validation and registry setup; split constructor-specific parsing before adding DSL fields. IC-028: Crew.new rejects unknown option keys. Option-choice validation lives in src/lua/config_choices.rs. IC-044 ratchet after extracting request construction or related tests/helpers."
     },
     {
@@ -194,8 +194,8 @@
     },
     {
       "path": "src/main.rs",
-      "max_lines": 423,
-      "rationale": "IC-011 baseline: the binary entry point still contains Clap command definitions, serve-environment validation, address resolution, command path selection, dispatch, and tests; move CLI definitions before adding commands."
+      "max_lines": 373,
+      "rationale": "IC-045 ratchet after extracting binary tests: the entry point retains Clap definitions, serve address validation and command dispatch; construction validation and process supervision are separate modules. Move command definitions before adding more CLI options."
     },
     {
       "path": "src/mcp/config.rs",

@@ -142,17 +142,19 @@ workflows inside a Lua script.
 > **Guard top-level `crew:run()` when mixing chat and task execution.**
 > IronCrew sets `IRONCREW_MODE` as a Lua global before `crew.lua` runs:
 > `"run"` under `ironcrew run` and `"chat"` under `ironcrew chat` (and the
-> HTTP conversation endpoints). If your script defines tasks and also
+> HTTP conversation endpoints), or `"validate"` during `validate --evaluate`.
+> If your script defines tasks and also
 > exposes a conversational agent, wrap the bootstrapping call:
 >
 > ```lua
-> if IRONCREW_MODE ~= "chat" then
+> if IRONCREW_MODE == "run" then
 >     crew:run()
 > end
 > ```
 >
 > This prevents chat-mode boot-up (REPL or HTTP `/start`) from triggering a
-> full task execution just to instantiate the crew.
+> full task execution just to instantiate the crew, and lets construction
+> validation check declarations without executing them.
 
 Create a conversation bound to a crew (it inherits the crew's provider, model,
 and tool registry):
