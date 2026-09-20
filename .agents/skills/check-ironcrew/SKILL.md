@@ -23,6 +23,28 @@ reconcile files only when the user also asks for changes.
 - Use the complete gate before a requested commit/push, release preparation,
   branch integration, or when the user explicitly asks for every check.
 
+## Pre-push admission
+
+- Enable the repository-owned hook once per clone with `task hooks-install`.
+  Confirm `git config --local --get core.hooksPath` returns `.githooks`.
+- Before any requested push, list open pull requests targeting the destination
+  branch and resolve relevant incoming dependency or workflow updates first.
+- Before committing work intended for `develop`, run `task develop-refresh`.
+  Review and commit any toolchain, manifest, lockfile, workflow, or policy
+  changes produced by the latest-stable refresh before validation.
+- Run `./scripts/pre-push-check.sh` directly before push even when the hook is
+  enabled. It is the canonical locally reproducible CI gate. It requires a
+  clean worktree, upgrades Bun before Bun-based tooling, refreshes managed
+  dependencies, and fails closed when refresh changes need a commit or the
+  Rust, cargo-audit, actionlint, or immutable GitHub Action pins do not match
+  current latest-stable policy.
+- When storage, HITL, journals, leases, or replica behavior changed, provide a
+  disposable PostgreSQL 15 database through `IRONCREW_TEST_PG_URL`; the script
+  then adds the serial integration and short replica-soak gates. An unset URL
+  is an explicit skip and does not make those changes ready to push.
+- The hook does not replace GitHub's macOS, Windows, protected-environment, or
+  other platform-only jobs. Require the exact pushed commit's CI before merge.
+
 ## Repository policy
 
 Run these first because they are cheap and fail before Rust compilation:
@@ -70,8 +92,8 @@ repetitions, cost/token, latency, revision, and dirty-worktree boundaries.
 ## PostgreSQL and replica gate
 
 Use a disposable PostgreSQL 15 database with a least-privilege test role and
-set `IRONCREW_TEST_PG_URL` only for the test process. Run the CI integration
-targets serially:
+set `IRONCREW_TEST_PG_URL` only for the test process. The canonical pre-push
+script runs these CI integration targets serially when that variable is set:
 
 ```bash
 cargo test --locked --all-features \

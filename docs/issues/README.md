@@ -6,8 +6,8 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 40
-- Active findings: 3
+- Total findings: 41
+- Active findings: 0
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -47,9 +47,10 @@ priority, area, and title. The registry is generated with
 | [IC-032](./IC-032.md) | P2 | Resolved | Release governance | Taskfile publish can overwrite signed release images |
 | [IC-033](./IC-033.md) | P2 | Resolved | Provider robustness | Provider request timeout is a fixed 120s total deadline |
 | [IC-034](./IC-034.md) | P3 | Resolved | Error hygiene | Error responses and provider error paths leak internals or lose status |
-| [IC-035](./IC-035.md) | P3 | Open | Failure visibility | Silent degradation on malformed tool arguments and failed hooks |
-| [IC-036](./IC-036.md) | P3 | Open | API hardening | Residual HTTP hardening gaps in proxy trust, timeouts, CORS, and audit coverage |
+| [IC-035](./IC-035.md) | P3 | Resolved | Failure visibility | Silent degradation on malformed tool arguments and failed hooks |
+| [IC-036](./IC-036.md) | P2 | Resolved | API hardening | Residual HTTP hardening gaps in proxy trust, timeouts, CORS, and audit coverage |
 | [IC-037](./IC-037.md) | P3 | Resolved | Provider maintainability | Provider scaffolding is triplicated and RateLimiter::new can panic |
 | [IC-038](./IC-038.md) | P3 | Resolved | Documentation accuracy | Documentation and example drift across nodes, endpoints, and model pins |
 | [IC-039](./IC-039.md) | P3 | Resolved | Build hygiene | Build context, dev-dependency comment, and client material housekeeping |
-| [IC-040](./IC-040.md) | P2 | Open | Maintainability | postgres_store.rs needs domain decomposition |
+| [IC-040](./IC-040.md) | P2 | Resolved | Maintainability | postgres_store.rs needs domain decomposition |
+| [IC-041](./IC-041.md) | P2 | Resolved | Build hygiene | No-default-features build regressed after provider HTTP extraction |

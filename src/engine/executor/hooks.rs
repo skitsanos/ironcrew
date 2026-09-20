@@ -1,7 +1,12 @@
 use crate::lua::limits::{LuaExecutionGuard, LuaLimits};
 use crate::lua::sandbox::{create_eval_lua, fresh_eval_environment};
+use crate::metrics::{HookFailureStage, HookKind};
 
-fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
+fn record_failure(kind: HookKind, stage: HookFailureStage) {
+    crate::metrics::record_hook_failure(kind, stage);
+}
+
+fn with_hook_lua<T>(kind: HookKind, fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
     let lua = match LuaLimits::from_env()
         .map_err(|error| error.to_string())
         .and_then(|limits| create_eval_lua(limits).map_err(|error| error.to_string()))
@@ -9,6 +14,7 @@ fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
         Ok(lua) => lua,
         Err(error) => {
             tracing::error!(%error, "Hook Lua VM could not be initialized");
+            record_failure(kind, HookFailureStage::VmInitialization);
             return fallback;
         }
     };
@@ -16,6 +22,7 @@ fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
         Ok(guard) => guard,
         Err(error) => {
             tracing::warn!(%error, "Hook Lua execution could not start");
+            record_failure(kind, HookFailureStage::ExecutionStart);
             return fallback;
         }
     };
@@ -27,13 +34,14 @@ fn with_hook_lua<T>(fallback: T, operation: impl FnOnce(&mlua::Lua) -> T) -> T {
 fn load_hook(
     lua: &mlua::Lua,
     bytecode: &[u8],
-    kind: &str,
+    kind: HookKind,
     task_name: &str,
 ) -> Option<mlua::Function> {
     let environment = match fresh_eval_environment(lua) {
         Ok(environment) => environment,
         Err(error) => {
-            tracing::warn!(%error, kind, task_name, "hook environment could not be created");
+            tracing::warn!(%error, hook = kind.as_str(), task_name, "hook environment could not be created");
+            record_failure(kind, HookFailureStage::Environment);
             return None;
         }
     };
@@ -44,7 +52,8 @@ fn load_hook(
     {
         Ok(function) => Some(function),
         Err(error) => {
-            tracing::warn!(%error, kind, task_name, "hook failed to load");
+            tracing::warn!(%error, hook = kind.as_str(), task_name, "hook failed to load");
+            record_failure(kind, HookFailureStage::Load);
             None
         }
     }
@@ -53,20 +62,34 @@ fn load_hook(
 /// Run a before_task hook using the thread-local Lua VM.
 /// Returns the (possibly modified) task description.
 pub(super) fn run_before_hook(bytecode: &[u8], task_name: &str, task_description: &str) -> String {
-    with_hook_lua(task_description.to_string(), |lua| {
-        let Some(func) = load_hook(lua, bytecode, "before_task", task_name) else {
+    let kind = HookKind::BeforeTask;
+    with_hook_lua(kind, task_description.to_string(), |lua| {
+        let Some(func) = load_hook(lua, bytecode, kind, task_name) else {
             return task_description.to_string();
         };
 
         match func.call::<mlua::Value>((task_name, task_description)) {
             Ok(mlua::Value::String(s)) => match s.to_str() {
                 Ok(s) => s.to_string(),
-                Err(_) => task_description.to_string(),
+                Err(error) => {
+                    tracing::warn!(%error, task_name, "before_task hook returned an invalid string");
+                    record_failure(kind, HookFailureStage::ReturnValue);
+                    task_description.to_string()
+                }
             },
             Ok(mlua::Value::Nil) => task_description.to_string(),
-            Ok(_) => task_description.to_string(),
-            Err(e) => {
-                tracing::warn!("before_task hook for task '{}' failed: {}", task_name, e);
+            Ok(value) => {
+                tracing::warn!(
+                    task_name,
+                    value_type = value.type_name(),
+                    "before_task hook returned an unsupported value"
+                );
+                record_failure(kind, HookFailureStage::ReturnValue);
+                task_description.to_string()
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_name, "before_task hook failed");
+                record_failure(kind, HookFailureStage::Run);
                 task_description.to_string()
             }
         }
@@ -81,20 +104,34 @@ pub(super) fn run_after_hook(
     output: &str,
     success: bool,
 ) -> String {
-    with_hook_lua(output.to_string(), |lua| {
-        let Some(func) = load_hook(lua, bytecode, "after_task", task_name) else {
+    let kind = HookKind::AfterTask;
+    with_hook_lua(kind, output.to_string(), |lua| {
+        let Some(func) = load_hook(lua, bytecode, kind, task_name) else {
             return output.to_string();
         };
 
         match func.call::<mlua::Value>((task_name, output, success)) {
             Ok(mlua::Value::String(s)) => match s.to_str() {
                 Ok(s) => s.to_string(),
-                Err(_) => output.to_string(),
+                Err(error) => {
+                    tracing::warn!(%error, task_name, "after_task hook returned an invalid string");
+                    record_failure(kind, HookFailureStage::ReturnValue);
+                    output.to_string()
+                }
             },
             Ok(mlua::Value::Nil) => output.to_string(),
-            Ok(_) => output.to_string(),
-            Err(e) => {
-                tracing::warn!("after_task hook for task '{}' failed: {}", task_name, e);
+            Ok(value) => {
+                tracing::warn!(
+                    task_name,
+                    value_type = value.type_name(),
+                    "after_task hook returned an unsupported value"
+                );
+                record_failure(kind, HookFailureStage::ReturnValue);
+                output.to_string()
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_name, "after_task hook failed");
+                record_failure(kind, HookFailureStage::Run);
                 output.to_string()
             }
         }
@@ -175,9 +212,27 @@ mod tests {
 
     #[test]
     fn failed_hook_load_returns_input_unchanged() {
+        let before = hook_failure_count(HookKind::BeforeTask, HookFailureStage::Load);
         assert_eq!(
             run_before_hook(b"not valid bytecode", "task", "original"),
             "original"
         );
+        let after = hook_failure_count(HookKind::BeforeTask, HookFailureStage::Load);
+        assert!(after >= before.saturating_add(1));
+    }
+
+    fn hook_failure_count(kind: HookKind, stage: HookFailureStage) -> u64 {
+        let mut body = String::new();
+        crate::metrics::append_prometheus(&mut body);
+        let prefix = format!(
+            "ironcrew_hook_failures_total{{hook=\"{}\",stage=\"{}\"}} ",
+            kind.as_str(),
+            stage.as_str()
+        );
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect("hook failure metric is exposed")
+            .parse()
+            .expect("hook failure metric is numeric")
     }
 }

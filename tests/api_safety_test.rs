@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ironcrew::api::{AppState, create_router};
+use ironcrew::engine::audit::AuditFilter;
 use ironcrew::engine::run_history::{JsonFileStore, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
@@ -531,6 +532,27 @@ async fn overlapping_conversation_message_fails_fast_instead_of_queueing() {
     assert_eq!(
         body["error"],
         "Conversation is busy; retry after the active operation completes"
+    );
+    let audits = server
+        .store
+        .list_audit_events(
+            &AuditFilter {
+                flow_path: Some("chat".into()),
+                action: Some("conversation.message".into()),
+                success: Some(false),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].target.as_deref(), Some("busy"));
+    assert_eq!(audits[0].status_code, 409);
+    assert_eq!(
+        audits[0].metadata,
+        Some(serde_json::json!({ "idempotent": false }))
     );
 }
 

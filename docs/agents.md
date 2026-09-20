@@ -212,19 +212,17 @@ crew:add_agent(Agent.new({
 ## Task Hooks
 
 Agents can define `before_task` and `after_task` callback functions that run
-around every task the agent executes. Hooks are useful for logging, metrics,
-input preprocessing, and output postprocessing.
+around every task the agent executes. Hooks are useful for input preprocessing
+and output postprocessing.
 
 ```lua
 crew:add_agent(Agent.new({
     name = "researcher",
     goal = "Research topics thoroughly",
     before_task = function(task_name, task_description)
-        log("info", "Starting: " .. task_name)
-        return task_description  -- return modified description, or nil for no change
+        return "Task " .. task_name .. ":\n" .. task_description
     end,
     after_task = function(task_name, output, success)
-        log("info", "Done: " .. task_name .. " (" .. (success and "ok" or "fail") .. ")")
         return output  -- return modified output, or nil for no change
     end,
 }))
@@ -247,7 +245,9 @@ or `nil` to keep it unchanged.
 - Hooks run in an isolated Lua VM per invocation (no access to the crew's
   globals or memory).
 - Hook errors are logged as warnings and do **not** fail the task -- the
-  original description or output is used instead.
+  original description or output is used instead. Every initialization, load,
+  execution, or invalid-return failure also increments
+  `ironcrew_hook_failures_total` on the authenticated HTTP metrics surface.
 - Hooks are stored as Lua bytecode on the `Crew`, so they work across all
   execution modes: standard tasks, foreach tasks, and retry loops.
 - Hooks do **not** run for error handler tasks or collaborative task synthesis

@@ -13,9 +13,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 pub use labels::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, TokenKind, ToolOutcome,
 };
 
 static METRICS: LazyLock<state::Metrics> = LazyLock::new(state::Metrics::default);
@@ -34,6 +34,10 @@ pub fn record_task(outcome: TaskOutcome, duration: Duration) {
 
 pub fn record_tool(outcome: ToolOutcome, duration: Duration) {
     METRICS.record_tool(outcome, duration);
+}
+
+pub fn record_hook_failure(hook: HookKind, stage: HookFailureStage) {
+    METRICS.record_hook_failure(hook, stage);
 }
 
 pub fn record_provider(
@@ -97,5 +101,7 @@ pub fn append_prometheus(body: &mut String) {
     prometheus::append(body, &METRICS);
 }
 
+#[cfg(test)]
+mod hook_tests;
 #[cfg(test)]
 mod tests;

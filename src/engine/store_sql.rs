@@ -18,6 +18,7 @@ use crate::engine::run_history::ListRunsFilter;
 /// Which SQL engine the clause is being built for. Governs placeholder syntax
 /// and dialect-specific operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub enum Dialect {
     Sqlite,
     Postgres,

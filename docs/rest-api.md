@@ -1041,11 +1041,15 @@ themselves audited.
 ### Trust-proxy mode
 
 When running behind a reverse proxy (Nginx, Envoy, AWS ALB, etc.),
-set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the first hop
-of `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
-Without the env var set, an attacker hitting the server directly could
-forge their IP by sending an `X-Forwarded-For` header; the gate
-prevents that.
+set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the rightmost
+IP in `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
+IronCrew treats only that append position as trusted; client-supplied
+prefixes are ignored, and an invalid rightmost value falls back to the
+TCP peer. Enable this only behind a trusted proxy that appends the address
+it observed. In a multi-proxy topology, the recorded value is the
+immediately preceding hop unless the final proxy rewrites the header to a
+validated client address. Without the env var set, IronCrew always uses the
+direct TCP peer, so a direct client cannot forge its audit IP with this header.
 
 ## GET /metrics
 
@@ -1068,6 +1072,7 @@ families; every label value is from the closed vocabulary shown here:
 | `ironcrew_runs_total` (counter), `ironcrew_run_duration_seconds` (histogram) | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total` (counter), `ironcrew_task_duration_seconds` (histogram) | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total` (counter), `ironcrew_tool_call_duration_seconds` (histogram) | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` (counter) | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total` (counter), `ironcrew_provider_request_duration_seconds` (histogram) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
 | `ironcrew_sse_connections_total` (counter) | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
@@ -1089,7 +1094,10 @@ series. A reconciler can count multiple abandoned runs without fabricating
 durations, so `ironcrew_runs_total{outcome="abandoned"}` may exceed the matching
 histogram `_count`. Skipped tasks record a zero-second duration. Provider token
 counters advance only when a successful provider response reports usage; they
-are usage telemetry, not invoice or billing data.
+are usage telemetry, not invoice or billing data. Hook failures retain the
+original task description or output while incrementing the counter, so an
+operator can detect a hook that is failing without exposing its source, task
+name, returned value, or error as a metric label.
 
 These counters and histograms are in-memory, process-local, saturating, and
 reset on every process start. They are not persisted or cluster-global. Record
@@ -1178,7 +1186,7 @@ CORS is configured via the `IRONCREW_CORS_ORIGINS` environment variable:
 | Value | Behavior |
 |-------|----------|
 | Absent (default) | No origins allowed (API not accessible from browsers) |
-| `*` | Permissive — all origins allowed (development only) |
+| `*` | All origins allowed, with the same restricted methods and headers below (development only) |
 | Comma-separated URLs | Only listed origins allowed |
 
 ```bash
@@ -1205,6 +1213,28 @@ IRONCREW_MAX_BODY_SIZE=8388608  # 8 MiB
 ```
 
 Values must be positive and cannot exceed 64 MiB.
+
+## HTTP Transport Limits
+
+The listener bounds slow or stalled clients at three levels:
+
+- `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` defaults to 10 seconds (range 1–300) for
+  the initial protocol preface and every HTTP/1 request-header block. It also
+  controls the HTTP/2 keep-alive interval and response timeout.
+- `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` defaults to 600 seconds (range 1–7200)
+  from request dispatch through response creation, including request-body
+  reads and handler work. Expiry returns `408 Request Timeout` with
+  `Cache-Control: no-store`. Once a streaming response has been created, its
+  body—including an SSE stream—is not wrapped by this deadline. Keep this
+  value above the longest synchronous handler budget, including
+  `IRONCREW_MAX_CONVERSATION_TURN_SECS`.
+- `IRONCREW_MAX_HTTP_CONNECTIONS` defaults to 1024 (range 1–100000) per
+  process. The listener waits for capacity before accepting another
+  connection. SSE connections count toward both this general cap and
+  `IRONCREW_MAX_SSE_CONNECTIONS`.
+
+For multiple replicas, total connection capacity is the per-process cap times
+the replica count; use a trusted gateway when a cluster-wide limit is required.
 
 ## Error Responses
 
@@ -1278,7 +1308,7 @@ docker run -p 3000:3000 \
   ironcrew
 ```
 
-The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.98.0` with
+The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.98.1` with
 `cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
 certificates. Those tags and the runtime package repositories are not a
 bit-for-bit reproducibility guarantee. The image runs as numeric non-root UID
