@@ -16,12 +16,12 @@
 --
 -- Topic: a product launch go/no-go decision with three stakeholders.
 --
--- Requires: OPENAI_API_KEY (for gpt-5.4-mini)
+-- Requires: OPENAI_API_KEY (for gpt-5.6-luna)
 
 local crew = Crew.new({
     goal = "Moderator-driven product launch debate",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 
 -- The three stakeholders

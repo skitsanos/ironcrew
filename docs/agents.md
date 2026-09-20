@@ -204,7 +204,7 @@ resolution chain):
 crew:add_agent(Agent.new({
     name = "deep_thinker",
     goal = "Perform complex reasoning tasks",
-    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-5.6-luna
+    model = "gpt-5.6-terra",      -- uses gpt-5.6-terra even if crew default is gpt-5.6-luna
     temperature = 0.2,
 }))
 ```

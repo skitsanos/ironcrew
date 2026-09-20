@@ -12,7 +12,7 @@
 --   - Hiring: hire vs pass + synthesizer
 --
 -- Data is fetched live from Yahoo Finance's public chart endpoint (no API key).
--- Requires: OPENAI_API_KEY (for gpt-5.4-mini)
+-- Requires: OPENAI_API_KEY (for gpt-5.6-luna)
 
 local TICKER = "NVDA"
 local RANGE = "1y"
@@ -191,7 +191,7 @@ print("")
 local crew = Crew.new({
     goal = "Bull vs Bear debate on " .. TICKER .. " with moderator synthesis",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

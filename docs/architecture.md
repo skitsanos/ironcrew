@@ -265,7 +265,7 @@ When executing a task, the model is resolved through a priority chain:
 local crew = Crew.new({
     model = "gpt-5.6-luna",        -- default fallback
     models = {
-        task_execution = "gpt-4o",
+        task_execution = "gpt-5.6-terra",
         collaboration = "gpt-5.6-luna",
     },
 })
