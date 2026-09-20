@@ -4,12 +4,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
-use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tokio::sync::Semaphore;
 
 use crate::utils::error::{IronCrewError, Result};
+
+mod codecs;
+
+use codecs::{
+    accounting_row_value, bounded_conversation_execution, bounded_metadata,
+    bounded_optional_metadata, conversation_summary, decode_idempotency_accounting,
+    decode_stored_json, idempotency_record, nonnegative_u64, parse_run_event_gap_reason,
+    parse_timestamp, run_event_gap_reason_db, run_record, run_summary, stored_bytes,
+};
 
 /// Upper bound on the per-retry backoff delay during store init.
 const CONNECT_BACKOFF_CAP_MS: u64 = 30_000;
@@ -57,158 +64,6 @@ fn validate_table_prefix(table_prefix: &str) -> Result<()> {
     Ok(())
 }
 
-fn decode_stored_json<T: DeserializeOwned>(raw: &str, field: &str) -> Result<T> {
-    serde_json::from_str(raw).map_err(|error| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL stored JSON in '{field}' has an invalid shape: {error}"
-        ))
-    })
-}
-
-fn postgres_stored_bytes(row: &PgRow, column: &str, label: &str) -> Result<u64> {
-    let value = row.try_get::<i64, _>(column).map_err(|error| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL stored conversation {label} byte-count decode failed: {error}"
-        ))
-    })?;
-    u64::try_from(value).map_err(|_| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL stored conversation {label} has an invalid byte count"
-        ))
-    })
-}
-
-fn postgres_bounded_metadata(
-    row: &PgRow,
-    value_column: &str,
-    bytes_column: &str,
-    label: &str,
-) -> Result<String> {
-    let bytes = postgres_stored_bytes(row, bytes_column, label)?;
-    super::conversation_record::validate_stored_conversation_metadata_bytes(label, bytes)?;
-    row.try_get::<Option<String>, _>(value_column)
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation {label} decode failed: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation {label} could not be materialized safely"
-            ))
-        })
-}
-
-fn postgres_bounded_optional_metadata(
-    row: &PgRow,
-    value_column: &str,
-    bytes_column: &str,
-    label: &str,
-) -> Result<Option<String>> {
-    let bytes = row
-        .try_get::<Option<i64>, _>(bytes_column)
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation {label} byte-count decode failed: {error}"
-            ))
-        })?;
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    let bytes = u64::try_from(bytes).map_err(|_| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL stored conversation {label} has an invalid byte count"
-        ))
-    })?;
-    super::conversation_record::validate_stored_conversation_metadata_bytes(label, bytes)?;
-    row.try_get::<Option<String>, _>(value_column)
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation {label} decode failed: {error}"
-            ))
-        })?
-        .map(Some)
-        .ok_or_else(|| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation {label} could not be materialized safely"
-            ))
-        })
-}
-
-fn postgres_bounded_conversation_execution(
-    row: &PgRow,
-) -> Result<super::sessions::ConversationExecution> {
-    let bytes = postgres_stored_bytes(row, "execution_bytes", "execution")?;
-    super::conversation_record::validate_stored_conversation_execution_bytes(bytes)?;
-    let execution = row
-        .try_get::<Option<String>, _>("execution")
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation execution identity decode failed: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            IronCrewError::Validation(
-                "PostgreSQL stored conversation execution identity could not be materialized safely"
-                    .into(),
-            )
-        })?;
-    super::conversation_json::preflight_conversation_execution_json(&execution)?;
-    decode_stored_json(&execution, "conversations.execution")
-}
-
-fn postgres_conversation_summary(row: &PgRow) -> Result<ConversationSummary> {
-    let messages_bytes = postgres_stored_bytes(row, "messages_bytes", "messages")?;
-    let message_count = row
-        .try_get::<Option<i64>, _>("message_count")
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL stored conversation message-count decode failed: {error}"
-            ))
-        })?
-        .map(|count| {
-            u64::try_from(count).map_err(|_| {
-                IronCrewError::Validation(
-                    "PostgreSQL stored conversation has an invalid message count".into(),
-                )
-            })
-        })
-        .transpose()?;
-    validate_stored_conversation_messages_envelope(messages_bytes, message_count)?;
-    let id = postgres_bounded_metadata(row, "id", "id_bytes", "id")?;
-    validate_session_id(&id)?;
-    let turn_count = row.try_get::<i64, _>("turn_count").map_err(|error| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL stored conversation turn-count decode failed: {error}"
-        ))
-    })?;
-    Ok(ConversationSummary {
-        id,
-        flow_path: postgres_bounded_optional_metadata(
-            row,
-            "flow_path",
-            "flow_path_bytes",
-            "flow path",
-        )?,
-        agent_name: postgres_bounded_metadata(row, "agent_name", "agent_name_bytes", "agent name")?,
-        created_at: postgres_bounded_metadata(
-            row,
-            "created_at",
-            "created_at_bytes",
-            "created timestamp",
-        )?,
-        updated_at: postgres_bounded_metadata(
-            row,
-            "bounded_updated_at",
-            "updated_at_bytes",
-            "updated timestamp",
-        )?,
-        turn_count: usize::try_from(turn_count).map_err(|_| {
-            IronCrewError::Validation("PostgreSQL conversation turn count is out of range".into())
-        })?,
-    })
-}
-
 fn parse_env<T>(name: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
@@ -224,18 +79,6 @@ where
     }
 }
 
-fn parse_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-        .map_err(|error| {
-            IronCrewError::Validation(format!("{label} is not valid RFC3339: {error}"))
-        })
-}
-
-fn canonical_timestamp(label: &str, value: &str) -> Result<String> {
-    Ok(parse_timestamp(label, value)?.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-}
-
 use super::conversation_json::{
     preflight_conversation_execution_json, preflight_conversation_messages_json,
 };
@@ -244,7 +87,7 @@ use super::conversation_record::{
     HARD_STORED_CONVERSATION_MESSAGES_BYTES, HARD_STORED_CONVERSATION_METADATA_BYTES,
     serialize_conversation_execution, serialize_conversation_messages,
     validate_conversation_record_after_decode, validate_conversation_record_for_write,
-    validate_stored_conversation_envelope, validate_stored_conversation_messages_envelope,
+    validate_stored_conversation_envelope,
 };
 use super::human_input::{
     DurableHumanInputQuestion, DurableHumanInputRegistration, HumanInputAad,
@@ -425,35 +268,6 @@ impl RunEventPruneSummary {
     fn for_run(&self, run_id: &str) -> RunEventRunEviction {
         self.by_run.get(run_id).cloned().unwrap_or_default()
     }
-}
-
-fn run_event_gap_reason_db(reason: RunEventGapReason) -> &'static str {
-    match reason {
-        RunEventGapReason::WriterBackpressure => "writer_backpressure",
-        RunEventGapReason::Retention => "retention",
-        RunEventGapReason::GlobalCapacity => "global_capacity",
-        RunEventGapReason::OwnerLost => "owner_lost",
-    }
-}
-
-fn parse_run_event_gap_reason(value: &str) -> Result<RunEventGapReason> {
-    match value {
-        "writer_backpressure" => Ok(RunEventGapReason::WriterBackpressure),
-        "retention" => Ok(RunEventGapReason::Retention),
-        "global_capacity" => Ok(RunEventGapReason::GlobalCapacity),
-        "owner_lost" => Ok(RunEventGapReason::OwnerLost),
-        _ => Err(IronCrewError::Validation(format!(
-            "PostgreSQL run-event state contains invalid eviction reason '{value}'"
-        ))),
-    }
-}
-
-fn nonnegative_u64(label: &str, value: i64) -> Result<u64> {
-    u64::try_from(value).map_err(|_| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL run-event {label} is negative or out of range"
-        ))
-    })
 }
 
 impl PostgresStore {
@@ -1722,7 +1536,7 @@ impl PostgresStore {
             .map_err(|error| {
                 IronCrewError::Validation(format!("PostgreSQL idempotency lookup failed: {error}"))
             })?;
-        row.as_ref().map(row_to_idempotency_record).transpose()
+        row.as_ref().map(idempotency_record).transpose()
     }
 
     async fn idempotency_principal_for_key(&self, key_hash: &str) -> Result<Option<PrincipalId>> {
@@ -5027,7 +4841,7 @@ impl StateStore for PostgresStore {
             .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?
             .ok_or_else(|| IronCrewError::Validation(format!("Run '{}' not found", run_id)))?;
 
-        row_to_record(&row)
+        run_record(&row)
     }
 
     async fn list_runs_summary(
@@ -5066,7 +4880,7 @@ impl StateStore for PostgresStore {
             .await
             .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?;
 
-        rows.iter().map(row_to_summary).collect()
+        rows.iter().map(run_summary).collect()
     }
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
@@ -5355,7 +5169,7 @@ impl StateStore for PostgresStore {
                                 "PostgreSQL conversation revision is negative".into(),
                             )
                         })?;
-                    let execution = postgres_bounded_conversation_execution(&row)?;
+                    let execution = bounded_conversation_execution(&row)?;
                     let expected_scope = super::sessions::conversation_mutation_scope(
                         &claim.scope,
                         &claim.resource_id,
@@ -5398,7 +5212,7 @@ impl StateStore for PostgresStore {
                     ))
                 })?
             {
-                let record = row_to_idempotency_record(&row)?;
+                let record = idempotency_record(&row)?;
                 let lease =
                     parse_timestamp("stored idempotency lease expiry", &record.lease_expires_at)?;
                 if lease > database_timestamp {
@@ -7423,7 +7237,7 @@ impl StateStore for PostgresStore {
                         "PostgreSQL conversation revision decode failed: {error}"
                     ))
                 })?;
-                let stored_execution = postgres_bounded_conversation_execution(&row)?;
+                let stored_execution = bounded_conversation_execution(&row)?;
                 Ok::<_, IronCrewError>((revision, stored_execution))
             })
             .transpose()?;
@@ -7866,7 +7680,7 @@ impl StateStore for PostgresStore {
                         "PostgreSQL conversation revision decode failed: {error}"
                     ))
                 })?;
-                let execution = postgres_bounded_conversation_execution(&row)?;
+                let execution = bounded_conversation_execution(&row)?;
                 Ok::<_, IronCrewError>((revision, execution))
             })
             .transpose()?;
@@ -7992,8 +7806,8 @@ impl StateStore for PostgresStore {
         let Some(row) = row_opt else {
             return Ok(None);
         };
-        let execution_bytes = postgres_stored_bytes(&row, "execution_bytes", "execution")?;
-        let messages_bytes = postgres_stored_bytes(&row, "messages_bytes", "messages")?;
+        let execution_bytes = stored_bytes(&row, "execution_bytes", "execution")?;
+        let messages_bytes = stored_bytes(&row, "messages_bytes", "messages")?;
         let message_count = row
             .try_get::<Option<i64>, _>("message_count")
             .map_err(|error| {
@@ -8042,33 +7856,23 @@ impl StateStore for PostgresStore {
             id: row
                 .try_get("id")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            flow_name: postgres_bounded_metadata(
-                &row,
-                "flow_name",
-                "flow_name_bytes",
-                "flow name",
-            )?,
-            flow_path: postgres_bounded_optional_metadata(
+            flow_name: bounded_metadata(&row, "flow_name", "flow_name_bytes", "flow name")?,
+            flow_path: bounded_optional_metadata(
                 &row,
                 "flow_path",
                 "flow_path_bytes",
                 "flow path",
             )?,
-            agent_name: postgres_bounded_metadata(
-                &row,
-                "agent_name",
-                "agent_name_bytes",
-                "agent name",
-            )?,
+            agent_name: bounded_metadata(&row, "agent_name", "agent_name_bytes", "agent name")?,
             execution: decode_stored_json(&execution_json, "conversations.execution")?,
             messages: decode_stored_json(&messages_json, "conversations.messages")?,
-            created_at: postgres_bounded_metadata(
+            created_at: bounded_metadata(
                 &row,
                 "created_at",
                 "created_at_bytes",
                 "created timestamp",
             )?,
-            updated_at: postgres_bounded_metadata(
+            updated_at: bounded_metadata(
                 &row,
                 "updated_at",
                 "updated_at_bytes",
@@ -8196,7 +8000,7 @@ impl StateStore for PostgresStore {
             })?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in &rows {
-            summaries.push(postgres_conversation_summary(row).map_err(|_| {
+            summaries.push(conversation_summary(row).map_err(|_| {
                 IronCrewError::Validation(
                     "PostgreSQL stored conversation summary is corrupt or exceeds hard limits"
                         .into(),
@@ -8536,260 +8340,6 @@ impl StateStore for PostgresStore {
             .map_err(|e| IronCrewError::Validation(format!("PG count audit: {}", e)))?;
         Ok(count as u64)
     }
-}
-
-fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord> {
-    let status_str: String = row
-        .try_get("status")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let task_results_str: String = row
-        .try_get("task_results")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let tags_str: String = row
-        .try_get("tags")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let duration_ms: i64 = row
-        .try_get("duration_ms")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let agent_count: i32 = row
-        .try_get("agent_count")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let task_count: i32 = row
-        .try_get("task_count")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let total_tokens: i32 = row
-        .try_get("total_tokens")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let cached_tokens: i32 = row
-        .try_get("cached_tokens")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-
-    Ok(RunRecord {
-        run_id: row
-            .try_get("run_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        flow_name: row
-            .try_get("flow_name")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        flow: row
-            .try_get("flow")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        status: status_str.parse::<RunStatus>()?,
-        started_at: row
-            .try_get("started_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        finished_at: row
-            .try_get("finished_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        duration_ms: duration_ms as u64,
-        task_results: decode_stored_json(&task_results_str, "runs.task_results")?,
-        agent_count: agent_count as usize,
-        task_count: task_count as usize,
-        total_tokens: total_tokens as u32,
-        cached_tokens: cached_tokens as u32,
-        tags: decode_stored_json(&tags_str, "runs.tags")?,
-        owner_instance_id: row
-            .try_get("owner_instance_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        lease_expires_at: row
-            .try_get("lease_expires_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-    })
-}
-
-/// Convert a row from the summary query into a RunSummary (no task_results).
-fn row_to_summary(row: &sqlx::postgres::PgRow) -> Result<RunSummary> {
-    let status_str: String = row
-        .try_get("status")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let tags_str: String = row
-        .try_get("tags")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let duration_ms: i64 = row
-        .try_get("duration_ms")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let agent_count: i32 = row
-        .try_get("agent_count")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let task_count: i32 = row
-        .try_get("task_count")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let total_tokens: i32 = row
-        .try_get("total_tokens")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-    let cached_tokens: i32 = row
-        .try_get("cached_tokens")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-
-    Ok(RunSummary {
-        run_id: row
-            .try_get("run_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        flow_name: row
-            .try_get("flow_name")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        flow: row
-            .try_get("flow")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        status: status_str.parse::<RunStatus>()?,
-        started_at: row
-            .try_get("started_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        finished_at: row
-            .try_get("finished_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?,
-        duration_ms: duration_ms as u64,
-        agent_count: agent_count as usize,
-        task_count: task_count as usize,
-        total_tokens: total_tokens as u32,
-        cached_tokens: cached_tokens as u32,
-        tags: decode_stored_json(&tags_str, "runs.tags")?,
-    })
-}
-
-fn nonnegative_accounting_value(label: &str, value: i64) -> Result<usize> {
-    usize::try_from(value).map_err(|_| {
-        IronCrewError::Validation(format!(
-            "PostgreSQL idempotency accounting value '{label}' is negative or out of range"
-        ))
-    })
-}
-
-fn decode_idempotency_accounting(values: (i64, i64, i64)) -> Result<IdempotencyAccounting> {
-    Ok(IdempotencyAccounting {
-        records: nonnegative_accounting_value("record_count", values.0)?,
-        in_flight: nonnegative_accounting_value("in_flight_count", values.1)?,
-        response_bytes: nonnegative_accounting_value("response_bytes", values.2)?,
-    })
-}
-
-fn accounting_row_value(row: &sqlx::postgres::PgRow, column: &str) -> Result<usize> {
-    let value = row
-        .try_get::<i64, _>(column)
-        .map_err(|error| IronCrewError::Validation(format!("Column error: {error}")))?;
-    nonnegative_accounting_value(column, value)
-}
-
-fn row_to_idempotency_record(row: &sqlx::postgres::PgRow) -> Result<IdempotencyRecord> {
-    let response_body_bytes = row
-        .try_get::<i64, _>("response_body_bytes")
-        .map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL idempotency response byte-count decode failed: {error}"
-            ))
-        })?;
-    let response_body_bytes = usize::try_from(response_body_bytes).map_err(|_| {
-        IronCrewError::Validation(
-            "PostgreSQL idempotency response byte count is out of range".into(),
-        )
-    })?;
-    if response_body_bytes > super::idempotency::HARD_IDEMPOTENCY_RESPONSE_BYTES {
-        return Err(IronCrewError::Validation(
-            "Stored idempotency response body exceeds the hard byte limit".into(),
-        ));
-    }
-    let base_revision = row
-        .try_get::<Option<i64>, _>("base_revision")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|_| {
-            IronCrewError::Validation("PostgreSQL idempotency base_revision is negative".into())
-        })?;
-    let response_status = row
-        .try_get::<Option<i32>, _>("response_status")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|_| {
-            IronCrewError::Validation(
-                "PostgreSQL idempotency response_status is out of range".into(),
-            )
-        })?;
-    let ttl_seconds = u64::try_from(
-        row.try_get::<i64, _>("ttl_seconds")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-    )
-    .map_err(|_| {
-        IronCrewError::Validation("PostgreSQL idempotency ttl_seconds is negative".into())
-    })?;
-    let state = row
-        .try_get::<String, _>("state")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
-        .parse::<IdempotencyState>()?;
-    let lease_expires_at: String = row
-        .try_get("lease_expires_at")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?;
-    let lease_expires_at = if lease_expires_at.is_empty() {
-        lease_expires_at
-    } else {
-        canonical_timestamp("stored idempotency lease expiry", &lease_expires_at)?
-    };
-    let created_at = canonical_timestamp(
-        "stored idempotency creation time",
-        &row.try_get::<String, _>("created_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-    )?;
-    let updated_at = canonical_timestamp(
-        "stored idempotency update time",
-        &row.try_get::<String, _>("updated_at")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-    )?;
-    let completed_at = row
-        .try_get::<Option<String>, _>("completed_at")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
-        .map(|value| canonical_timestamp("stored idempotency completion time", &value))
-        .transpose()?;
-    let expires_at = row
-        .try_get::<Option<String>, _>("expires_at")
-        .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?
-        .map(|value| canonical_timestamp("stored idempotency retention expiry", &value))
-        .transpose()?;
-
-    let record = IdempotencyRecord {
-        key_hash: row
-            .try_get("key_hash")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        principal_id: PrincipalId::from_digest(
-            row.try_get("principal_id")
-                .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        )?,
-        request_fingerprint: row
-            .try_get("request_fingerprint")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        operation: row
-            .try_get("operation")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        scope: row
-            .try_get("scope")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        resource_id: row
-            .try_get("resource_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        exclusive_scope: row
-            .try_get("exclusive_scope")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        attempt_id: row
-            .try_get("attempt_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        owner_instance_id: row
-            .try_get("owner_instance_id")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        base_revision,
-        state,
-        response_status,
-        response_body: row
-            .try_get("response_body")
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {e}")))?,
-        lease_expires_at,
-        created_at,
-        updated_at,
-        completed_at,
-        expires_at,
-        ttl_seconds,
-    };
-    record.validate()?;
-    Ok(record)
 }
 
 #[cfg(test)]

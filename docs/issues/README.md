@@ -52,5 +52,5 @@ priority, area, and title. The registry is generated with
 | [IC-037](./IC-037.md) | P3 | Resolved | Provider maintainability | Provider scaffolding is triplicated and RateLimiter::new can panic |
 | [IC-038](./IC-038.md) | P3 | Resolved | Documentation accuracy | Documentation and example drift across nodes, endpoints, and model pins |
 | [IC-039](./IC-039.md) | P3 | Resolved | Build hygiene | Build context, dev-dependency comment, and client material housekeeping |
-| [IC-040](./IC-040.md) | P2 | Open | Maintainability | postgres_store.rs needs domain decomposition |
+| [IC-040](./IC-040.md) | P2 | In progress | Maintainability | postgres_store.rs needs domain decomposition |
 | [IC-041](./IC-041.md) | P2 | Resolved | Build hygiene | No-default-features build regressed after provider HTTP extraction |
