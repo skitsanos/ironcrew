@@ -10,12 +10,13 @@ use tokio::sync::Semaphore;
 use crate::utils::error::{IronCrewError, Result};
 
 mod codecs;
+mod run_history;
 
 use codecs::{
     accounting_row_value, bounded_conversation_execution, bounded_metadata,
     bounded_optional_metadata, conversation_summary, decode_idempotency_accounting,
     decode_stored_json, idempotency_record, nonnegative_u64, parse_run_event_gap_reason,
-    parse_timestamp, run_event_gap_reason_db, run_record, run_summary, stored_bytes,
+    parse_timestamp, run_event_gap_reason_db, stored_bytes,
 };
 
 /// Upper bound on the per-retry backoff delay during store init.
@@ -3525,166 +3526,7 @@ impl PostgresStore {
 #[async_trait]
 impl StateStore for PostgresStore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
-        let run_id = intent
-            .suggested_id
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let tags_json = serde_json::to_string(&intent.tags)
-            .map_err(|e| IronCrewError::Validation(format!("Tags serialize: {}", e)))?;
-        let empty_tasks = serde_json::to_string(&serde_json::Value::Array(Vec::new()))
-            .map_err(|e| IronCrewError::Validation(format!("Empty tasks serialize: {}", e)))?;
-        let sql = format!(
-            "INSERT INTO {} (run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results, agent_count, task_count, total_tokens, cached_tokens, tags, owner_instance_id, lease_expires_at)
-             VALUES ($1, $2, $3, 'running', $4, '', 0, $5::jsonb, $6, $7, 0, 0, $8::jsonb, $9, $10)
-             ON CONFLICT (run_id) DO NOTHING",
-            self.table_name
-        );
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            IronCrewError::Validation(format!("PG insert intent transaction: {error}"))
-        })?;
-        self.lock_run_fence(&mut tx, true).await?;
-        self.lock_resource(&mut tx, RUN_OPERATION, "", &run_id)
-            .await?;
-        let (database_now, lease_expires_at) = self
-            .database_clock_with_deadline(&mut tx, self.lease.ttl().as_secs(), "run intent lease")
-            .await?;
-        let inserted = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(&run_id)
-            .bind(&intent.flow_name)
-            .bind(&intent.flow)
-            .bind(&intent.started_at)
-            .bind(&empty_tasks)
-            .bind(intent.agent_count as i64)
-            .bind(intent.task_count as i64)
-            .bind(&tags_json)
-            .bind(self.lease.instance_id())
-            .bind(&lease_expires_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PG insert intent: {}", e)))?;
-        let inserted_new = inserted.rows_affected() == 1;
-        if !inserted_new {
-            let hydrate_sql = format!(
-                "UPDATE {runs} AS run SET \
-                     flow_name = $1, agent_count = $2, task_count = $3, \
-                     tags = $4::jsonb, lease_expires_at = $5 \
-                 WHERE run.run_id = $6 AND run.flow = $7 \
-                   AND run.owner_instance_id = $8 \
-                   AND run.status IN ('running', 'waiting_for_input') \
-                   AND EXISTS (\
-                       SELECT 1 FROM {idempotency} AS idem \
-                       WHERE idem.operation = $9 AND idem.scope = $7 \
-                         AND idem.resource_id = $6 \
-                         AND idem.owner_instance_id = $8 \
-                         AND idem.state IN ('running', 'completed') \
-                         AND idem.owner_draining_at IS NULL\
-                   )",
-                runs = self.table_name,
-                idempotency = self.idempotency_table
-            );
-            let hydrated = sqlx::query(sqlx::AssertSqlSafe(hydrate_sql))
-                .bind(&intent.flow_name)
-                .bind(intent.agent_count as i64)
-                .bind(intent.task_count as i64)
-                .bind(&tags_json)
-                .bind(&lease_expires_at)
-                .bind(&run_id)
-                .bind(&intent.flow)
-                .bind(self.lease.instance_id())
-                .bind(RUN_OPERATION)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    IronCrewError::Validation(format!(
-                        "PG idempotent provisional run hydration: {error}"
-                    ))
-                })?;
-            if hydrated.rows_affected() != 1 {
-                let drain_sql = format!(
-                    "SELECT owner_draining_at FROM {} \
-                     WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
-                       AND owner_instance_id = $4",
-                    self.idempotency_table
-                );
-                let draining: Option<Option<String>> =
-                    sqlx::query_scalar(sqlx::AssertSqlSafe(drain_sql))
-                        .bind(RUN_OPERATION)
-                        .bind(&intent.flow)
-                        .bind(&run_id)
-                        .bind(self.lease.instance_id())
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|error| {
-                            IronCrewError::Validation(format!(
-                                "PG provisional run owner-drain verification: {error}"
-                            ))
-                        })?;
-                if draining.flatten().is_some() {
-                    return Err(IronCrewError::OwnerDraining {
-                        owner_instance_id: self.lease.instance_id().to_string(),
-                    });
-                }
-                return Err(IronCrewError::Conflict(format!(
-                    "Run '{run_id}' already exists without a matching idempotent provisional intent"
-                )));
-            }
-        }
-        let mapping_sql = format!(
-            "UPDATE {} SET state = 'running', lease_expires_at = $1, updated_at = $2 \
-             WHERE operation = $3 AND scope = $4 AND resource_id = $5 \
-               AND owner_instance_id = $6 AND state = 'claimed' \
-               AND cancel_requested_at IS NULL \
-               AND owner_draining_at IS NULL \
-               AND lease_expires_at::timestamptz > $2::timestamptz",
-            self.idempotency_table
-        );
-        let mapped = sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
-            .bind(&lease_expires_at)
-            .bind(&database_now)
-            .bind(RUN_OPERATION)
-            .bind(&intent.flow)
-            .bind(&run_id)
-            .bind(self.lease.instance_id())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!("PG run idempotency mapping transition: {error}"))
-            })?;
-        if mapped.rows_affected() == 0 {
-            let linked_sql = format!(
-                "SELECT owner_draining_at FROM {} \
-                 WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
-                   AND owner_instance_id = $4",
-                self.idempotency_table
-            );
-            let linked: Option<Option<String>> =
-                sqlx::query_scalar(sqlx::AssertSqlSafe(linked_sql))
-                    .bind(RUN_OPERATION)
-                    .bind(&intent.flow)
-                    .bind(&run_id)
-                    .bind(self.lease.instance_id())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|error| {
-                        IronCrewError::Validation(format!(
-                            "PG run idempotency mapping verification: {error}"
-                        ))
-                    })?;
-            if linked.as_ref().is_some_and(Option::is_some) {
-                return Err(IronCrewError::OwnerDraining {
-                    owner_instance_id: self.lease.instance_id().to_string(),
-                });
-            }
-            if inserted_new && linked.is_some() {
-                return Err(IronCrewError::Conflict(format!(
-                    "Run '{run_id}' cannot start because its idempotency claim expired or was cancelled"
-                )));
-            }
-        }
-        tx.commit().await.map_err(|error| {
-            IronCrewError::Validation(format!("PG insert intent commit: {error}"))
-        })?;
-        tracing::debug!("Run intent saved: {}", run_id);
-        Ok(run_id)
+        self.insert_run_intent(intent).await
     }
 
     async fn update_run_completion(
@@ -3692,108 +3534,7 @@ impl StateStore for PostgresStore {
         run_id: &str,
         completion: RunCompletion,
     ) -> Result<RunTransition> {
-        completion.validate()?;
-        let task_results_json = serde_json::to_string(&completion.task_results)
-            .map_err(|e| IronCrewError::Validation(format!("task_results serialize: {}", e)))?;
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            IronCrewError::Validation(format!("PG update completion transaction: {error}"))
-        })?;
-        self.lock_idempotency_quota(&mut tx).await?;
-        self.lock_run_fence(&mut tx, true).await?;
-        self.lock_resource(&mut tx, RUN_OPERATION, "", run_id)
-            .await?;
-        let (database_now, _) = self
-            .database_clock_with_deadline(&mut tx, 0, "run completion")
-            .await?;
-        let sql = format!(
-            "UPDATE {}
-             SET status = $1, finished_at = $2, duration_ms = $3,
-                 task_results = $4::jsonb, total_tokens = $5, cached_tokens = $6,
-                 lease_expires_at = ''
-             WHERE run_id = $7 AND status IN ('running', 'waiting_for_input')
-               AND owner_instance_id = $8",
-            self.table_name
-        );
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(completion.status.to_string())
-            .bind(&completion.finished_at)
-            .bind(completion.duration_ms as i64)
-            .bind(&task_results_json)
-            .bind(completion.total_tokens as i32)
-            .bind(completion.cached_tokens as i32)
-            .bind(run_id)
-            .bind(self.lease.instance_id())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PG update completion: {}", e)))?;
-
-        let transition = if result.rows_affected() == 0 {
-            let sql = format!(
-                "SELECT status, owner_instance_id, finished_at FROM {} WHERE run_id = $1 FOR UPDATE",
-                self.table_name
-            );
-            let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-                .bind(run_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| {
-                    IronCrewError::Validation(format!("PG completion state query: {}", e))
-                })?;
-            let Some(row) = row else {
-                return Err(IronCrewError::Validation(format!(
-                    "Run '{}' not found",
-                    run_id
-                )));
-            };
-            let status: String = row
-                .try_get("status")
-                .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-            let parsed = status.parse::<RunStatus>()?;
-            if parsed.is_terminal() {
-                RunTransition::AlreadyTerminal(parsed)
-            } else {
-                let owner: String = row
-                    .try_get("owner_instance_id")
-                    .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-                return Err(IronCrewError::Validation(format!(
-                    "Run '{}' is owned by instance '{}', not '{}'",
-                    run_id,
-                    owner,
-                    self.lease.instance_id()
-                )));
-            }
-        } else {
-            RunTransition::Applied
-        };
-
-        let mapping_sql = format!(
-            "UPDATE {} SET state = 'completed', lease_expires_at = '', \
-             updated_at = $1, completed_at = $1, \
-             expires_at = to_char(\
-                 ($1::timestamptz + ttl_seconds * interval '1 second') AT TIME ZONE 'UTC', \
-                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
-             ) \
-             WHERE operation = $2 AND resource_id = $3 \
-               AND state IN ('claimed', 'running', 'indeterminate')",
-            self.idempotency_table
-        );
-        sqlx::query(sqlx::AssertSqlSafe(mapping_sql))
-            .bind(&database_now)
-            .bind(RUN_OPERATION)
-            .bind(run_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PG run idempotency completion transition: {error}"
-                ))
-            })?;
-        self.delete_human_inputs_for_run(&mut tx, run_id).await?;
-        tx.commit().await.map_err(|error| {
-            IronCrewError::Validation(format!("PG update completion commit: {error}"))
-        })?;
-        tracing::info!("Run completion saved: {} ({})", run_id, completion.status);
-        Ok(transition)
+        self.finish_run(run_id, completion).await
     }
 
     async fn update_run_status(
@@ -3801,32 +3542,7 @@ impl StateStore for PostgresStore {
         run_id: &str,
         status: crate::engine::run_history::RunStatus,
     ) -> Result<()> {
-        if !status.is_in_flight() {
-            return Err(IronCrewError::Validation(format!(
-                "update_run_status requires an in-flight status, got '{}'",
-                status
-            )));
-        }
-        let sql = format!(
-            "UPDATE {} SET status = $1
-             WHERE run_id = $2 AND status IN ('running', 'waiting_for_input')
-               AND owner_instance_id = $3",
-            self.table_name
-        );
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(status.to_string())
-            .bind(run_id)
-            .bind(self.lease.instance_id())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PG update status: {}", e)))?;
-        if result.rows_affected() == 0 {
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' not found or not in an in-flight state",
-                run_id
-            )));
-        }
-        Ok(())
+        self.set_run_status(run_id, status).await
     }
 
     fn instance_id(&self) -> &str {
@@ -4828,20 +4544,7 @@ impl StateStore for PostgresStore {
     }
 
     async fn get_run(&self, run_id: &str) -> Result<RunRecord> {
-        let sql = format!(
-            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, task_results::text, agent_count, task_count, total_tokens, cached_tokens, tags::text, owner_instance_id, lease_expires_at
-             FROM {} WHERE run_id = $1",
-            self.table_name
-        );
-
-        let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(run_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?
-            .ok_or_else(|| IronCrewError::Validation(format!("Run '{}' not found", run_id)))?;
-
-        run_record(&row)
+        self.load_run(run_id).await
     }
 
     async fn list_runs_summary(
@@ -4850,84 +4553,15 @@ impl StateStore for PostgresStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunSummary>> {
-        // Shared WHERE builder keeps the tag containment identical to the
-        // SQLite backend. We NEVER select task_results — that's the whole
-        // point of the summary view. LIMIT/OFFSET stay inline (trusted
-        // integers) so the builder's `$N` numbering is left undisturbed.
-        let WhereClause {
-            sql: where_sql,
-            params,
-        } = store_sql::runs_where(filter, Dialect::Postgres);
-        let mut sql = format!(
-            "SELECT run_id, flow_name, flow, status, started_at, finished_at, duration_ms, \
-             agent_count, task_count, total_tokens, cached_tokens, tags::text \
-             FROM {}{}",
-            self.table_name, where_sql
-        );
-        sql.push_str(" ORDER BY started_at DESC");
-        if limit > 0 {
-            sql.push_str(&format!(" LIMIT {}", limit as i64));
-            if offset > 0 {
-                sql.push_str(&format!(" OFFSET {}", offset as i64));
-            }
-        }
-
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
-        let query = bind_params(query, &params);
-
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL query error: {}", e)))?;
-
-        rows.iter().map(run_summary).collect()
+        self.load_run_summaries(filter, limit, offset).await
     }
 
     async fn count_runs(&self, filter: &ListRunsFilter) -> Result<u64> {
-        let WhereClause {
-            sql: where_sql,
-            params,
-        } = store_sql::runs_where(filter, Dialect::Postgres);
-        let sql = format!("SELECT COUNT(*) FROM {}{}", self.table_name, where_sql);
-
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()));
-        let query = bind_params(query, &params);
-
-        let row = query
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL count error: {}", e)))?;
-        let count: i64 = row
-            .try_get(0)
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-        Ok(count as u64)
+        self.load_run_count(filter).await
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<()> {
-        let sql = format!("DELETE FROM {} WHERE run_id = $1", self.table_name);
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            IronCrewError::Validation(format!("PostgreSQL delete transaction: {error}"))
-        })?;
-        // Cascading event deletion fires the global accounting trigger. Take
-        // the same lock order as append/read to prevent a run-row/usage-row
-        // deadlock and keep exact counters observable throughout the delete.
-        self.lock_run_event_usage(&mut tx).await?;
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(run_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IronCrewError::Validation(format!("PostgreSQL delete error: {}", e)))?;
-
-        if result.rows_affected() == 0 {
-            return Err(IronCrewError::Validation(format!(
-                "Run '{}' not found",
-                run_id
-            )));
-        }
-        tx.commit().await.map_err(|error| {
-            IronCrewError::Validation(format!("PostgreSQL delete commit: {error}"))
-        })?;
-        Ok(())
+        self.remove_run(run_id).await
     }
 
     async fn lookup_idempotency_for_principal(
