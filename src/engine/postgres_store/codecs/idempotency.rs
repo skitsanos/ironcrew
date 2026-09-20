@@ -5,7 +5,7 @@ use crate::engine::idempotency::{
 };
 use crate::utils::error::{IronCrewError, Result};
 
-use super::super::IdempotencyAccounting;
+use super::super::idempotency::IdempotencyAccounting;
 use super::canonical_timestamp;
 
 pub(in crate::engine::postgres_store) fn decode_idempotency_accounting(
