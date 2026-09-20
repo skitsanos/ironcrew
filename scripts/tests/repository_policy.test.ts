@@ -5,6 +5,16 @@ import { join } from "node:path";
 import { validatePlainMappingKeys } from "../validate_skills";
 
 const repository = join(import.meta.dir, "../..");
+
+function isolatedGitEnvironment(excluded: string[] = []) {
+  const excludedKeys = new Set(excluded);
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !key.startsWith("GIT_") && !excludedKeys.has(key),
+    ),
+  );
+}
+
 const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
@@ -174,11 +184,7 @@ describe("repository integration policy", () => {
     const fixture = await mkdtemp(join(tmpdir(), "ironcrew-worktree-policy-"));
     const checker = join(repository, "scripts/check_worktree.ts");
     const emptyGitConfig = join(fixture, "empty.gitconfig");
-    const gitEnvironment = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key]) => !key.startsWith("GIT_CONFIG_") && key !== "IRONCREW_POLICY_BASE_SHA",
-      ),
-    );
+    const gitEnvironment = isolatedGitEnvironment(["IRONCREW_POLICY_BASE_SHA"]);
     gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
     gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
 
@@ -781,9 +787,7 @@ describe("repository integration policy", () => {
     const fixture = await mkdtemp(join(tmpdir(), "ironcrew-release-policy-"));
     const verifier = join(repository, "scripts/verify_release_source.sh");
     const emptyGitConfig = join(fixture, "empty.gitconfig");
-    const gitEnvironment = Object.fromEntries(
-      Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_CONFIG_")),
-    );
+    const gitEnvironment = isolatedGitEnvironment();
     gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
     gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
 
