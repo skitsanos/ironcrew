@@ -1,6 +1,7 @@
 -- OpenAI Responses API — reasoning models
 --
--- Uses reasoning_effort to enable deep thinking on gpt-5.4.
+-- Uses reasoning_effort to enable deep thinking on gpt-5.4; the crew sets the
+-- default and the solver agent raises it for its own requests.
 -- The reasoning summary is captured in the run record under `reasoning`.
 -- With stream = true, reasoning summary deltas appear dim on stderr.
 
@@ -18,6 +19,8 @@ crew:add_agent(Agent.new({
     name = "solver",
     goal = "Solve problems methodically",
     capabilities = { "reasoning", "logic" },
+    -- Per-agent override: this agent thinks harder than the crew default.
+    reasoning_effort = "high",
 }))
 
 crew:add_task({

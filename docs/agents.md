@@ -55,6 +55,7 @@ not need to call `crew:add_agent()` for file-based agents.
 | `temperature`     | number            | no       | nil (provider default)             | LLM sampling temperature                              |
 | `max_tokens`      | integer           | no       | nil (provider default)             | Maximum tokens in LLM response                        |
 | `model`           | string            | no       | nil (uses crew default)            | Per-agent model override (highest priority)            |
+| `reasoning_effort`| string            | no       | nil (crew default / provider default) | Per-agent reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` — validated at parse time (see below) |
 | `expected_output` | string            | no       | nil                                | Description of what this agent should produce          |
 | `response_format` | table             | no       | nil                                | Controls LLM output format (see below)                |
 | `before_task`     | function          | no       | nil                                | Hook called before each task execution (see below)    |
@@ -69,6 +70,14 @@ not need to call `crew:add_agent()` for file-based agents.
 > reasoning is enabled. When an agent has tools, IronCrew explicitly sends
 > `reasoning_effort = "none"`; use `openai-responses` for an explicitly
 > reasoning-oriented OpenAI task.
+
+> **Per-agent `reasoning_effort`:** overrides the crew-level value for that
+> agent's requests. On `openai-responses` it maps to `reasoning.effort`; on the
+> plain `openai` provider it is forwarded as `reasoning_effort`, except that an
+> agent with tools on Luna may only set `"none"` (any other value fails the
+> request with a message pointing at `openai-responses`). The `anthropic`
+> provider rejects it outright — its equivalent is the crew-level
+> `thinking_budget`. Nothing is ever silently dropped.
 
 ## Response Format
 

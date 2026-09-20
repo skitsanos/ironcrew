@@ -29,14 +29,26 @@ pub(super) fn insert_completion_token_limit(
 /// Keeps Luna's Chat Completions tool calls on its supported execution path.
 /// Luna defaults to reasoning when the field is omitted, but the API rejects
 /// function tools unless reasoning effort is explicitly disabled.
-pub(super) fn insert_tool_reasoning_compatibility(body: &mut Value, model: &str, has_tools: bool) {
-    let is_luna = model == "gpt-5.6-luna" || model.starts_with("gpt-5.6-luna-");
-    if has_tools && is_luna {
+pub(super) fn insert_tool_reasoning_compatibility(
+    body: &mut Value,
+    model: &str,
+    has_tools: bool,
+    explicit_effort: Option<&str>,
+) {
+    if let Some(effort) = explicit_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if has_tools && super::reasoning_effort::is_luna(model) {
         body["reasoning_effort"] = json!("none");
     }
 }
 
-pub(super) fn insert_tools(body: &mut Value, model: &str, tools: Option<&[ToolSchema]>) {
+pub(super) fn insert_tools(
+    body: &mut Value,
+    model: &str,
+    tools: Option<&[ToolSchema]>,
+    explicit_effort: Option<&str>,
+) {
     if let Some(schemas) = tools {
         body["tools"] = json!(
             schemas
@@ -56,6 +68,7 @@ pub(super) fn insert_tools(body: &mut Value, model: &str, tools: Option<&[ToolSc
         body,
         model,
         tools.is_some_and(|schemas| !schemas.is_empty()),
+        explicit_effort,
     );
 }
 
@@ -132,7 +145,7 @@ mod tests {
         for model in ["gpt-5.6-luna", "gpt-5.6-luna-2026-08-01"] {
             let mut body = json!({});
 
-            insert_tool_reasoning_compatibility(&mut body, model, true);
+            insert_tool_reasoning_compatibility(&mut body, model, true, None);
 
             assert_eq!(body["reasoning_effort"], "none", "model: {model}");
         }
@@ -147,7 +160,7 @@ mod tests {
         ] {
             let mut body = json!({});
 
-            insert_tool_reasoning_compatibility(&mut body, model, has_tools);
+            insert_tool_reasoning_compatibility(&mut body, model, has_tools, None);
 
             assert!(body.get("reasoning_effort").is_none(), "model: {model}");
         }
@@ -231,5 +244,24 @@ mod tests {
                 limit: 18_000,
             } if actual > 18_000
         ));
+    }
+
+    #[test]
+    fn explicit_agent_effort_is_forwarded_on_chat_completions() {
+        let mut body = json!({});
+        insert_tool_reasoning_compatibility(&mut body, "gpt-5.6-luna", false, Some("low"));
+        assert_eq!(body["reasoning_effort"], "low");
+
+        // Non-Luna models forward it even alongside tools.
+        let mut body = json!({});
+        insert_tool_reasoning_compatibility(&mut body, "gpt-5.4", true, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn luna_with_tools_still_forces_none_over_an_explicit_none() {
+        let mut body = json!({});
+        insert_tool_reasoning_compatibility(&mut body, "gpt-5.6-luna", true, Some("none"));
+        assert_eq!(body["reasoning_effort"], "none");
     }
 }
