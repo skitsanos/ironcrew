@@ -1,11 +1,44 @@
-# Usage accounting foundation (IC-046, in progress)
+# Usage accounting (IC-046, in progress)
 
-This page describes the new Rust `ironcrew::usage` library foundation. It is
-**not yet connected to the runtime provider adapters, task results, CLI, Lua,
-HTTP events, or stored run/session records**. Those still use the existing
-accounting contract and have the gaps tracked by [IC-046](issues/IC-046.md).
-Do not use this foundation's tests as evidence that runtime billing observability
-or the future IC-047 run budget is implemented.
+This page describes the Rust `ironcrew::usage` contract and the built-in HTTP
+provider capture layer. Rust callers can explicitly attach a shared tracker to
+`ChatRequest.usage_tracker`; OpenAI Chat, Responses and Anthropic then retain
+checked receipts independently of their output return value.
+
+**Automatic run/task/conversation scope propagation, `ChatResponse.usage`,
+task results, CLI, Lua, HTTP events and stored run/session records have not yet
+migrated.** Those still have the gaps tracked by [IC-046](issues/IC-046.md).
+The old usage fields are not a fallback source for the new tracker. Do not use
+transport tests as proof of end-to-end billing observability or an IC-047 budget.
+
+## Request-scoped HTTP capture
+
+Rust callers set `request.usage_tracker = Some(tracker.clone())` before calling
+any built-in provider's `chat`, `chat_with_tools` or `chat_stream`, and read
+`tracker.snapshot()` afterward, including after an error. Sharing that tracker
+across retries or concurrent calls includes each dispatched attempt once.
+`Agent::chat_request` leaves the scope unset; callers must choose its ownership
+explicitly. The scope is never serialized into the provider request or retained
+globally. Custom `LlmProvider` implementations do not automatically participate.
+
+An attempt starts after local validation and rate-limit waiting, immediately
+before HTTP dispatch. Invalid credentials/options/URLs rejected before dispatch
+do not invent a request. A dispatched attempt without a receipt settles as
+unavailable; timeout or cancellation does not prove zero provider cost.
+
+Non-streaming receipt capture precedes output decoding. Streaming capture
+precedes content assembly and output-channel awaits. Final unsuccessful
+Responses events and bounded HTTP error bodies can still carry valid receipts.
+Cancellation drops the attempt guard and retains its last observed snapshot.
+Aggregate overflow fails normal completion and remains a sticky tracker error
+after cancellation; it is never silently saturated.
+
+Chat streaming requests usage and recognizes its usage-only terminal chunk.
+Responses requires a terminal response status/event with a usage object;
+missing/queued/in-progress statuses cannot prove final accounting. Anthropic
+requires a message-delta output receipt followed by message-stop. Later
+nonterminal usage updates cannot inherit an earlier terminal coverage claim.
+Truncation and missing terminal receipts preserve partial or unavailable usage.
 
 ## Receipt contract
 
@@ -101,10 +134,11 @@ visible through the upcoming CLI/Lua/HTTP/store integration.
 
 ## Remaining integration
 
-1. Wire receipts and attempt guards into provider calls and streams, preserving
-   them through retries, content/tool failures, cancellation, conversations and
-   nested/delegated execution. Replace the old usage types rather than adding a
-   compatibility fallback. Prove the actual executor paths with mock providers.
+1. Propagate scopes automatically through task retries, conversations and
+   nested/delegated execution, including custom providers. Replace the old
+   response/task usage types rather than adding a compatibility fallback.
+   Prove actual executor ownership with mock providers; the loopback HTTP tests
+   cover transport capture, not automatic runtime propagation.
 2. Carry the same coverage contract through Lua, CLI, HTTP/events, run/session
    persistence and JSON/SQLite/PostgreSQL. Preserve owner fencing and terminal
    compare-and-set behavior; select lossless storage/wire representations.

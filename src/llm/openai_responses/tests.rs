@@ -16,6 +16,7 @@ fn request(images: Option<Vec<ImageInput>>, format: Option<ResponseFormat>) -> C
         response_format: format,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        usage_tracker: None,
         reasoning_effort: None,
     }
 }

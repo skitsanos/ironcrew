@@ -383,8 +383,9 @@ Task results may include provider-reported token usage: `prompt_tokens`,
 aggregate retained task receipts, not every attempted provider call. Missing
 receipts and failed/retried attempts are not fully represented yet; these
 numbers are not invoices or proof of zero cost. [IC-046's accounting foundation](usage-accounting.md)
-defines the replacement contract; its runtime and storage integration is still
-in progress.
+defines the replacement contract and explicit Rust request-scoped capture in
+the three built-in HTTP providers. Automatic runtime scope propagation, public
+output and storage integration are still in progress.
 
 For providers that support prompt caching, enable it at the crew level:
 

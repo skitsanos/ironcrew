@@ -164,7 +164,7 @@ mod tests {
         );
         provider.execution_policy = policy(actual - 1);
 
-        let error = provider.send_request(body).await.unwrap_err();
+        let error = provider.send_request(body, None).await.unwrap_err();
         assert!(matches!(
             error,
             IronCrewError::ProviderRequestTooLarge {
@@ -221,7 +221,7 @@ mod tests {
             Some("https://127.0.0.1:9/v1".into()),
         );
         let error = provider
-            .send_request(json!({"payload": "x".repeat(18_000)}))
+            .send_request(json!({"payload": "x".repeat(18_000)}), None)
             .await
             .unwrap_err();
         assert!(matches!(
