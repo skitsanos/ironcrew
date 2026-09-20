@@ -9,14 +9,12 @@ use tokio::sync::Semaphore;
 use crate::utils::error::{IronCrewError, Result};
 
 mod codecs;
+mod conversations;
 mod idempotency;
 mod run_events;
 mod run_history;
 
-use codecs::{
-    bounded_conversation_execution, bounded_metadata, bounded_optional_metadata,
-    conversation_summary, decode_stored_json, parse_timestamp, stored_bytes,
-};
+use codecs::{decode_stored_json, parse_timestamp};
 
 /// Upper bound on the per-retry backoff delay during store init.
 const CONNECT_BACKOFF_CAP_MS: u64 = 30_000;
@@ -62,26 +60,16 @@ where
     }
 }
 
-use super::conversation_json::{
-    preflight_conversation_execution_json, preflight_conversation_messages_json,
-};
-use super::conversation_record::{
-    HARD_STORED_CONVERSATION_EXECUTION_BYTES, HARD_STORED_CONVERSATION_MESSAGES,
-    HARD_STORED_CONVERSATION_MESSAGES_BYTES, HARD_STORED_CONVERSATION_METADATA_BYTES,
-    serialize_conversation_execution, serialize_conversation_messages,
-    validate_conversation_record_after_decode, validate_conversation_record_for_write,
-    validate_stored_conversation_envelope,
-};
 use super::human_input::{
     DurableHumanInputQuestion, DurableHumanInputRegistration, HumanInputAad,
     HumanInputAnswerOutcome, HumanInputKeyring, HumanInputListOutcome, HumanInputReadOutcome,
     HumanInputRegistrationOutcome, question_digest, validate_durable_answer,
 };
 use super::idempotency::{
-    CONVERSATION_MESSAGE_OPERATION, ConversationIdempotencyCommit, IdempotencyClaim,
-    IdempotencyClaimOutcome, IdempotencyCompletion, IdempotencyCompletionOutcome,
-    IdempotencyLimits, IdempotencyLookup, IdempotencyState, IdempotencyUsage, PrincipalId,
-    RUN_OPERATION, RunCancellationRequest, RunFenceHeartbeat,
+    ConversationIdempotencyCommit, IdempotencyClaim, IdempotencyClaimOutcome,
+    IdempotencyCompletion, IdempotencyCompletionOutcome, IdempotencyLimits, IdempotencyLookup,
+    IdempotencyState, IdempotencyUsage, PrincipalId, RUN_OPERATION, RunCancellationRequest,
+    RunFenceHeartbeat,
 };
 use super::input_bridge::{max_pending, max_pending_bytes};
 use super::run_events::{
@@ -91,9 +79,7 @@ use super::run_events::{
 use super::run_history::{
     ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunSummary, RunTransition,
 };
-use super::sessions::{
-    ConversationRecord, ConversationSummary, DialogStateRecord, validate_session_id,
-};
+use super::sessions::{ConversationRecord, ConversationSummary, DialogStateRecord};
 use super::store::{ConversationCoordinationScope, RunLeaseConfig, StateStore};
 use super::store_sql::{self, Dialect, SqlParam, WhereClause};
 
@@ -558,45 +544,6 @@ impl PostgresStore {
             .map_err(|error| {
                 IronCrewError::Validation(format!(
                     "PostgreSQL reconciled run mailbox cleanup failed: {error}"
-                ))
-            })?;
-        Ok(())
-    }
-
-    async fn reconcile_expired_conversation_batch(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        database_now: &str,
-    ) -> Result<()> {
-        let sql = format!(
-            "WITH candidates AS (\
-                 SELECT key_hash FROM {idempotency} \
-                 WHERE operation = $2 AND state IN ('claimed', 'running') \
-                   AND lease_expires_at::timestamptz <= $1::timestamptz \
-                 ORDER BY lease_expires_at, key_hash \
-                 LIMIT $3 FOR UPDATE SKIP LOCKED\
-             ) \
-             UPDATE {idempotency} AS idem \
-             SET state = 'indeterminate', response_status = NULL, \
-                 response_body = NULL, lease_expires_at = '', updated_at = $1, \
-                 completed_at = $1, expires_at = to_char(\
-                     ($1::timestamptz + idem.ttl_seconds * interval '1 second') \
-                         AT TIME ZONE 'UTC', \
-                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'\
-                 ) \
-             FROM candidates \
-             WHERE idem.key_hash = candidates.key_hash",
-            idempotency = self.idempotency_table,
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(database_now)
-            .bind(CONVERSATION_MESSAGE_OPERATION)
-            .bind(RUN_RECONCILIATION_BATCH_SIZE)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PG conversation idempotency reconciliation: {error}"
                 ))
             })?;
         Ok(())
@@ -4142,145 +4089,7 @@ impl StateStore for PostgresStore {
         self.idempotency_usage_record(principal_id, limits).await
     }
     async fn save_conversation(&self, record: &ConversationRecord) -> Result<u64> {
-        validate_conversation_record_for_write(record)?;
-        let messages_json = serialize_conversation_messages(&record.messages)?;
-        let execution_json = serialize_conversation_execution(&record.execution)?;
-        let expected_revision = i64::try_from(record.revision).map_err(|_| {
-            IronCrewError::Validation("Conversation revision is out of range".into())
-        })?;
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL save_conversation transaction error: {e}"
-            ))
-        })?;
-        self.lock_resource(
-            &mut tx,
-            CONVERSATION_MESSAGE_OPERATION,
-            record.flow_path.as_deref().unwrap_or(""),
-            &record.id,
-        )
-        .await?;
-        let guard_sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {} \
-             WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
-               AND state IN ('claimed', 'running'))",
-            self.idempotency_table
-        );
-        let active: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(guard_sql))
-            .bind(CONVERSATION_MESSAGE_OPERATION)
-            .bind(record.flow_path.as_deref().unwrap_or(""))
-            .bind(&record.id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL conversation idempotency guard failed: {error}"
-                ))
-            })?;
-        if active {
-            return Err(IronCrewError::Conflict(format!(
-                "Conversation '{}' has an active idempotent message operation",
-                record.id
-            )));
-        }
-        let select_sql = format!(
-            "SELECT revision, \
-                    CASE WHEN octet_length(execution::text) <= $3 THEN execution::text END AS execution, \
-                    octet_length(execution::text)::BIGINT AS execution_bytes FROM {} \
-             WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 FOR UPDATE",
-            self.conversations_table
-        );
-        let current = sqlx::query(sqlx::AssertSqlSafe(select_sql))
-            .bind(&record.id)
-            .bind(&record.flow_path)
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES).unwrap_or(i64::MAX))
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL save_conversation revision read error: {e}"
-                ))
-            })?;
-        let current = current
-            .map(|row| {
-                let revision = row.try_get::<i64, _>("revision").map_err(|error| {
-                    IronCrewError::Validation(format!(
-                        "PostgreSQL conversation revision decode failed: {error}"
-                    ))
-                })?;
-                let execution = bounded_conversation_execution(&row)?;
-                Ok::<_, IronCrewError>((revision, execution))
-            })
-            .transpose()?;
-        let revision: Option<i64> = match current {
-            None if expected_revision == 0 => {
-                let insert_sql = format!(
-                    "INSERT INTO {} \
-                     (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision) \
-                     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, 1) \
-                     ON CONFLICT (flow_path, id) DO NOTHING RETURNING revision",
-                    self.conversations_table
-                );
-                sqlx::query_scalar(sqlx::AssertSqlSafe(insert_sql))
-                    .bind(&record.id)
-                    .bind(&record.flow_name)
-                    .bind(&record.flow_path)
-                    .bind(&record.agent_name)
-                    .bind(&execution_json)
-                    .bind(&messages_json)
-                    .bind(&record.created_at)
-                    .bind(&record.updated_at)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "PostgreSQL save_conversation insert error: {e}"
-                        ))
-                    })?
-            }
-            Some((current_revision, current_execution))
-                if current_revision == expected_revision
-                    && current_execution == record.execution =>
-            {
-                let update_sql = format!(
-                    "UPDATE {} SET flow_name = $3, agent_name = $4, \
-                     execution = $5::jsonb, messages = $6::jsonb, created_at = $7, updated_at = $8, \
-                     revision = revision + 1 \
-                     WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $9 \
-                     RETURNING revision",
-                    self.conversations_table
-                );
-                sqlx::query_scalar(sqlx::AssertSqlSafe(update_sql))
-                    .bind(&record.id)
-                    .bind(&record.flow_path)
-                    .bind(&record.flow_name)
-                    .bind(&record.agent_name)
-                    .bind(&execution_json)
-                    .bind(&messages_json)
-                    .bind(&record.created_at)
-                    .bind(&record.updated_at)
-                    .bind(expected_revision)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "PostgreSQL save_conversation update error: {e}"
-                        ))
-                    })?
-            }
-            _ => None,
-        };
-        let revision = revision.ok_or_else(|| {
-            IronCrewError::Conflict(format!(
-                "Conversation '{}' changed since revision {}; reopen it before saving",
-                record.id, record.revision
-            ))
-        })?;
-        tx.commit().await.map_err(|e| {
-            IronCrewError::Validation(format!("PostgreSQL save_conversation commit error: {e}"))
-        })?;
-        u64::try_from(revision)
-            .map_err(|_| IronCrewError::Validation("Invalid conversation revision".into()))
+        self.save_conversation_record(record).await
     }
 
     async fn get_conversation(
@@ -4288,188 +4097,11 @@ impl StateStore for PostgresStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<ConversationRecord>> {
-        validate_session_id(id)?;
-        // Flow-scoped lookup: when `flow_path` is Some, require an exact
-        // match. `$2::TEXT IS NULL` lets the same query serve global
-        // (unscoped) admin lookups.
-        let sql = format!(
-            "SELECT id, \
-                    CASE WHEN octet_length(flow_name) <= $3 THEN flow_name END AS flow_name, \
-                    octet_length(flow_name)::BIGINT AS flow_name_bytes, \
-                    CASE WHEN flow_path IS NULL OR octet_length(flow_path) <= $3 THEN flow_path END AS flow_path, \
-                    octet_length(flow_path)::BIGINT AS flow_path_bytes, \
-                    CASE WHEN octet_length(agent_name) <= $3 THEN agent_name END AS agent_name, \
-                    octet_length(agent_name)::BIGINT AS agent_name_bytes, \
-                    CASE WHEN octet_length(execution::text) <= $4 THEN execution::text END AS execution, \
-                    octet_length(execution::text)::BIGINT AS execution_bytes, \
-                    CASE \
-                      WHEN octet_length(messages::text) <= $5 \
-                       AND CASE WHEN jsonb_typeof(messages) = 'array' \
-                                THEN jsonb_array_length(messages)::BIGINT <= $6 \
-                                ELSE FALSE END \
-                      THEN messages::text \
-                    END AS messages, \
-                    octet_length(messages::text)::BIGINT AS messages_bytes, \
-                    CASE WHEN jsonb_typeof(messages) = 'array' \
-                         THEN jsonb_array_length(messages)::BIGINT END AS message_count, \
-                    CASE WHEN octet_length(created_at) <= $3 THEN created_at END AS created_at, \
-                    octet_length(created_at)::BIGINT AS created_at_bytes, \
-                    CASE WHEN octet_length(updated_at) <= $3 THEN updated_at END AS updated_at, \
-                    octet_length(updated_at)::BIGINT AS updated_at_bytes, revision \
-             FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
-            self.conversations_table
-        );
-        let row_opt = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(id)
-            .bind(flow_path)
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_METADATA_BYTES).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_EXECUTION_BYTES).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_MESSAGES_BYTES).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_MESSAGES).unwrap_or(i64::MAX))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL get_conversation error: {}", e))
-            })?;
-        let Some(row) = row_opt else {
-            return Ok(None);
-        };
-        let execution_bytes = stored_bytes(&row, "execution_bytes", "execution")?;
-        let messages_bytes = stored_bytes(&row, "messages_bytes", "messages")?;
-        let message_count = row
-            .try_get::<Option<i64>, _>("message_count")
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL stored conversation message-count decode failed: {error}"
-                ))
-            })?
-            .map(|count| {
-                u64::try_from(count).map_err(|_| {
-                    IronCrewError::Validation(
-                        "PostgreSQL stored conversation has an invalid message count".into(),
-                    )
-                })
-            })
-            .transpose()?;
-        validate_stored_conversation_envelope(execution_bytes, messages_bytes, message_count)?;
-        let execution_json = row
-            .try_get::<Option<String>, _>("execution")
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL stored conversation execution identity decode failed: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                IronCrewError::Validation(
-                    "PostgreSQL stored conversation execution identity could not be materialized safely"
-                        .into(),
-                )
-            })?;
-        let messages_json = row
-            .try_get::<Option<String>, _>("messages")
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL stored conversation messages decode failed: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                IronCrewError::Validation(
-                    "PostgreSQL stored conversation messages could not be materialized safely"
-                        .into(),
-                )
-            })?;
-        preflight_conversation_execution_json(&execution_json)?;
-        preflight_conversation_messages_json(&messages_json)?;
-        let record = ConversationRecord {
-            id: row
-                .try_get("id")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            flow_name: bounded_metadata(&row, "flow_name", "flow_name_bytes", "flow name")?,
-            flow_path: bounded_optional_metadata(
-                &row,
-                "flow_path",
-                "flow_path_bytes",
-                "flow path",
-            )?,
-            agent_name: bounded_metadata(&row, "agent_name", "agent_name_bytes", "agent name")?,
-            execution: decode_stored_json(&execution_json, "conversations.execution")?,
-            messages: decode_stored_json(&messages_json, "conversations.messages")?,
-            created_at: bounded_metadata(
-                &row,
-                "created_at",
-                "created_at_bytes",
-                "created timestamp",
-            )?,
-            updated_at: bounded_metadata(
-                &row,
-                "updated_at",
-                "updated_at_bytes",
-                "updated timestamp",
-            )?,
-            revision: u64::try_from(
-                row.try_get::<i64, _>("revision")
-                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            )
-            .map_err(|_| IronCrewError::Validation("Invalid conversation revision".into()))?,
-        };
-        validate_conversation_record_after_decode(&record)?;
-        Ok(Some(record))
+        self.get_conversation_record(flow_path, id).await
     }
 
     async fn delete_conversation(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
-        validate_session_id(id)?;
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL delete_conversation transaction error: {error}"
-            ))
-        })?;
-        self.lock_resource(
-            &mut tx,
-            CONVERSATION_MESSAGE_OPERATION,
-            flow_path.unwrap_or(""),
-            id,
-        )
-        .await?;
-        let guard_sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {} \
-             WHERE operation = $1 AND scope = $2 AND resource_id = $3 \
-               AND state IN ('claimed', 'running'))",
-            self.idempotency_table
-        );
-        let active: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(guard_sql))
-            .bind(CONVERSATION_MESSAGE_OPERATION)
-            .bind(flow_path.unwrap_or(""))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|error| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL conversation delete idempotency guard failed: {error}"
-                ))
-            })?;
-        if active {
-            return Err(IronCrewError::Conflict(format!(
-                "Conversation '{id}' has an active idempotent message operation"
-            )));
-        }
-        let sql = format!(
-            "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
-            self.conversations_table
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(id)
-            .bind(flow_path)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL delete_conversation error: {}", e))
-            })?;
-        tx.commit().await.map_err(|error| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL delete_conversation commit error: {error}"
-            ))
-        })?;
-        Ok(())
+        self.delete_conversation_record(flow_path, id).await
     }
 
     async fn list_conversations(
@@ -4478,187 +4110,16 @@ impl StateStore for PostgresStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversationSummary>> {
-        let sql = format!(
-            "SELECT \
-                    CASE WHEN octet_length(c.id) <= $4 THEN c.id END AS id, \
-                    octet_length(c.id)::BIGINT AS id_bytes, \
-                    CASE WHEN c.flow_path IS NULL OR octet_length(c.flow_path) <= $4 \
-                         THEN c.flow_path END AS flow_path, \
-                    octet_length(c.flow_path)::BIGINT AS flow_path_bytes, \
-                    CASE WHEN octet_length(c.agent_name) <= $4 THEN c.agent_name END AS agent_name, \
-                    octet_length(c.agent_name)::BIGINT AS agent_name_bytes, \
-                    (SELECT COUNT(*) FROM jsonb_array_elements( \
-                       CASE WHEN octet_length(c.messages::text) <= $5 \
-                         THEN CASE WHEN jsonb_typeof(c.messages) = 'array' \
-                           THEN CASE WHEN jsonb_array_length(c.messages)::BIGINT <= $6 \
-                             THEN c.messages ELSE '[]'::jsonb END \
-                           ELSE '[]'::jsonb END \
-                         ELSE '[]'::jsonb END \
-                     ) AS message WHERE message->>'role' = 'user') AS turn_count, \
-                    octet_length(c.messages::text)::BIGINT AS messages_bytes, \
-                    CASE WHEN jsonb_typeof(c.messages) = 'array' \
-                         THEN jsonb_array_length(c.messages)::BIGINT END AS message_count, \
-                    CASE WHEN octet_length(c.created_at) <= $4 THEN c.created_at END AS created_at, \
-                    octet_length(c.created_at)::BIGINT AS created_at_bytes, \
-                    CASE WHEN octet_length(c.updated_at) <= $4 THEN c.updated_at END \
-                         AS bounded_updated_at, \
-                    octet_length(c.updated_at)::BIGINT AS updated_at_bytes \
-             FROM {} AS c \
-             WHERE ($1::TEXT IS NULL OR c.flow_path = $1) \
-             ORDER BY bounded_updated_at DESC \
-             LIMIT $2 OFFSET $3",
-            self.conversations_table
-        );
-        let limit_i = if limit == 0 {
-            i64::MAX
-        } else {
-            i64::try_from(limit).unwrap_or(i64::MAX)
-        };
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(flow_path)
-            .bind(limit_i)
-            .bind(i64::try_from(offset).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_METADATA_BYTES).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_MESSAGES_BYTES).unwrap_or(i64::MAX))
-            .bind(i64::try_from(HARD_STORED_CONVERSATION_MESSAGES).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+        self.list_conversation_records(flow_path, limit, offset)
             .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL list_conversations error: {}", e))
-            })?;
-        let mut summaries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            summaries.push(conversation_summary(row).map_err(|_| {
-                IronCrewError::Validation(
-                    "PostgreSQL stored conversation summary is corrupt or exceeds hard limits"
-                        .into(),
-                )
-            })?);
-        }
-        Ok(summaries)
     }
 
     async fn count_conversations(&self, flow_path: Option<&str>) -> Result<u64> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {} \
-             WHERE ($1::TEXT IS NULL OR flow_path = $1)",
-            self.conversations_table
-        );
-        let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(flow_path)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL count_conversations error: {}", e))
-            })?;
-        let count: i64 = row
-            .try_get(0)
-            .map_err(|e| IronCrewError::Validation(format!("Column error: {}", e)))?;
-        Ok(count as u64)
+        self.count_conversation_records(flow_path).await
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
-        let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
-        })?;
-        let transcript_json = serde_json::to_string(&record.transcript).map_err(|e| {
-            IronCrewError::Validation(format!("Failed to serialize transcript: {}", e))
-        })?;
-        let expected_revision = i64::try_from(record.revision)
-            .map_err(|_| IronCrewError::Validation("Dialog revision is out of range".into()))?;
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            IronCrewError::Validation(format!(
-                "PostgreSQL save_dialog_state transaction error: {e}"
-            ))
-        })?;
-        let select_sql = format!(
-            "SELECT revision FROM {} \
-             WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 FOR UPDATE",
-            self.dialogs_table
-        );
-        let current: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(select_sql))
-            .bind(&record.id)
-            .bind(&record.flow_path)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!(
-                    "PostgreSQL save_dialog_state revision read error: {e}"
-                ))
-            })?;
-        let revision: Option<i64> = match current {
-            None if expected_revision == 0 => {
-                let insert_sql = format!(
-                    "INSERT INTO {} \
-                     (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision) \
-                     VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, 1) \
-                     ON CONFLICT (flow_path, id) DO NOTHING RETURNING revision",
-                    self.dialogs_table
-                );
-                sqlx::query_scalar(sqlx::AssertSqlSafe(insert_sql))
-                    .bind(&record.id)
-                    .bind(&record.flow_name)
-                    .bind(&record.flow_path)
-                    .bind(&agents_json)
-                    .bind(&record.starter)
-                    .bind(&transcript_json)
-                    .bind(record.next_index as i32)
-                    .bind(record.stopped)
-                    .bind(&record.stop_reason)
-                    .bind(&record.created_at)
-                    .bind(&record.updated_at)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "PostgreSQL save_dialog_state insert error: {e}"
-                        ))
-                    })?
-            }
-            Some(current) if current == expected_revision => {
-                let update_sql = format!(
-                    "UPDATE {} SET flow_name = $3, agent_names = $4::jsonb, \
-                     starter = $5, transcript = $6::jsonb, next_index = $7, \
-                     stopped = $8, stop_reason = $9, created_at = $10, \
-                     updated_at = $11, revision = revision + 1 \
-                     WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $12 \
-                     RETURNING revision",
-                    self.dialogs_table
-                );
-                sqlx::query_scalar(sqlx::AssertSqlSafe(update_sql))
-                    .bind(&record.id)
-                    .bind(&record.flow_path)
-                    .bind(&record.flow_name)
-                    .bind(&agents_json)
-                    .bind(&record.starter)
-                    .bind(&transcript_json)
-                    .bind(record.next_index as i32)
-                    .bind(record.stopped)
-                    .bind(&record.stop_reason)
-                    .bind(&record.created_at)
-                    .bind(&record.updated_at)
-                    .bind(expected_revision)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        IronCrewError::Validation(format!(
-                            "PostgreSQL save_dialog_state update error: {e}"
-                        ))
-                    })?
-            }
-            _ => None,
-        };
-        let revision = revision.ok_or_else(|| {
-            IronCrewError::Conflict(format!(
-                "Dialog '{}' changed since revision {}; reopen it before saving",
-                record.id, record.revision
-            ))
-        })?;
-        tx.commit().await.map_err(|e| {
-            IronCrewError::Validation(format!("PostgreSQL save_dialog_state commit error: {e}"))
-        })?;
-        u64::try_from(revision)
-            .map_err(|_| IronCrewError::Validation("Invalid dialog revision".into()))
+        self.save_dialog_state_record(record).await
     }
 
     async fn get_dialog_state(
@@ -4666,82 +4127,11 @@ impl StateStore for PostgresStore {
         flow_path: Option<&str>,
         id: &str,
     ) -> Result<Option<DialogStateRecord>> {
-        let sql = format!(
-            "SELECT id, flow_name, flow_path, agent_names::text, starter, transcript::text, \
-             next_index, stopped, stop_reason, created_at, updated_at, revision \
-             FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
-            self.dialogs_table
-        );
-        let row_opt = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(id)
-            .bind(flow_path)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL get_dialog_state error: {}", e))
-            })?;
-        let Some(row) = row_opt else {
-            return Ok(None);
-        };
-        let agents_str: String = row
-            .try_get("agent_names")
-            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
-        let transcript_str: String = row
-            .try_get("transcript")
-            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
-        let next_index_i32: i32 = row
-            .try_get("next_index")
-            .map_err(|e| IronCrewError::Validation(e.to_string()))?;
-        Ok(Some(DialogStateRecord {
-            id: row
-                .try_get("id")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            flow_name: row
-                .try_get("flow_name")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            flow_path: row
-                .try_get("flow_path")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            agent_names: decode_stored_json(&agents_str, "dialogs.agent_names")?,
-            starter: row
-                .try_get("starter")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            transcript: decode_stored_json(&transcript_str, "dialogs.transcript")?,
-            next_index: next_index_i32.max(0) as usize,
-            stopped: row
-                .try_get("stopped")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            stop_reason: row
-                .try_get("stop_reason")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            created_at: row
-                .try_get("created_at")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            updated_at: row
-                .try_get("updated_at")
-                .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            revision: u64::try_from(
-                row.try_get::<i64, _>("revision")
-                    .map_err(|e| IronCrewError::Validation(e.to_string()))?,
-            )
-            .map_err(|_| IronCrewError::Validation("Invalid dialog revision".into()))?,
-        }))
+        self.get_dialog_state_record(flow_path, id).await
     }
 
     async fn delete_dialog_state(&self, flow_path: Option<&str>, id: &str) -> Result<()> {
-        let sql = format!(
-            "DELETE FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
-            self.dialogs_table
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
-            .bind(id)
-            .bind(flow_path)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                IronCrewError::Validation(format!("PostgreSQL delete_dialog_state error: {}", e))
-            })?;
-        Ok(())
+        self.delete_dialog_state_record(flow_path, id).await
     }
 
     async fn save_audit_event(&self, event: &crate::engine::audit::AuditEvent) -> Result<String> {
