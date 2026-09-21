@@ -19,10 +19,11 @@ def decimal_count(value: Any) -> int:
 
 def costing_counts(snapshot: Any, planned_calls: int) -> dict[str, int]:
     if (not isinstance(snapshot, dict)
-            or set(snapshot) != {"settled", "in_flight", "coverage"}
+            or set(snapshot) != {"settled", "in_flight", "coverage", "budget"}
             or snapshot["coverage"] != "complete"
             or decimal_count(snapshot["in_flight"]) != 0):
         raise ValueError("incomplete token usage snapshot")
+    validate_budget(snapshot["budget"])
     settled = snapshot["settled"]
     if (not isinstance(settled, dict)
             or set(settled) != {*FIELDS, "requests", "coverage"}
@@ -53,3 +54,22 @@ def costing_counts(snapshot: Any, planned_calls: int) -> dict[str, int]:
     # Optional unknown detail is not replaced with zero in the runtime receipt.
     # Costing retains its conservative existing cache-write allowance.
     return {key: values[key] for key in FIELDS[:4]}
+
+
+def validate_budget(budget: Any) -> None:
+    if (not isinstance(budget, dict)
+            or set(budget) != {"state", "limit", "charged", "retained", "reserved", "in_flight"}
+            or budget["state"] not in ("disabled", "active")):
+        raise ValueError("incomplete or blocked token budget")
+    charged, retained, reserved, active = [
+        decimal_count(budget[key]) for key in ("charged", "retained", "reserved", "in_flight")
+    ]
+    if budget["state"] == "disabled":
+        if budget["limit"] is not None or any((charged, retained, reserved, active)):
+            raise ValueError("invalid disabled token budget")
+        return
+    limit = decimal_count(budget["limit"])
+    if (not 1 <= limit <= 1_000_000_000 or charged + reserved > limit
+            or retained > charged or (active == 0) != (reserved == 0)
+            or active > reserved):
+        raise ValueError("invalid token budget counters")

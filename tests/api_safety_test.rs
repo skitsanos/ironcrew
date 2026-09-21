@@ -2,6 +2,8 @@
 //! flow isolation, and terminal SSE delivery. Usage fixtures use only a local
 //! mock provider; no paid or external provider calls are made.
 
+#[path = "api_safety/budget.rs"]
+mod budget;
 #[path = "api_safety/usage.rs"]
 mod usage;
 

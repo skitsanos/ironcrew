@@ -118,6 +118,7 @@ pub(super) async fn enforce_request_timeout(
             StatusCode::REQUEST_TIMEOUT,
             [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
             Json(ErrorResponse {
+                budget: None,
                 error: format!(
                     "HTTP request exceeded IRONCREW_HTTP_REQUEST_TIMEOUT_SECS ({})",
                     timeout.as_secs()

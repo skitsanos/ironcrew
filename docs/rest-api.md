@@ -1,5 +1,6 @@
 # IronCrew REST API
 
+
 IronCrew includes a built-in REST API server that lets you run crew flows over HTTP,
 stream execution events via SSE, and manage run history.
 
@@ -962,6 +963,10 @@ requires an exact match with the stored agent. A mismatch returns `409 Conflict`
 before the flow is evaluated or a live Lua conversation is constructed, without
 changing the stored transcript or active-session state.
 
+Successful `/messages`, `/history`, and conversation-list entries include checked
+session `usage`; see [usage accounting](usage-accounting.md) for checkpoint and
+resume boundaries. Live unsaved receipts are not a durable billing journal.
+
 `/start`, `/messages`, and `/history` expose the durable `revision`, a UUID
 `incarnation_id`, and canonical source/definition fingerprints as applicable.
 The definition covers the Lua source tree, selected Agent, resolved model and
@@ -1102,7 +1107,9 @@ families; every label value is from the closed vocabulary shown here:
 | `ironcrew_tool_calls_total` (counter), `ironcrew_tool_call_duration_seconds` (histogram) | `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_hook_failures_total` (counter) | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total` (counter), `ironcrew_provider_request_duration_seconds` (histogram) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
-| `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `total`, `cached`, `cache_write`, `reasoning` |
+| `ironcrew_provider_usage_incomplete_fields_total` (counter) | Same `provider` and `type` labels; missing/partial field receipts |
+| `ironcrew_provider_usage_receipts_total` (counter) | Same `provider`; `coverage`: `complete`, `partial`, `unavailable` |
 | `ironcrew_sse_connections_total` (counter) | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
 | `ironcrew_lease_losses_total` (counter) | `scope`: `run`, `conversation` |
 | `ironcrew_reconciliation_cycles_total` (counter) | `outcome`: `success`, `error` |
@@ -1121,8 +1128,9 @@ The four duration histograms use cumulative second buckets at `0.005`, `0.01`,
 series. A reconciler can count multiple abandoned runs without fabricating
 durations, so `ironcrew_runs_total{outcome="abandoned"}` may exceed the matching
 histogram `_count`. Skipped tasks record a zero-second duration. Provider token
-counters advance only when a successful provider response reports usage; they
-are usage telemetry, not invoice or billing data. Hook failures retain the
+counters retain known lower bounds from successful, failed and cancelled
+dispatches; pair them with incomplete-field and receipt-coverage counters. They
+are process-local usage telemetry, not invoice or billing data. Hook failures retain the
 original task description or output while incrementing the counter, so an
 operator can detect a hook that is failing without exposing its source, task
 name, returned value, or error as a metric label.
@@ -1346,3 +1354,10 @@ default command.
 The image sets `IRONCREW_HOST=0.0.0.0`, so the published port is reachable
 without an extra bind flag. A host-built binary still defaults to `127.0.0.1`
 unless `PORT`, `IRONCREW_HOST`, or `--host` selects another address.
+## Run and message token budgets
+
+[`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) applies per HTTP flow entrypoint
+and separately per standalone conversation message. Run `usage.budget` persists
+with terminal records/events. Message responses add `request_usage`; their
+existing `usage` remains session-lifetime receipts. Budget-denied messages
+return HTTP 422 and a `budget` snapshot, never a successful assistant result.

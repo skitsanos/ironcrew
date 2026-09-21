@@ -6,7 +6,14 @@ use ironcrew::engine::store::StateStore;
 use ironcrew::engine::task::TaskResult;
 use ironcrew::usage::{UsageCounts, UsageCoverage, UsageReceipt, UsageSnapshot, UsageTracker};
 
+#[path = "usage_storage/budgets.rs"]
+mod budgets;
+#[path = "usage_storage/sessions.rs"]
+mod sessions;
+
 async fn checked_round_trip(store: &dyn StateStore) {
+    budgets::checked_round_trip(store).await;
+    sessions::checked_round_trip(store).await;
     let tracker = UsageTracker::default();
     tracker
         .start()
@@ -135,6 +142,7 @@ async fn sqlite_preserves_checked_usage_and_rejects_forged_coverage() {
     let store = SqliteStore::new(root.path().join("usage.db")).unwrap();
     checked_round_trip(&store).await;
     let conn = rusqlite::Connection::open(root.path().join("usage.db")).unwrap();
+    sessions::sqlite_corruption(&store, &conn).await;
     conn.execute("UPDATE runs SET usage = ?1", ["x".repeat(4097)])
         .unwrap();
     let error = store
@@ -159,6 +167,7 @@ async fn postgres_preserves_checked_usage_and_rejects_forged_coverage() {
         .unwrap();
     checked_round_trip(&store).await;
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sessions::postgres_corruption(&store, &pool).await;
     sqlx::query("UPDATE ic046_usage_runs SET usage = $1")
         .bind(sqlx::types::Json(
             serde_json::json!({"oversized": "x".repeat(4097)}),

@@ -7,6 +7,14 @@ mod idempotency;
 mod run_events;
 mod runs;
 
+pub(super) fn session_usage(row: &sqlx::postgres::PgRow) -> Result<crate::usage::UsageSnapshot> {
+    use sqlx::Row;
+    let raw: Option<String> = row
+        .try_get("usage")
+        .map_err(|_| IronCrewError::Validation("Session usage checkpoint decode failed".into()))?;
+    crate::engine::session_usage::decode(raw.as_deref())
+}
+
 pub(super) use conversation::{
     bounded_conversation_execution, bounded_metadata, bounded_optional_metadata,
     conversation_summary, stored_bytes,

@@ -103,12 +103,16 @@ impl LlmProvider for TokenProvider {
 
     async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
         Ok(ChatResponse {
-            usage: Some(super::super::provider::TokenUsage {
-                prompt_tokens: 11,
-                completion_tokens: 7,
-                total_tokens: 18,
-                cached_tokens: 3,
-            }),
+            usage: crate::usage::UsageReceipt::from_counts(
+                crate::usage::UsageCounts {
+                    prompt_tokens: Some(11),
+                    completion_tokens: Some(7),
+                    total_tokens: Some(18),
+                    cached_tokens: Some(3),
+                    ..Default::default()
+                },
+                true,
+            ),
             ..ChatResponse::default()
         })
     }

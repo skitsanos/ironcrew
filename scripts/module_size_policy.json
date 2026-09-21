@@ -19,13 +19,13 @@
     },
     {
       "path": "src/api/conversations.rs",
-      "max_lines": 2309,
-      "rationale": "IC-011 baseline after SSE extraction: conversation start, keyed turns, durable cold rehydration, history, deletion, and lifecycle fencing remain coupled; split idempotency or lifecycle handlers before extending the API. IC-034: server-side failures answer generically instead of echoing backend errors."
+      "max_lines": 2264,
+      "rationale": "IC-011 baseline after SSE extraction: conversation start, keyed turns, durable cold rehydration, history, deletion, and lifecycle fencing remain coupled; split idempotency or lifecycle handlers before extending the API. IC-034: server-side failures answer generically instead of echoing backend errors. IC-046: checked session usage helpers extracted and the ceiling ratcheted. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/api/handlers.rs",
-      "max_lines": 3683,
-      "rationale": "IC-011 baseline, ratcheted by IC-029 flow-inspection extraction: run HTTP handlers still combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized."
+      "max_lines": 3641,
+      "rationale": "IC-011 baseline, ratcheted by IC-029 flow-inspection extraction: run HTTP handlers still combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/api/idempotency.rs",
@@ -34,8 +34,8 @@
     },
     {
       "path": "src/cli/commands.rs",
-      "max_lines": 799,
-      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command. Task 9: cmd_validate gained a feature-gated postgres operations validation step."
+      "max_lines": 689,
+      "rationale": "IC-011 baseline after init extraction: run, validate, nodes, doctor, format, list, and export command implementations remain in one legacy command module; move another command family into a focused module before adding a command. Task 9: cmd_validate gained a feature-gated postgres operations validation step. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/cli/graph_extract.rs",
@@ -44,8 +44,8 @@
     },
     {
       "path": "src/cli/server.rs",
-      "max_lines": 440,
-      "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy."
+      "max_lines": 311,
+      "rationale": "IC-011 baseline: serve bootstrap validates environment policy, storage pruning, public-bind security, and graceful shutdown configuration; extract configuration parsing and tests before adding startup policy. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/engine/crew.rs",
@@ -99,8 +99,8 @@
     },
     {
       "path": "src/engine/orchestrator.rs",
-      "max_lines": 753,
-      "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode."
+      "max_lines": 735,
+      "rationale": "IC-011 baseline: sequential, hierarchical, collaborative, and foreach task scheduling share context propagation, dependency checks, hooks, and output accounting; split orchestration strategies before adding another mode. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/engine/run_events.rs",
@@ -109,13 +109,13 @@
     },
     {
       "path": "src/engine/run_history.rs",
-      "max_lines": 2541,
-      "rationale": "IC-011 priority debt, ratcheted by IC-029 async-adapter extraction: the synchronous JSON core still combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family."
+      "max_lines": 2525,
+      "rationale": "IC-011 priority debt, ratcheted by IC-029 async-adapter extraction: the synchronous JSON core still combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/engine/sqlite_store.rs",
-      "max_lines": 3839,
-      "rationale": "IC-011 priority debt: the SQLite StateStore combines migrations and repositories for runs, idempotency, conversations, HITL, journals, audit, and leases; extract table-focused repositories before extending storage."
+      "max_lines": 3743,
+      "rationale": "IC-011 priority debt: the SQLite StateStore combines migrations and repositories for runs, idempotency, conversations, HITL, journals, audit, and leases; extract table-focused repositories before extending storage. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/engine/store.rs",
@@ -129,8 +129,8 @@
     },
     {
       "path": "src/llm/provider.rs",
-      "max_lines": 590,
-      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: request configuration extracted before adding explicit usage scope."
+      "max_lines": 582,
+      "rationale": "IC-011 baseline: provider-neutral message, request, response, tool, stream, and token models share history protocol and resource-limit validation with the provider trait; split validation before extending the protocol. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: request configuration extracted before adding explicit usage scope. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/lua/agent_turn.rs",
@@ -144,8 +144,8 @@
     },
     {
       "path": "src/lua/conversation.rs",
-      "max_lines": 740,
-      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
+      "max_lines": 585,
+      "rationale": "IC-011 baseline: the Lua conversation handle owns bounded history, prepared turns, provider and tool execution, image parsing, source identity, and construction; separate turn execution before new conversation features. Task 8: threads a `lua` handle through to read the optional app-db fingerprint app-data for conversation-definition digesting. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: checked session usage helpers extracted and the ceiling ratcheted. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/lua/crew_userdata.rs",
@@ -154,8 +154,8 @@
     },
     {
       "path": "src/lua/dialog.rs",
-      "max_lines": 1275,
-      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection and IC-042 stop-test extraction: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers."
+      "max_lines": 1240,
+      "rationale": "IC-011 baseline, ratcheted by IC-035 malformed-tool-argument rejection and IC-042 stop-test extraction: multi-agent dialog configuration, bounded transcript and working history, speaker turns, stopping rules, Lua userdata, and builder logic remain coupled; extract transcript policy before adding dialog modes. Agent-level reasoning_effort (Agent::chat_request) adjusted this count. IC-044 ratchet after extracting request construction or related tests/helpers. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/lua/json.rs",

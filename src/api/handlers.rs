@@ -982,52 +982,8 @@ where
     work.await
 }
 
-fn classify_work_result(
-    join_result: std::result::Result<
-        std::result::Result<RunWorkResult, IronCrewError>,
-        tokio::task::JoinError,
-    >,
-    elapsed_ms: u64,
-) -> WorkOutcome {
-    match join_result {
-        Ok(Ok(work)) => {
-            let RunWorkResult {
-                status: response_status,
-                duration_ms: response_duration_ms,
-                usage: response_usage,
-            } = work;
-            let status = response_status
-                .parse::<RunStatus>()
-                .ok()
-                .filter(RunStatus::is_terminal)
-                .unwrap_or(RunStatus::Success);
-            WorkOutcome {
-                status,
-                duration_ms: response_duration_ms,
-                usage: response_usage,
-                error_message: None,
-            }
-        }
-        Ok(Err(error)) => WorkOutcome {
-            status: RunStatus::Failed,
-            duration_ms: elapsed_ms,
-            usage: crate::usage::UsageSnapshot::unavailable(),
-            error_message: Some(error.to_string()),
-        },
-        Err(join_error) if join_error.is_cancelled() => WorkOutcome {
-            status: RunStatus::Aborted,
-            duration_ms: elapsed_ms,
-            usage: crate::usage::UsageSnapshot::unavailable(),
-            error_message: None,
-        },
-        Err(join_error) => WorkOutcome {
-            status: RunStatus::Failed,
-            duration_ms: elapsed_ms,
-            usage: crate::usage::UsageSnapshot::unavailable(),
-            error_message: Some(format!("Task panicked: {join_error}")),
-        },
-    }
-}
+mod work_outcome;
+use work_outcome::classify_work_result;
 
 // ---------------------------------------------------------------------------
 // Flow execution
@@ -1041,6 +997,8 @@ pub async fn run_flow(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<serde_json::Value>>,
 ) -> RunFlowResult {
+    let usage_tracker = crate::usage::UsageTracker::for_run()
+        .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let input = body.map(|Json(v)| v);
     let request_key =
         super::idempotency::request_key(&headers, state.idempotency.require_key, principal.id())
@@ -1322,7 +1280,6 @@ pub async fn run_flow(
     // times out after `crew:run()` completed, the monitor can still preserve
     // those task results while applying the authoritative terminal status.
     let api_lifecycle = crate::lua::crew_userdata::ApiRunLifecycle::default();
-    let usage_tracker = crate::usage::UsageTracker::default();
     let usage_for_work = usage_tracker.clone();
 
     // Prepare the work task, then register it while holding the active-map
@@ -1953,6 +1910,7 @@ async fn execute_crew_from_path_with_events(
         lua.load(&script).exec_async().await.err()
     };
 
+    usage_tracker.budget().check()?;
     // Even if post-run Lua code failed (e.g., json_parse on skipped output),
     // the crew may have completed successfully. Prefer its staged completion,
     // preserving the historical behavior where that crew outcome wins.

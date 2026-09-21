@@ -1,4 +1,8 @@
-# Usage accounting (IC-046, in progress)
+# Usage accounting (IC-046)
+
+Operator-controlled admission is documented separately in
+[run token budgets](token-budgets.md). Every snapshot includes its budget state;
+receipt coverage and budget capacity are distinct measurements.
 
 This page describes the Rust `ironcrew::usage` contract, built-in HTTP capture,
 and process-local execution ownership. OpenAI Chat, Responses and Anthropic
@@ -6,8 +10,8 @@ retain checked receipts independently of their output return value.
 
 Task results, run records/summaries, CLI/HTTP outputs and task/run events now
 expose checked `usage` snapshots. JSON, SQLite and PostgreSQL persist these
-snapshots without narrowing counts. **Direct `ChatResponse.usage` and persisted
-conversation/dialog history still await migration** in [IC-046](issues/IC-046.md).
+snapshots without narrowing counts. `ChatResponse.usage` is a checked
+`UsageReceipt`; conversation/dialog checkpoints retain checked session history.
 The old usage fields are not a fallback source for the new tracker. Do not use
 transport tests as proof of end-to-end billing observability or an IC-047 budget.
 
@@ -45,9 +49,9 @@ the returned provider into crew/conversation/dialog execution. Retain the
 tracker to inspect it after success, error or cancellation. Unbound crew runs,
 conversation/dialog handles and agent turns create an isolated scope themselves.
 Lua embedders can inspect the VM's `UsageTracker` app data after execution or
-preinstall a tracker to retain access after dropping the VM. A reused VM or
-conversation handle accumulates its process-local lifetime, not historical
-usage recovered from persistent storage.
+preinstall a tracker to retain access after dropping the VM. A reused VM
+accumulates its process-local lifetime. Conversation/dialog usage includes
+its restored durable checkpoint plus newly observed calls.
 
 An explicit `ChatRequest.usage_tracker` takes precedence over a provider's
 bound scope. `ToolCallContext.usage_tracker` likewise chooses the scope for
@@ -58,10 +62,11 @@ Custom `LlmProvider` implementations opt into checked receipt ownership by
 returning `true` from `records_usage()` and settling the supplied request tracker
 once per actual dispatch, including errors and cancellation. Providers without
 that contract have each invocation counted as **unavailable** by the execution
-wrapper after its offline validation hook succeeds. Their old `TokenUsage`
-fields are deliberately not converted into checked receipts. This opaque
+wrapper after its offline validation hook succeeds. A returned receipt alone
+does not opt a custom provider into full attempt accounting. This opaque
 invocation boundary cannot reveal internal HTTP retries or billing details.
-Forwarding wrappers must preserve both `records_usage()` and `usage_tracker()`.
+Forwarding wrappers must preserve `records_usage()`, `usage_tracker()` and
+`records_usage_metrics()` to avoid duplicate accounting or telemetry.
 
 Terminal run snapshots are durable; in-flight attempts are not checkpointed.
 These snapshots are not token-budget enforcement or execution failover.
@@ -140,7 +145,20 @@ to rows without a checkpoint; they never infer receipts from old integer columns
 Old columns are left untouched, but are no longer read or written. Old JSON run
 records and old task-result payloads without `usage` are unsupported and fail
 decoding; export/archive them before upgrading. No legacy result adapter exists.
-Resumed conversation/dialog handles still do not recover historical usage.
+Conversation/dialog records require the same checked `usage` field. SQL migration
+marks older session checkpoints unavailable; old JSON session shapes without it
+are unsupported. A successful save commits usage and transcript together under
+the existing revision check (and HTTP idempotency transaction when applicable).
+In-flight snapshots are rejected. Resuming restores usage without charging that
+history to the new run/flow. Resetting transcript history does not reset usage.
+
+Session durability is **checkpoint-based**, not a billing journal: a failed or
+cancelled turn retains its receipt in the live handle; the next successful save
+includes it even though its transcript was rolled back. Eviction/process death
+before that save loses those unsaved receipts. `/history` and list summaries show
+the last durable checkpoint, not a guarantee of all provider activity since it.
+CLI `/usage` and Lua session methods show the live handle; successful HTTP
+message responses include its `usage` snapshot. No execution recovery is implied.
 
 ## Lua snapshots
 
@@ -148,15 +166,17 @@ Resumed conversation/dialog handles still do not recover historical usage.
 |---|---|
 | `crew:usage()` | Latest run that entered execution; `nil` before any such run |
 | `crew:flow_usage()` | Inclusive enclosing VM/caller scope, including all its crews and sessions |
-| `conversation:usage()` | Calls owned by this conversation handle since construction/resume |
-| `dialog:usage()` | Calls owned by this dialog handle since construction/resume |
+| `conversation:usage()` | Restored session checkpoint plus calls observed by this handle |
+| `dialog:usage()` | Restored session checkpoint plus calls observed by this handle |
 
 Each call returns a detached snapshot, not a live mutable view. A new run replaces
 the crew's last-run view; earlier returned snapshots stay unchanged. Nested calls
 are already included in ancestors: never add `crew:usage()` to `crew:flow_usage()`.
-Explicit Rust request/tool-context scope overrides choose a different owner and
-are intentionally excluded from a handle's default scope. Resuming a persisted
-session creates an empty process-local scope; it does not recover historical usage.
+Explicit conversation caller scopes charge the chosen caller instead of the
+creation flow, while also updating the independent session observer. Shared
+ancestors are deduplicated; bounded scope graphs permit 64 levels and 128 nodes.
+Session lifetime totals and current-run totals overlap only for new calls: never
+add them together. History restored from storage is not dispatched work.
 
 ```lua
 local ok, result = pcall(function() return crew:run() end)
@@ -225,11 +245,11 @@ atomic: overflow returns `UsageOverflow` without partially modifying totals.
 It must never be ignored or converted into a successful zero count.
 
 `UsageTracker` is a process-local shared accounting scope with constant-size
-counters per node and a maximum of 64 child levels. Its
+counters per node, at most 64 child levels and 128 ancestry nodes. Its
 attempt guard settles exactly once on completion or drop, including cancellation
 of a polled async request. Clones share a scope; separately created trackers do
 not. `child()` creates a disjoint child view and updates its inclusive ancestors
-atomically, with root-first locks. A nesting-limit failure rejects the new scope
+atomically, with globally ordered locks and deduplicated observers. A scope-limit failure rejects the new scope
 before dispatch. Retries and delegated calls use separate guards on the run scope
 or a descendant.
 Do not add child results again to a tracker that already includes child requests.
@@ -245,16 +265,19 @@ by this in-memory helper. It also does not reserve or enforce a token budget.
 
 These are token measurements, not invoices. They exclude provider-side activity
 for which no receipt reaches IronCrew, non-token tool charges, billing tiers,
-credits and monetary reconciliation. Partial or unavailable usage must stay
-visible through the upcoming CLI/Lua/HTTP/store integration.
+credits and monetary reconciliation. Partial or unavailable usage remains
+explicit in CLI/Lua/HTTP/store results.
 
-## Remaining integration
+## Provider metrics
 
-1. Replace the old response/task usage types and add per-task views without
-   double-counting inclusive run/flow totals. Do not add a compatibility
-   fallback to old receipt fields.
-2. Carry the same coverage contract through result fields, CLI, HTTP/events, run/session
-   persistence and JSON/SQLite/PostgreSQL. Preserve owner fencing and terminal
-   compare-and-set behavior and the lossless decimal-string wire representation.
-3. Run durable-backend acceptance against disposable PostgreSQL 15 and the
-   complete affected gates before resolving IC-046 or implementing IC-047.
+Built-in transports record one receipt per dispatch, including errors and
+cancelled streams, even without an execution tracker. Runtime wrappers do not
+count those receipts again. Custom providers use wrapper telemetry unless they
+declare `records_usage_metrics()` and own it themselves.
+
+`ironcrew_provider_tokens_total` contains known lower bounds, with fixed `type`
+labels `prompt`, `completion`, `total`, `cached`, `cache_write`, `reasoning`.
+Pair it with `ironcrew_provider_usage_incomplete_fields_total` (same labels) and
+`ironcrew_provider_usage_receipts_total` (`provider`, `coverage`) to distinguish
+unknown details from known zero. These process-local operational counters are
+not lossless billing records; use checked snapshots for exact unsigned counts.

@@ -80,7 +80,7 @@ pub async fn run_single_agent_turn(
 ) -> Result<(String, Option<String>)> {
     let provider = match &ctx.usage_tracker {
         Some(tracker) => crate::llm::scope::with_usage_tracker(provider.clone(), tracker.clone()),
-        None => crate::llm::scope::ensure_scope(provider.clone()),
+        None => crate::llm::scope::ensure_scope(provider.clone())?,
     };
     let mut ctx = ctx.clone();
     ctx.usage_tracker = provider.usage_tracker();
@@ -265,7 +265,7 @@ mod tests {
                 content: Some("final answer".into()),
                 reasoning: None,
                 tool_calls: vec![],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }
@@ -284,7 +284,7 @@ mod tests {
                     content: Some("final answer".into()),
                     reasoning: None,
                     tool_calls: vec![],
-                    usage: None,
+                    usage: Default::default(),
                     raw_blocks: None,
                 });
             }
@@ -301,7 +301,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 }],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }
@@ -317,7 +317,7 @@ mod tests {
                 content: Some("too late".into()),
                 reasoning: None,
                 tool_calls: vec![],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }

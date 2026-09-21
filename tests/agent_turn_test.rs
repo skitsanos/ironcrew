@@ -34,7 +34,7 @@ impl LlmProvider for EchoProvider {
             content: Some(format!("stub-reply-{}", last)),
             reasoning: None,
             tool_calls: vec![],
-            usage: None,
+            usage: Default::default(),
             raw_blocks: None,
         })
     }

@@ -98,6 +98,9 @@ fixed_labels!(TokenKind {
     Prompt => "prompt",
     Completion => "completion",
     Cached => "cached",
+    Total => "total",
+    CacheWrite => "cache_write",
+    Reasoning => "reasoning",
 });
 
 fixed_labels!(SseScope {

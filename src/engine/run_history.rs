@@ -424,27 +424,8 @@ fn flow_filter_matches(record: &ConversationRecord, flow_path: Option<&str>) -> 
 
 // ── Dialog on-disk helpers (mirror the conversation helpers above) ──────
 
-fn dialog_file_path(dialogs_dir: &Path, flow_path: Option<&str>, id: &str) -> PathBuf {
-    match flow_path {
-        Some(flow) => {
-            let flow_dir = dialogs_dir.join(encode_flow_component(flow));
-            let _ = std::fs::create_dir_all(&flow_dir);
-            flow_dir.join(format!("{}.json", id))
-        }
-        None => dialogs_dir.join(format!("{}.json", id)),
-    }
-}
-
-fn load_dialog_file(path: &Path, id: &str) -> Result<Option<DialogStateRecord>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = read_json_record(path)?;
-    let record: DialogStateRecord = serde_json::from_str(&data).map_err(|e| {
-        IronCrewError::Validation(format!("Failed to parse dialog state '{}': {}", id, e))
-    })?;
-    Ok(Some(record))
-}
+mod dialog_files;
+use dialog_files::{dialog_file_path, load_dialog_file};
 
 fn walk_dialog_records(
     dialogs_dir: &Path,
@@ -486,7 +467,9 @@ fn walk_dialog_records(
 
 fn read_dialog_for_walk(path: &Path) -> Option<DialogStateRecord> {
     let data = read_json_record(path).ok()?;
-    serde_json::from_str::<DialogStateRecord>(&data).ok()
+    let record = serde_json::from_str::<DialogStateRecord>(&data).ok()?;
+    super::session_usage::validate(&record.usage).ok()?;
+    Some(record)
 }
 
 fn dialog_flow_matches(record: &DialogStateRecord, flow_path: Option<&str>) -> bool {
@@ -2391,6 +2374,7 @@ impl StateStore for JsonFileStoreCore {
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
+        super::session_usage::validate(&record.usage)?;
         validate_session_id(&record.id)?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))

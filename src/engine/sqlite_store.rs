@@ -40,123 +40,8 @@ pub struct SqliteStore {
     lease: RunLeaseConfig,
 }
 
-struct BoundedConversationRow {
-    id: String,
-    flow_name: Option<String>,
-    flow_name_bytes: i64,
-    flow_path: Option<String>,
-    flow_path_bytes: Option<i64>,
-    agent_name: Option<String>,
-    agent_name_bytes: i64,
-    execution: Option<String>,
-    execution_bytes: i64,
-    messages: Option<String>,
-    messages_bytes: i64,
-    message_count: Option<i64>,
-    created_at: Option<String>,
-    created_at_bytes: i64,
-    updated_at: Option<String>,
-    updated_at_bytes: i64,
-    revision: i64,
-}
-
-struct BoundedConversationSummaryRow {
-    id: Option<String>,
-    id_bytes: i64,
-    flow_path: Option<String>,
-    flow_path_bytes: Option<i64>,
-    agent_name: Option<String>,
-    agent_name_bytes: i64,
-    turn_count: i64,
-    messages_bytes: i64,
-    message_count: Option<i64>,
-    created_at: Option<String>,
-    created_at_bytes: i64,
-    updated_at: Option<String>,
-    updated_at_bytes: i64,
-}
-
-fn sqlite_stored_bytes(value: i64, label: &str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| {
-        IronCrewError::Validation(format!(
-            "SQLite stored conversation {label} has an invalid byte count"
-        ))
-    })
-}
-
-fn sqlite_bounded_metadata(value: Option<String>, bytes: i64, label: &str) -> Result<String> {
-    let bytes = sqlite_stored_bytes(bytes, label)?;
-    validate_stored_conversation_metadata_bytes(label, bytes)?;
-    value.ok_or_else(|| {
-        IronCrewError::Validation(format!(
-            "SQLite stored conversation {label} could not be materialized safely"
-        ))
-    })
-}
-
-fn sqlite_bounded_optional_metadata(
-    value: Option<String>,
-    bytes: Option<i64>,
-    label: &str,
-) -> Result<Option<String>> {
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    sqlite_bounded_metadata(value, bytes, label).map(Some)
-}
-
-fn sqlite_bounded_conversation_execution(
-    value: Option<String>,
-    bytes: i64,
-    column: usize,
-) -> Result<super::sessions::ConversationExecution> {
-    let bytes = sqlite_stored_bytes(bytes, "execution")?;
-    super::conversation_record::validate_stored_conversation_execution_bytes(bytes)?;
-    let value = value.ok_or_else(|| {
-        IronCrewError::Validation(
-            "SQLite stored conversation execution identity could not be materialized safely".into(),
-        )
-    })?;
-    preflight_conversation_execution_json(&value)?;
-    decode_stored_json(&value, column).map_err(|error| {
-        IronCrewError::Validation(format!(
-            "SQLite stored conversation execution identity has an invalid shape: {error}"
-        ))
-    })
-}
-
-fn sqlite_conversation_summary(row: BoundedConversationSummaryRow) -> Result<ConversationSummary> {
-    let messages_bytes = sqlite_stored_bytes(row.messages_bytes, "messages")?;
-    let message_count = row
-        .message_count
-        .map(|count| sqlite_stored_bytes(count, "message count"))
-        .transpose()?;
-    validate_stored_conversation_messages_envelope(messages_bytes, message_count)?;
-    let id = sqlite_bounded_metadata(row.id, row.id_bytes, "id")?;
-    validate_session_id(&id)?;
-    Ok(ConversationSummary {
-        id,
-        flow_path: sqlite_bounded_optional_metadata(
-            row.flow_path,
-            row.flow_path_bytes,
-            "flow path",
-        )?,
-        agent_name: sqlite_bounded_metadata(row.agent_name, row.agent_name_bytes, "agent name")?,
-        created_at: sqlite_bounded_metadata(
-            row.created_at,
-            row.created_at_bytes,
-            "created timestamp",
-        )?,
-        updated_at: sqlite_bounded_metadata(
-            row.updated_at,
-            row.updated_at_bytes,
-            "updated timestamp",
-        )?,
-        turn_count: usize::try_from(row.turn_count).map_err(|_| {
-            IronCrewError::Validation("SQLite conversation turn count is out of range".into())
-        })?,
-    })
-}
+mod session_rows;
+use session_rows::*;
 
 /// Map the shared `SqlParam` values to boxed `rusqlite::ToSql` trait objects so
 /// they can be passed to `params_from_iter`. Kept as a free fn so both
@@ -338,7 +223,6 @@ impl SqliteStore {
         // history). Detected via PRAGMA so we only ALTER when absent — mirrors
         // `migrate_sessions_to_composite_unique`'s "check first" style.
         migrate_runs_add_flow(&conn)?;
-        usage_schema::migrate(&conn)?;
         migrate_runs_add_lease_columns(&conn)?;
 
         // Enforce the documented `(flow_path, id)` uniqueness on sessions.
@@ -354,6 +238,7 @@ impl SqliteStore {
         // checking for the new composite unique index and, if absent,
         // rebuild and copy data.
         migrate_sessions_to_composite_unique(&conn)?;
+        usage_schema::migrate(&conn)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -2649,10 +2534,11 @@ impl StateStore for SqliteStore {
                 })?;
                 let messages = serialize_conversation_messages(&conversation.messages)?;
                 let execution = serialize_conversation_execution(&conversation.execution)?;
+                let usage_json = super::session_usage::encode(&conversation.usage)?;
                 let changed = tx
                     .execute(
                         "UPDATE conversations SET flow_name = ?3, agent_name = ?4, execution = ?5, messages = ?6, \
-                         created_at = ?7, updated_at = ?8, revision = ?9 \
+                         created_at = ?7, updated_at = ?8, revision = ?9, usage = ?11 \
                          WHERE id = ?1 AND flow_path IS ?2 AND revision = ?10",
                         rusqlite::params![
                             &conversation.id,
@@ -2673,6 +2559,7 @@ impl StateStore for SqliteStore {
                                     "Conversation revision is out of range".into(),
                                 )
                             })?,
+                            &usage_json,
                         ],
                     )
                     .map_err(|error| {
@@ -3011,6 +2898,7 @@ impl StateStore for SqliteStore {
                     )));
                 }
 
+                let usage_json = super::session_usage::encode(&record.usage)?;
                 let messages_json = serialize_conversation_messages(&record.messages)?;
                 let execution_json = serialize_conversation_execution(&record.execution)?;
                 let current = match tx.query_row(
@@ -3053,8 +2941,8 @@ impl StateStore for SqliteStore {
                     None if record.revision == 0 => {
                         tx.execute(
                             "INSERT INTO conversations \
-                             (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                             (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision, usage) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                             rusqlite::params![
                                 &record.id,
                                 &record.flow_name,
@@ -3065,6 +2953,7 @@ impl StateStore for SqliteStore {
                                 &record.created_at,
                                 &record.updated_at,
                                 next_revision_i64,
+                                &usage_json,
                             ],
                         )
                         .map_err(|e| {
@@ -3081,7 +2970,7 @@ impl StateStore for SqliteStore {
                             .execute(
                                 "UPDATE conversations SET \
                                  flow_name = ?3, agent_name = ?4, execution = ?5, messages = ?6, \
-                                 created_at = ?7, updated_at = ?8, revision = ?9 \
+                                 created_at = ?7, updated_at = ?8, revision = ?9, usage = ?11 \
                                  WHERE id = ?1 AND flow_path IS ?2 AND revision = ?10",
                                 rusqlite::params![
                                     &record.id,
@@ -3094,6 +2983,7 @@ impl StateStore for SqliteStore {
                                     &record.updated_at,
                                     next_revision_i64,
                                     expected_revision,
+                                    &usage_json,
                                 ],
                             )
                             .map_err(|e| {
@@ -3172,7 +3062,8 @@ impl StateStore for SqliteStore {
                                 CASE WHEN length(CAST(created_at AS BLOB)) <= ?3 THEN created_at END, \
                                 length(CAST(created_at AS BLOB)), \
                                 CASE WHEN length(CAST(updated_at AS BLOB)) <= ?3 THEN updated_at END, \
-                                length(CAST(updated_at AS BLOB)), revision \
+                                length(CAST(updated_at AS BLOB)), revision, \
+                                CASE WHEN length(CAST(usage AS BLOB)) <= 4096 THEN usage END \
                          FROM conversations \
                          WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
                     )
@@ -3211,6 +3102,7 @@ impl StateStore for SqliteStore {
                                 updated_at: row.get(14)?,
                                 updated_at_bytes: row.get(15)?,
                                 revision: row.get(16)?,
+                                usage: row.get(17)?,
                             })
                         },
                     )
@@ -3250,6 +3142,7 @@ impl StateStore for SqliteStore {
                 preflight_conversation_execution_json(&execution_json)?;
                 preflight_conversation_messages_json(&messages_json)?;
                 let record = ConversationRecord {
+                    usage: super::session_usage::decode(row.usage.as_deref())?,
                     id: row.id,
                     flow_name: sqlite_bounded_metadata(
                         row.flow_name,
@@ -3384,7 +3277,8 @@ impl StateStore for SqliteStore {
                            length(CAST(c.created_at AS BLOB)), \
                            CASE WHEN length(CAST(c.updated_at AS BLOB)) <= ?4 THEN c.updated_at END \
                                 AS bounded_updated_at, \
-                           length(CAST(c.updated_at AS BLOB)) \
+                           length(CAST(c.updated_at AS BLOB)), \
+                           CASE WHEN length(CAST(c.usage AS BLOB)) <= 4096 THEN c.usage END \
                          FROM conversations AS c \
                          WHERE (?1 IS NULL OR c.flow_path = ?1) \
                          ORDER BY bounded_updated_at DESC \
@@ -3426,6 +3320,7 @@ impl StateStore for SqliteStore {
                                 created_at_bytes: row.get(10)?,
                                 updated_at: row.get(11)?,
                                 updated_at_bytes: row.get(12)?,
+                                usage: row.get(13)?,
                             })
                         },
                     )
@@ -3492,6 +3387,7 @@ impl StateStore for SqliteStore {
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
+        super::session_usage::validate(&record.usage)?;
         let conn = Arc::clone(&self.conn);
         let record = record.clone();
         let next_revision = record
@@ -3512,6 +3408,7 @@ impl StateStore for SqliteStore {
                         ))
                     })?;
 
+                let usage_json = super::session_usage::encode(&record.usage)?;
                 let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
                     IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
                 })?;
@@ -3542,8 +3439,8 @@ impl StateStore for SqliteStore {
                     None if record.revision == 0 => {
                         tx.execute(
                             "INSERT INTO dialogs \
-                             (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                             (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision, usage) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                             rusqlite::params![
                                 &record.id,
                                 &record.flow_name,
@@ -3557,6 +3454,7 @@ impl StateStore for SqliteStore {
                                 &record.created_at,
                                 &record.updated_at,
                                 next_revision_i64,
+                                &usage_json,
                             ],
                         )
                         .map_err(|e| {
@@ -3572,7 +3470,7 @@ impl StateStore for SqliteStore {
                                  flow_name = ?3, agent_names = ?4, starter = ?5, \
                                  transcript = ?6, next_index = ?7, stopped = ?8, \
                                  stop_reason = ?9, created_at = ?10, updated_at = ?11, \
-                                 revision = ?12 \
+                                 revision = ?12, usage = ?14 \
                                  WHERE id = ?1 AND flow_path IS ?2 AND revision = ?13",
                                 rusqlite::params![
                                     &record.id,
@@ -3588,6 +3486,7 @@ impl StateStore for SqliteStore {
                                     &record.updated_at,
                                     next_revision_i64,
                                     expected_revision,
+                                    &usage_json,
                                 ],
                             )
                             .map_err(|e| {
@@ -3638,7 +3537,8 @@ impl StateStore for SqliteStore {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, flow_name, flow_path, agent_names, starter, transcript, next_index, \
-                         stopped, stop_reason, created_at, updated_at, revision \
+                         stopped, stop_reason, created_at, updated_at, revision, \
+                         CASE WHEN length(CAST(usage AS BLOB)) <= 4096 THEN usage END \
                          FROM dialogs \
                          WHERE id = ?1 AND (?2 IS NULL OR flow_path = ?2)",
                     )
@@ -3649,6 +3549,7 @@ impl StateStore for SqliteStore {
                         let agents_json: String = row.get(3)?;
                         let transcript_json: String = row.get(5)?;
                         Ok(DialogStateRecord {
+                            usage: decode_stored_json(&row.get::<_, String>(12)?, 12)?,
                             id: row.get(0)?,
                             flow_name: row.get(1)?,
                             flow_path: row.get(2)?,
@@ -3673,6 +3574,9 @@ impl StateStore for SqliteStore {
                             other
                         ))),
                     })?;
+                if let Some(record) = &row {
+                    super::session_usage::validate(&record.usage)?;
+                }
                 Ok(row)
             })
             .await,

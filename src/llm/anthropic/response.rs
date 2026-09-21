@@ -1,9 +1,7 @@
 use serde_json::Value;
 
 use crate::engine::agent::ResponseFormat;
-use crate::llm::provider::{
-    ChatRequest, ChatResponse, TokenUsage, ToolCallFunction, ToolCallRequest,
-};
+use crate::llm::provider::{ChatRequest, ChatResponse, ToolCallFunction, ToolCallRequest};
 use crate::utils::error::{IronCrewError, Result};
 
 pub(super) fn structured_output_tool_name(request: &ChatRequest) -> Option<&str> {
@@ -101,13 +99,7 @@ pub(super) fn parse_anthropic_response(
         }
     }
 
-    let usage = resp.get("usage").map(|usage| TokenUsage {
-        prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
-        total_tokens: (usage["input_tokens"].as_u64().unwrap_or(0)
-            + usage["output_tokens"].as_u64().unwrap_or(0)) as u32,
-        cached_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
-    });
+    let usage = crate::usage::ProviderUsage::Anthropic.parse(resp.get("usage"), true);
 
     if structured_output_tool.is_some() && !saw_structured_output && tool_calls.is_empty() {
         return Err(IronCrewError::Provider(

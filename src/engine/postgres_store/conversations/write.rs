@@ -19,6 +19,7 @@ impl PostgresStore {
         validate_conversation_record_for_write(record)?;
         let messages_json = serialize_conversation_messages(&record.messages)?;
         let execution_json = serialize_conversation_execution(&record.execution)?;
+        let usage_json = crate::engine::session_usage::encode(&record.usage)?;
         let expected_revision = i64::try_from(record.revision).map_err(|_| {
             IronCrewError::Validation("Conversation revision is out of range".into())
         })?;
@@ -90,8 +91,8 @@ impl PostgresStore {
             None if expected_revision == 0 => {
                 let insert_sql = format!(
                     "INSERT INTO {} \
-                     (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision) \
-                     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, 1) \
+                     (id, flow_name, flow_path, agent_name, execution, messages, created_at, updated_at, revision, usage) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, 1, $9::jsonb) \
                      ON CONFLICT (flow_path, id) DO NOTHING RETURNING revision",
                     self.conversations_table
                 );
@@ -104,6 +105,7 @@ impl PostgresStore {
                     .bind(&messages_json)
                     .bind(&record.created_at)
                     .bind(&record.updated_at)
+                    .bind(&usage_json)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| {
@@ -119,7 +121,7 @@ impl PostgresStore {
                 let update_sql = format!(
                     "UPDATE {} SET flow_name = $3, agent_name = $4, \
                      execution = $5::jsonb, messages = $6::jsonb, created_at = $7, updated_at = $8, \
-                     revision = revision + 1 \
+                     revision = revision + 1, usage = $10::jsonb \
                      WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $9 \
                      RETURNING revision",
                     self.conversations_table
@@ -134,6 +136,7 @@ impl PostgresStore {
                     .bind(&record.created_at)
                     .bind(&record.updated_at)
                     .bind(expected_revision)
+                    .bind(&usage_json)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| {

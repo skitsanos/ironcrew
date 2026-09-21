@@ -1,5 +1,6 @@
 # Cloud Deployment
 
+
 How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**, **Railway**, and similar platforms. This doc covers graceful shutdown, resource limits, security posture, and platform-specific recipes.
 
 IronCrew is distributed as a single Rust executable. The default Linux release
@@ -846,7 +847,9 @@ Execution and storage instrumentation uses only closed label vocabularies:
 | `ironcrew_tool_calls_total`; `ironcrew_tool_call_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `cancelled` |
 | `ironcrew_hook_failures_total` | counter | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total`; `ironcrew_provider_request_duration_seconds` | counter; histogram | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
-| `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `total`, `cached`, `cache_write`, `reasoning` |
+| `ironcrew_provider_usage_incomplete_fields_total` | counter | Same `provider` and `type` labels; missing/partial field receipts |
+| `ironcrew_provider_usage_receipts_total` | counter | Same `provider`; `coverage`: `complete`, `partial`, `unavailable` |
 | `ironcrew_sse_connections_total` | counter | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
 | `ironcrew_lease_losses_total` | counter | `scope`: `run`, `conversation` |
 | `ironcrew_reconciliation_cycles_total` | counter | `outcome`: `success`, `error` |
@@ -1749,3 +1752,9 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [ ] Container runs non-root with no privilege escalation and dropped capabilities
 - [ ] TLS terminated at ingress / router / load balancer
 - [ ] Log level set to `info` or lower (never `debug` in prod)
+## Optional provider-spend guard
+
+Set [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) consistently on replicas to
+limit each execution's admitted input-plus-output tokens. Invalid settings fail
+server startup. The policy is opt-in and not a currency or global tenant quota;
+aggregate exposure scales with concurrent admitted runs across replicas.

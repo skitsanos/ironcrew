@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SnapshotWire")]
 pub struct UsageSnapshot {
+    pub budget: super::budget::BudgetSnapshot,
     pub settled: UsageAggregate,
     #[serde(with = "super::wire")]
     pub in_flight: u64,
@@ -20,6 +21,7 @@ impl Default for UsageSnapshot {
 
 impl UsageSnapshot {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.budget.validate()?;
         self.settled.validate()?;
         self.settled
             .requests()
@@ -49,6 +51,7 @@ impl UsageSnapshot {
             UsageCoverage::Partial
         };
         Self {
+            budget: Default::default(),
             settled,
             in_flight,
             coverage,
@@ -58,13 +61,16 @@ impl UsageSnapshot {
     /// No trustworthy execution checkpoint exists (for example after owner
     /// death). Do not manufacture a zero-cost or zero-request receipt.
     pub fn unavailable() -> Self {
-        Self::new(UsageAggregate::unavailable(), 0)
+        let mut snapshot = Self::new(UsageAggregate::unavailable(), 0);
+        snapshot.budget.state = super::budget::BudgetState::Unavailable;
+        snapshot
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotWire {
+    budget: super::budget::BudgetSnapshot,
     settled: UsageAggregate,
     #[serde(with = "super::wire")]
     in_flight: u64,
@@ -78,7 +84,9 @@ impl TryFrom<SnapshotWire> for UsageSnapshot {
             .requests()
             .checked_add(wire.in_flight)
             .ok_or("usage request count overflow")?;
-        let value = Self::new(wire.settled, wire.in_flight);
+        let mut value = Self::new(wire.settled, wire.in_flight);
+        wire.budget.validate()?;
+        value.budget = wire.budget;
         if value.coverage != wire.coverage {
             return Err("inconsistent usage snapshot coverage");
         }

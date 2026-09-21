@@ -8,6 +8,7 @@ mod histogram;
 mod labels;
 mod prometheus;
 mod state;
+mod usage;
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -49,15 +50,8 @@ pub fn record_provider(
     METRICS.record_provider(family, operation, outcome, duration);
 }
 
-pub fn record_provider_tokens(family: ProviderFamily, usage: &crate::llm::provider::TokenUsage) {
-    METRICS.record_provider_tokens(
-        family,
-        [
-            u64::from(usage.prompt_tokens),
-            u64::from(usage.completion_tokens),
-            u64::from(usage.cached_tokens),
-        ],
-    );
+pub fn record_provider_usage(family: ProviderFamily, usage: &crate::usage::UsageReceipt) {
+    METRICS.usage.record(family, usage);
 }
 
 pub fn record_sse(scope: SseScope, outcome: SseOutcome) {

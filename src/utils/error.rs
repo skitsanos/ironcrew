@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum IronCrewError {
+    #[error("{0}")]
+    TokenBudget(#[from] crate::usage::budget::BudgetError),
     #[error("Construction validation INCOMPLETE: {0}")]
     ValidationIncomplete(String),
 
@@ -55,7 +57,22 @@ pub enum IronCrewError {
 
 impl IronCrewError {
     pub(crate) fn allows_task_retry(&self) -> bool {
-        !matches!(self, Self::EmptyProviderResponse)
+        if let Self::Lua(error) = self {
+            let mut current = Some(error);
+            while let Some(error) = current {
+                if error
+                    .downcast_ref::<crate::usage::budget::BudgetError>()
+                    .is_some()
+                    || error
+                        .downcast_ref::<Self>()
+                        .is_some_and(|inner| !inner.allows_task_retry())
+                {
+                    return false;
+                }
+                current = error.parent();
+            }
+        }
+        !matches!(self, Self::EmptyProviderResponse | Self::TokenBudget(_))
     }
 }
 

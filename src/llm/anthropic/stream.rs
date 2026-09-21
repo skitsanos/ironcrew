@@ -48,9 +48,6 @@ impl AnthropicProvider {
         let output_limit = self.execution_policy.output_bytes();
         let mut stored_output_bytes = 0_usize;
         let mut block_states: BTreeMap<usize, BlockState> = BTreeMap::new();
-        let mut input_tokens: u32 = 0;
-        let mut output_tokens: u32 = 0;
-        let mut cached_tokens: u32 = 0;
 
         let mut lines = ProviderSseLines::new(resp, self.execution_policy, "Anthropic stream");
         let mut current_event_type = String::new();
@@ -85,11 +82,6 @@ impl AnthropicProvider {
             match current_event_type.as_str() {
                 "message_start" => {
                     accounting.observe(parsed["message"].get("usage"), false);
-                    if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
-                        input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-                        cached_tokens =
-                            usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32;
-                    }
                 }
                 "content_block_start" => {
                     let index = parsed["index"].as_u64().unwrap_or(0) as usize;
@@ -197,9 +189,6 @@ impl AnthropicProvider {
                 "message_delta" => {
                     saw_final_usage |= parsed["usage"].get("output_tokens").is_some();
                     accounting.observe(parsed.get("usage"), false);
-                    if let Some(usage) = parsed.get("usage") {
-                        output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
-                    }
                 }
                 "message_stop" => {
                     saw_message_stop = true;
@@ -246,17 +235,12 @@ impl AnthropicProvider {
             Some(full_reasoning)
         };
 
-        accounting.finish()?;
+        let usage = accounting.finish()?;
         Ok(ChatResponse {
             content,
             reasoning,
             tool_calls,
-            usage: Some(TokenUsage {
-                prompt_tokens: input_tokens,
-                completion_tokens: output_tokens,
-                total_tokens: input_tokens + output_tokens,
-                cached_tokens,
-            }),
+            usage,
             // The streaming path does not reconstruct replayable thinking blocks
             // (that needs the per-block signature reassembled from signature
             // deltas). It isn't required for the tool-use round-trip: the

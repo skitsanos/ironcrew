@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::accounting::ProviderAttempt;
 use super::provider::*;
 use crate::usage::{ProviderUsage, UsageTracker};
+mod budget;
 mod stream;
 use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
 mod request_body;
@@ -98,17 +99,8 @@ impl OpenAiResponsesProvider {
         body: Value,
         usage_tracker: Option<&UsageTracker>,
     ) -> Result<ChatResponse> {
-        let request_body = self.prepare_request(&body)?;
-
-        if let Some(ref limiter) = self.rate_limit {
-            limiter.wait().await;
-        }
-
+        let (request_body, mut accounting) = self.prepare_dispatch(body, usage_tracker).await?;
         let url = format!("{}/v1/responses", self.base_url);
-        crate::utils::network::validate_url_not_private(&url)
-            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
-
-        let mut accounting = ProviderAttempt::start(usage_tracker, ProviderUsage::OpenAiResponses)?;
         let resp = self
             .client
             .post(&url)
@@ -163,6 +155,13 @@ use response::parse_responses_response;
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn supports_token_budget(&self) -> bool {
+        self.budget_supported()
+    }
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
+
     fn records_usage(&self) -> bool {
         true
     }
@@ -237,10 +236,8 @@ impl LlmProvider for OpenAiResponsesProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -269,10 +266,8 @@ impl LlmProvider for OpenAiResponsesProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -290,5 +285,7 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 }
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;

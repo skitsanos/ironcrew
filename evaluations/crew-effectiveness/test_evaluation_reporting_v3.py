@@ -9,6 +9,8 @@ def fixture_usage(prompt, completion, total, cached, requests=1):
     fields = dict(prompt_tokens=prompt, completion_tokens=completion,
                   total_tokens=total, cached_tokens=cached)
     return {
+        "budget": {"state": "disabled", "limit": None, "charged": "0",
+                   "retained": "0", "reserved": "0", "in_flight": "0"},
         "coverage": "complete", "in_flight": "0",
         "settled": {
             "coverage": "complete", "requests": str(requests),
@@ -26,6 +28,8 @@ class EvaluationReportingV3Tests(unittest.TestCase):
         for path, value in [
             (("in_flight",), "1"),
             (("coverage",), "partial"),
+            (("budget", "charged"), "1"),
+            (("budget", "state"), "exhausted"),
             (("settled", "requests"), "2"),
             (("settled", "total_tokens", "known"), 12),
             (("settled", "total_tokens", "known"), "012"),

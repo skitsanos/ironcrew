@@ -62,7 +62,7 @@ impl LlmProvider for CannedProvider {
             content: Some(self.reply.clone()),
             reasoning: None,
             tool_calls: vec![],
-            usage: None,
+            usage: Default::default(),
             raw_blocks: None,
         })
     }
@@ -87,7 +87,7 @@ impl LlmProvider for CannedProvider {
                             arguments: "{}".into(),
                         },
                     }],
-                    usage: None,
+                    usage: Default::default(),
                     raw_blocks: None,
                 });
             }
@@ -142,7 +142,7 @@ impl LlmProvider for RecordingProvider {
             content: Some(self.reply.clone()),
             reasoning: None,
             tool_calls: vec![],
-            usage: None,
+            usage: Default::default(),
             raw_blocks: None,
         })
     }

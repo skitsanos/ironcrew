@@ -15,6 +15,6 @@ pub(super) fn register<M: UserDataMethods<LuaCrew>>(methods: &mut M) {
         }
     });
     methods.add_method("flow_usage", |lua, _, ()| {
-        usage::snapshot(lua, &usage::tracker(lua))
+        usage::snapshot(lua, &usage::tracker(lua)?)
     });
 }

@@ -23,29 +23,8 @@ const HARD_MAX_CONCURRENT_TASKS: usize = 256;
 mod result_budget;
 use result_budget::RetainedResultBudget;
 
-/// Resolve the model to use for a task, following the priority chain:
-/// 1. Agent's model override
-/// 2. Task's model override
-/// 3. Model Router purpose-based mapping
-/// 4. Crew's default model
-pub fn resolve_model(task: &Task, agent: &Agent, crew: &Crew, purpose: &str) -> String {
-    // 1. Agent's model override
-    if let Some(ref model) = agent.model {
-        return model.clone();
-    }
-    // 2. Task's model override
-    if let Some(ref model) = task.model {
-        return model.clone();
-    }
-    // 3. Model Router purpose-based
-    if crew.model_router.is_configured() {
-        return crew
-            .model_router
-            .resolve(purpose, &crew.provider_config.model);
-    }
-    // 4. Crew default
-    crew.provider_config.model.clone()
-}
+mod model_routing;
+pub use model_routing::resolve_model;
 
 /// Filter tasks in a phase to only those eligible for execution.
 /// Skips error handlers, tasks with failed dependencies, and tasks whose conditions are false.
@@ -259,7 +238,7 @@ pub async fn run_crew(
     provider: Arc<dyn LlmProvider>,
     tool_registry: &ToolRegistry,
 ) -> Result<Vec<TaskResult>> {
-    let provider = crate::llm::scope::ensure_scope(provider);
+    let provider = crate::llm::scope::ensure_scope(provider)?;
     crew.validate_resource_limits()?;
     if crew.agents.is_empty() {
         return Err(IronCrewError::Validation("No agents in crew".into()));
@@ -745,6 +724,9 @@ pub async fn run_crew(
     // Note: RunComplete is NOT emitted here — the API handler is responsible
     // for emitting it with the correct run_id after the Lua script fully completes.
 
+    if let Some(tracker) = provider.usage_tracker() {
+        tracker.budget().check()?;
+    }
     // Return results in phase order
     Ok(task_order
         .iter()

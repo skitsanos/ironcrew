@@ -20,6 +20,8 @@ use crate::utils::error::{IronCrewError, Result};
 /// was last saved — the transcript, turn index, and any custom stop state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogStateRecord {
+    /// Checked usage at the same revision as this transcript checkpoint.
+    pub usage: crate::usage::UsageSnapshot,
     pub id: String,
     pub flow_name: String,
     /// User-facing flow identifier. See `ConversationRecord::flow_path`.

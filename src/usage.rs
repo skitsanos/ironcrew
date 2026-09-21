@@ -1,9 +1,10 @@
 //! Checked usage-receipt foundation for IC-046.
 //!
 //! Built-in providers and Lua execution expose checked, hierarchical snapshots.
-//! Runtime task result fields and durable stores have not yet migrated.
+//! Task/run results and durable run stores retain the same checked snapshots.
 //! Counts describe provider receipts, not invoices or inferred text lengths.
 mod aggregate;
+pub mod budget;
 mod parsing;
 mod snapshot;
 mod tracker;

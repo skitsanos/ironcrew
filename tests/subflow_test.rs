@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use async_trait::async_trait;
 use ironcrew::engine::conversation_definition::{ConversationSourceContext, capture_flow_source};
 use ironcrew::engine::runtime::Runtime;
-use ironcrew::llm::provider::{ChatRequest, ChatResponse, LlmProvider, TokenUsage, ToolSchema};
+use ironcrew::llm::provider::{ChatRequest, ChatResponse, LlmProvider, ToolSchema};
 use ironcrew::lua::api::{
     load_agents_from_files, load_tool_defs_from_files, register_agent_constructor,
     register_crew_constructor,
@@ -42,13 +42,6 @@ impl LlmProvider for NoopProvider {
     ) -> ironcrew::utils::error::Result<ChatResponse> {
         Err(IronCrewError::Provider("NoopProvider: no LLM calls".into()))
     }
-}
-
-/// Suppress a dead_code lint on TokenUsage which is imported through the
-/// provider prelude but not referenced directly in tests.
-#[allow(dead_code)]
-fn _unused_usage() -> TokenUsage {
-    TokenUsage::default()
 }
 
 /// Build a top-level Lua VM and `Arc<Runtime>` for a given project

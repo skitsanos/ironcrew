@@ -163,6 +163,10 @@ fn merge_consecutive_roles(messages: Vec<Value>) -> Vec<Value> {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
+
     fn records_usage(&self) -> bool {
         true
     }
@@ -224,10 +228,8 @@ impl LlmProvider for AnthropicProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -257,10 +259,8 @@ impl LlmProvider for AnthropicProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)

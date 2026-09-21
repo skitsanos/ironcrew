@@ -21,6 +21,7 @@ use ironcrew::llm::provider::ChatMessage;
 
 fn record(id: &str, flow_path: &str) -> ConversationRecord {
     ConversationRecord {
+        usage: Default::default(),
         id: id.to_string(),
         flow_name: format!("{}-goal", flow_path),
         flow_path: Some(flow_path.to_string()),
@@ -171,6 +172,7 @@ async fn legacy_records_are_invisible_to_scoped_queries() {
 
 fn dialog_record(id: &str, flow_path: &str) -> DialogStateRecord {
     DialogStateRecord {
+        usage: Default::default(),
         id: id.to_string(),
         flow_name: format!("{}-goal", flow_path),
         flow_path: Some(flow_path.to_string()),

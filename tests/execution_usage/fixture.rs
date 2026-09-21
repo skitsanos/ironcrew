@@ -37,6 +37,9 @@ impl Recorder {
 
 #[async_trait]
 impl LlmProvider for Recorder {
+    fn supports_token_budget(&self) -> bool {
+        true
+    }
     fn records_usage(&self) -> bool {
         true
     }
@@ -48,6 +51,7 @@ impl LlmProvider for Recorder {
         let tracker = request
             .usage_tracker
             .expect("execution must supply a scope");
+        let reservation = tracker.budget().reserve(10, 3)?;
         let mut attempt = tracker.start().unwrap();
         self.calls.fetch_add(1, Ordering::SeqCst);
         let step = self
@@ -75,7 +79,8 @@ impl LlmProvider for Recorder {
                 std::future::pending::<ChatResponse>().await
             }
             Step::Fail => {
-                attempt.finish(receipt).unwrap();
+                attempt.finish(receipt.clone()).unwrap();
+                reservation.finish(&receipt)?;
                 return Err(IronCrewError::Provider("fixture failure".into()));
             }
             Step::Reply(content) => ChatResponse {
@@ -94,7 +99,8 @@ impl LlmProvider for Recorder {
                 ..Default::default()
             },
         };
-        attempt.finish(receipt).unwrap();
+        attempt.finish(receipt.clone()).unwrap();
+        reservation.finish(&receipt)?;
         Ok(response)
     }
 

@@ -172,12 +172,12 @@ impl OpenAiProvider {
             Some(full_reasoning)
         };
 
-        accounting.finish()?;
+        let usage = accounting.finish()?;
         Ok(ChatResponse {
             content,
             reasoning,
             tool_calls,
-            usage: None,
+            usage,
             raw_blocks: None,
         })
     }
