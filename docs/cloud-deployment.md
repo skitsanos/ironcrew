@@ -559,9 +559,11 @@ the run ID and dropped-result count.
 | `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | `600` | Per-principal/process rate for question-list observation; range 1–60000. |
 | `IRONCREW_ADMISSION_OBSERVATION_BURST` | `20` | Per-principal/process observation burst; range 1–1000. |
 
-IronCrew supports PostgreSQL 15+ only. This matches the session-storage
-features used by the runtime and the intended deployment target of
-extension-capable Postgres installs such as `pgvector`.
+Use the latest stable PostgreSQL for new deployments and acceptance tests.
+The runtime's SQL feature floor is PostgreSQL 15+, not a recommendation to
+install that major. Choose extension-capable installations such as `pgvector`
+when needed. Plan upgrades of existing databases separately; never reuse an
+older data volume with a new major image without PostgreSQL's upgrade procedure.
 
 ### Deployment evidence and replica parity
 

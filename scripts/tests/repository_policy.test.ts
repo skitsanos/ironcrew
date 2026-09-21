@@ -353,7 +353,7 @@ describe("repository integration policy", () => {
     expect(openshift).toContain(`docker.io/skitsanos/ironcrew:${version}`);
   });
 
-  test("PostgreSQL 15 process and soak gates remain in CI", async () => {
+  test("latest-stable PostgreSQL process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
     const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
       packageRules: Array<Record<string, unknown>>;
@@ -372,34 +372,38 @@ describe("repository integration policy", () => {
       }>;
     };
     const postgres = workflow.jobs["postgres-integration"];
-    expect(postgres.services?.postgres.image).toBe("postgres:15");
-    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([
+    expect(postgres.services?.postgres.image).toBe("postgres:latest");
+    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([]);
+    expect(renovate.packageRules.filter((rule) => rule.pinDigests === false)).toEqual([
       {
-        description: "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+        description: "Keep disposable PostgreSQL CI on the moving latest-stable image",
         matchManagers: ["github-actions"],
         matchDatasources: ["docker"],
         matchPackageNames: ["postgres"],
         matchFileNames: [".github/workflows/ci.yml"],
-        enabled: false,
+        pinDigests: false,
       },
     ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test two_process_replica_acceptance_test");
     expect(commands).toContain("--test usage_storage_test");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
-    expect(agents).toContain("Pull the moving `postgres:15` tag");
-    expect(agents).toContain("Do not substitute `postgres:latest`");
+    expect(commands).toContain("-s evaluations/replica-lifecycle");
+    expect(agents).toContain("Pull the moving `postgres:latest` tag");
+    expect(agents).toContain("latest stable release");
     expect(agents).toContain("Never run a global Docker system, image, builder");
-    expect(soakGuide).toContain("docker pull postgres:15");
-    expect(soakGuide).toContain("postgres:15");
+    expect(soakGuide).toContain("docker pull postgres:latest");
     expect(soakGuide).toContain("docker run --rm -d");
     expect(soakGuide).toContain("ironcrew_pg_container_id=$(docker run");
     expect(soakGuide).toContain('docker stop "$ironcrew_pg_container_id"');
     expect(soakGuide).toContain('docker inspect "$ironcrew_pg_container_id"');
-    expect(storeTest).toContain("docker pull postgres:15");
-    expect(storeTest).toContain("postgres:15");
-    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:17");
-    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:latest");
+    expect(storeTest).toContain("docker pull postgres:latest");
+    expect(storeTest).not.toContain("postgres:15");
+    for (const name of ["check-ironcrew", "resolve-ironcrew-issue"]) {
+      const skill = await Bun.file(join(repository, `.agents/skills/${name}/SKILL.md`)).text();
+      expect(skill).toContain("postgres:latest");
+      expect(skill).not.toContain("disposable PostgreSQL 15");
+    }
   });
 
   test("Lua validation includes the platform-canary runtime smoke", async () => {

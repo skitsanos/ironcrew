@@ -35,12 +35,12 @@ Use a dedicated PostgreSQL container and a release binary for meaningful RSS
 and latency evidence:
 
 ```bash
-docker pull postgres:15
+docker pull postgres:latest
 ironcrew_pg_container_id=$(docker run --rm -d --name ironcrew-replica-soak-pg \
   -e POSTGRES_USER=ironcrew \
   -e POSTGRES_PASSWORD=local-soak-only-9c7f6b2a \
   -e POSTGRES_DB=ironcrew_soak \
-  -p 55432:5432 postgres:15) || exit 1
+  -p 55432:5432 postgres:latest) || exit 1
 test -n "$ironcrew_pg_container_id" || exit 1
 
 cargo build --release --features postgres --bin ironcrew
@@ -94,7 +94,9 @@ Its 128 MiB per-replica RSS ceiling is evaluated from host-process samples. The
 separate 1 GiB platform-memory comparator remains unenforced and is not the
 contract pass ceiling.
 
-Run it only against an isolated PostgreSQL 15 database:
+Run it only against an isolated database created from freshly pulled
+`postgres:latest`. Record the resolved version and image digest; never reuse
+an existing data volume across major versions:
 
 ```bash
 DATABASE_URL='postgres://ironcrew_runtime:...@127.0.0.1:55432/ironcrew_ic018' \

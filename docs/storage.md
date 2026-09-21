@@ -312,6 +312,13 @@ DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
 on PostgreSQL 15 features for flow-scoped session uniqueness and is intended
 for extension-capable deployments such as installations that use `pgvector`.
 
+Use the **latest stable PostgreSQL** for new deployments and acceptance tests.
+The 15+ requirement describes the runtime's SQL feature floor, not the version
+to install or a continuing oldest-major CI target. Disposable local/CI tests
+use freshly pulled `postgres:latest` and record its resolved version and digest.
+Existing production data requires a separately planned major-version upgrade;
+never attach an older cluster's volume to a new major image as an upgrade.
+
 **Advantages:**
 - Durable records shared independently of the container filesystem
 - **JSONB columns** for `task_results` and `tags` — query into JSON natively with SQL

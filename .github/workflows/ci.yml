@@ -91,8 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        # Exercise the minimum PostgreSQL major version IronCrew supports.
-        image: postgres:15
+        # Exercise the latest stable PostgreSQL; historical receipts keep their versions.
+        image: postgres:latest
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ironcrew_ci_admin
@@ -120,7 +120,10 @@ jobs:
           CREATE DATABASE ironcrew_test OWNER ironcrew_ci;
           \connect ironcrew_test
           GRANT USAGE, CREATE ON SCHEMA public TO ironcrew_ci;
+          SELECT version();
           SQL
+      - name: Test replica lifecycle harness contracts
+        run: python3 -B -m unittest discover -s evaluations/replica-lifecycle -p 'test_*.py'
       - name: Run PostgreSQL integration tests
         run: >-
           cargo test --locked --all-features

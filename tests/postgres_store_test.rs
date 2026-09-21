@@ -3,10 +3,10 @@
 //! Skipped unless `IRONCREW_TEST_PG_URL` points at a reachable PostgreSQL
 //! instance, e.g.:
 //!
-//!   docker pull postgres:15
+//!   docker pull postgres:latest
 //!   docker run --rm -d --name ironcrew-postgres-test \
 //!     -e POSTGRES_PASSWORD=ironcrew -e POSTGRES_USER=ironcrew \
-//!     -e POSTGRES_DB=ironcrew_test -p 55432:5432 postgres:15
+//!     -e POSTGRES_DB=ironcrew_test -p 55432:5432 postgres:latest
 //!   IRONCREW_TEST_PG_URL=postgres://ironcrew:ironcrew@localhost:55432/ironcrew_test \
 //!     cargo test --all-features --test postgres_store_test
 //!

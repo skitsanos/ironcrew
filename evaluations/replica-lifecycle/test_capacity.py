@@ -17,6 +17,7 @@ from capacity_config import (  # noqa: E402
     EVENT_PAYLOAD_ENVELOPE_PER_PROCESS,
     REPLAY_BYTES_PER_RUN,
     child_environment,
+    container_contract,
 )
 from capacity_assertions import validate_process_metrics  # noqa: E402
 from harness_runtime import parse_metric  # noqa: E402
@@ -27,6 +28,15 @@ from reporting import sanitize_failure  # noqa: E402
 
 
 class CapacityContractTests(unittest.TestCase):
+    def test_container_contract_requires_running_latest_stable_tag(self) -> None:
+        with patch("capacity_config.subprocess.run", return_value=SimpleNamespace(
+                stdout="true|postgres:latest\n")):
+            self.assertEqual(container_contract("owned-fixture"), "postgres:latest")
+        for result in ("false|postgres:latest", "true|postgres:15", "true|postgres:18"):
+            with self.subTest(result=result), patch("capacity_config.subprocess.run",
+                    return_value=SimpleNamespace(stdout=result)), self.assertRaises(RuntimeError):
+                container_contract("owned-fixture")
+
     def test_logical_event_envelope_includes_replay_and_durable_queue(self) -> None:
         self.assertEqual(
             EVENT_PAYLOAD_ENVELOPE_PER_PROCESS,
