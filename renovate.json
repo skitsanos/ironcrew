@@ -22,12 +22,12 @@
       "allowedVersions": "<0.3.0"
     },
     {
-      "description": "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+      "description": "Keep disposable PostgreSQL CI on the moving latest-stable image",
       "matchManagers": ["github-actions"],
       "matchDatasources": ["docker"],
       "matchPackageNames": ["postgres"],
       "matchFileNames": [".github/workflows/ci.yml"],
-      "enabled": false
+      "pinDigests": false
     },
     {
       "description": "Present one dependency refresh for develop instead of a PR queue",

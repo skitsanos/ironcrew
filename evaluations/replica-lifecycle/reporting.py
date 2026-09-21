@@ -43,7 +43,7 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "## Evidence boundary",
         "",
-        "This is a local macOS/Linux host-process and disposable PostgreSQL 15 gate. "
+        "This is a local macOS/Linux host-process and disposable PostgreSQL gate. "
         "The provider is a bounded loopback mock. RSS is sampled from host processes, "
         "not a pod cgroup, and this report is not Railway/OpenShift or live-provider proof.",
         "",
@@ -126,7 +126,7 @@ def markdown(report: dict[str, Any]) -> str:
             "",
             f"- Git commit: `{report['revision']['git_commit']}` (dirty worktree: `{str(report['revision']['dirty']).lower()}`)",
             f"- Binary SHA-256: `{report['revision']['binary_sha256']}`",
-            f"- PostgreSQL: `{report.get('postgres_server_version', 'unknown')}` using the moving `postgres:15` contract",
+            f"- PostgreSQL: `{report.get('postgres_server_version', 'unknown')}` using image `{report.get('container_image', 'unknown')}`",
             f"- Exact prefix cleanup: `{json.dumps(report.get('cleanup'), sort_keys=True)}`",
             f"- Controlled replica exits: `{json.dumps(report.get('shutdown'), sort_keys=True)}`",
         ]

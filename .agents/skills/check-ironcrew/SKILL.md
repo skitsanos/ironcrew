@@ -39,7 +39,7 @@ reconcile files only when the user also asks for changes.
   Rust, cargo-audit, actionlint, or immutable GitHub Action pins do not match
   current latest-stable policy.
 - When storage, HITL, journals, leases, or replica behavior changed, provide a
-  disposable PostgreSQL 15 database through `IRONCREW_TEST_PG_URL`; the script
+  disposable latest-stable PostgreSQL database through `IRONCREW_TEST_PG_URL`; the script
   then adds the serial integration and short replica-soak gates. An unset URL
   is an explicit skip and does not make those changes ready to push.
 - The hook does not replace GitHub's macOS, Windows, protected-environment, or
@@ -91,8 +91,10 @@ repetitions, cost/token, latency, revision, and dirty-worktree boundaries.
 
 ## PostgreSQL and replica gate
 
-Use a disposable PostgreSQL 15 database with a least-privilege test role and
-set `IRONCREW_TEST_PG_URL` only for the test process. The canonical pre-push
+Pull `postgres:latest` immediately before creating a disposable database, record
+the resolved server version/image digest, and use a least-privilege test role.
+Never reuse an existing data volume for a new major version. Set
+`IRONCREW_TEST_PG_URL` only for the test process. The canonical pre-push
 script runs these CI integration targets serially when that variable is set:
 
 ```bash
