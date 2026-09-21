@@ -19,9 +19,9 @@ The PostgreSQL cross-replica HITL mailbox and run-event journal described here
 require IronCrew v3.0.0 or newer. The legacy `2.22.0` image does not contain
 those capabilities.
 
-The current source tree prepares v4.0.0. Its image references below are release
+The current source tree prepares v4.0.1. Its image references below are release
 targets, not evidence that the image has been published. Read the
-[v4 upgrade notes](releases/v4.0.0.md) before upgrading existing stores or clients.
+[v4 upgrade notes](releases/v4.0.1.md) before upgrading existing stores or clients.
 
 ---
 
@@ -1022,7 +1022,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: docker.io/skitsanos/ironcrew:4.0.0
+        image: docker.io/skitsanos/ironcrew:4.0.1
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080
