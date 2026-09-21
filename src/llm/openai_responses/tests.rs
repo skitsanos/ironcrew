@@ -59,6 +59,27 @@ fn absent_response_format_leaves_text_unset() {
 }
 
 #[test]
+fn function_schemas_preserve_optional_arguments_without_claiming_strict_mode() {
+    use crate::tools::{Tool, ask_human::AskHumanTool, file_write::FileWriteTool};
+
+    let tools = [
+        AskHumanTool.schema(),
+        FileWriteTool::new(None, None).schema(),
+    ];
+    let body = provider()
+        .build_body(&request(None, None), Some(&tools))
+        .unwrap();
+    for (wire, schema) in body["tools"].as_array().unwrap().iter().zip(&tools) {
+        assert_eq!(wire["strict"], false);
+        assert_eq!(wire["parameters"], schema.parameters);
+    }
+    assert_eq!(
+        body["tools"][0]["parameters"]["required"],
+        json!(["question"])
+    );
+}
+
+#[test]
 fn user_images_are_sent_as_input_image_parts() {
     let body = provider()
         .build_body(

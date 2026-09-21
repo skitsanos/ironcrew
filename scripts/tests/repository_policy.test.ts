@@ -996,6 +996,29 @@ describe("repository integration policy", () => {
     expect(commands).not.toContain("{{.DEV_IMAGE}}:latest");
   });
 
+  test("live provider smoke is opt-in, trusted-branch-only and secret-minimal", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/live-smoke.yml")).text();
+    const workflow = Bun.YAML.parse(source) as {
+      on: Record<string, unknown>;
+      permissions: Record<string, string>;
+      jobs: { smoke: { if: string; environment: string; steps: Array<Record<string, unknown>> } };
+    };
+    expect(Object.keys(workflow.on).sort()).toEqual(["schedule", "workflow_dispatch"]);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(workflow.jobs.smoke.if).toContain("github.event.repository.default_branch");
+    expect(workflow.jobs.smoke.if).toContain("github.actor == 'skitsanos'");
+    expect(workflow.jobs.smoke.if).toContain("vars.IRONCREW_LIVE_SMOKE_APPROVED == 'true'");
+    expect(workflow.jobs.smoke.if).toContain("vars.IRONCREW_LIVE_SMOKE_NIGHTLY == 'true'");
+    expect(workflow.jobs.smoke.environment).toBe("live-provider-smoke");
+    expect(source.match(/secrets\.OPENAI_API_KEY/g)?.length).toBe(1);
+    expect(source).toContain("retention-days: 7");
+    expect(source).toContain("persist-credentials: false");
+    const gate = await Bun.file(join(repository, "scripts/pre-push-check.sh")).text();
+    expect(gate).toContain("IRONCREW_SMOKE_TEST_BIN=");
+    expect(gate).toContain("-s evaluations/live-smoke");
+    expect(gate).not.toContain("--mode live");
+  });
+
   test("release guidance preserves approval and manual publication boundaries", async () => {
     const sources = await Promise.all([
       Bun.file(join(repository, ".agents/skills/release-ironcrew/SKILL.md")).text(),

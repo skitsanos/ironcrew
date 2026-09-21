@@ -7,7 +7,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts check`.
 
 - Total findings: 48
-- Active findings: 1
+- Active findings: 0
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
 
@@ -60,4 +60,4 @@ priority, area, and title. The registry is generated with
 | [IC-045](./IC-045.md) | P2 | Resolved | Configuration safety | Validate does not evaluate crew construction without effects |
 | [IC-046](./IC-046.md) | P2 | Resolved | Usage observability | Token accounting omits reasoning detail and incomplete-attempt coverage |
 | [IC-047](./IC-047.md) | P2 | Resolved | Execution budgets | Runs lack a shared token budget across provider requests |
-| [IC-048](./IC-048.md) | P2 | Open | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |
+| [IC-048](./IC-048.md) | P2 | Resolved | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |
