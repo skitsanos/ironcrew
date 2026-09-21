@@ -185,6 +185,10 @@ jobs:
             --mode contract \
             --binary target/debug/ironcrew \
             --report /tmp/ironcrew-crew-effectiveness-contract.json
+      - name: Test live-smoke controls and CLI/HTTP contract without credentials
+        env:
+          IRONCREW_SMOKE_TEST_BIN: target/debug/ironcrew
+        run: python3 -B -m unittest discover -s evaluations/live-smoke -p 'test_*.py'
 
   release-build:
     name: Release Build

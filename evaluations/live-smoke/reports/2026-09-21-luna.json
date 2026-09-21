@@ -1,0 +1,572 @@
+{
+  "binary": {
+    "path": "target/debug/ironcrew",
+    "path_scope": "repository_relative",
+    "sha256": "2551d084c2496355740f84f0b30b8e853d62c36dcf526dffbbe5c32544c40518",
+    "version": "ironcrew 3.0.0"
+  },
+  "cases": [
+    {
+      "allocated_token_capacity": 10000,
+      "conservative_cost_estimate_usd": 0.000156,
+      "elapsed_seconds": 2.029,
+      "generation_requests": 1,
+      "id": "cli-basic",
+      "outputs": [
+        {
+          "bytes": 104,
+          "sha256": "62740cfa591d42b75b5f5f76ff1d9a0b12c96109b7f7e1f57d38406b02b4ea84"
+        }
+      ],
+      "status": "passed",
+      "transport": "cli",
+      "usage": {
+        "budget": {
+          "charged": "52",
+          "in_flight": "0",
+          "limit": "10000",
+          "reserved": "0",
+          "retained": "0",
+          "state": "active"
+        },
+        "coverage": "complete",
+        "in_flight": "0",
+        "settled": {
+          "cache_write_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "cached_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "completion_tokens": {
+            "complete": true,
+            "known": "21"
+          },
+          "coverage": "complete",
+          "prompt_tokens": {
+            "complete": true,
+            "known": "31"
+          },
+          "reasoning_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "requests": "1",
+          "total_tokens": {
+            "complete": true,
+            "known": "52"
+          }
+        }
+      }
+    },
+    {
+      "allocated_token_capacity": 10000,
+      "conservative_cost_estimate_usd": 0.000258,
+      "elapsed_seconds": 2.781,
+      "generation_requests": 2,
+      "id": "cli-dialog",
+      "outputs": [
+        {
+          "bytes": 13,
+          "sha256": "c20848c75dd00fae75a20eb2504850469edf02d780f653b2c242bf3f5b575767"
+        },
+        {
+          "bytes": 20,
+          "sha256": "ea23c1be7e11b9325a0837b88d157d4a55f18355af4f6578f9cf7da2c4afeb90"
+        }
+      ],
+      "status": "passed",
+      "stop_reason": "smoke_turn_cap",
+      "streaming": true,
+      "transport": "cli",
+      "turns": 2,
+      "usage": {
+        "budget": {
+          "charged": "86",
+          "in_flight": "0",
+          "limit": "10000",
+          "reserved": "0",
+          "retained": "0",
+          "state": "active"
+        },
+        "coverage": "complete",
+        "in_flight": "0",
+        "settled": {
+          "cache_write_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "cached_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "completion_tokens": {
+            "complete": true,
+            "known": "14"
+          },
+          "coverage": "complete",
+          "prompt_tokens": {
+            "complete": true,
+            "known": "72"
+          },
+          "reasoning_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "requests": "2",
+          "total_tokens": {
+            "complete": true,
+            "known": "86"
+          }
+        }
+      }
+    },
+    {
+      "allocated_token_capacity": 10000,
+      "approved_write_present": true,
+      "conservative_cost_estimate_usd": 0.008247,
+      "denied_write_absent": true,
+      "elapsed_seconds": 13.205,
+      "generation_requests": 6,
+      "human_decisions": [
+        {
+          "agent": "writer",
+          "decision": "confirmed",
+          "kind": "question"
+        },
+        {
+          "agent": "writer",
+          "decision": "allow",
+          "kind": "approval"
+        },
+        {
+          "agent": "reviewer",
+          "decision": "confirmed",
+          "kind": "question"
+        },
+        {
+          "agent": "reviewer",
+          "decision": "deny",
+          "kind": "approval"
+        }
+      ],
+      "id": "cli-hitl",
+      "outputs": [
+        {
+          "bytes": 137,
+          "sha256": "92f38058d5f891ac5255864bf8888f1af199232906143c81f1eda01c9619c6e7"
+        },
+        {
+          "bytes": 146,
+          "sha256": "36215035ff2df5354a62cc44198e65bb28d9123349005f2c603f02f322c9a703"
+        }
+      ],
+      "status": "passed",
+      "transport": "cli-pty",
+      "usage": {
+        "budget": {
+          "charged": "2749",
+          "in_flight": "0",
+          "limit": "10000",
+          "reserved": "0",
+          "retained": "0",
+          "state": "active"
+        },
+        "coverage": "complete",
+        "in_flight": "0",
+        "settled": {
+          "cache_write_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "cached_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "completion_tokens": {
+            "complete": true,
+            "known": "219"
+          },
+          "coverage": "complete",
+          "prompt_tokens": {
+            "complete": true,
+            "known": "2530"
+          },
+          "reasoning_tokens": {
+            "complete": true,
+            "known": "26"
+          },
+          "requests": "6",
+          "total_tokens": {
+            "complete": true,
+            "known": "2749"
+          }
+        }
+      }
+    },
+    {
+      "allocated_token_capacity": 10000,
+      "approved_write_present": true,
+      "conservative_cost_estimate_usd": 0.008232,
+      "denied_write_absent": true,
+      "elapsed_seconds": 11.668,
+      "generation_requests": 6,
+      "human_decisions": [
+        {
+          "agent": "writer",
+          "decision": "confirmed",
+          "kind": "question"
+        },
+        {
+          "agent": "writer",
+          "decision": "allow",
+          "kind": "approval"
+        },
+        {
+          "agent": "reviewer",
+          "decision": "confirmed",
+          "kind": "question"
+        },
+        {
+          "agent": "reviewer",
+          "decision": "deny",
+          "kind": "approval"
+        }
+      ],
+      "id": "http-hitl",
+      "outputs": [
+        {
+          "bytes": 137,
+          "sha256": "92f38058d5f891ac5255864bf8888f1af199232906143c81f1eda01c9619c6e7"
+        },
+        {
+          "bytes": 146,
+          "sha256": "36215035ff2df5354a62cc44198e65bb28d9123349005f2c603f02f322c9a703"
+        }
+      ],
+      "status": "passed",
+      "transport": "http",
+      "usage": {
+        "budget": {
+          "charged": "2744",
+          "in_flight": "0",
+          "limit": "10000",
+          "reserved": "0",
+          "retained": "0",
+          "state": "active"
+        },
+        "coverage": "complete",
+        "in_flight": "0",
+        "settled": {
+          "cache_write_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "cached_tokens": {
+            "complete": true,
+            "known": "0"
+          },
+          "completion_tokens": {
+            "complete": true,
+            "known": "206"
+          },
+          "coverage": "complete",
+          "prompt_tokens": {
+            "complete": true,
+            "known": "2538"
+          },
+          "reasoning_tokens": {
+            "complete": true,
+            "known": "15"
+          },
+          "requests": "6",
+          "total_tokens": {
+            "complete": true,
+            "known": "2744"
+          }
+        }
+      }
+    }
+  ],
+  "conservative_cost_estimate_usd": 0.016893,
+  "disposable_runtime_removed": true,
+  "elapsed_seconds": 31.583,
+  "finished_at": "2026-09-21T06:20:16.000133+00:00",
+  "mode": "live",
+  "observed_generation_requests": 15,
+  "plan": {
+    "cases": [
+      {
+        "fixture": "basic.lua",
+        "id": "cli-basic",
+        "max_requests": 1,
+        "transport": "cli"
+      },
+      {
+        "fixture": "dialog.lua",
+        "id": "cli-dialog",
+        "max_requests": 2,
+        "transport": "cli"
+      },
+      {
+        "fixture": "hitl.lua",
+        "id": "cli-hitl",
+        "max_requests": 22,
+        "transport": "cli-pty"
+      },
+      {
+        "fixture": "hitl.lua",
+        "id": "http-hitl",
+        "max_requests": 22,
+        "transport": "http"
+      }
+    ],
+    "efforts": [
+      "none",
+      "low"
+    ],
+    "evidence_boundary": "local compatibility, not effectiveness, replicas or deployment",
+    "limits": {
+      "capture_bytes_per_stream": 1048576,
+      "concurrency": 1,
+      "generation_requests": 47,
+      "input_count_requests": 47,
+      "max_tool_rounds_per_task": 10,
+      "output_tokens_per_request": 1024,
+      "runs": 4,
+      "task_retries": 0,
+      "tokens_per_run": 10000,
+      "total_tokens": 40000,
+      "wall_seconds": 300
+    },
+    "model": "gpt-5.6-luna",
+    "model_identity_scope": "requested current alias, not an immutable provider snapshot",
+    "nightly_activation": "disabled until owner approval and protected environment setup",
+    "origin": "https://api.openai.com",
+    "pricing": {
+      "ceiling_usd": "0.15",
+      "conservative_usd_per_million_tokens": "3.00",
+      "estimated_upper_bound_usd": "0.12",
+      "fresh": true,
+      "max_age_days": 30,
+      "notice": "Estimate, not an invoice; depends on provider token bounds. No hosted tools.",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verified_on": "2026-09-21"
+    },
+    "provider": "openai-responses",
+    "schema": "ironcrew.live-smoke.v1"
+  },
+  "raw_prompts_answers_outputs_retained": false,
+  "runtime_budget_enforced": true,
+  "source": {
+    "changed_file_bytes": 182751,
+    "changed_path_count": 24,
+    "changed_paths": [
+      {
+        "bytes": 7987,
+        "mode": 420,
+        "path": ".github/workflows/ci.yml",
+        "sha256": "36e4de6c39bf537a16a39d76761bf3d19845ec9c6b9844d717bda27552554ca7",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 2206,
+        "mode": 420,
+        "path": ".github/workflows/live-smoke.yml",
+        "sha256": "fe5fff8c043fa429f9c0c062bb59e8b59e2c433a485650eaf17bafb61fdb9f49",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 1675,
+        "mode": 420,
+        "path": "ISSUES.md",
+        "sha256": "cd04a17bb926c04982e12dfea5ab26c36cc58daeeb332e23bcda56b64c119f53",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 8369,
+        "mode": 420,
+        "path": "README.md",
+        "sha256": "a73af3699ce444c88cb323b4a2c3588c61fb3b8420e786a3a1aaf065edf205a8",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 3605,
+        "mode": 420,
+        "path": "docs/issues/IC-048.md",
+        "sha256": "e6e568cf555ec461c22fd54877bdc1af8ef91a822ca163942ce2c59cd1b822c1",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 6616,
+        "mode": 420,
+        "path": "docs/issues/README.md",
+        "sha256": "c0b8a765249356daa058eade3484abc20c2f236792440521b22172677eb1581c",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 17182,
+        "mode": 420,
+        "path": "docs/providers.md",
+        "sha256": "dd2f0b625493f973d62d9933ed94baf65676dc5d2759e6762d7585aa54c265fc",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 7274,
+        "mode": 420,
+        "path": "evaluations/live-smoke/README.md",
+        "sha256": "880ee8df6f59518d21c910076110742af5a9d5974071a446fc61699691846e48",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 5563,
+        "mode": 420,
+        "path": "evaluations/live-smoke/contracts.py",
+        "sha256": "802b8a6d6f438ada12b5085227523dc22341f622766a51a21d1564d20d98e6a3",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 717,
+        "mode": 420,
+        "path": "evaluations/live-smoke/fixtures/basic.lua",
+        "sha256": "089ce6684c6ff68ba85778d79edb2663163557ad91e65ce618c2e67990936a29",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 1018,
+        "mode": 420,
+        "path": "evaluations/live-smoke/fixtures/dialog.lua",
+        "sha256": "5dd3e8ff50f3856bb1d00acfa90da78891482d9d4f63799817e40460b1167cb0",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 2068,
+        "mode": 420,
+        "path": "evaluations/live-smoke/fixtures/hitl.lua",
+        "sha256": "d2bea916e3ac346f7f4a819ce55361cfe26529bd49434918e9c798b01f3b55cf",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 4964,
+        "mode": 420,
+        "path": "evaluations/live-smoke/http_case.py",
+        "sha256": "dc22ffadc0a93d688c1f486a1d3cfd9ac9e6c9fa8e6713a350d58a70abb9bc5c",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 4243,
+        "mode": 420,
+        "path": "evaluations/live-smoke/mock_provider.py",
+        "sha256": "6c48029ad0a96c3d942b6c8b578d5f974d2cc80fc0935c950fc3f194132800bf",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 2921,
+        "mode": 420,
+        "path": "evaluations/live-smoke/plan.py",
+        "sha256": "0d8d137ef6aeffd61fd77d2aebc99670de932fe64d1b2924e0e628e0e64d829b",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 5405,
+        "mode": 420,
+        "path": "evaluations/live-smoke/process.py",
+        "sha256": "608fcf11a4ecdb5f237b2a2585ed01f5e539e0a31b7a6aca7882f762306e6283",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 10155,
+        "mode": 420,
+        "path": "evaluations/live-smoke/smoke.py",
+        "sha256": "0340b89600d90fbd387a9f4b2cba26d01c60459fb582598f32ec7af28b4727ba",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 1817,
+        "mode": 420,
+        "path": "evaluations/live-smoke/support.py",
+        "sha256": "3d2e41bfa5aa7827516637e736563b814625468584bc8842916306ff587ba715",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 11549,
+        "mode": 420,
+        "path": "evaluations/live-smoke/test_smoke.py",
+        "sha256": "dda7a586b5a5512bd1e10d748ef010d542cf02680ff223634f74b73ab0b368ea",
+        "source": "untracked",
+        "state": "file"
+      },
+      {
+        "bytes": 7364,
+        "mode": 493,
+        "path": "scripts/pre-push-check.sh",
+        "sha256": "15ca142b95581f5739e4c4de52300f29bf6a2ff49b449480fc1782bb39bffcc2",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 47152,
+        "mode": 420,
+        "path": "scripts/tests/repository_policy.test.ts",
+        "sha256": "cc6884733d9a081be221c7a750377ecda438ef889dfd891fc1454a6458d2dd44",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 7797,
+        "mode": 420,
+        "path": "src/llm/openai_responses/budget_tests.rs",
+        "sha256": "4f18f13c771e1fac52a38ae527633bfd7e2c637ea197438281027973317d2974",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 9667,
+        "mode": 420,
+        "path": "src/llm/openai_responses/request_body.rs",
+        "sha256": "d0d422eca31969604e633f251d6733a9ac5c792817442ae965a023afb84afae9",
+        "source": "tracked",
+        "state": "file"
+      },
+      {
+        "bytes": 5437,
+        "mode": 420,
+        "path": "src/llm/openai_responses/tests.rs",
+        "sha256": "b6bf04ca48336aff79d5a6330ad12c3b3484c2f16fef27e1e0edf596e5e20c45",
+        "source": "tracked",
+        "state": "file"
+      }
+    ],
+    "dirty": true,
+    "manifest_encoding": "sorted compact JSON of revision, tracked_diff_sha256, and changed_paths",
+    "revision": "48729e5b35befa5820c594c836e030854540f191",
+    "tracked_changed_path_count": 11,
+    "tracked_diff_sha256": "47670da5cdec623c51d48531f0f9b612ad97dd4fd57817f75617962e8561a9aa",
+    "untracked_path_count": 13,
+    "worktree_manifest_sha256": "9873d8e90afcd6d44bdff8733f2f7eebf617b430925fa2faf9b80753d3b91f97"
+  },
+  "source_stable": true,
+  "started_at": "2026-09-21T06:19:44.416389+00:00",
+  "status": "passed",
+  "unreceipted_case_capacity_tokens": 0
+}

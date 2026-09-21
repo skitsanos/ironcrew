@@ -168,7 +168,9 @@ impl OpenAiResponsesProvider {
         // 3. Build tools array
         let mut tools_json: Vec<Value> = Vec::new();
 
-        // Custom function tools
+        // Shared tool schemas permit omitted optional fields. Do not advertise
+        // strict schemas or let Responses normalize those fields into required
+        // nullable values; tool implementations validate arguments at execution.
         if let Some(tool_schemas) = tools {
             for t in tool_schemas {
                 tools_json.push(json!({
@@ -176,7 +178,7 @@ impl OpenAiResponsesProvider {
                     "name": t.name,
                     "description": t.description,
                     "parameters": t.parameters,
-                    "strict": true,
+                    "strict": false,
                 }));
             }
         }

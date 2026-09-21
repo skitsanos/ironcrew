@@ -224,6 +224,13 @@ The Responses API is OpenAI's newer endpoint with first-class reasoning items,
 built-in server-side tools, and cleaner streaming semantics. Also supported by
 **Azure OpenAI**, **xAI/Grok**, and **OpenRouter**.
 
+Custom function tools send `strict = false`, preserving the shared tool schema's
+optional arguments. IronCrew does not silently rewrite those schemas to require
+every field or accept `null` in place of omission. Runtime tool validation and
+approval still apply. This setting is identical in native token-count preflights
+and generation requests; it does not change strict JSON-schema **response**
+formats. See OpenAI's [strict-mode requirements](https://developers.openai.com/api/docs/guides/function-calling#strict-mode).
+
 ### Basic usage
 
 ```lua
@@ -436,6 +443,10 @@ lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
 section of [docs/crews.md](crews.md) for the full config schema, transport
 details, and examples.
 ## Opt-in run budgets
+
+[The live compatibility smoke](../evaluations/live-smoke/README.md) checks the
+current Luna Responses path through CLI, streaming dialogs and HTTP human input.
+Its default mode is provider-free; paid and scheduled execution are opt-in.
 
 [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) enables shared pre-dispatch
 admission. The initial bounded transport is native OpenAI Responses without

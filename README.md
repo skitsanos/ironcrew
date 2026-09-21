@@ -107,6 +107,7 @@ ironcrew run .
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
 | [Run Token Budgets](docs/token-budgets.md) | Opt-in shared input/output ceilings, conservative reservations, supported providers and scope boundaries |
+| [Live Compatibility Smoke](evaluations/live-smoke/README.md) | Opt-in bounded Luna CLI/HTTP/HITL checks, offline regressions and protected nightly setup |
 | [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
 

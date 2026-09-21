@@ -137,6 +137,9 @@ run "crew-effectiveness contract" \
     --report "$scratch_root/crew-effectiveness-contract.json"
 run "replica-soak unit tests" \
   python3 -m unittest discover -s evaluations/replica-soak -p 'test_*.py'
+run "live-smoke offline controls and CLI/HTTP contract" \
+  env IRONCREW_SMOKE_TEST_BIN="$repo_root/target/debug/ironcrew" \
+    python3 -B -m unittest discover -s evaluations/live-smoke -p 'test_*.py'
 
 if [[ -n "${IRONCREW_TEST_PG_URL:-}" ]]; then
   run "PostgreSQL integration tests" \

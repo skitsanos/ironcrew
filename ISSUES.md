@@ -8,7 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-048](docs/issues/IC-048.md) | P2 | Open | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |
+| — | — | — | — | No active findings |
 
 ## Working agreement
 

@@ -11,6 +11,9 @@ struct Fixture {
 }
 
 async fn count(State(state): State<Fixture>, Json(body): Json<Value>) -> axum::response::Response {
+    if state.mode == "tools" && body["tools"][0]["strict"] != false {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
     state.calls.lock().unwrap().push(("count".into(), body));
     match state.mode {
         "bad_count" => Json(json!({"input_tokens": -1})).into_response(),
@@ -117,23 +120,31 @@ fn budget_transport_contract() {
         return;
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for mode in ["ok", "stream", "missing", "http_error", "decode_error", "overrun", "bad_count", "oversized_count", "count_error"] {
+        for mode in ["ok", "tools", "stream", "missing", "http_error", "decode_error", "overrun", "bad_count", "oversized_count", "count_error"] {
             let (provider, tracker, state, server) = fixture(mode, 100).await;
             let result = if mode == "stream" {
                 let (tx, _rx) = tokio::sync::mpsc::channel(16);
                 provider.chat_stream(request(&tracker), tx).await
+            } else if mode == "tools" {
+                use crate::tools::{Tool, ask_human::AskHumanTool};
+                provider.chat_with_tools(request(&tracker), &[AskHumanTool.schema()]).await
             } else { provider.chat(request(&tracker)).await };
             let budget = tracker.snapshot().unwrap().budget;
             let count_failed = ["bad_count", "oversized_count", "count_error"].contains(&mode);
-            assert_eq!(result.is_ok(), ["ok", "stream", "missing"].contains(&mode), "{mode}: {result:?}");
+            assert_eq!(result.is_ok(), ["ok", "tools", "stream", "missing"].contains(&mode), "{mode}: {result:?}");
             assert_eq!(budget.charged, if count_failed { 0 } else if ["missing", "overrun"].contains(&mode) {20} else {13}, "{mode}");
             assert_eq!(budget.in_flight, 0);
             assert_eq!(state.calls.lock().unwrap().len(), if count_failed {1} else {2});
             if count_failed { assert_eq!(budget.state, BudgetState::CountingFailed); }
             if mode == "overrun" { assert_eq!(budget.state, BudgetState::BoundViolated); }
-            if mode == "ok" {
+            if ["ok", "tools"].contains(&mode) {
                 let calls = state.calls.lock().unwrap();
                 assert_eq!(calls[0].1["input"], calls[1].1["input"]);
+                assert_eq!(calls[0].1["tools"], calls[1].1["tools"]);
+                if mode == "tools" {
+                    assert_eq!(calls[0].1["tools"][0]["strict"], false);
+                    assert_eq!(calls[1].1["tools"][0]["parameters"]["required"], json!(["question"]));
+                }
                 assert!(calls[0].1.get("max_output_tokens").is_none());
                 assert_eq!(calls[1].1["max_output_tokens"], 10);
             }
