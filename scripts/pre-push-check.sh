@@ -104,6 +104,9 @@ trap cleanup EXIT
 
 git status --porcelain=v1 -z --untracked-files=all >"$scratch_root/worktree-before"
 
+# Fail before expensive gates if the required database coverage cannot run.
+run "PostgreSQL floor/latest admission" bun --no-env-file run scripts/check-postgres.ts --check-only
+
 run "Rust module-size policy" python3 -B scripts/check_module_size.py
 run "repository Python tests" \
   python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
@@ -121,7 +124,9 @@ run "chat UI production bundle" \
 run "Rust formatting" cargo fmt --all -- --check
 run "Rust no-default-features build" cargo build --no-default-features
 run "Rust all-target Clippy" cargo clippy --all-targets -- -D warnings
-run "Rust all-target tests" cargo test --all-targets
+# Database targets share destructive fixtures; run them only in the serial gate.
+run "Rust all-target tests" \
+  env -u IRONCREW_TEST_PG_URL -u IRONCREW_TEST_PG_FLOOR_URL cargo test --all-targets
 run "Rust documentation tests" cargo test --doc
 run "dependency security audit" cargo audit --deny warnings
 
@@ -143,27 +148,15 @@ run "live-smoke offline controls and CLI/HTTP contract" \
   env IRONCREW_SMOKE_TEST_BIN="$repo_root/target/debug/ironcrew" \
     python3 -B -m unittest discover -s evaluations/live-smoke -p 'test_*.py'
 
-if [[ -n "${IRONCREW_TEST_PG_URL:-}" ]]; then
-  run "PostgreSQL integration tests" \
-    cargo test --locked --all-features \
-      --test postgres_store_test \
-      --test usage_storage_test \
-      --test multi_replica_http_test \
-      --test two_process_replica_acceptance_test \
-      -- --test-threads=1
-  printf 'pre-push: running PostgreSQL replica-soak contract\n'
-  DATABASE_URL="$IRONCREW_TEST_PG_URL" \
-    python3 evaluations/replica-soak/soak.py \
-      --binary target/debug/ironcrew \
-      --runs 2 \
-      --duration-seconds 30 \
-      --concurrency 1 \
-      --report "$scratch_root/replica-soak/result.json"
-else
-  printf '%s\n' \
-    'pre-push: PostgreSQL integration not run because IRONCREW_TEST_PG_URL is unset.' \
-    'pre-push: storage, HITL, journal, lease, or replica changes require a disposable latest-stable PostgreSQL database before push.'
-fi
+run "PostgreSQL floor/latest integration tests" bun --no-env-file run scripts/check-postgres.ts
+printf 'pre-push: running PostgreSQL replica-soak contract on latest\n'
+DATABASE_URL="$IRONCREW_TEST_PG_URL" \
+  python3 evaluations/replica-soak/soak.py \
+    --binary target/debug/ironcrew \
+    --runs 2 \
+    --duration-seconds 30 \
+    --concurrency 1 \
+    --report "$scratch_root/replica-soak/result.json"
 
 run "locked release build" cargo build --release --locked
 

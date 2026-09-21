@@ -750,7 +750,7 @@ individual ranges stated in their descriptions.
 |-------------------|-------------|
 | `IRONCREW_STORE`    | Storage backend: `json`, `sqlite`, or `postgres` (`postgresql` is accepted as an alias; matching is case-insensitive). Defaults to `json` when absent. Public server binds require this to be explicit; unknown values fail startup |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
-| `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) |
+| `DATABASE_URL` | PostgreSQL 17+ connection string (required when `IRONCREW_STORE=postgres`; the floor stays fixed throughout IronCrew 4.x — see the [support policy](storage.md#postgresql-support-policy)) |
 | `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`), at most 37 lowercase ASCII alphanumeric/underscore bytes |
 | `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (default: `10`; range: 1–128) |
 | `IRONCREW_DB_CONNECT_RETRIES` | PostgreSQL connection retries after the initial attempt (default: `10`; range: 0–100) |

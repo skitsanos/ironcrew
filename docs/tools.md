@@ -492,7 +492,7 @@ the complete environment table in
 [CLI](cli.md#environment-variables).
 
 **Protocol and MRTR boundary.** IronCrew tracks only the latest published MCP
-specification at release time. For v3.0.0 that revision is `2026-07-28`.
+specification at release time. For v4.0.0 that revision is `2026-07-28`.
 IronCrew uses `server/discover` and never falls back to legacy initialization;
 when a newer specification is published, the next release advances the strict
 pin and removes the superseded revision rather than adding compatibility. It advertises

@@ -28,7 +28,7 @@ hardening step.
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |
 | SQLite | `sqlite` | Single-server and Docker deployments, faster queries |
-| PostgreSQL | `postgres` | Durable cloud records, cross-replica run SSE replay, keyed-run coordination, keyed conversation-turn rehydration, and optional encrypted cross-replica HITL. PostgreSQL 15+ required |
+| PostgreSQL | `postgres` | Durable cloud records, cross-replica run SSE replay, keyed-run coordination, keyed conversation-turn rehydration, and optional encrypted cross-replica HITL. PostgreSQL 17+ required for IronCrew 4.x; see the [support policy](#postgresql-support-policy) |
 
 ## Configuration
 
@@ -38,7 +38,7 @@ Environment variables control storage:
 |----------|-------------|---------|
 | `IRONCREW_STORE` | Backend type: `json`, `sqlite`, or `postgres` (alias `postgresql`; case-insensitive) | `json` |
 | `IRONCREW_STORE_PATH` | Custom path for the SQLite database file | `<flow>/.ironcrew/ironcrew.db` |
-| `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) | — |
+| `DATABASE_URL` | PostgreSQL 17+ connection string (required when `IRONCREW_STORE=postgres`) | — |
 | `IRONCREW_PG_TABLE_PREFIX` | Table name prefix for shared PostgreSQL databases: at most 37 lowercase ASCII alphanumeric/underscore bytes | `""` (table = `runs`) |
 | `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (range 1–128; sized for concurrent HTTP requests, not per-flow) | `10` |
 | `IRONCREW_DB_CONNECT_RETRIES` | Connection retries after the initial PostgreSQL connection attempt (range 0–100) | `10` |
@@ -308,14 +308,28 @@ IRONCREW_STORE=postgres
 DATABASE_URL=postgres://user:password@localhost:5432/ironcrew
 ```
 
-**Version requirement:** PostgreSQL 15 or newer is required. IronCrew depends
-on PostgreSQL 15 features for flow-scoped session uniqueness and is intended
-for extension-capable deployments such as installations that use `pgvector`.
+### PostgreSQL support policy
 
-Use the **latest stable PostgreSQL** for new deployments and acceptance tests.
-The 15+ requirement describes the runtime's SQL feature floor, not the version
-to install or a continuing oldest-major CI target. Disposable local/CI tests
-use freshly pulled `postgres:latest` and record its resolved version and digest.
+**Version requirement:** PostgreSQL 17+ is required for IronCrew 4.x. The runtime
+refuses older servers at connect time, for both shared storage and Lua
+application-data connections.
+
+At each IronCrew major release, the minimum is set to the older of the two
+latest stable PostgreSQL major releases available when that IronCrew major
+ships. That floor remains fixed throughout the IronCrew major's lifetime;
+minor and patch releases do not raise it. Any floor increase is documented
+in the next IronCrew major release's breaking changes.
+
+This is a release-time choice of minimum, not a rolling two-major limit or an
+upper-version cap. A new PostgreSQL major does not by itself drop support for
+the existing floor. For IronCrew 4.x, the floor stays at 17 while the latest
+stable CI target follows new PostgreSQL releases.
+
+Use the **latest stable PostgreSQL** for new deployments. CI runs all five
+PostgreSQL integration suites against both the floor (`postgres:17`) and
+`postgres:latest`; local acceptance must cover both as well. Freshly pull the
+test images and record each resolved server version and image digest. Choose
+extension-capable installations such as those supporting `pgvector` when needed.
 Existing production data requires a separately planned major-version upgrade;
 never attach an older cluster's volume to a new major image as an upgrade.
 
@@ -333,7 +347,8 @@ never attach an older cluster's volume to a new major image as an upgrade.
 
 **Limitations:**
 - Requires an external PostgreSQL server
-- Requires PostgreSQL 15+
+- Requires PostgreSQL 17+ throughout IronCrew 4.x; see the
+  [support policy](#postgresql-support-policy) for floor selection and validation.
 - Adds compile-time dependency on `sqlx`
 - Does not distribute active run handles, move an in-flight conversation Lua
   VM, or provide execution takeover. Unkeyed runs and deployments without a

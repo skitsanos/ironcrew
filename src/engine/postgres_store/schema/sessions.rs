@@ -102,7 +102,7 @@ impl PostgresStore {
         // Enforce the documented `(flow_path, id)` uniqueness for sessions.
         // Earlier versions used `id` as the sole PRIMARY KEY, which meant a
         // save from flow-B would overwrite flow-A's session with the same
-        // id. PostgreSQL 15+ is required so we can use `NULLS NOT DISTINCT`
+        // id. `NULLS NOT DISTINCT` needs PostgreSQL 15; the supported floor is 17
         // and preserve deterministic uniqueness for legacy `flow_path IS NULL`
         // rows as well.
         let session_unique_indexes: &[(&str, String)] = &[
