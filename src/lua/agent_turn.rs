@@ -14,76 +14,23 @@
 //! Extracted from the original `LuaConversationInner::run_turn` body
 //! so both paths share tool-loop logic without duplication.
 
-use std::ops::{Deref, DerefMut};
+mod tool_dispatch;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::CrewEvent;
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::{
-    ChatMessage, ChatRequest, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES,
-    LlmProvider, append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
+    ChatMessage, DEFAULT_CHAT_HISTORY_MAX_MESSAGES, HARD_CHAT_HISTORY_MAX_MESSAGES, LlmProvider,
+    append_text_bounded, chat_history_max_bytes, enforce_conversation_history_limits,
     max_reasoning_bytes, validate_chat_history,
 };
 use crate::tools::ToolCallContext;
 use crate::utils::error::{IronCrewError, Result};
 
-/// Rolls back the currently-active user turn if the future is cancelled or
-/// returns before `commit`. Keeping this guard alive across provider/tool
-/// awaits makes Tokio timeout and shutdown cancellation history-safe.
-pub(crate) struct ActiveTurnGuard<'a> {
-    history: &'a mut Vec<ChatMessage>,
-    /// Exact transcript that existed before the active user message. History
-    /// limiting can drain old turn groups while a provider/tool request is in
-    /// flight, so remembering only the active user's index is not sufficient:
-    /// cancellation would otherwise keep the drain and silently lose older
-    /// persisted context.
-    rollback_snapshot: Option<Vec<ChatMessage>>,
-    committed: bool,
-}
-
-impl<'a> ActiveTurnGuard<'a> {
-    pub(crate) fn new(history: &'a mut Vec<ChatMessage>) -> Self {
-        let rollback_snapshot = history
-            .iter()
-            .rposition(|message| message.role == "user")
-            .map(|active_start| history[..active_start].to_vec());
-        Self {
-            history,
-            rollback_snapshot,
-            committed: false,
-        }
-    }
-
-    pub(crate) fn commit(&mut self) {
-        self.committed = true;
-        self.rollback_snapshot = None;
-    }
-}
-
-impl Deref for ActiveTurnGuard<'_> {
-    type Target = Vec<ChatMessage>;
-
-    fn deref(&self) -> &Self::Target {
-        self.history
-    }
-}
-
-impl DerefMut for ActiveTurnGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.history
-    }
-}
-
-impl Drop for ActiveTurnGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed
-            && let Some(snapshot) = self.rollback_snapshot.take()
-        {
-            *self.history = snapshot;
-        }
-    }
-}
+mod guard;
+pub(crate) use guard::ActiveTurnGuard;
 
 /// Returns the per-tool-call timeout in seconds.
 ///
@@ -131,6 +78,12 @@ pub async fn run_single_agent_turn(
     history_buffer: &mut Vec<ChatMessage>,
     ctx: &ToolCallContext,
 ) -> Result<(String, Option<String>)> {
+    let provider = match &ctx.usage_tracker {
+        Some(tracker) => crate::llm::scope::with_usage_tracker(provider.clone(), tracker.clone()),
+        None => crate::llm::scope::ensure_scope(provider.clone())?,
+    };
+    let mut ctx = ctx.clone();
+    ctx.usage_tracker = provider.usage_tracker();
     let mut history = ActiveTurnGuard::new(history_buffer);
     let max_history = match max_history {
         Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
@@ -170,15 +123,7 @@ pub async fn run_single_agent_turn(
     loop {
         validate_chat_history(&history, max_history, max_history_bytes, true)?;
         let messages_snapshot: Vec<ChatMessage> = history.clone();
-        let request = ChatRequest {
-            messages: messages_snapshot,
-            model: model.to_string(),
-            temperature: agent.temperature,
-            max_tokens: agent.max_tokens,
-            response_format: agent.response_format.clone(),
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
+        let request = agent.chat_request(model.to_string(), messages_snapshot);
 
         let response = if has_tools {
             provider.chat_with_tools(request, &tool_schemas).await?
@@ -207,9 +152,7 @@ pub async fn run_single_agent_turn(
 
         // No tool calls → final assistant reply, append + return.
         if response.tool_calls.is_empty() {
-            let content = response
-                .content
-                .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+            let content = require_final_content(response.content)?;
 
             history.push(ChatMessage::assistant(Some(content.clone()), None));
             enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
@@ -247,60 +190,8 @@ pub async fn run_single_agent_turn(
         ));
         enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
 
-        // Execute each tool call and append its result.
         for tool_call in &response.tool_calls {
-            let started = std::time::Instant::now();
-            if let Some(bus) = &ctx.eventbus {
-                bus.emit(CrewEvent::ToolCall {
-                    task: scope.clone(),
-                    tool: tool_call.function.name.clone(),
-                });
-            }
-
-            let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(serde_json::Value::Null);
-
-            // A call may extend its own dispatch deadline (ask_human waits
-            // on a person; approval-gated tools wait for a sign-off);
-            // everything else gets the global timeout.
-            let timeout = ctx.tool_registry.as_ref().map_or_else(
-                || Duration::from_secs(tool_timeout_secs()),
-                |registry| {
-                    registry
-                        .dispatch_timeout(&tool_call.function.name, &args)
-                        .unwrap_or_else(|| registry.default_dispatch_timeout())
-                },
-            );
-            let (result_text, ok) = match &ctx.tool_registry {
-                Some(reg) => {
-                    let dispatch = reg.execute(&tool_call.function.name, args, ctx);
-                    match tokio::time::timeout(timeout, dispatch).await {
-                        Ok(Ok(s)) => (s, true),
-                        Ok(Err(e)) => (format!("Tool error: {}", e), false),
-                        Err(_) => (
-                            format!("Tool error: Tool timed out after {}s", timeout.as_secs()),
-                            false,
-                        ),
-                    }
-                }
-                None => (
-                    format!(
-                        "Tool error: no tool registry available to dispatch {}",
-                        tool_call.function.name
-                    ),
-                    false,
-                ),
-            };
-
-            if let Some(bus) = &ctx.eventbus {
-                bus.emit(CrewEvent::ToolResult {
-                    task: scope.clone(),
-                    tool: tool_call.function.name.clone(),
-                    success: ok,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-
+            let result_text = tool_dispatch::execute(tool_call, &scope, &ctx).await;
             history.push(ChatMessage::tool(&tool_call.id, &result_text));
             enforce_conversation_history_limits(&mut history, max_history, max_history_bytes)?;
         }
@@ -312,6 +203,7 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -373,7 +265,7 @@ mod tests {
                 content: Some("final answer".into()),
                 reasoning: None,
                 tool_calls: vec![],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }
@@ -392,7 +284,7 @@ mod tests {
                     content: Some("final answer".into()),
                     reasoning: None,
                     tool_calls: vec![],
-                    usage: None,
+                    usage: Default::default(),
                     raw_blocks: None,
                 });
             }
@@ -409,7 +301,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 }],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }
@@ -425,7 +317,7 @@ mod tests {
                 content: Some("too late".into()),
                 reasoning: None,
                 tool_calls: vec![],
-                usage: None,
+                usage: Default::default(),
                 raw_blocks: None,
             })
         }

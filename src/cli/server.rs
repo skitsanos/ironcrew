@@ -4,145 +4,11 @@ use std::sync::Arc;
 use crate::api;
 use crate::utils::error::{IronCrewError, Result};
 
-const MAX_REQUEST_BODY_HARD_LIMIT: usize = 64 * 1024 * 1024;
-const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
-const MAX_SHUTDOWN_ROUTING_GRACE_SECS: u64 = 300;
-const MAX_SHUTDOWN_DRAIN_MS: u64 = 30_000;
-
-enum StartupPruneOutcome {
-    Pruned(usize),
-    MaintenanceUnhealthy(IronCrewError),
-}
-
-async fn startup_prune_with_policy<F>(
-    maintenance_watchdog: Option<std::time::Duration>,
-    prune: F,
-) -> Result<StartupPruneOutcome>
-where
-    F: std::future::Future<Output = Result<usize>>,
-{
-    let prune_result = match maintenance_watchdog {
-        Some(timeout) => match tokio::time::timeout(timeout, prune).await {
-            Ok(result) => result,
-            Err(_) => Err(IronCrewError::Validation(format!(
-                "Startup idempotency pruning exceeded its {} ms maintenance timeout",
-                timeout.as_millis()
-            ))),
-        },
-        None => prune.await,
-    };
-    match prune_result {
-        Ok(count) => Ok(StartupPruneOutcome::Pruned(count)),
-        Err(error) => {
-            crate::metrics::record_store_error(crate::metrics::StoreOperation::Idempotency, &error);
-            if maintenance_watchdog.is_some() {
-                Ok(StartupPruneOutcome::MaintenanceUnhealthy(error))
-            } else {
-                Err(IronCrewError::Validation(format!(
-                    "Failed to prune the idempotency ledger at startup: {error}"
-                )))
-            }
-        }
-    }
-}
-
-fn bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
-    let value = match std::env::var(name) {
-        Ok(value) => value.parse::<u64>().map_err(|_| {
-            IronCrewError::Validation(format!("{name} must be an integer between {min} and {max}"))
-        })?,
-        Err(std::env::VarError::NotPresent) => default,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(IronCrewError::Validation(format!(
-                "{name} must contain valid UTF-8"
-            )));
-        }
-    };
-    if !(min..=max).contains(&value) {
-        return Err(IronCrewError::Validation(format!(
-            "{name} must be between {min} and {max}"
-        )));
-    }
-    Ok(value)
-}
-
-fn public_bind_requires_auth(host: &str) -> bool {
-    host.parse::<std::net::IpAddr>()
-        .map(|address| !address.is_loopback())
-        .unwrap_or_else(|_| !host.eq_ignore_ascii_case("localhost"))
-}
-
-fn unauthenticated_public_bind_allowed() -> Result<bool> {
-    match std::env::var("IRONCREW_ALLOW_UNAUTHENTICATED") {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => Ok(true),
-        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => Ok(false),
-        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => Err(IronCrewError::Validation(
-            "IRONCREW_ALLOW_UNAUTHENTICATED must be one of: 1, true, 0, false".into(),
-        )),
-    }
-}
-
-fn prepare_file_write_root(public_bind: bool, flows_dir: &Path) -> Result<()> {
-    let configured = std::env::var_os("IRONCREW_FILE_WRITE_ROOT");
-    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
-        if public_bind {
-            return Err(IronCrewError::Validation(
-                "Public server binds require IRONCREW_FILE_WRITE_ROOT to be an explicit writable directory separate from the flow source tree".into(),
-            ));
-        }
-        return Ok(());
-    };
-    let root = std::path::PathBuf::from(configured);
-    if public_bind && !root.is_absolute() {
-        return Err(IronCrewError::Validation(
-            "IRONCREW_FILE_WRITE_ROOT must be absolute for public server binds".into(),
-        ));
-    }
-    std::fs::create_dir_all(&root).map_err(|error| {
-        IronCrewError::Validation(format!(
-            "Failed to create IRONCREW_FILE_WRITE_ROOT '{}': {error}",
-            root.display()
-        ))
-    })?;
-    let root = std::fs::canonicalize(&root).map_err(|error| {
-        IronCrewError::Validation(format!(
-            "Failed to resolve IRONCREW_FILE_WRITE_ROOT '{}': {error}",
-            root.display()
-        ))
-    })?;
-    if root == flows_dir || root.starts_with(flows_dir) || flows_dir.starts_with(&root) {
-        return Err(IronCrewError::Validation(format!(
-            "IRONCREW_FILE_WRITE_ROOT '{}' must be disjoint from flows directory '{}'",
-            root.display(),
-            flows_dir.display()
-        )));
-    }
-    Ok(())
-}
-
-fn require_public_mcp_policy(public_bind: bool) -> Result<()> {
-    if !public_bind {
-        return Ok(());
-    }
-    for (name, transport) in [
-        ("IRONCREW_MCP_ALLOWED_COMMANDS", "stdio"),
-        ("IRONCREW_MCP_ALLOWED_HTTP_HOSTS", "HTTP"),
-    ] {
-        if !matches!(std::env::var(name), Ok(value) if !value.trim().is_empty()) {
-            return Err(IronCrewError::Validation(format!(
-                "Public server binds require {name}; set an exact allowlist or __disabled__ to disable {transport} MCP"
-            )));
-        }
-    }
-    Ok(())
-}
+mod startup_policy;
+use startup_policy::*;
 
 pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
-    use axum::extract::DefaultBodyLimit;
-    use axum::http;
-    use tower_http::cors::{AllowOrigin, CorsLayer};
-
+    crate::usage::budget::TokenBudget::from_environment()?;
     // `.env` is loaded once in `main` before the runtime starts; the server
     // never mutates the environment per-request (that was a data race and a
     // cross-flow secret-bleed source). Flows use the process environment.
@@ -189,10 +55,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         );
     }
 
-    // Bootstrap the persistence store ONCE at server startup. Every
-    // request handler below reuses `state.store` — this avoids per-call
-    // Postgres migrations and keeps one connection pool across the
-    // server's lifetime.
+    // Bootstrap one persistence store and reuse its connection pool.
     let store = crate::engine::store::create_store(flows_dir.join(".ironcrew"))
         .await
         .map_err(|e| IronCrewError::Validation(format!("Failed to init store: {}", e)))?;
@@ -215,6 +78,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let max_active_conversation_lifecycles =
         api::conversation_lifecycle::max_active_conversation_lifecycles();
     let max_active_runs = api::handlers::max_active_runs();
+    let max_active_inspections = api::handlers::max_active_inspections();
     let max_sse_connections = api::handlers::max_sse_connections();
     let max_run_lifetime = api::handlers::max_run_lifetime();
     let idempotency = api::idempotency::IdempotencyConfig::from_env(max_run_lifetime)?;
@@ -256,6 +120,8 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_active_conversations)),
         max_active_runs,
         run_permits: Arc::new(tokio::sync::Semaphore::new(max_active_runs)),
+        max_active_inspections,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(max_active_inspections)),
         max_sse_connections,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(max_sse_connections)),
         max_run_lifetime,
@@ -311,56 +177,13 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     // Background task: evict idle chat session handles.
     let idle_eviction_handle = tokio::spawn(api::conversations::idle_eviction_loop(state.clone()));
 
-    // CORS: use IRONCREW_CORS_ORIGINS env var (comma-separated) or deny all
-    let cors = match std::env::var("IRONCREW_CORS_ORIGINS") {
-        Ok(origins) if origins == "*" => CorsLayer::permissive(),
-        Ok(origins) => {
-            let allowed: Vec<http::HeaderValue> = origins
-                .split(',')
-                .filter(|origin| !origin.trim().is_empty())
-                .map(|origin| {
-                    origin.trim().parse().map_err(|error| {
-                        IronCrewError::Validation(format!(
-                            "Invalid IRONCREW_CORS_ORIGINS entry {:?}: {error}",
-                            origin.trim()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(allowed))
-                .allow_methods([
-                    http::Method::GET,
-                    http::Method::POST,
-                    http::Method::DELETE,
-                    http::Method::OPTIONS,
-                ])
-                .allow_headers([
-                    http::HeaderName::from_static("authorization"),
-                    http::HeaderName::from_static("content-type"),
-                    api::idempotency::IDEMPOTENCY_KEY_HEADER,
-                    api::idempotency::IDEMPOTENCY_RECOVERY_KEY_HEADER,
-                ])
-                .expose_headers([
-                    api::idempotency::IDEMPOTENCY_REPLAYED_HEADER,
-                    api::lifecycle::INSTANCE_ID_HEADER,
-                    http::header::RETRY_AFTER,
-                ])
-        }
-        Err(_) => CorsLayer::new(), // no origins allowed by default
-    };
+    // CORS: use IRONCREW_CORS_ORIGINS (comma-separated) or deny all.
+    let cors = super::server_cors::from_env()?;
 
-    // Request body size limit (default 10MB, configurable via IRONCREW_MAX_BODY_SIZE)
-    let max_body = bounded_env_u64(
-        "IRONCREW_MAX_BODY_SIZE",
-        10 * 1024 * 1024,
-        1,
-        MAX_REQUEST_BODY_HARD_LIMIT as u64,
-    )? as usize;
-
-    let app = api::create_router(state.clone())
-        .layer(cors)
-        .layer(DefaultBodyLimit::max(max_body));
+    let http_limits = super::http_limits::HttpLimits::from_env()?;
+    let app = http_limits
+        .apply(api::create_router(state.clone()))
+        .layer(cors);
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -416,6 +239,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
         state,
         heartbeat_handle,
         idle_eviction_handle,
+        http_limits,
         super::server_shutdown::ShutdownConfig {
             routing_grace: std::time::Duration::from_secs(routing_grace_secs),
             teardown_timeout: std::time::Duration::from_secs(shutdown_timeout_secs),

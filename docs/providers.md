@@ -1,5 +1,6 @@
 # LLM Providers
 
+
 IronCrew supports three provider types:
 
 1. **`openai`** — OpenAI Chat Completions API (and any OpenAI-compatible endpoint: Gemini, Groq, Kimi, DeepSeek, Ollama, Azure, OpenRouter)
@@ -37,12 +38,17 @@ local crew = Crew.new({
 ```
 
 GPT-5.6 Luna accepts only its provider-default temperature. Omit explicit
-`temperature` values when Luna is effective; IronCrew forwards configured
-values and the provider rejects unsupported non-default settings.
+`temperature` values (or use `1`) when Luna is effective; IronCrew rejects
+unsupported non-default settings during construction and request building.
+With no explicit effort, Luna uses `low`.
 For Chat Completions requests with function tools, IronCrew explicitly sends
 `reasoning_effort = "none"` because Luna rejects that combination under its
 default reasoning mode. Use `provider = "openai-responses"` when explicit
 reasoning is required.
+
+These defaults apply to the official OpenAI endpoint. See the
+[model capability policy](model-capabilities.md) for custom endpoints,
+unknown model IDs, validation boundaries, and evidence sources.
 
 ### Google Gemini
 
@@ -218,13 +224,20 @@ The Responses API is OpenAI's newer endpoint with first-class reasoning items,
 built-in server-side tools, and cleaner streaming semantics. Also supported by
 **Azure OpenAI**, **xAI/Grok**, and **OpenRouter**.
 
+Custom function tools send `strict = false`, preserving the shared tool schema's
+optional arguments. IronCrew does not silently rewrite those schemas to require
+every field or accept `null` in place of omission. Runtime tool validation and
+approval still apply. This setting is identical in native token-count preflights
+and generation requests; it does not change strict JSON-schema **response**
+formats. See OpenAI's [strict-mode requirements](https://developers.openai.com/api/docs/guides/function-calling#strict-mode).
+
 ### Basic usage
 
 ```lua
 local crew = Crew.new({
     goal = "My crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 ```
 
@@ -234,12 +247,23 @@ local crew = Crew.new({
 local crew = Crew.new({
     goal = "Reasoning crew",
     provider = "openai-responses",
-    model = "gpt-5.4-nano",
-    reasoning_effort = "medium",      -- "low" | "medium" | "high"
+    model = "gpt-5.6-luna",
+    reasoning_effort = "low",         -- Luna: "none" | "low" | "medium" | "high" | "xhigh" | "max"
     reasoning_summary = "auto",       -- "auto" | "concise" | "detailed"
     stream = true,
 })
 ```
+
+Both values (and `web_search_context_size`) are validated when the crew is
+constructed. Effort is also checked against the effective model policy;
+Luna rejects `minimal`. Omitted Luna effort defaults to `low`.
+
+Individual agents can override the effort for their own requests with
+`reasoning_effort` on the agent table (syntax checked at parse time, effective
+model checked when added to the crew); a complex-analysis agent can run at
+`"high"` while a formatter runs
+at `"low"` inside one crew. See [docs/agents.md](agents.md) for the provider
+matrix.
 
 Reasoning summaries are streamed dim to stderr and persisted to the run record.
 
@@ -249,7 +273,7 @@ Reasoning summaries are streamed dim to stderr and persisted to the run record.
 local crew = Crew.new({
     goal = "Research crew",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
     server_tools = { "web_search", "file_search", "code_interpreter" },
     web_search_context_size = "medium",           -- "low" | "medium" | "high"
     file_search_vector_store_ids = { "vs_abc" },  -- required for file_search
@@ -362,8 +386,13 @@ Individual agents and tasks can also override the model with a `model` field.
 
 ## Token Usage and Prompt Caching
 
-Every task result includes token usage: `prompt_tokens`, `completion_tokens`,
-`total_tokens`, and `cached_tokens`. Run records aggregate these across all tasks.
+Task and run results expose checked `usage` snapshots, including failed/retried
+attempts, reasoning/cache detail and explicit unknowns. Counts are decimal strings
+or null; inspect coverage before treating a subtotal as complete. These are not
+invoices. See [usage accounting](usage-accounting.md) for scope boundaries,
+provider semantics, Lua accessors and durable storage. Direct Rust
+`ChatResponse.usage` returns a checked receipt; sessions restore their checked
+checkpoint without charging prior usage to a new run.
 
 For providers that support prompt caching, enable it at the crew level:
 
@@ -407,9 +436,18 @@ Model capability is only half the picture — crews can also attach
 **Model Context Protocol (MCP) servers** to expose external tools to every
 agent. Pass `mcp_servers = {...}` to `Crew.new({...})` with either a stdio
 spawn spec or a Streamable HTTP URL for a server implementing MCP
-`2026-07-28` discovery. This is the latest published MCP revision for v3.0.0;
+`2026-07-28` discovery. This is the latest published MCP revision for v4.0.0;
 each later IronCrew release targets the then-current official revision only and
 removes the superseded protocol. IronCrew does not support legacy initialize/SSE
 lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
 section of [docs/crews.md](crews.md) for the full config schema, transport
 details, and examples.
+## Opt-in run budgets
+
+[The live compatibility smoke](../evaluations/live-smoke/README.md) checks the
+current Luna Responses path through CLI, streaming dialogs and HTTP human input.
+Its default mode is provider-free; paid and scheduled execution are opt-in.
+
+[`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) enables shared pre-dispatch
+admission. The initial bounded transport is native OpenAI Responses without
+provider-hosted tools; unsupported transports fail closed only when enabled.

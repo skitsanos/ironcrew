@@ -1,7 +1,7 @@
 # Replica lifecycle capacity gate
 
 This IC-020 gate launches one, then two, then three real `ironcrew serve`
-processes against one disposable PostgreSQL 15 database. Each process is
+processes against one disposable latest-stable PostgreSQL database. Each process is
 directly addressed; no load balancer is inferred.
 
 For every phase the harness admits two runs per process. Their single provider
@@ -53,12 +53,13 @@ provider/API quota.
 
 ## Local run
 
-Pull the newest patch of IronCrew's supported minimum major immediately before
-the gate. The fixed name and captured ID make cleanup attributable; refuse to
+Pull the latest stable PostgreSQL image immediately before the gate and record
+the resolved server version and image digest. The fixed name and captured ID
+make cleanup attributable; refuse to
 reuse a pre-existing container and never prune Docker globally.
 
 ```bash
-docker pull postgres:15
+docker pull postgres:latest
 
 ironcrew_ic020_pg_name=ironcrew-ic020-capacity-pg
 if docker inspect "$ironcrew_ic020_pg_name" >/dev/null 2>&1; then
@@ -72,7 +73,7 @@ ironcrew_ic020_pg_id=$(docker run --rm -d \
   -e POSTGRES_PASSWORD=ic020-capacity-local-password \
   -e POSTGRES_DB=ironcrew_capacity \
   -p 127.0.0.1:55433:5432 \
-  postgres:15) || exit 1
+  postgres:latest) || exit 1
 test -n "$ironcrew_ic020_pg_id" || exit 1
 
 cleanup_ic020_capacity() {
@@ -98,11 +99,11 @@ python3 evaluations/replica-lifecycle/capacity.py \
   --binary target/release/ironcrew \
   --database-url postgres://ironcrew:ic020-capacity-local-password@127.0.0.1:55433/ironcrew_capacity \
   --postgres-container "$ironcrew_ic020_pg_id" \
-  --report evaluations/replica-lifecycle/reports/2026-08-10-local-postgres15
+  --report /tmp/ironcrew-replica-capacity-new
 ```
 
 The runner requires a loopback DSN and a running container whose configured
-image is exactly `postgres:15`. It generates a unique
+image is exactly `postgres:latest`. It generates a unique
 `ic020cap_<random>_` table prefix, stops only its own child process groups, and
 drops/verifies only that prefix even after a failed phase. It does not stop the
 caller-owned PostgreSQL container; the shell trap above does that by captured

@@ -707,31 +707,8 @@ impl RunEventEntry {
     }
 }
 
-/// Terminal run metadata returned alongside a page. `event_sequence` is absent
-/// while the terminal journal row is still pending or when its bounded writer
-/// failed permanently; the authoritative run record still lets clients close
-/// with an explicitly incomplete synthetic terminal event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunEventTerminalState {
-    pub status: RunStatus,
-    pub duration_ms: u64,
-    pub total_tokens: u32,
-    pub event_sequence: Option<u64>,
-}
-
-impl RunEventTerminalState {
-    pub fn validate(&self) -> Result<()> {
-        if !self.status.is_terminal() {
-            return Err(IronCrewError::Validation(
-                "Run-event terminal state must contain a terminal run status".into(),
-            ));
-        }
-        if let Some(sequence) = self.event_sequence {
-            validate_sequence(sequence)?;
-        }
-        Ok(())
-    }
-}
+mod terminal;
+pub use terminal::RunEventTerminalState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEventPage {
@@ -1215,7 +1192,15 @@ mod tests {
         RunEventTerminalState {
             status: RunStatus::Success,
             duration_ms: 10,
-            total_tokens: 20,
+            usage: crate::usage::UsageSnapshot::from_receipt(
+                crate::usage::UsageReceipt::from_counts(
+                    crate::usage::UsageCounts {
+                        total_tokens: Some(20),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+            ),
             event_sequence: Some(10),
         }
         .validate()
@@ -1238,7 +1223,15 @@ mod tests {
             terminal: Some(RunEventTerminalState {
                 status: RunStatus::Success,
                 duration_ms: 10,
-                total_tokens: 20,
+                usage: crate::usage::UsageSnapshot::from_receipt(
+                    crate::usage::UsageReceipt::from_counts(
+                        crate::usage::UsageCounts {
+                            total_tokens: Some(20),
+                            ..Default::default()
+                        },
+                        true,
+                    ),
+                ),
                 event_sequence: Some(10),
             }),
         };

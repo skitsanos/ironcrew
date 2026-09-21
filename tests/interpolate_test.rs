@@ -14,7 +14,7 @@ fn test_interpolate_output() {
             output: "Rust is fast and safe".into(),
             success: true,
             duration_ms: 1500,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         },
     );
@@ -35,7 +35,7 @@ fn test_interpolate_multiple() {
             output: "data1".into(),
             success: true,
             duration_ms: 100,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         },
     );
@@ -47,7 +47,7 @@ fn test_interpolate_multiple() {
             output: "data2".into(),
             success: true,
             duration_ms: 200,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         },
     );
@@ -68,7 +68,7 @@ fn test_interpolate_success_field() {
             output: "done".into(),
             success: true,
             duration_ms: 50,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         },
     );
@@ -120,7 +120,7 @@ fn test_interpolate_agent_and_duration() {
             output: "output".into(),
             success: true,
             duration_ms: 2500,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         },
     );

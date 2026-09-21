@@ -1,5 +1,6 @@
 # IronCrew REST API
 
+
 IronCrew includes a built-in REST API server that lets you run crew flows over HTTP,
 stream execution events via SSE, and manage run history.
 
@@ -134,7 +135,7 @@ be exactly `sha256:` followed by 64 lowercase hexadecimal characters.
 
 ```json
 {
-  "version": "3.0.0",
+  "version": "4.0.0",
   "instance_id": "replica-a",
   "process_start_id": "9b0d1822-c5e8-4bf1-8b78-8133f9287710",
   "deployment": {
@@ -641,8 +642,8 @@ results.
 | `crew_started`       | `goal`, `agent_count`, `task_count`, `model`                  | Crew execution begins                        |
 | `phase_start`        | `phase`, `tasks`                                              | A new execution phase starts                 |
 | `task_assigned`      | `task`, `agent`, `phase`                                      | Task assigned to an agent                    |
-| `task_completed`     | `task`, `agent`, `duration_ms`, `success`, `output`, `token_usage` | Task finished successfully              |
-| `task_failed`        | `task`, `agent`, `error`, `duration_ms`                       | Task execution failed                        |
+| `task_completed`     | `task`, `agent`, `duration_ms`, `success`, `output`, `usage` | Task finished successfully              |
+| `task_failed`        | `task`, `agent`, `error`, `duration_ms`, `usage`                       | Task execution failed                        |
 | `task_skipped`       | `task`, `reason`                                              | Task skipped (condition evaluated false)     |
 | `task_thinking`      | `task`, `agent`, `content`                                    | Model reasoning/thinking (Anthropic, OpenAI Responses, DeepSeek, Kimi) |
 | `task_retry`         | `task`, `attempt`, `max_retries`, `backoff_secs`, `error`     | Task being retried after failure             |
@@ -657,23 +658,33 @@ results.
 | `dialog_started`     | `dialog_id`, `agents`, `max_turns`                            | A `crew:dialog()` was created (`agents` is the array of participating agent names in turn order) |
 | `dialog_turn`        | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | One turn in an agent-to-agent dialog (`speaker` = "a" or "b") |
 | `dialog_thinking`    | `dialog_id`, `turn_index`, `speaker`, `agent`, `content`      | Reasoning captured during a dialog turn      |
-| `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended (either reached `max_turns` or a `should_stop` callback stopped it; `stop_reason` is present only when the callback stopped it) |
+| `dialog_completed`   | `dialog_id`, `total_turns`, `stop_reason?`                    | Dialog ended after reaching `max_turns` or stopping early; `stop_reason` is present for `should_stop` and blank-final-reply termination |
 | `message_sent`       | `from`, `to`, `message_type`                                  | Inter-agent message sent                     |
 | `memory_set`         | `key`                                                         | A memory key was written                     |
 | `human_input_requested` | local: `question_id`, `prompt`, `choices`, `timeout_s`, `kind`; durable: `question_id`, `timeout_s`, `kind`, `question_method`, `question_endpoint`, `question_metadata` | The run suspended on a human question. PostgreSQL replay deliberately uses `question_metadata: "omitted_from_event_journal"`; GET the authenticated questions endpoint to recover encrypted prompt/choices. |
 | `human_input_received` | `question_id`, `outcome`                                    | The question resolved (`outcome`: `"answered"` or `"timeout"`). Never carries the answer content — answers may contain secrets |
 | `journal_gap`        | `first_sequence`, `last_sequence`, `reason`                  | PostgreSQL replay omitted/evicted a sequence range. Its SSE id advances through `last_sequence`; do not infer events inside the gap. |
 | `log`                | `level`, `message`                                            | General log entry (info, error, etc.)        |
-| `run_complete`       | `run_id`, `status`, `duration_ms`, `total_tokens`             | Run finished (terminal event)                |
+| `run_complete`       | `run_id`, `status`, `duration_ms`, `usage`             | Run finished (terminal event)                |
 
-The `token_usage` field in `task_completed` contains:
+The `usage` field in task/run results and terminal events contains a checked
+snapshot. Counts are decimal strings or null, and completeness is explicit.
+See [usage accounting](usage-accounting.md) for scope and persistence boundaries:
 
 ```json
 {
-  "prompt_tokens": 150,
-  "completion_tokens": 42,
-  "total_tokens": 192,
-  "cached_tokens": 0
+  "coverage": "complete",
+  "in_flight": "0",
+  "settled": {
+    "requests": "1",
+    "coverage": "complete",
+    "prompt_tokens": { "known": "150", "complete": true },
+    "completion_tokens": { "known": "42", "complete": true },
+    "total_tokens": { "known": "192", "complete": true },
+    "cached_tokens": { "known": "0", "complete": true },
+    "cache_write_tokens": { "known": null, "complete": false },
+    "reasoning_tokens": { "known": null, "complete": false }
+  }
 }
 ```
 
@@ -700,9 +711,10 @@ events per primitive when multiple are running in the same `crew:run()`.
   inside `run()`)
 - `dialog_thinking` — once per turn when reasoning is captured
 - `dialog_completed` — emitted exactly once, either when the dialog reaches
-  `max_turns` or when a `should_stop` Lua callback requests early termination.
-  The event carries an optional `stop_reason` string in the early-stop case
-  (omitted for max-turns completion, so older clients are unaffected)
+  `max_turns`, when a `should_stop` Lua callback requests early termination,
+  or when the model returns a blank final reply after zero or more tool rounds.
+  The event carries an optional `stop_reason` string in either early-stop case
+  (`"empty_response"` for a blank reply) and omits it for max-turns completion.
 
 Conversation and dialog output also still streams to stderr in the Lua process
 (with dim styling for reasoning) — the SSE events are an additional channel.
@@ -784,8 +796,18 @@ curl "http://localhost:3000/flows/research-crew/runs?since=2026-03-01T00:00:00Z"
       "duration_ms": 80000,
       "agent_count": 2,
       "task_count": 3,
-      "total_tokens": 1200,
-      "cached_tokens": 400,
+      "usage": {
+        "coverage": "complete", "in_flight": "0",
+        "settled": {
+          "requests": "3", "coverage": "complete",
+          "prompt_tokens": { "known": "1000", "complete": true },
+          "completion_tokens": { "known": "200", "complete": true },
+          "total_tokens": { "known": "1200", "complete": true },
+          "cached_tokens": { "known": "400", "complete": true },
+          "cache_write_tokens": { "known": null, "complete": false },
+          "reasoning_tokens": { "known": null, "complete": false }
+        }
+      },
       "tags": ["prod"]
     }
   ],
@@ -869,6 +891,11 @@ curl http://localhost:3000/flows/research-crew/agents
 Returns agent definitions including `name`, `goal`, `capabilities`, `tools`,
 `temperature`, and `model`.
 
+Both inspection routes run project discovery, file reads, Lua parsing, and VM
+construction outside Tokio's async worker pool. A dedicated process-local
+semaphore bounds their concurrency through `IRONCREW_MAX_ACTIVE_INSPECTIONS`
+(default `4`, hard ceiling `64`); saturation fails fast with `503`.
+
 ### List Built-in Tools
 
 ```bash
@@ -915,6 +942,13 @@ Text and image inputs are independently bounded; see the
 [chat environment table](chat.md#environment-variables) for the exact defaults
 and hard ceilings.
 
+A missing, empty, or whitespace-only final provider reply fails the message
+request through the server-error response path; it is not a successful empty
+assistant message. The candidate turn is discarded without publishing history,
+advancing the conversation revision, or emitting `conversation_turn`. Tool
+effects may already have happened and are not rolled back or automatically
+replayed. Existing idempotency and indeterminate-outcome rules still apply.
+
 A dead owner can be recovered only at a committed turn boundary. After owner
 death between turns, another replica can accept the next keyed message and
 rehydrate the exact stored revision. Death during provider/tool work or commit
@@ -928,6 +962,10 @@ non-empty `agent` is supplied, IronCrew trims surrounding whitespace and
 requires an exact match with the stored agent. A mismatch returns `409 Conflict`
 before the flow is evaluated or a live Lua conversation is constructed, without
 changing the stored transcript or active-session state.
+
+Successful `/messages`, `/history`, and conversation-list entries include checked
+session `usage`; see [usage accounting](usage-accounting.md) for checkpoint and
+resume boundaries. Live unsaved receipts are not a durable billing journal.
 
 `/start`, `/messages`, and `/history` expose the durable `revision`, a UUID
 `incarnation_id`, and canonical source/definition fingerprints as applicable.
@@ -1036,11 +1074,15 @@ themselves audited.
 ### Trust-proxy mode
 
 When running behind a reverse proxy (Nginx, Envoy, AWS ALB, etc.),
-set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the first hop
-of `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
-Without the env var set, an attacker hitting the server directly could
-forge their IP by sending an `X-Forwarded-For` header; the gate
-prevents that.
+set `IRONCREW_TRUST_PROXY=1` so the audit recorder uses the rightmost
+IP in `X-Forwarded-For` instead of the direct TCP peer for `source_ip`.
+IronCrew treats only that append position as trusted; client-supplied
+prefixes are ignored, and an invalid rightmost value falls back to the
+TCP peer. Enable this only behind a trusted proxy that appends the address
+it observed. In a multi-proxy topology, the recorded value is the
+immediately preceding hop unless the final proxy rewrites the header to a
+validated client address. Without the env var set, IronCrew always uses the
+direct TCP peer, so a direct client cannot forge its audit IP with this header.
 
 ## GET /metrics
 
@@ -1063,8 +1105,11 @@ families; every label value is from the closed vocabulary shown here:
 | `ironcrew_runs_total` (counter), `ironcrew_run_duration_seconds` (histogram) | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total` (counter), `ironcrew_task_duration_seconds` (histogram) | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total` (counter), `ironcrew_tool_call_duration_seconds` (histogram) | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` (counter) | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total` (counter), `ironcrew_provider_request_duration_seconds` (histogram) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
-| `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_provider_tokens_total` (counter) | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `total`, `cached`, `cache_write`, `reasoning` |
+| `ironcrew_provider_usage_incomplete_fields_total` (counter) | Same `provider` and `type` labels; missing/partial field receipts |
+| `ironcrew_provider_usage_receipts_total` (counter) | Same `provider`; `coverage`: `complete`, `partial`, `unavailable` |
 | `ironcrew_sse_connections_total` (counter) | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
 | `ironcrew_lease_losses_total` (counter) | `scope`: `run`, `conversation` |
 | `ironcrew_reconciliation_cycles_total` (counter) | `outcome`: `success`, `error` |
@@ -1083,8 +1128,12 @@ The four duration histograms use cumulative second buckets at `0.005`, `0.01`,
 series. A reconciler can count multiple abandoned runs without fabricating
 durations, so `ironcrew_runs_total{outcome="abandoned"}` may exceed the matching
 histogram `_count`. Skipped tasks record a zero-second duration. Provider token
-counters advance only when a successful provider response reports usage; they
-are usage telemetry, not invoice or billing data.
+counters retain known lower bounds from successful, failed and cancelled
+dispatches; pair them with incomplete-field and receipt-coverage counters. They
+are process-local usage telemetry, not invoice or billing data. Hook failures retain the
+original task description or output while incrementing the counter, so an
+operator can detect a hook that is failing without exposing its source, task
+name, returned value, or error as a metric label.
 
 These counters and histograms are in-memory, process-local, saturating, and
 reset on every process start. They are not persisted or cluster-global. Record
@@ -1108,7 +1157,7 @@ curl http://localhost:3000/health
 ```json
 {
   "status": "ok",
-  "version": "3.0.0"
+  "version": "4.0.0"
 }
 ```
 
@@ -1123,7 +1172,7 @@ lifecycle withdrawal, readiness returns `503` with the exact current phase:
   "status": "not_ready",
   "component": "lifecycle",
   "lifecycle_state": "draining",
-  "version": "3.0.0"
+  "version": "4.0.0"
 }
 ```
 
@@ -1173,7 +1222,7 @@ CORS is configured via the `IRONCREW_CORS_ORIGINS` environment variable:
 | Value | Behavior |
 |-------|----------|
 | Absent (default) | No origins allowed (API not accessible from browsers) |
-| `*` | Permissive — all origins allowed (development only) |
+| `*` | All origins allowed, with the same restricted methods and headers below (development only) |
 | Comma-separated URLs | Only listed origins allowed |
 
 ```bash
@@ -1200,6 +1249,28 @@ IRONCREW_MAX_BODY_SIZE=8388608  # 8 MiB
 ```
 
 Values must be positive and cannot exceed 64 MiB.
+
+## HTTP Transport Limits
+
+The listener bounds slow or stalled clients at three levels:
+
+- `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` defaults to 10 seconds (range 1–300) for
+  the initial protocol preface and every HTTP/1 request-header block. It also
+  controls the HTTP/2 keep-alive interval and response timeout.
+- `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` defaults to 600 seconds (range 1–7200)
+  from request dispatch through response creation, including request-body
+  reads and handler work. Expiry returns `408 Request Timeout` with
+  `Cache-Control: no-store`. Once a streaming response has been created, its
+  body—including an SSE stream—is not wrapped by this deadline. Keep this
+  value above the longest synchronous handler budget, including
+  `IRONCREW_MAX_CONVERSATION_TURN_SECS`.
+- `IRONCREW_MAX_HTTP_CONNECTIONS` defaults to 1024 (range 1–100000) per
+  process. The listener waits for capacity before accepting another
+  connection. SSE connections count toward both this general cap and
+  `IRONCREW_MAX_SSE_CONNECTIONS`.
+
+For multiple replicas, total connection capacity is the per-process cap times
+the replica count; use a trusted gateway when a cluster-wide limit is required.
 
 ## Error Responses
 
@@ -1273,7 +1344,7 @@ docker run -p 3000:3000 \
   ironcrew
 ```
 
-The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.97.1` with
+The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.98.1` with
 `cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
 certificates. Those tags and the runtime package repositories are not a
 bit-for-bit reproducibility guarantee. The image runs as numeric non-root UID
@@ -1283,3 +1354,10 @@ default command.
 The image sets `IRONCREW_HOST=0.0.0.0`, so the published port is reachable
 without an extra bind flag. A host-built binary still defaults to `127.0.0.1`
 unless `PORT`, `IRONCREW_HOST`, or `--host` selects another address.
+## Run and message token budgets
+
+[`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) applies per HTTP flow entrypoint
+and separately per standalone conversation message. Run `usage.budget` persists
+with terminal records/events. Message responses add `request_usage`; their
+existing `usage` remains session-lifetime receipts. Budget-denied messages
+return HTTP 422 and a `budget` snapshot, never a successful assistant result.

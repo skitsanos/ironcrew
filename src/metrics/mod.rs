@@ -8,14 +8,15 @@ mod histogram;
 mod labels;
 mod prometheus;
 mod state;
+mod usage;
 
 use std::sync::LazyLock;
 use std::time::Duration;
 
 pub use labels::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, TokenKind, ToolOutcome,
 };
 
 static METRICS: LazyLock<state::Metrics> = LazyLock::new(state::Metrics::default);
@@ -36,6 +37,10 @@ pub fn record_tool(outcome: ToolOutcome, duration: Duration) {
     METRICS.record_tool(outcome, duration);
 }
 
+pub fn record_hook_failure(hook: HookKind, stage: HookFailureStage) {
+    METRICS.record_hook_failure(hook, stage);
+}
+
 pub fn record_provider(
     family: ProviderFamily,
     operation: ProviderOperation,
@@ -45,15 +50,8 @@ pub fn record_provider(
     METRICS.record_provider(family, operation, outcome, duration);
 }
 
-pub fn record_provider_tokens(family: ProviderFamily, usage: &crate::llm::provider::TokenUsage) {
-    METRICS.record_provider_tokens(
-        family,
-        [
-            u64::from(usage.prompt_tokens),
-            u64::from(usage.completion_tokens),
-            u64::from(usage.cached_tokens),
-        ],
-    );
+pub fn record_provider_usage(family: ProviderFamily, usage: &crate::usage::UsageReceipt) {
+    METRICS.usage.record(family, usage);
 }
 
 pub fn record_sse(scope: SseScope, outcome: SseOutcome) {
@@ -97,5 +95,7 @@ pub fn append_prometheus(body: &mut String) {
     prometheus::append(body, &METRICS);
 }
 
+#[cfg(test)]
+mod hook_tests;
 #[cfg(test)]
 mod tests;

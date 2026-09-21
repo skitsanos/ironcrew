@@ -7,4 +7,5 @@ pub mod lua;
 pub mod mcp;
 pub mod metrics;
 pub mod tools;
+pub mod usage;
 pub mod utils;

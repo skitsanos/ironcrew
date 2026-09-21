@@ -8,7 +8,6 @@
 .env.build
 docs/superpowers
 examples/clients
-Taskfile.yaml
 TODO.md
 review.md
 remediation-plan.md

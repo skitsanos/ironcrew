@@ -95,7 +95,10 @@ async fn test_memory_persistent_roundtrip() {
 
     // Write
     {
-        let store = MemoryStore::persistent(path.clone()).unwrap();
+        let store =
+            MemoryStore::persistent_with_config_async(path.clone(), MemoryConfig::default())
+                .await
+                .unwrap();
         store.set("key1".into(), json!("value1")).await.unwrap();
         store
             .set("key2".into(), json!({"nested": true}))
@@ -106,7 +109,9 @@ async fn test_memory_persistent_roundtrip() {
 
     // Read back
     {
-        let store = MemoryStore::persistent(path).unwrap();
+        let store = MemoryStore::persistent_with_config_async(path, MemoryConfig::default())
+            .await
+            .unwrap();
         assert_eq!(store.get("key1").await, Some(json!("value1")));
         assert_eq!(store.get("key2").await, Some(json!({"nested": true})));
     }

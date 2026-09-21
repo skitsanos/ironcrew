@@ -227,8 +227,8 @@ citations, and one configuration flag instead of a whole tool implementation.
 
 **CORS.** The API server denies cross-origin requests by default. Set
 `IRONCREW_CORS_ORIGINS` to a comma-separated list of allowed origins, or `*`
-for permissive access (development only). In production, always list specific
-origins.
+to allow every origin while retaining the API's restricted methods and headers
+(development only). In production, always list specific origins.
 
 **SSRF protection.** The `http_request` tool and all Lua `http.*` globals block
 requests to private/internal IP addresses (loopback, RFC1918, link-local, CGNAT)
@@ -249,8 +249,9 @@ served via `GET /audit`. Callers can self-label by sending an
 `X-Audit-Actor: alice@example.com` header — the value is voluntary,
 validated for length and control characters, and replaced by the JWT
 `sub` claim when JWT auth lands. Behind a reverse proxy, set
-`IRONCREW_TRUST_PROXY=1` so the recorder uses `X-Forwarded-For` for
-source-IP capture. See `docs/rest-api.md`.
+`IRONCREW_TRUST_PROXY=1` only when that trusted proxy appends its observed
+client address to `X-Forwarded-For`. The recorder uses the rightmost IP and
+ignores client-supplied prefixes. See `docs/rest-api.md`.
 
 **MCP hardening.** When MCP servers are in the mix, tighten the defaults:
 
@@ -275,6 +276,14 @@ source-IP capture. See `docs/rest-api.md`.
 - `IRONCREW_MCP_TOOL_RESULT_MAX_BYTES` — default `262144` (256 KB). Caps
   the result size returned from any MCP tool call; oversized results are
   truncated with a marker.
+
+**Provider deadlines.** Keep the provider connection deadline short with
+`IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` (default `10`, maximum `120`), while
+allowing legitimate extended-thinking streams enough total time through
+`IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` (default `900`, maximum `86400`). Both
+values are captured with the provider byte limits and bound into the durable
+conversation fingerprint, so replicas or resumed conversations fail closed if
+their effective request policy differs.
 
 **Request/response size limits.** The server enforces a max request body size
 (`IRONCREW_MAX_BODY_SIZE`, default 10MB). HTTP tools and Lua `http.*` enforce
@@ -327,7 +336,10 @@ contain sensitive task output.
 
 **Default (JSON files).** By default, run records are stored as individual JSON
 files under `<flow>/.ironcrew/runs/`. This requires no extra dependencies and
-works well for development and moderate workloads.
+works well for development and moderate workloads. The asynchronous store
+adapter moves directory access, JSON parsing, atomic writes, and fsyncs onto
+owned blocking workers; its process-wide file lock never parks a Tokio worker.
+Persistent crew-memory load/save uses the same blocking-worker boundary.
 
 **SQLite backend.** Set `IRONCREW_STORE=sqlite` to store run records in a SQLite
 database instead. The database file defaults to `<flow>/.ironcrew/ironcrew.db`
@@ -412,7 +424,7 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile pins Rust `1.97.1`, builds with
+**Multi-arch builds.** The Dockerfile pins Rust `1.98.1`, builds with
 `--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
 architectures with:
 
@@ -447,7 +459,9 @@ as a promise that every long-running crew execution will finish.
 **Prompt caching.** Enable `prompt_cache_key` on crews with repetitive system
 prompts. Cached tokens are tracked in run records.
 
-**Token tracking.** Monitor `total_tokens` and `cached_tokens` in run records.
+**Token tracking.** Monitor `usage.coverage` and `usage.settled` in run records.
+Token subtotals have decimal-string `known` values (or null) and a `complete`
+flag. Unknown usage is not zero cost; see [usage accounting](usage-accounting.md).
 Use the SSE `task_completed` event for per-task breakdowns.
 
 **Model routing.** Route cheap tasks to fast models and expensive tasks to

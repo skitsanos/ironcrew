@@ -21,4 +21,5 @@ crew:add_task({
     agent = "assistant",
 })
 
+if IRONCREW_MODE == "validate" then return end
 crew:run()

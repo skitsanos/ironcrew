@@ -1,5 +1,6 @@
 # CLI Reference
 
+
 IronCrew provides a single binary, `ironcrew`, with subcommands for scaffolding,
 running, validating, inspecting, and serving crew workflows.
 
@@ -75,23 +76,88 @@ ironcrew chat examples/chat-cli --agent tutor --id onboarding-2026-04
 
 - The Lua VM has `IRONCREW_MODE = "chat"` set before `crew.lua` executes,
   so guard any top-level one-shot `crew:run()` with
-  `if IRONCREW_MODE ~= "chat" then ... end`.
+  `if IRONCREW_MODE == "run" then ... end` (also safe for construction validation).
 - Slash commands: `/help`, `/exit`, `/quit`, `/reset`, `/id`, `/save`,
-  `/history`.
+  `/history`, `/usage` (checked session checkpoint plus live receipts).
 - See [docs/chat.md](chat.md) for the full reference and
   [examples/chat-cli/](../examples/chat-cli/) for a runnable example.
 
 ### validate
 
-Check project structure and Lua syntax without executing anything.
+Choose declaration/syntax checks or bounded construction evaluation.
 
 ```
 ironcrew validate .
 ironcrew validate path/to/project
+ironcrew validate --evaluate path/to/project
 ```
 
-Validates agent/tool file syntax, entrypoint Lua syntax, and reference
-integrity (agent tool arrays vs. known tools).
+Without `--evaluate`, this evaluates separate agent/tool declarations, compiles
+the entrypoint, and checks agent tool references. It does **not** evaluate
+inline crew construction and is not a no-effects guarantee for untrusted
+project code. The HTTP `/flows/{flow}/validate` contract is unchanged.
+
+With `--evaluate`, IronCrew uses the real constructors and model capability
+policy to evaluate `config.lua`, agent/tool declarations, snapshot-backed
+`_lib` imports, and the selected entrypoint. It checks constructed task graphs,
+unknown references, cycles, task model overrides, and evaluated conversation
+and dialog options. Credentials are not required or validated; `.env` is not
+loaded. Provider credentials used internally are inert validation placeholders.
+Default model/effort rules remain `gpt-5.6-luna` with `low`, or `none` for Luna
+Chat Completions function tools.
+
+| Exit | Meaning in `--evaluate` mode |
+|---|---|
+| `0` | The evaluated construction path passed |
+| `1` | Invalid construction, source/resource limit, or worker failure |
+| `2` | Invalid CLI arguments |
+| `3` | Incomplete: execution/external state required, or no crew constructed |
+
+CI must require exit `0`; do not tolerate `3`. No fake task results, empty
+stored histories, or synthetic human answers are returned to Lua. Calling
+`crew:run`, session methods, memory/message access, HTTP, PostgreSQL, filesystem,
+process, environment, or nested-flow operations stops evaluation. MCP syntax
+is parsed, but tool discovery requires external work and is incomplete. SQL
+declarations are parsed without a connection when the postgres feature is
+enabled (otherwise they are incomplete). A declared persistent crew or session
+does not open or resume its store.
+
+Keep construction separate from execution:
+
+```lua
+local crew = Crew.new({ goal = "Answer a question" })
+crew:add_agent({ name = "assistant", goal = "Answer concisely" })
+crew:add_task({ name = "answer", description = "Explain Rust ownership" })
+if IRONCREW_MODE == "validate" then return end
+local results = crew:run()
+```
+
+This checks only the path reached with `IRONCREW_MODE = "validate"` and no
+`input`. Callback bodies and untaken branches are compiled, not invoked;
+execution-dependent construction after the boundary cannot be checked. A guard
+must come **after all construction intended for validation**. Passing is not
+proof of credentials, model availability, provider behavior, output quality,
+persisted-state compatibility, or runtime-only branches.
+
+The restricted VM supports pure Lua string/table/math operations and the
+bounded JSON helpers. `env`, clocks, random UUIDs, protected calls (`pcall`,
+`xpcall`), coroutines, dynamic code loading, `setmetatable` (including finalizers),
+crypto and regex helpers are unsupported and report incomplete; `print` is
+suppressed. Agent/tool file
+declarations use separate VMs, as they do at runtime. Their budgets are shared
+with the entrypoint and config evaluation.
+
+Limits are fixed for this mode: 32 MiB per Lua VM; two million aggregate Lua
+instructions; 64 stack frames; a five-second hook deadline; 256 declarations,
+16 crews, 16,384 option-table entries and 8 MiB of admitted strings/bytecode.
+A supervised worker enforces a **10-second hard deadline**, including native
+Lua calls and source loading; cancellation closes its lifetime channel and
+terminates it. Worker stdout/stderr are capped at 64 KiB each. Source capture
+uses no-follow reads, rejects symlinks/special source files, and caps traversal
+at depth 32, 16,384 entries, 1,024 Lua/SQL files and 64 MiB total. Individual
+files default to 1 MiB (`IRONCREW_LUA_MAX_SOURCE_BYTES`, maximum 16 MiB).
+Only captured Lua/SQL sources are read; arbitrary data files and `.env` are not.
+Secure capture currently requires Unix; unsupported platforms fail closed.
 
 ### list
 
@@ -149,6 +215,9 @@ deliberately enabled. Local
 | GET    | `/flows/{flow}/runs`             | List past runs for a flow |
 | GET    | `/flows/{flow}/runs/{id}`        | Get run details |
 | DELETE | `/flows/{flow}/runs/{id}`        | Delete a run record |
+| POST   | `/flows/{flow}/abort/{run_id}`   | Abort an in-flight run |
+| GET    | `/flows/{flow}/questions/{run_id}` | List pending `ask_human` questions for a run |
+| POST   | `/flows/{flow}/answer/{run_id}`  | Answer a pending `ask_human` question |
 | GET    | `/flows/{flow}/validate`         | Validate a flow |
 | GET    | `/flows/{flow}/agents`           | List agents in a flow |
 | POST   | `/flows/{flow}/conversations/{id}/start`    | Create or re-open a chat session |
@@ -158,6 +227,7 @@ deliberately enabled. Local
 | DELETE | `/flows/{flow}/conversations/{id}`          | Drop handle + delete record |
 | GET    | `/flows/{flow}/conversations`               | Paginated list (filtered by flow) |
 | GET    | `/nodes`                         | List built-in tools |
+| GET    | `/audit`                         | Protected, paginated audit event log |
 
 `/health/ready` is pessimistic about run-lease maintenance. A bounded startup
 reconciliation or PostgreSQL idempotency-prune failure allows the HTTP process
@@ -467,6 +537,7 @@ be set in the shell or in `.env` files.
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | Hard cap on simultaneously-active in-memory chat handles across the server (default: `8`). Breaches return `503`. Total persisted sessions are unbounded — only live handles are capped |
 | `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | Hard cap on distinct conversation IDs with an in-flight start/message/delete/eviction operation (default: `256`; hard ceiling: `4096`). Saturation for a new ID returns `503`; entries are removed after their final owner exits |
 | `IRONCREW_MAX_ACTIVE_RUNS` | Hard cap on simultaneously in-flight flow runs (`POST /flows/{flow}/run`, default: `4`). Breaches return `503` |
+| `IRONCREW_MAX_ACTIVE_INSPECTIONS` | Dedicated cap on concurrent `GET /flows/{flow}/validate` and `/agents` inspections (default: `4`; hard ceiling: `64`). Saturation returns `503` without consuming a Tokio worker |
 | `IRONCREW_COLLABORATION_MAX_TRANSCRIPT_BYTES` | Aggregate retained collaborative-task transcript (default: `8388608` = 8 MiB; hard ceiling: 32 MiB) |
 | `IRONCREW_COLLABORATION_MAX_TURN_BYTES` | Maximum provider response retained for one collaborative turn (default: `1048576` = 1 MiB; hard ceiling: 8 MiB) |
 | `IRONCREW_COLLABORATION_MAX_PARTICIPANT_TURNS` | Maximum `participants × max_turns` per collaborative task (default: `64`; hard ceiling: `512`) |
@@ -506,8 +577,11 @@ be set in the shell or in `.env` files.
 | `IRONCREW_HOST` | Server bind host used when `--host` is absent. If neither is set, `PORT` implies `0.0.0.0`; otherwise the default is `127.0.0.1` |
 | `IRONCREW_PORT` | Server bind port used when `--port` is absent. Takes precedence over platform `PORT` |
 | `PORT` | Platform-provided server port fallback (including Railway). Causes the default host to become `0.0.0.0` |
-| `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). Set to `*` for permissive. Absent = deny all |
+| `IRONCREW_CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://app.example.com,https://admin.example.com`). `*` allows every origin but still restricts methods and headers to the documented API surface. Absent = deny all |
 | `IRONCREW_MAX_BODY_SIZE` | Max request body size in bytes (default: `10485760` = 10 MiB; range: 1–67108864) |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | Deadline for the initial protocol preface and each HTTP/1 request-header block (default: `10`; range: 1–300 seconds). The same interval drives HTTP/2 keep-alive probes and their response timeout |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | Deadline from request dispatch through response creation, including request-body reads and handler work (default: `600`; range: 1–7200 seconds). Timeout responses are non-cacheable `408`; an established streaming response body, including SSE, is not wrapped by this deadline |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | Maximum concurrently accepted HTTP connections per process (default: `1024`; range: 1–100000). The listener waits for capacity before accepting another connection; established SSE connections count toward this cap and their separate SSE cap |
 | `IRONCREW_MAX_CONVERSATION_TURN_SECS` | Whole conversation-turn deadline, including provider and tool rounds (default: `300`; hard ceiling: `3600`) |
 | `IRONCREW_MAX_RUN_LIFETIME` | Max run duration in seconds for API mode (default: `1800` = 30 min; hard ceiling: `86400`) |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | Require exactly one valid `Idempotency-Key` on HTTP runs and JSON/SQLite conversation messages (default: `false`; recommended: `true` in production). PostgreSQL conversation messages require the header regardless because it is their shared turn fence |
@@ -533,7 +607,10 @@ replica count; shared PostgreSQL idempotency and global journal budgets do not
 multiply. PostgreSQL's keyed cancellation/HITL coordination does not make
 process admission global. Put any required cluster-wide request or provider
 budget in a trusted shared gateway with bounded queues and idempotency-key
-preservation. Rate-limit breaches return `429` with numeric
+preservation. The HTTP connection cap is also per-process, so aggregate
+connection capacity is `replicas × IRONCREW_MAX_HTTP_CONNECTIONS`. Keep the
+request timeout above the longest synchronous handler budget, including
+`IRONCREW_MAX_CONVERSATION_TURN_SECS`. Rate-limit breaches return `429` with numeric
 `Retry-After` and `Cache-Control: no-store`; the independent control bucket
 keeps abort/answer/delete operations available when work admission is busy,
 and the observation bucket prevents aggressive question-list polling from
@@ -588,8 +665,8 @@ provider response and are not billing data.
 | Variable          | Description |
 |-------------------|-------------|
 | `IRONCREW_ALLOW_PRIVATE_IPS` | Set to `1` or `true` to allow protected HTTP clients to reach private/internal addresses. Unset keeps DNS resolution, actual connections, and redirect targets restricted to public addresses |
-| `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read. Fail-closed: every name not listed returns `nil`. |
-| `IRONCREW_TRUST_PROXY` | Set to `1` to honor `X-Forwarded-For` for source-IP capture in audit events (only enable when running behind a trusted reverse proxy) |
+| `IRONCREW_ENV_ALLOWLIST` | Comma-separated exact env var names Lua `env()` may read (matched case-insensitively, but names must match in full). Fail-closed: every name not listed returns `nil`. |
+| `IRONCREW_TRUST_PROXY` | Set to `1` only behind a trusted append-style reverse proxy. Audit capture uses the rightmost valid `X-Forwarded-For` IP, ignores client-supplied prefixes, and falls back to the TCP peer when that entry is invalid. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | Default page size on `GET /audit` (default `50`) |
 | `IRONCREW_AUDIT_MAX_LIMIT` | Hard cap on `GET /audit?limit=` (default `500`) |
 
@@ -603,13 +680,15 @@ provider response and are not billing data.
 | `IRONCREW_HTTP_MAX_HEADER_BYTES` | Aggregate response-header cap for protected HTTP tools (default: `65536` = 64 KiB) |
 | `IRONCREW_HTTP_MAX_JSON_BYTES` | Largest HTTP body auto-parsed into an additional JSON tree (default: `2097152` = 2 MiB) |
 | `IRONCREW_HTTP_MAX_OUTPUT_BYTES` | Maximum serialized `http_request` result after JSON escaping/formatting (default: `16777216` = 16 MiB) |
-| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parse. Default: `2097152` (2 MiB) |
+| `IRONCREW_WEB_SCRAPE_MAX_BYTES` | Max HTML body size for the `web_scrape` tool, in bytes. Streamed and capped before DOM parsing, which runs on a blocking worker. Default: `2097152` (2 MiB) |
 | `IRONCREW_MAX_IMAGE_BYTES` | Per-image cap for local and remote image inputs (default: `20971520` = 20 MiB) |
 | `IRONCREW_PROVIDER_MAX_REQUEST_BYTES` | Maximum serialized provider JSON request body, enforced before network send (default: `33554432` = 32 MiB; hard maximum: `268435456` = 256 MiB) |
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | Maximum non-streaming provider response body (default: `16777216` = 16 MiB) |
 | `IRONCREW_PROVIDER_MAX_ERROR_BYTES` | Maximum provider/remote-image error body retained (default: `262144` = 256 KiB) |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | Maximum raw provider SSE bytes consumed for one streaming response (default: `33554432` = 32 MiB) |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | Maximum accumulated provider text/reasoning output (default: `16777216` = 16 MiB) |
+| `IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` | Provider TCP/TLS connection deadline (default: `10`; range: 1–120 seconds; invalid or excessive values use the default) |
+| `IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` | Total provider request deadline, including response streaming (default: `900`; range: 1–86400 seconds). Raise deliberately for unusually long extended-thinking responses |
 | `IRONCREW_CHAT_HISTORY_MAX_BYTES` | Maximum estimated in-memory bytes retained in one provider chat history (default: `33554432` = 32 MiB; hard ceiling: `268435456`) |
 | `IRONCREW_MAX_REASONING_BYTES` | Maximum reasoning/thinking text retained across one provider tool loop (default: `1048576` = 1 MiB; hard ceiling: `16777216`) |
 | `IRONCREW_FILE_READ_MAX_BYTES` | Max bytes read by `file_read` or per file in `file_read_glob` (default: `10485760` = 10 MiB; hard ceiling: `268435456` = 256 MiB) |
@@ -621,6 +700,7 @@ provider response and are not billing data.
 | `IRONCREW_GLOB_MAX_OUTPUT_BYTES` | Maximum final serialized `file_read_glob` JSON output, including escaping and metadata (default: `67108864` = 64 MiB; hard ceiling: `268435456` = 256 MiB) |
 | `IRONCREW_SHELL_TIMEOUT_SECS` | Default shell command deadline (default: `60`; range: 1–3600). A call-level `timeout_secs` can override it within the same range |
 | `IRONCREW_SHELL_MAX_OUTPUT_BYTES` | Max bytes captured per stream (stdout and stderr independently) by the `shell` tool (default: `1048576`; range: 1–16777216) |
+| `IRONCREW_SHELL_ENV_PASSTHROUGH` | Comma-separated exact env var names passed to `shell` children in addition to `PATH`, `HOME`, `USER`, `LANG`, `TZ`, `TERM`, and `LC_*`. The child never inherits the full process environment; `IRONCREW_*` names are never re-admitted |
 | `IRONCREW_JSON_SCHEMA_MAX_BYTES` | Maximum serialized JSON Schema accepted by `validate_schema` (default: `262144`; range: 1024–4194304). External `$ref` retrieval is disabled; local `#` fragments remain supported |
 | `IRONCREW_ASK_HUMAN_TIMEOUT` | Default question timeout when a flow omits `timeout_s` (default: `600`) |
 | `IRONCREW_ASK_HUMAN_MAX_TIMEOUT` | Maximum accepted per-question timeout (default: `3600`; hard ceiling: `86400` seconds) |
@@ -668,9 +748,9 @@ individual ranges stated in their descriptions.
 
 | Variable          | Description |
 |-------------------|-------------|
-| `IRONCREW_STORE`    | Storage backend: exactly `json`, `sqlite`, or `postgres` (`json` only when absent). Public server binds require this to be explicit; unknown values fail startup |
+| `IRONCREW_STORE`    | Storage backend: `json`, `sqlite`, or `postgres` (`postgresql` is accepted as an alias; matching is case-insensitive). Defaults to `json` when absent. Public server binds require this to be explicit; unknown values fail startup |
 | `IRONCREW_STORE_PATH` | Path for SQLite database file (default: `<flow>/.ironcrew/ironcrew.db`) |
-| `DATABASE_URL` | PostgreSQL 15+ connection string (required when `IRONCREW_STORE=postgres`) |
+| `DATABASE_URL` | PostgreSQL 17+ connection string (required when `IRONCREW_STORE=postgres`; the floor stays fixed throughout IronCrew 4.x — see the [support policy](storage.md#postgresql-support-policy)) |
 | `IRONCREW_PG_TABLE_PREFIX` | Table prefix for shared PostgreSQL databases (e.g., `myapp_` → `myapp_runs`), at most 37 lowercase ASCII alphanumeric/underscore bytes |
 | `IRONCREW_DB_POOL_SIZE` | PostgreSQL connection pool size (default: `10`; range: 1–128) |
 | `IRONCREW_DB_CONNECT_RETRIES` | PostgreSQL connection retries after the initial attempt (default: `10`; range: 0–100) |
@@ -695,6 +775,22 @@ repeated database failures can extend that window; this mechanism records
 `abandoned` work and never resumes execution on another process. See
 [Storage Backends](storage.md#run-ownership-and-terminal-writes) for the exact
 formula and minimum-TTL example.
+
+**App Data (`postgres.*`):**
+
+| Variable | Description |
+|---|---|
+| `IRONCREW_APP_DATABASE_URL` | Dedicated app-data PostgreSQL URL for the `postgres.*` Lua namespace; separate from `DATABASE_URL` (the internal `StateStore`'s connection string). Not readable from Lua by default; becomes readable only if explicitly listed in `IRONCREW_ENV_ALLOWLIST` — never allowlist it (or `DATABASE_URL`). Unset → `postgres.*` calls fail with a configuration hint |
+| `IRONCREW_APP_DB_MAX_CONNECTIONS` | Pool size for the app-data database (default: `4`; hard ceiling: `32`) |
+| `IRONCREW_APP_DB_STATEMENT_TIMEOUT_MS` | Server-side `statement_timeout` set for each app-data transaction (default: `5000`; hard ceiling: `60000`) |
+| `IRONCREW_APP_DB_MAX_ROWS` | Maximum rows returned by one `postgres.query` call (default: `500`; hard ceiling: `10000`) |
+| `IRONCREW_APP_DB_MAX_RESPONSE_BYTES` | Maximum serialized bytes returned by one `postgres.query`/`query_one` call (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_PARAM_BYTES` | Maximum serialized bytes for one bound parameter (default: `1048576` = 1 MiB; hard ceiling: `16777216` = 16 MiB) |
+| `IRONCREW_APP_DB_MAX_OPERATIONS` | Maximum `sql/*.sql` operations loaded for one project (load-time; default: `64`; hard ceiling: `256`) |
+| `IRONCREW_APP_DB_MAX_SQL_BYTES` | Maximum bytes in one operation's `.sql` file (load-time; default: `65536` = 64 KiB; hard ceiling: `1048576` = 1 MiB) |
+
+See [PostgreSQL App Data](postgres-app-data.md) for the trust model, operation
+format, Lua API, and the sub-flow limitation.
 
 **Crew memory:**
 
@@ -724,3 +820,9 @@ Pass `-v` on any command to set the log level to `debug`, overriding
 ```
 ironcrew run . -v
 ```
+## Run token ceiling
+
+Set [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) to enable a process-local
+execution ceiling. It is unset/disabled by default, strictly validated, and
+shared across nested work. Inspect `usage.budget` in run history; CLI chat uses
+one budget for the interactive execution, not a fresh allowance per message.

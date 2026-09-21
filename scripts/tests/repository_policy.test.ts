@@ -1,19 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validatePlainMappingKeys } from "../validate_skills";
 
 const repository = join(import.meta.dir, "../..");
+
+function isolatedGitEnvironment(excluded: string[] = []) {
+  const excludedKeys = new Set(excluded);
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !key.startsWith("GIT_") && !excludedKeys.has(key),
+    ),
+  );
+}
+
 const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-  "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
+  "anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
-  "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
-  "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8",
-  "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5",
+  "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
+  "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
+  "dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
@@ -59,12 +69,26 @@ describe("repository integration policy", () => {
     expect(policy).toBeDefined();
     expect(
       policy.steps.some(
-        (step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14",
+        (step) =>
+          step.uses ===
+            "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6" &&
+          step.with?.["bun-version"] === "latest",
       ),
     ).toBeTrue();
     expect(
-      policy.steps.find((step) => step.uses === "actions/checkout@v7")?.with,
+      policy.steps.find(
+        (step) =>
+          step.uses ===
+          "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      )?.with,
     ).toEqual({ "fetch-depth": 0 });
+    for (const job of Object.values(workflow.jobs)) {
+      for (const step of job.steps) {
+        if (step.uses) {
+          expect(step.uses).toMatch(/@[0-9a-f]{40}$/);
+        }
+      }
+    }
     const registry = policy.steps.find(
       (step) => step.name === "Validate issue registry against trusted history",
     );
@@ -81,18 +105,123 @@ describe("repository integration policy", () => {
     expect(commands).toContain("bun run scripts/issues_registry.ts check");
     expect(commands).toContain("bun test scripts/tests/*.test.ts");
     expect(commands).toContain("bun run scripts/check_worktree.ts");
+    expect(commands).toContain("bun install --frozen-lockfile --cwd=examples/chat-ui");
+    expect(commands).toContain(
+      "bun build examples/chat-ui/src/index.html --outdir=/tmp/ironcrew-chat-ui",
+    );
     expect(commands).toMatch(/actionlint"? \.github\/workflows\/\*\.yml/);
+  });
+
+  test("the tracked pre-push hook mirrors every locally reproducible CI job", async () => {
+    const hook = await Bun.file(join(repository, ".githooks/pre-push")).text();
+    const guard = await Bun.file(join(repository, "scripts/pre-push-check.sh")).text();
+    const refresh = await Bun.file(
+      join(repository, "scripts/refresh-develop-dependencies.sh"),
+    ).text();
+    const taskfile = await Bun.file(join(repository, "Taskfile.yaml")).text();
+
+    expect((await stat(join(repository, ".githooks/pre-push"))).mode & 0o111).not.toBe(0);
+    expect((await stat(join(repository, "scripts/pre-push-check.sh"))).mode & 0o111).not.toBe(0);
+    expect(
+      (await stat(join(repository, "scripts/refresh-develop-dependencies.sh"))).mode & 0o111,
+    ).not.toBe(0);
+    expect(hook).toContain('exec "$repo_root/scripts/pre-push-check.sh"');
+    expect(taskfile).toContain("core.hooksPath .githooks");
+    expect(taskfile).toContain("./scripts/pre-push-check.sh");
+    expect(taskfile).toContain("./scripts/refresh-develop-dependencies.sh");
+    expect(guard).toContain("./scripts/refresh-develop-dependencies.sh");
+    expect(guard).toContain("git rev-parse --local-env-vars");
+    expect(guard).toContain('unset "$git_environment_name"');
+    expect(refresh).toContain("latest immutable GitHub Action releases");
+    expect(refresh).toContain('Path(".github/workflows").glob("*.yml")');
+    expect(refresh).toContain('["git", "ls-remote", "--tags", remote]');
+    expect(refresh).toContain('f"refs/heads/{version}"');
+    expect(guard).not.toContain('require_exact_version "Bun"');
+    expect(guard).toContain('require_exact_version "Rust" "$expected_rust"');
+    expect(guard).toContain('require_exact_version "Cargo" "$expected_rust"');
+    expect(guard).toContain('require_exact_version "cargo-audit" "$expected_audit"');
+    expect(guard).toContain('require_exact_version "actionlint" "$expected_actionlint"');
+    expect(refresh).toContain('bun upgrade --stable');
+    expect(refresh).toContain('rustup update stable --no-self-update');
+    expect(refresh).toContain('cargo upgrade --incompatible --exclude sse-stream');
+    expect(refresh).toContain('cargo outdated --root-deps-only --ignore sse-stream --exit-code 1');
+    expect(refresh).toContain('bun update --latest --cwd="$repo_root/examples/chat-ui"');
+    expect(guard).toContain("at least 4 GiB of free disk");
+    expect(guard).toContain("export CARGO_INCREMENTAL=0");
+    expect(guard).toContain("export CARGO_PROFILE_DEV_DEBUG=0");
+
+    for (const command of [
+      "python3 -B scripts/check_module_size.py",
+      "python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'",
+      "bun run scripts/validate_skills.ts",
+      "bun run scripts/issues_registry.ts check",
+      "bun test scripts/tests/*.test.ts",
+      "actionlint .github/workflows/*.yml",
+      "bun run scripts/check_worktree.ts",
+      "bun install --frozen-lockfile",
+      "bun build",
+      "cargo fmt --all -- --check",
+      "cargo build --no-default-features",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test --all-targets",
+      "cargo test --doc",
+      "cargo audit --deny warnings",
+      "cargo build --locked --bin ironcrew",
+      "./scripts/check-lua-examples.sh",
+      "python3 -m unittest discover -s evaluations/crew-effectiveness -p 'test_*.py'",
+      "cargo build --release --locked",
+    ]) {
+      expect(guard).toContain(command);
+    }
+
+    expect(guard).toContain("evaluations/crew-effectiveness/evaluate.py");
+    expect(guard).toContain("IRONCREW_TEST_PG_URL");
+    expect(guard).toContain('bun --no-env-file run scripts/check-postgres.ts --check-only');
+    expect(guard).toContain('run "PostgreSQL floor/latest integration tests" bun --no-env-file run scripts/check-postgres.ts');
+    expect(guard.indexOf("scripts/check-postgres.ts --check-only")).toBeLessThan(
+      guard.indexOf('run "Rust all-target tests"'),
+    );
+    expect(guard).toContain("env -u IRONCREW_TEST_PG_URL -u IRONCREW_TEST_PG_FLOOR_URL cargo test --all-targets");
+    expect(guard).toContain("evaluations/replica-soak/soak.py");
+    expect(guard).not.toContain("PostgreSQL integration not run");
+    expect(guard).toContain("GitHub CI remains authoritative for macOS, Windows");
+  });
+
+  test("the PostgreSQL support floor is consistent across runtime, docs, and CI", async () => {
+    const runtime = await Bun.file(join(repository, "src/engine/pg_runtime.rs")).text();
+    const floor = runtime.match(/MINIMUM_POSTGRES_MAJOR: u32 = (\d+);/)?.[1];
+    expect(floor).toBe("17");
+    for (const doc of ["docs/storage.md", "docs/cli.md", "docs/cloud-deployment.md", "AGENTS.md"]) {
+      const text = await Bun.file(join(repository, doc)).text();
+      expect(text).toContain(`PostgreSQL ${floor}+`);
+      expect(text).not.toMatch(/PostgreSQL 1[0-6]\+/);
+    }
+    const ci = Bun.YAML.parse(await Bun.file(join(repository, ".github/workflows/ci.yml")).text()) as {
+      jobs: Record<string, {
+        name: string;
+        env: Record<string, string>;
+        services: Record<string, { image: string; ports: string[] }>;
+        steps: Array<{ run?: string; uses?: string; with?: Record<string, string> }>;
+      }>;
+    };
+    const job = ci.jobs["postgres-integration"];
+    expect(job.name).toBe("PostgreSQL integration");
+    expect(job.services["postgres-floor"].image).toBe(`postgres:${floor}`);
+    expect(job.services.postgres.image).toBe("postgres:latest");
+    expect(job.services["postgres-floor"].ports).toEqual(["5433:5432"]);
+    expect(job.services.postgres.ports).toEqual(["5432:5432"]);
+    expect(new URL(job.env.IRONCREW_TEST_PG_FLOOR_URL).port).toBe("5433");
+    expect(new URL(job.env.IRONCREW_TEST_PG_URL).port).toBe("5432");
+    expect(job.steps.filter((step) => step.run === "bun --no-env-file run scripts/check-postgres.ts")).toHaveLength(1);
+    expect(job.steps.some((step) => step.uses?.startsWith("oven-sh/setup-bun@") &&
+      step.with?.["bun-version"] === "latest")).toBeTrue();
   });
 
   test("worktree validation covers untracked, staged, and committed whitespace", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "ironcrew-worktree-policy-"));
     const checker = join(repository, "scripts/check_worktree.ts");
     const emptyGitConfig = join(fixture, "empty.gitconfig");
-    const gitEnvironment = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key]) => !key.startsWith("GIT_CONFIG_") && key !== "IRONCREW_POLICY_BASE_SHA",
-      ),
-    );
+    const gitEnvironment = isolatedGitEnvironment(["IRONCREW_POLICY_BASE_SHA"]);
     gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
     gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
 
@@ -178,19 +307,24 @@ describe("repository integration policy", () => {
       .map((step) => step.run ?? "")
       .join("\n");
     expect(commands).toContain("cargo fmt --all -- --check");
+    expect(commands).toContain("cargo build --no-default-features");
     expect(commands).toContain("cargo clippy --all-targets -- -D warnings");
     expect(commands).toContain("cargo test --all-targets");
     expect(commands).toContain("cargo test --doc");
-    expect(source.match(/dtolnay\/rust-toolchain@1\.97\.1/g)).toHaveLength(8);
-    expect(manifest).toContain('rust-version = "1.97.1"');
-    expect(toolchain).toContain('channel = "1.97.1"');
+    expect(
+      source.match(
+        /dtolnay\/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e/g,
+      ),
+    ).toHaveLength(8);
+    expect(manifest).toContain('rust-version = "1.98.1"');
+    expect(toolchain).toContain('channel = "1.98.1"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
-    expect(dockerfile).toContain("FROM rust:1.97.1-bookworm AS builder");
+    expect(dockerfile).toContain("FROM rust:1.98.1-bookworm AS builder");
     expect(release).toContain(
-      "dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1",
+      "dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1",
     );
     expect(release).toContain(
-      "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
+      "anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2",
     );
   });
 
@@ -199,9 +333,32 @@ describe("repository integration policy", () => {
     const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
 
     expect(workflow).toContain("cargo audit --deny warnings");
-    expect(workflow).toContain("cargo-audit --version 0.22.1 --locked");
+    expect(workflow).toContain("cargo-audit --version 0.22.2 --locked");
     expect(lockfile).toContain('name = "event-listener"\nversion = "5.4.2"');
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
+  });
+
+  test("Renovate consolidates latest dependency and immutable pin refreshes", async () => {
+    const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
+      extends: string[];
+      baseBranchPatterns: string[];
+      minimumReleaseAge: string;
+      prConcurrentLimit: number;
+      prHourlyLimit: number;
+      packageRules: Array<Record<string, unknown>>;
+    };
+
+    expect(renovate.extends).toEqual(["config:best-practices"]);
+    expect(renovate.baseBranchPatterns).toEqual(["develop"]);
+    expect(renovate.minimumReleaseAge).toBe("0 days");
+    expect(renovate.prConcurrentLimit).toBe(1);
+    expect(renovate.prHourlyLimit).toBe(1);
+    expect(renovate.packageRules).toContainEqual(
+      expect.objectContaining({
+        groupName: "dependency refresh",
+        groupSlug: "dependency-refresh",
+      }),
+    );
   });
 
   test("the release documents one strict current MCP revision", async () => {
@@ -222,6 +379,17 @@ describe("repository integration policy", () => {
     const version = manifest.match(/^version = "([^"]+)"$/m)?.[1];
     expect(version).toBeDefined();
 
+    const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
+    expect(lockfile).toContain(`name = "ironcrew"\nversion = "${version}"`);
+    const readme = await Bun.file(join(repository, "README.md")).text();
+    expect(readme).toContain(`docs/releases/v${version}.md`);
+    const notes = await Bun.file(join(repository, `docs/releases/v${version}.md`)).text();
+    expect(notes).toStartWith(`# IronCrew ${version}\n`);
+    for (const name of ["tools", "providers"]) {
+      const source = await Bun.file(join(repository, `docs/${name}.md`)).text();
+      expect(source).toContain(`v${version}`);
+    }
+
     const rest = await Bun.file(join(repository, "docs/rest-api.md")).text();
     const cloud = await Bun.file(join(repository, "docs/cloud-deployment.md")).text();
     const openshift = await Bun.file(join(repository, "deploy/openshift.yaml")).text();
@@ -230,7 +398,7 @@ describe("repository integration policy", () => {
     expect(openshift).toContain(`docker.io/skitsanos/ironcrew:${version}`);
   });
 
-  test("PostgreSQL 15 process and soak gates remain in CI", async () => {
+  test("latest-stable PostgreSQL process and soak gates remain in CI", async () => {
     const source = await Bun.file(join(repository, ".github/workflows/ci.yml")).text();
     const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
       packageRules: Array<Record<string, unknown>>;
@@ -249,33 +417,37 @@ describe("repository integration policy", () => {
       }>;
     };
     const postgres = workflow.jobs["postgres-integration"];
-    expect(postgres.services?.postgres.image).toBe("postgres:15");
-    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([
+    expect(postgres.services?.postgres.image).toBe("postgres:latest");
+    expect(renovate.packageRules.filter((rule) => rule.enabled === false)).toEqual([]);
+    expect(renovate.packageRules.filter((rule) => rule.pinDigests === false)).toEqual([
       {
-        description: "Keep CI on the moving PostgreSQL 15 minimum-version gate",
+        description: "Keep disposable PostgreSQL CI on the moving latest-stable image",
         matchManagers: ["github-actions"],
         matchDatasources: ["docker"],
         matchPackageNames: ["postgres"],
         matchFileNames: [".github/workflows/ci.yml"],
-        enabled: false,
+        pinDigests: false,
       },
     ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
-    expect(commands).toContain("--test two_process_replica_acceptance_test");
+    expect(commands).toContain("bun --no-env-file run scripts/check-postgres.ts");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
-    expect(agents).toContain("Pull the moving `postgres:15` tag");
-    expect(agents).toContain("Do not substitute `postgres:latest`");
+    expect(commands).toContain("-s evaluations/replica-lifecycle");
+    expect(agents).toContain("Pull the moving `postgres:latest` tag");
+    expect(agents).toContain("latest stable release");
     expect(agents).toContain("Never run a global Docker system, image, builder");
-    expect(soakGuide).toContain("docker pull postgres:15");
-    expect(soakGuide).toContain("postgres:15");
+    expect(soakGuide).toContain("docker pull postgres:latest");
     expect(soakGuide).toContain("docker run --rm -d");
     expect(soakGuide).toContain("ironcrew_pg_container_id=$(docker run");
     expect(soakGuide).toContain('docker stop "$ironcrew_pg_container_id"');
     expect(soakGuide).toContain('docker inspect "$ironcrew_pg_container_id"');
-    expect(storeTest).toContain("docker pull postgres:15");
-    expect(storeTest).toContain("postgres:15");
-    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:17");
-    expect(`${soakGuide}\n${storeTest}`).not.toContain("postgres:latest");
+    expect(storeTest).toContain("docker pull postgres:latest");
+    expect(storeTest).not.toContain("postgres:15");
+    for (const name of ["check-ironcrew", "resolve-ironcrew-issue"]) {
+      const skill = await Bun.file(join(repository, `.agents/skills/${name}/SKILL.md`)).text();
+      expect(skill).toContain("postgres:latest");
+      expect(skill).not.toContain("disposable PostgreSQL 15");
+    }
   });
 
   test("Lua validation includes the platform-canary runtime smoke", async () => {
@@ -288,6 +460,10 @@ describe("repository integration policy", () => {
 
     expect(luaGate).toContain("evaluations/platform-canary/runtime_smoke.py");
     expect(luaGate).toContain('"flows_executed":4');
+    expect(luaGate).toContain('validate --evaluate "$flow"');
+    expect(luaGate).toContain("examples/providers/03-openai-responses-reasoning.lua");
+    expect(luaGate).toContain("examples/config-lua");
+    expect(luaGate).toContain("examples/conversation");
     expect(canaryGuide).toContain("Static Lua validation does not execute");
   });
 
@@ -667,9 +843,7 @@ describe("repository integration policy", () => {
     const fixture = await mkdtemp(join(tmpdir(), "ironcrew-release-policy-"));
     const verifier = join(repository, "scripts/verify_release_source.sh");
     const emptyGitConfig = join(fixture, "empty.gitconfig");
-    const gitEnvironment = Object.fromEntries(
-      Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_CONFIG_")),
-    );
+    const gitEnvironment = isolatedGitEnvironment();
     gitEnvironment.GIT_CONFIG_NOSYSTEM = "1";
     gitEnvironment.GIT_CONFIG_GLOBAL = emptyGitConfig;
 
@@ -854,6 +1028,43 @@ describe("repository integration policy", () => {
     expect(protocol).toContain("bounded reconciliation loop");
     expect(immutability).toContain("immutable_tags_settings");
     expect(immutability).toContain("SEMVER_IMMUTABILITY_RULE");
+  });
+
+  test("local Docker tasks cannot publish release image tags", async () => {
+    const source = await Bun.file(join(repository, "Taskfile.yaml")).text();
+    const taskfile = Bun.YAML.parse(source) as {
+      vars: Record<string, unknown>;
+      tasks: Record<string, unknown>;
+    };
+    const commands = JSON.stringify(taskfile.tasks);
+
+    expect(taskfile.vars.DEV_IMAGE).toBe("skitsanos/ironcrew-dev");
+    expect(commands).toContain("{{.DEV_IMAGE}}");
+    expect(commands).not.toContain("{{.IMAGE}}:");
+    expect(commands).not.toContain("{{.DEV_IMAGE}}:latest");
+  });
+
+  test("live provider smoke is opt-in, trusted-branch-only and secret-minimal", async () => {
+    const source = await Bun.file(join(repository, ".github/workflows/live-smoke.yml")).text();
+    const workflow = Bun.YAML.parse(source) as {
+      on: Record<string, unknown>;
+      permissions: Record<string, string>;
+      jobs: { smoke: { if: string; environment: string; steps: Array<Record<string, unknown>> } };
+    };
+    expect(Object.keys(workflow.on).sort()).toEqual(["schedule", "workflow_dispatch"]);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(workflow.jobs.smoke.if).toContain("github.event.repository.default_branch");
+    expect(workflow.jobs.smoke.if).toContain("github.actor == 'skitsanos'");
+    expect(workflow.jobs.smoke.if).toContain("vars.IRONCREW_LIVE_SMOKE_APPROVED == 'true'");
+    expect(workflow.jobs.smoke.if).toContain("vars.IRONCREW_LIVE_SMOKE_NIGHTLY == 'true'");
+    expect(workflow.jobs.smoke.environment).toBe("live-provider-smoke");
+    expect(source.match(/secrets\.OPENAI_API_KEY/g)?.length).toBe(1);
+    expect(source).toContain("retention-days: 7");
+    expect(source).toContain("persist-credentials: false");
+    const gate = await Bun.file(join(repository, "scripts/pre-push-check.sh")).text();
+    expect(gate).toContain("IRONCREW_SMOKE_TEST_BIN=");
+    expect(gate).toContain("-s evaluations/live-smoke");
+    expect(gate).not.toContain("--mode live");
   });
 
   test("release guidance preserves approval and manual publication boundaries", async () => {

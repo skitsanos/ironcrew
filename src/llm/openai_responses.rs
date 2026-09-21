@@ -10,16 +10,21 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
 
+use super::accounting::ProviderAttempt;
 use super::provider::*;
+use crate::usage::{ProviderUsage, UsageTracker};
+mod budget;
+mod stream;
+use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
+mod request_body;
 use crate::utils::error::{IronCrewError, Result};
 
 /// OpenAI Responses API-specific configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesConfig {
-    /// Reasoning effort: "low" | "medium" | "high"
+    /// Crew-level effort; validated against the effective model's capabilities.
     pub reasoning_effort: Option<String>,
     /// Reasoning summary mode: "auto" | "concise" | "detailed"
     pub reasoning_summary: Option<String>,
@@ -46,31 +51,6 @@ pub enum ServerTool {
     },
 }
 
-struct RateLimiter {
-    min_interval: Duration,
-    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
-}
-
-impl RateLimiter {
-    fn new(min_interval_ms: u64) -> Self {
-        Self {
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
-            )),
-        }
-    }
-
-    async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = std::time::Instant::now();
-    }
-}
-
 pub struct OpenAiResponsesProvider {
     client: Client,
     base_url: String,
@@ -82,14 +62,10 @@ pub struct OpenAiResponsesProvider {
 
 impl OpenAiResponsesProvider {
     pub fn new(api_key: String, base_url: Option<String>, config: ResponsesConfig) -> Self {
-        let client = crate::utils::network::secure_client_builder(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-        )
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client");
-
         let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let client = super::provider_http::secure_provider_client_builder(execution_policy)
+            .build()
+            .expect("Failed to build HTTP client");
         let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         Self {
@@ -117,209 +93,14 @@ impl OpenAiResponsesProvider {
         self.base_url.contains("x.ai")
     }
 
-    /// Translate a ChatRequest into a Responses API request body.
-    fn build_body(&self, request: &ChatRequest, tools: Option<&[ToolSchema]>) -> Value {
-        // 1. Extract system messages → instructions param
-        let instructions_text: Vec<&str> = request
-            .messages
-            .iter()
-            .filter(|m| m.role == "system")
-            .filter_map(|m| m.content.as_deref())
-            .collect();
-
-        // 2. Build input array from non-system messages
-        let mut input_items: Vec<Value> = Vec::new();
-
-        // If Grok, inject system as a user-role message at the start
-        if self.is_grok() && !instructions_text.is_empty() {
-            input_items.push(json!({
-                "type": "message",
-                "role": "system",
-                "content": [{
-                    "type": "input_text",
-                    "text": instructions_text.join("\n\n"),
-                }],
-            }));
-        }
-
-        for msg in &request.messages {
-            if msg.role == "system" {
-                continue;
-            }
-
-            match msg.role.as_str() {
-                "user" => {
-                    input_items.push(json!({
-                        "type": "message",
-                        "role": "user",
-                        "content": [{
-                            "type": "input_text",
-                            "text": msg.content.as_deref().unwrap_or(""),
-                        }],
-                    }));
-                }
-                "assistant" => {
-                    // Replay captured `reasoning` output items verbatim, before
-                    // the text/function_call items. The Responses API 400s in
-                    // stateless mode (store:false) when a `function_call` is sent
-                    // without its paired reasoning item for reasoning models.
-                    if let Some(ref raw) = msg.raw_blocks {
-                        for item in raw {
-                            input_items.push(item.clone());
-                        }
-                    }
-                    // Text portion (if any)
-                    if let Some(ref content) = msg.content
-                        && !content.is_empty()
-                    {
-                        input_items.push(json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": content,
-                            }],
-                        }));
-                    }
-                    // Tool calls become separate function_call items
-                    if let Some(ref tool_calls) = msg.tool_calls {
-                        for tc in tool_calls {
-                            input_items.push(json!({
-                                "type": "function_call",
-                                "call_id": tc.id,
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            }));
-                        }
-                    }
-                }
-                "tool" => {
-                    // Tool results become top-level function_call_output items
-                    input_items.push(json!({
-                        "type": "function_call_output",
-                        "call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                        "output": msg.content.as_deref().unwrap_or(""),
-                    }));
-                }
-                _ => continue,
-            }
-        }
-
-        let mut body = json!({
-            "model": request.model,
-            "input": input_items,
-            "store": false,
-        });
-
-        // Instructions (non-Grok providers)
-        if !self.is_grok() && !instructions_text.is_empty() {
-            body["instructions"] = json!(instructions_text.join("\n\n"));
-        }
-
-        // Max output tokens
-        if let Some(max) = request.max_tokens {
-            body["max_output_tokens"] = json!(max);
-        }
-
-        // Temperature
-        if let Some(temp) = request.temperature {
-            body["temperature"] = json!(temp);
-        }
-
-        // Reasoning config
-        if self.config.reasoning_effort.is_some() || self.config.reasoning_summary.is_some() {
-            let mut reasoning = json!({});
-            if let Some(ref effort) = self.config.reasoning_effort {
-                reasoning["effort"] = json!(effort);
-            }
-            if let Some(ref summary) = self.config.reasoning_summary {
-                reasoning["summary"] = json!(summary);
-            }
-            body["reasoning"] = reasoning;
-
-            // Include encrypted reasoning content for stateless multi-turn
-            body["include"] = json!(["reasoning.encrypted_content"]);
-        }
-
-        // 3. Build tools array
-        let mut tools_json: Vec<Value> = Vec::new();
-
-        // Custom function tools
-        if let Some(tool_schemas) = tools {
-            for t in tool_schemas {
-                tools_json.push(json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                    "strict": true,
-                }));
-            }
-        }
-
-        // Server-side tools
-        for st in &self.config.server_tools {
-            match st {
-                ServerTool::WebSearch { context_size } => {
-                    let mut tool = json!({"type": "web_search"});
-                    if let Some(cs) = context_size {
-                        tool["search_context_size"] = json!(cs);
-                    }
-                    tools_json.push(tool);
-                }
-                ServerTool::FileSearch {
-                    vector_store_ids,
-                    max_num_results,
-                } => {
-                    let mut tool = json!({
-                        "type": "file_search",
-                        "vector_store_ids": vector_store_ids,
-                    });
-                    if let Some(max) = max_num_results {
-                        tool["max_num_results"] = json!(max);
-                    }
-                    tools_json.push(tool);
-                }
-                ServerTool::CodeInterpreter => {
-                    tools_json.push(json!({
-                        "type": "code_interpreter",
-                        "container": {"type": "auto"},
-                    }));
-                }
-                ServerTool::Mcp {
-                    server_label,
-                    server_url,
-                    allowed_tools,
-                } => {
-                    tools_json.push(json!({
-                        "type": "mcp",
-                        "server_label": server_label,
-                        "server_url": server_url,
-                        "allowed_tools": allowed_tools,
-                        "require_approval": "never",
-                    }));
-                }
-            }
-        }
-
-        if !tools_json.is_empty() {
-            body["tools"] = json!(tools_json);
-        }
-
-        body
-    }
-
-    async fn send_request(&self, body: Value) -> Result<ChatResponse> {
-        let request_body = self.prepare_request(&body)?;
-
-        if let Some(ref limiter) = self.rate_limit {
-            limiter.wait().await;
-        }
-
+    /// Send a capability-checked Responses request within captured HTTP limits.
+    async fn send_request(
+        &self,
+        body: Value,
+        usage_tracker: Option<&UsageTracker>,
+    ) -> Result<ChatResponse> {
+        let (request_body, mut accounting) = self.prepare_dispatch(body, usage_tracker).await?;
         let url = format!("{}/v1/responses", self.base_url);
-        crate::utils::network::validate_url_not_private(&url)
-            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
-
         let resp = self
             .client
             .post(&url)
@@ -331,14 +112,18 @@ impl OpenAiResponsesProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
-        let response_limit = if status.is_success() {
-            self.execution_policy.response_bytes()
-        } else {
-            self.execution_policy.error_bytes()
-        };
+        if !status.is_success() {
+            return Err(read_error_response(
+                resp,
+                self.execution_policy,
+                "OpenAI Responses error response",
+            )
+            .await?
+            .into_accounted_error(&mut accounting));
+        }
         let bytes = crate::utils::http::read_response_bytes(
             resp,
-            response_limit,
+            self.execution_policy.response_bytes(),
             "OpenAI Responses response",
         )
         .await
@@ -354,406 +139,37 @@ impl OpenAiResponsesProvider {
             IronCrewError::Provider(format!("Invalid JSON from Responses API: {}", e))
         })?;
 
-        if !status.is_success() {
-            let error_msg = resp_body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown Responses API error");
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
-
-        parse_responses_response(&resp_body)
-    }
-
-    async fn send_request_stream(
-        &self,
-        mut body: Value,
-        tx: tokio::sync::mpsc::Sender<StreamChunk>,
-    ) -> Result<ChatResponse> {
-        body["stream"] = json!(true);
-        let request_body = self.prepare_request(&body)?;
-
-        if let Some(ref limiter) = self.rate_limit {
-            limiter.wait().await;
-        }
-
-        let url = format!("{}/v1/responses", self.base_url);
-        crate::utils::network::validate_url_not_private(&url)
-            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(request_body)
-            .send()
-            .await
-            .map_err(IronCrewError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let limit = self.execution_policy.error_bytes();
-            let bytes = crate::utils::http::read_response_bytes(
-                resp,
-                limit,
-                "OpenAI Responses error response",
-            )
-            .await
-            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let error_msg = error_body["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let raw = String::from_utf8_lossy(&bytes);
-                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
-
-        let mut full_content = String::new();
-        let mut full_reasoning = String::new();
-        let output_limit = self.execution_policy.output_bytes();
-        let mut stored_output_bytes = 0_usize;
-        let mut item_states: HashMap<String, ItemState> = HashMap::new();
-        let mut usage_data: Option<Value> = None;
-
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let stream_limit = self.execution_policy.stream_bytes();
-        let mut buffer =
-            crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI Responses stream");
-        let mut current_event_type = String::new();
-        // Track terminal delivery: `response.failed`/`error`, or a stream that
-        // ends before `response.completed`, must fail rather than return
-        // partial content as a successful response.
-        let mut stream_error: Option<String> = None;
-        let mut saw_completed = false;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(IronCrewError::Http)?;
-            let lines = buffer
-                .push(&chunk)
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-
-            for raw_line in lines {
-                let line = raw_line.trim();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(event_type) = line.strip_prefix("event: ") {
-                    current_event_type = event_type.trim().to_string();
-                    continue;
-                }
-
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-
-                if data == "[DONE]" {
-                    saw_completed = true;
-                    let _ = tx.send(StreamChunk::Done).await;
-                    continue;
-                }
-
-                let Ok(parsed) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-
-                match current_event_type.as_str() {
-                    "response.output_item.added" => {
-                        let item = &parsed["item"];
-                        let item_id = item["id"].as_str().unwrap_or("").to_string();
-                        let item_type = item["type"].as_str().unwrap_or("").to_string();
-
-                        if item_type == "function_call" {
-                            let name = item["name"].as_str().unwrap_or("").to_string();
-                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                            let _ = tx
-                                .send(StreamChunk::ToolCallStart {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await;
-                            item_states.insert(
-                                item_id.clone(),
-                                ItemState {
-                                    item_type,
-                                    call_id,
-                                    name,
-                                    text: String::new(),
-                                },
-                            );
-                        } else {
-                            item_states.insert(
-                                item_id,
-                                ItemState {
-                                    item_type,
-                                    call_id: String::new(),
-                                    name: String::new(),
-                                    text: String::new(),
-                                },
-                            );
-                        }
-                    }
-                    "response.output_text.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            crate::utils::http::bounded_push_str(
-                                &mut full_content,
-                                delta,
-                                &mut stored_output_bytes,
-                                output_limit,
-                                "OpenAI Responses accumulated output",
-                            )
-                            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                            let _ = tx.send(StreamChunk::Text(delta.to_string())).await;
-                        }
-                    }
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            crate::utils::http::bounded_push_str(
-                                &mut full_reasoning,
-                                delta,
-                                &mut stored_output_bytes,
-                                output_limit,
-                                "OpenAI Responses accumulated output",
-                            )
-                            .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                            let _ = tx.send(StreamChunk::Thinking(delta.to_string())).await;
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        if let Some(delta) = parsed["delta"].as_str() {
-                            let item_id = parsed["item_id"].as_str().unwrap_or("");
-                            if let Some(state) = item_states.get_mut(item_id) {
-                                crate::utils::http::bounded_push_str(
-                                    &mut state.text,
-                                    delta,
-                                    &mut stored_output_bytes,
-                                    output_limit,
-                                    "OpenAI Responses accumulated output",
-                                )
-                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                let _ = tx
-                                    .send(StreamChunk::ToolCallDelta {
-                                        id: state.call_id.clone(),
-                                        arguments_delta: delta.to_string(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    "response.completed" => {
-                        saw_completed = true;
-                        if let Some(usage) = parsed["response"].get("usage").cloned() {
-                            usage_data = Some(usage);
-                        }
-                        let _ = tx.send(StreamChunk::Done).await;
-                    }
-                    "response.failed" | "error" => {
-                        let err_msg = parsed["error"]["message"]
-                            .as_str()
-                            .or_else(|| parsed["response"]["error"]["message"].as_str())
-                            .unwrap_or("Responses API stream error");
-                        let _ = tx.send(StreamChunk::Error(err_msg.to_string())).await;
-                        stream_error = Some(err_msg.to_string());
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            if stream_error.is_some() {
-                break;
-            }
-        }
-
-        if let Some(err) = stream_error {
-            return Err(IronCrewError::Provider(format!(
-                "OpenAI Responses stream error — {err}"
-            )));
-        }
-        if !saw_completed {
-            return Err(IronCrewError::Provider(
-                "OpenAI Responses stream ended before response.completed (truncated response)"
-                    .into(),
-            ));
-        }
-
-        // Assemble tool calls from item states
-        let tool_calls: Vec<ToolCallRequest> = item_states
-            .into_values()
-            .filter(|s| s.item_type == "function_call" && !s.call_id.is_empty())
-            .map(|s| ToolCallRequest {
-                id: s.call_id,
-                call_type: "function".to_string(),
-                function: ToolCallFunction {
-                    name: s.name,
-                    arguments: s.text,
-                },
-            })
-            .collect();
-
-        let content = if full_content.is_empty() {
-            None
-        } else {
-            Some(full_content)
-        };
-
-        let reasoning = if full_reasoning.is_empty() {
-            None
-        } else {
-            Some(full_reasoning)
-        };
-
-        let usage = usage_data.map(|u| TokenUsage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-            cached_tokens: u["input_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-        });
-
-        Ok(ChatResponse {
-            content,
-            reasoning,
-            tool_calls,
-            usage,
-            // Streaming doesn't reassemble full reasoning items (with
-            // encrypted_content) for replay. Not needed for the tool-use
-            // round-trip: the executor forces non-streaming when tools are
-            // present, and `parse_responses_response` captures them there.
-            raw_blocks: None,
-        })
+        let terminal_usage = matches!(
+            resp_body["status"].as_str(),
+            Some("completed" | "failed" | "incomplete" | "cancelled")
+        );
+        accounting.observe(resp_body.get("usage"), terminal_usage);
+        let response = parse_responses_response(&resp_body)?;
+        accounting.finish()?;
+        Ok(response)
     }
 }
 
-/// State tracked per output item during streaming.
-struct ItemState {
-    item_type: String,
-    call_id: String,
-    name: String,
-    text: String,
-}
-
-/// Parse a non-streaming Responses API response into ChatResponse.
-fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
-    let output = resp["output"]
-        .as_array()
-        .ok_or_else(|| IronCrewError::Provider("Missing 'output' array in response".into()))?;
-
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut reasoning_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
-    // Reasoning output items captured verbatim (including encrypted_content) so
-    // the tool loop can replay them — the Responses API 400s on a function_call
-    // sent without its paired reasoning item in stateless mode.
-    let mut raw_blocks: Vec<Value> = Vec::new();
-
-    for item in output {
-        let item_type = item["type"].as_str().unwrap_or("");
-        match item_type {
-            "message" => {
-                // Collect output_text parts from content array
-                if let Some(content) = item["content"].as_array() {
-                    for part in content {
-                        if part["type"].as_str() == Some("output_text")
-                            && let Some(text) = part["text"].as_str()
-                        {
-                            text_parts.push(text.to_string());
-                        }
-                    }
-                }
-            }
-            "reasoning" => {
-                // Collect summary parts (the full reasoning text isn't exposed)
-                if let Some(summary) = item["summary"].as_array() {
-                    for s in summary {
-                        if let Some(text) = s["text"].as_str() {
-                            reasoning_parts.push(text.to_string());
-                        }
-                    }
-                }
-                // Keep the whole reasoning item (with encrypted_content) for replay.
-                raw_blocks.push(item.clone());
-            }
-            "function_call" => {
-                let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                let name = item["name"].as_str().unwrap_or("").to_string();
-                let arguments = item["arguments"].as_str().unwrap_or("{}").to_string();
-                tool_calls.push(ToolCallRequest {
-                    id: call_id,
-                    call_type: "function".to_string(),
-                    function: ToolCallFunction { name, arguments },
-                });
-            }
-            "web_search_call" => {
-                // Append a summary of the search action
-                if let Some(action) = item.get("action") {
-                    let query = action["query"].as_str().unwrap_or("");
-                    text_parts.push(format!("[Web search: {}]", query));
-                }
-            }
-            "file_search_call" => {
-                if let Some(queries) = item["queries"].as_array() {
-                    let qs: Vec<&str> = queries.iter().filter_map(|q| q.as_str()).collect();
-                    text_parts.push(format!("[File search: {}]", qs.join(", ")));
-                }
-            }
-            "code_interpreter_call" => {
-                if let Some(code) = item["code"].as_str() {
-                    text_parts.push(format!("[Code executed]\n{}", code));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let usage = resp.get("usage").map(|u| TokenUsage {
-        prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-        total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-        cached_tokens: u["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32,
-    });
-
-    let content = if text_parts.is_empty() {
-        None
-    } else {
-        Some(text_parts.join("\n"))
-    };
-
-    let reasoning = if reasoning_parts.is_empty() {
-        None
-    } else {
-        Some(reasoning_parts.join("\n"))
-    };
-
-    Ok(ChatResponse {
-        content,
-        reasoning,
-        tool_calls,
-        usage,
-        raw_blocks: if raw_blocks.is_empty() {
-            None
-        } else {
-            Some(raw_blocks)
-        },
-    })
-}
+mod response;
+use response::parse_responses_response;
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn supports_token_budget(&self) -> bool {
+        self.budget_supported()
+    }
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
+
+    fn records_usage(&self) -> bool {
+        true
+    }
+
+    fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
+        self.resolve_options(request, has_tools).map(|_| ())
+    }
+
     fn metrics_family(&self) -> crate::metrics::ProviderFamily {
         crate::metrics::ProviderFamily::OpenAiResponses
     }
@@ -795,6 +211,7 @@ impl LlmProvider for OpenAiResponsesProvider {
                 "reasoning_effort": self.config.reasoning_effort,
                 "reasoning_summary": self.config.reasoning_summary,
                 "server_tools": server_tools,
+                "capability_policy": super::capabilities::REVISION,
                 "execution_policy": self.execution_policy.definition(),
             }),
         )
@@ -809,18 +226,18 @@ impl LlmProvider for OpenAiResponsesProvider {
             tools = 0,
             "LLM request metadata"
         );
-        let body = self.build_body(&request, None);
-        let response = self.send_request(body).await?;
+        let body = self.build_body(&request, None)?;
+        let response = self
+            .send_request(body, request.usage_tracker.as_ref())
+            .await?;
         tracing::debug!(
             provider = "openai-responses",
             content_bytes = response.content.as_ref().map_or(0, String::len),
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -839,18 +256,18 @@ impl LlmProvider for OpenAiResponsesProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
-        let body = self.build_body(&request, Some(tools));
-        let response = self.send_request(body).await?;
+        let body = self.build_body(&request, Some(tools))?;
+        let response = self
+            .send_request(body, request.usage_tracker.as_ref())
+            .await?;
         tracing::debug!(
             provider = "openai-responses",
             content_bytes = response.content.as_ref().map_or(0, String::len),
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -861,8 +278,14 @@ impl LlmProvider for OpenAiResponsesProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&request, None);
+        let body = self.build_body(&request, None)?;
         tracing::debug!("Responses API streaming request");
-        self.send_request_stream(body, tx).await
+        self.send_request_stream(body, request.usage_tracker.as_ref(), tx)
+            .await
     }
 }
+
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod tests;

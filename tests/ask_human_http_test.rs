@@ -128,6 +128,8 @@ async fn spawn_test_server() -> (SocketAddr, PathBuf) {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_active_runs: 100,
         run_permits: Arc::new(tokio::sync::Semaphore::new(100)),
+        max_active_inspections: 100,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_sse_connections: 100,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_run_lifetime: std::time::Duration::from_secs(30 * 60),
@@ -433,7 +435,9 @@ async fn abort_after_crew_completion_preserves_staged_task_results() {
     assert_eq!(results.len(), 1, "abort discarded completed task results");
     assert_eq!(results[0]["task"], "skipped");
     assert_eq!(results[0]["success"], true);
-    assert_eq!(terminal["total_tokens"], 0);
+    assert_eq!(terminal["usage"]["settled"]["requests"], "0");
+    assert_eq!(terminal["usage"]["settled"]["total_tokens"]["known"], "0");
+    assert_eq!(terminal["usage"]["coverage"], "complete");
 }
 
 #[tokio::test]

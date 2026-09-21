@@ -50,7 +50,12 @@
 
 ## Multi-replica and deployment boundaries
 
-- PostgreSQL 15+ is IronCrew's shared durable coordination layer; it is not a
+- PostgreSQL 17+ is IronCrew 4.x's shared durable coordination layer. At each
+  IronCrew major release, choose the older of the two latest stable PostgreSQL
+  majors as the minimum and retain that floor throughout the IronCrew major's
+  lifetime. Record floor changes in the release's breaking changes; a new
+  PostgreSQL major alone does not raise an existing IronCrew major's floor.
+  See `docs/storage.md#postgresql-support-policy`. PostgreSQL is not a
   distributed Lua execution engine. Preserve run ownership, lease fencing,
   idempotency, HITL mailbox encryption, and terminal-write compare-and-set rules.
 - Distinguish process-local execution, conversation handles, admission, and live
@@ -63,11 +68,14 @@
 - Storage integration tests are destructive. Use disposable, explicitly named
   PostgreSQL databases or containers and remove only resources created by the
   test. Never point a test at shared or production infrastructure.
-- Docker-backed PostgreSQL tests use the newest patched image of IronCrew's
-  minimum supported major. Pull the moving `postgres:15` tag immediately before
-  a local run, reuse that tag across test suites, and keep CI on `postgres:15`.
-  Do not substitute `postgres:latest`, which can silently change the database
-  major, or create dated/per-test image tags that accumulate locally.
+- Docker-backed PostgreSQL tests cover both ends of the support window: the
+  floor image (`postgres:17`) and the latest stable release.
+  Pull the moving `postgres:latest` tag immediately before a local run, reuse
+  that tag across test suites, and keep CI on both the floor image and
+  `postgres:latest`.
+  Record the resolved server version and image digest as evidence. Never reuse
+  an existing database volume across major versions or select beta/RC images.
+  Historical receipts retain their original versions; do not relabel old runs.
 - Start disposable test containers with an explicit name and `--rm`; stop them
   after the gate and verify they disappeared. Inspect Docker ownership before
   cleanup. Never run a global Docker system, image, builder, container, or volume
@@ -111,11 +119,26 @@
   `actionlint .github/workflows/*.yml` after workflow changes when available.
 - Run `cargo test --doc` after public Rust API documentation changes and
   `cargo audit --deny warnings` after dependency or security-sensitive changes.
-- Before a requested commit or push, run every locally reproducible CI gate for
-  the affected surfaces. Run `bun run scripts/check_worktree.ts`, inspect
-  `git status --short`, and review the complete tracked and untracked diff.
-  Report platform-only jobs such as Windows as CI evidence rather than claiming
-  they ran locally.
+- Before committing work intended for `develop`, run `task develop-refresh`.
+  It upgrades Bun to the latest stable release, refreshes managed Cargo and Bun
+  dependencies, and verifies the current Rust, cargo-audit, actionlint,
+  direct-dependency, and immutable GitHub Action freshness boundaries. Review
+  and commit every resulting manifest, lockfile, workflow, or policy change
+  before validation.
+- Before a requested push, run every locally reproducible CI gate through
+  `./scripts/pre-push-check.sh`. Enable the tracked fail-closed hook once per
+  clone with `task hooks-install`; do not bypass it with `--no-verify`. The gate
+  starts clean, reruns the latest-stable refresh, and stops if refresh changes
+  repository files. The complete gate requires disposable databases for both
+  `IRONCREW_TEST_PG_FLOOR_URL` (floor) and `IRONCREW_TEST_PG_URL` (latest stable).
+  Its shared `scripts/check-postgres.ts` runner validates both versions before
+  destructive tests and runs all five suites serially on each. Missing URLs,
+  the wrong floor, identical majors, or a failed suite stop the gate; an omitted
+  database is not a successful skip. Follow `.agents/skills/check-ironcrew/SKILL.md`
+  for the focused command. Run
+  `bun run scripts/check_worktree.ts`, inspect `git status --short`, and review
+  the complete tracked and untracked diff. Report platform-only jobs such as
+  Windows as CI evidence rather than claiming they ran locally.
 
 ## Issue lifecycle and completion
 

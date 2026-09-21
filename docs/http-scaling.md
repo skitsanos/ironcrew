@@ -1,5 +1,6 @@
 # HTTP Scaling
 
+
 How to size, tune, and scale IronCrew's HTTP server for production traffic.
 
 This guide focuses on `ironcrew serve` in long-lived deployments where chat
@@ -156,6 +157,11 @@ For HTTP chat, the lifecycle is:
 1. `POST /flows/{flow}/conversations/{id}/start`
 2. Session becomes active in memory
 3. Session is visible in the store and list/history endpoints
+
+   Checked session usage is saved at the same transcript revision and restored
+   on a peer without recharging prior counts to a new run. Uncheckpointed calls
+   can be lost on eviction/process death; this is not distributed billing or
+   execution failover. See [usage accounting](usage-accounting.md).
 4. `POST /messages` appends turns
 5. After `IRONCREW_CHAT_SESSION_IDLE_SECS` of inactivity, the live handle is evicted
 6. The persisted record remains and can be resumed later
@@ -602,3 +608,9 @@ Then raise only after load testing your actual flows.
 
 The main rule is simple: do not treat the default of `8` as a guaranteed safe
 production value. It is only a fallback default.
+## Per-execution token ceilings
+
+[Run token budgets](token-budgets.md) are process-local, not shared account
+quotas: independent runs/replicas each have an allowance. Terminal capacity
+snapshots persist, but in-flight reservations do not provide execution failover
+or restartable distributed budgets. Standalone messages use per-request budgets.

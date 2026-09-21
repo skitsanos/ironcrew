@@ -30,6 +30,7 @@ fn definition<'a>(source: &'a str, agent: &'a Agent) -> ConversationDefinition<'
         max_tool_rounds: 10,
         resolved_tools_fingerprint: TOOLS_FINGERPRINT,
         provider_execution_fingerprint: PROVIDER_FINGERPRINT,
+        app_db: None,
     }
 }
 
@@ -55,4 +56,44 @@ fn every_definition_input_changes_the_fingerprint() {
         resolved_tools_fingerprint: OTHER_TOOLS_FINGERPRINT,
         provider_execution_fingerprint: OTHER_PROVIDER_FINGERPRINT,
     );
+}
+
+#[test]
+fn app_db_definition_changes_the_fingerprint_only_when_present() {
+    let source = format!("sha256:{}", "0".repeat(64));
+    let base_agent = agent();
+    let base = definition(&source, &base_agent);
+    let without = conversation_definition_fingerprint(&base).unwrap();
+    let value = serde_json::json!({"policy": {"max_rows": 500}, "operations": []});
+    let with = conversation_definition_fingerprint(&ConversationDefinition {
+        app_db: Some(&value),
+        ..base
+    })
+    .unwrap();
+    assert_ne!(without, with);
+    let changed = serde_json::json!({"policy": {"max_rows": 100}, "operations": []});
+    let with_changed = conversation_definition_fingerprint(&ConversationDefinition {
+        app_db: Some(&changed),
+        ..base
+    })
+    .unwrap();
+    assert_ne!(with, with_changed);
+}
+
+#[test]
+fn agent_reasoning_effort_is_absent_from_json_when_unset_and_changes_the_fingerprint_when_set() {
+    let base = agent();
+    let json = serde_json::to_value(&base).unwrap();
+    assert!(
+        json.get("reasoning_effort").is_none(),
+        "unset effort must not appear in the canonical agent JSON (fingerprint stability): {json}"
+    );
+    let source = format!("sha256:{}", "a".repeat(64));
+    let without = conversation_definition_fingerprint(&definition(&source, &base)).unwrap();
+    let with_effort = Agent {
+        reasoning_effort: Some("high".into()),
+        ..agent()
+    };
+    let with = conversation_definition_fingerprint(&definition(&source, &with_effort)).unwrap();
+    assert_ne!(without, with);
 }

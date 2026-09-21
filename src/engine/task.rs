@@ -63,14 +63,6 @@ pub struct Task {
     pub model: Option<String>, // per-task model override
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskTokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
-    pub cached_tokens: u32,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
@@ -78,8 +70,7 @@ pub struct TaskResult {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
-    #[serde(default)]
-    pub token_usage: Option<TaskTokenUsage>,
+    pub usage: crate::usage::UsageSnapshot,
     /// Reasoning/thinking captured from the model (Anthropic thinking blocks,
     /// OpenAI-compat reasoning_content). Persisted to run records when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]

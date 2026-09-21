@@ -152,6 +152,7 @@ fn validate_metadata(record: &ConversationRecord) -> Result<()> {
 
 /// Enforce durable identity and transcript invariants before every store write.
 pub fn validate_conversation_record_for_write(record: &ConversationRecord) -> Result<()> {
+    super::session_usage::validate(&record.usage)?;
     validate_session_id(&record.id)?;
     validate_metadata(record)?;
     record.execution.validate()?;
@@ -173,6 +174,7 @@ pub fn validate_conversation_record_for_write(record: &ConversationRecord) -> Re
 /// remain exportable, but current identities must satisfy their persisted
 /// transcript limits before the record can be adopted.
 pub fn validate_conversation_record_after_decode(record: &ConversationRecord) -> Result<()> {
+    super::session_usage::validate(&record.usage)?;
     validate_session_id(&record.id)?;
     validate_metadata(record)?;
     if record.messages.len() > HARD_STORED_CONVERSATION_MESSAGES {
@@ -209,6 +211,7 @@ mod tests {
 
     fn record() -> ConversationRecord {
         ConversationRecord {
+            usage: Default::default(),
             id: "bounded-chat".into(),
             flow_name: "chat".into(),
             flow_path: Some("chat".into()),

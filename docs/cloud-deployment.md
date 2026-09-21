@@ -1,5 +1,6 @@
 # Cloud Deployment
 
+
 How to run IronCrew in managed cloud environments: **Kubernetes**, **OpenShift**, **Railway**, and similar platforms. This doc covers graceful shutdown, resource limits, security posture, and platform-specific recipes.
 
 IronCrew is distributed as a single Rust executable. The default Linux release
@@ -17,6 +18,10 @@ multi-replica roadmap, see the
 The PostgreSQL cross-replica HITL mailbox and run-event journal described here
 require IronCrew v3.0.0 or newer. The legacy `2.22.0` image does not contain
 those capabilities.
+
+The current source tree prepares v4.0.0. Its image references below are release
+targets, not evidence that the image has been published. Read the
+[v4 upgrade notes](releases/v4.0.0.md) before upgrading existing stores or clients.
 
 ---
 
@@ -174,11 +179,14 @@ Production deployments should set these at minimum:
 | `IRONCREW_MCP_MAX_REQUEST_STATE_BYTES` | `65536` or lower | Byte cap on opaque state echoed during MRTR; hard ceiling `1048576`. |
 | `IRONCREW_MCP_MAX_INBOUND_MESSAGE_BYTES` | `1048576` or lower | Pre-JSON cap per stdio line, HTTP JSON message, or SSE event; hard ceiling `16777216`. One transport chunk may temporarily exceed the cap but is rejected before copying into IronCrew-owned assembly/parser buffers. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MB) or lower | Caps request body size against memory-exhaustion DoS. |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Bounds the initial protocol preface and each HTTP/1 header block; range 1–300 seconds. Also controls HTTP/2 keep-alive probes. |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Bounds request-body reads and handler work until response creation; range 1–7200 seconds. Keep above the longest synchronous handler budget. Established SSE bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` or lower | Per-process accepted-connection cap; range 1–100000. Size aggregate capacity as replicas times this value. |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) or lower | Caps `http_request` and Lua `http.*` bodies. `IRONCREW_MAX_RESPONSE_SIZE` is only a deprecated fallback. |
 | `IRONCREW_HITL_ENCRYPTION_KEYS` | secret JSON keyring, identical in steady state | Enables encrypted PostgreSQL cross-replica HITL for idempotency-keyed runs. During the controlled rotation overlap, every process must contain both keys even while active ids temporarily differ. Store only in Railway/OpenShift secrets; never bake it into the image. |
 | `IRONCREW_HITL_ACTIVE_KEY_ID` | one id from the HITL keyring | Selects the key for newly registered question metadata. Answers inherit their authenticated question's key. Both HITL variables must be set together. |
 | `IRONCREW_ENV_ALLOWLIST` | comma-separated names | Fail-closed allowlist shared by Lua `env()` and `${env.NAME}` interpolation. Opt in only the exact vars a crew needs. See [docs/sandbox.md](sandbox.md). |
-| `IRONCREW_TRUST_PROXY` | unset | Set to `1` only when running behind a trusted reverse proxy. Audit-log source-IP capture then prefers `X-Forwarded-For` over the direct TCP peer. Leave unset for direct-exposure deployments to prevent IP spoofing. |
+| `IRONCREW_TRUST_PROXY` | unset | Set to `1` only behind a trusted reverse proxy that appends its observed client address to `X-Forwarded-For`. Audit capture uses the rightmost valid IP and ignores client-supplied prefixes; an invalid rightmost entry falls back to the TCP peer. Leave unset for direct exposure. |
 | `IRONCREW_AUDIT_DEFAULT_LIMIT` | `50` | Default `GET /audit?limit=` value. |
 | `IRONCREW_AUDIT_MAX_LIMIT` | `500` | Hard cap on `GET /audit?limit=`. |
 
@@ -248,6 +256,9 @@ per-flow read grants.
 |---|---|---|
 | `IRONCREW_MAX_PROMPT_CHARS` | `102400` characters | Caps prompt size per task. |
 | `IRONCREW_MAX_BODY_SIZE` | `10485760` (10 MiB) | Request body cap (hard ceiling 64 MiB). |
+| `IRONCREW_HTTP_HEADER_TIMEOUT_SECS` | `10` | Initial protocol/HTTP/1 header deadline and HTTP/2 keep-alive interval/timeout (range 1–300 seconds). |
+| `IRONCREW_HTTP_REQUEST_TIMEOUT_SECS` | `600` | Request dispatch/body/handler deadline until response creation (range 1–7200 seconds); established stream bodies are exempt. |
+| `IRONCREW_MAX_HTTP_CONNECTIONS` | `1024` | Accepted HTTP connection cap per process (range 1–100000); SSE also has its narrower cap below. |
 | `IRONCREW_HTTP_MAX_REQUEST_HEADER_BYTES` | `65536` (64 KiB) | Outbound `http_request` header budget (hard ceiling 1 MiB). |
 | `IRONCREW_HTTP_MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB) | Outbound `http_request` body cap (hard ceiling 64 MiB). |
 | `IRONCREW_HTTP_MAX_RESPONSE_BYTES` | `8388608` (8 MiB) | HTTP tool/Lua HTTP body cap. |
@@ -256,6 +267,8 @@ per-flow read grants.
 | `IRONCREW_PROVIDER_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Non-streaming model response cap. |
 | `IRONCREW_PROVIDER_MAX_STREAM_BYTES` | `33554432` (32 MiB) | Raw model SSE stream cap. |
 | `IRONCREW_PROVIDER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB) | Accumulated model output/reasoning cap. |
+| `IRONCREW_PROVIDER_CONNECT_TIMEOUT_SECS` | `10` | Provider TCP/TLS connection deadline (range 1–120 seconds). |
+| `IRONCREW_PROVIDER_REQUEST_TIMEOUT_SECS` | `900` | Total provider request deadline, including streaming (range 1–86400 seconds). |
 | `IRONCREW_CHAT_HISTORY_MAX_BYTES` | `33554432` (32 MiB) | Aggregate in-memory provider history cap (hard ceiling 256 MiB). |
 | `IRONCREW_MAX_REASONING_BYTES` | `1048576` (1 MiB) | Reasoning retained during one provider tool loop (hard ceiling 16 MiB). |
 | `IRONCREW_MAX_IMAGE_BYTES` | `20971520` (20 MiB) | Per-image local/remote input cap. |
@@ -307,6 +320,7 @@ per-flow read grants.
 | `IRONCREW_MAX_ACTIVE_CONVERSATIONS` | `8` | Max simultaneous live HTTP chat sessions in this process. Exceeding returns 503. |
 | `IRONCREW_MAX_CONVERSATION_LIFECYCLES` | `256` | Bounds distinct conversation IDs with an in-flight lifecycle operation, preventing unbounded coordination-map growth (hard ceiling 4096). |
 | `IRONCREW_MAX_ACTIVE_RUNS` | `4` | Max simultaneous in-flight flow runs (`POST /flows/{flow}/run`). Exceeding returns 503. |
+| `IRONCREW_MAX_ACTIVE_INSPECTIONS` | `4` | Max concurrent flow validation/agent-list inspections per process (hard ceiling 64). Exceeding returns 503. |
 | `IRONCREW_REQUIRE_IDEMPOTENCY_KEY` | `false` | Set `true` in production so run and JSON/SQLite message retries cannot silently duplicate work. PostgreSQL conversation messages require a key regardless. |
 | `IRONCREW_IDEMPOTENCY_TTL_SECONDS` | `86400` | Replay/tombstone retention; must exceed max run lifetime by at least one hour. |
 | `IRONCREW_IDEMPOTENCY_MAX_RESPONSE_BYTES` | `8388608` | Per-key transient serialization and stored-response cap. Lower to 4 MiB for the 1 GiB baseline. |
@@ -420,6 +434,9 @@ have explicit per-service CPU/RAM limits and conservative application caps.
 - `IRONCREW_RATE_LIMIT_MS` — per-provider minimum interval between LLM calls (milliseconds). Use to stay within provider-side quotas.
 - `IRONCREW_DEFAULT_MAX_CONCURRENT` limits task parallelism inside each crew run; it is not a process-wide provider limit.
 - `IRONCREW_MAX_ACTIVE_RUNS` and `IRONCREW_MAX_ACTIVE_CONVERSATIONS` are process-wide admission limits for the HTTP server.
+- `IRONCREW_MAX_ACTIVE_INSPECTIONS` independently bounds concurrent flow
+  validation/agent-list requests (default `4`, hard ceiling `64`); saturation
+  fails fast with `503` while filesystem and parse work runs off Tokio workers.
 - `IRONCREW_ADMISSION_WORK_RATE_PER_MINUTE` / `IRONCREW_ADMISSION_WORK_BURST`
   apply a per-principal token bucket before run and conversation-message work
   begins (defaults `60` / `10`).
@@ -521,7 +538,7 @@ the run ID and dropped-result count.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | — | PostgreSQL 15+ DSN. Required. |
+| `DATABASE_URL` | — | PostgreSQL 17+ DSN for IronCrew 4.x. Required; see the [support policy](storage.md#postgresql-support-policy). |
 | `IRONCREW_PG_TABLE_PREFIX` | empty | Prefix for shared databases (e.g. `tenant1_`), max 37 lowercase ASCII alphanumeric/underscore bytes. |
 | `IRONCREW_DB_POOL_SIZE` | `10` | Connection pool size (range 1–128). Raise only for measured concurrent load. |
 | `IRONCREW_DB_CONNECT_RETRIES` | `10` | Connection retries after the initial attempt (range 0–100). |
@@ -546,9 +563,14 @@ the run ID and dropped-result count.
 | `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | `600` | Per-principal/process rate for question-list observation; range 1–60000. |
 | `IRONCREW_ADMISSION_OBSERVATION_BURST` | `20` | Per-principal/process observation burst; range 1–1000. |
 
-IronCrew supports PostgreSQL 15+ only. This matches the session-storage
-features used by the runtime and the intended deployment target of
-extension-capable Postgres installs such as `pgvector`.
+Use the latest stable PostgreSQL for new deployments. IronCrew 4.x retains a
+PostgreSQL 17 floor throughout its lifetime; the floor is chosen from the two
+latest stable majors when an IronCrew major ships, not raised whenever
+PostgreSQL releases a new major. See the [support policy](storage.md#postgresql-support-policy).
+CI and local acceptance cover both `postgres:17` and `postgres:latest`.
+Choose extension-capable installations such as `pgvector` when needed. Plan
+upgrades of existing databases separately; never reuse an older data volume
+with a new major image without PostgreSQL's upgrade procedure.
 
 ### Deployment evidence and replica parity
 
@@ -632,7 +654,7 @@ sequentially. At the default TTL they are bounded to 5 seconds each outside the
 database and 4 seconds per statement inside it. The inner limit resolves one
 blocked statement; the outer limit also covers cumulative statement latency.
 If the outer watchdog wins before core reconciliation commits, the owned SQLx
-transaction is dropped and rolled back. PostgreSQL 15 regressions verify that
+transaction is dropped and rolled back. The PostgreSQL integration suite (run on the floor image and `postgres:latest`) verifies that
 atomic rollback and pool recovery. Best-effort run-event pruning happens in a
 later non-authoritative transaction: a timeout there cannot undo committed
 run/idempotency/HITL recovery, although readiness can remain down until the
@@ -832,8 +854,11 @@ Execution and storage instrumentation uses only closed label vocabularies:
 | `ironcrew_runs_total`; `ironcrew_run_duration_seconds` | counter; histogram | `outcome`: `success`, `partial_failure`, `failed`, `aborted`, `timed_out`, `abandoned` |
 | `ironcrew_tasks_total`; `ironcrew_task_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `skipped`, `cancelled` |
 | `ironcrew_tool_calls_total`; `ironcrew_tool_call_duration_seconds` | counter; histogram | `outcome`: `success`, `error`, `cancelled` |
+| `ironcrew_hook_failures_total` | counter | `hook`: `before_task`, `after_task`; `stage`: `vm_initialization`, `execution_start`, `environment`, `load`, `run`, `return_value` |
 | `ironcrew_provider_requests_total`; `ironcrew_provider_request_duration_seconds` | counter; histogram | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `operation`: `chat`, `chat_with_tools`, `chat_stream`; `outcome`: `success`, `error`, `cancelled` |
-| `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `cached` |
+| `ironcrew_provider_tokens_total` | counter | `provider`: `openai`, `openai_responses`, `anthropic`, `other`; `type`: `prompt`, `completion`, `total`, `cached`, `cache_write`, `reasoning` |
+| `ironcrew_provider_usage_incomplete_fields_total` | counter | Same `provider` and `type` labels; missing/partial field receipts |
+| `ironcrew_provider_usage_receipts_total` | counter | Same `provider`; `coverage`: `complete`, `partial`, `unavailable` |
 | `ironcrew_sse_connections_total` | counter | `scope`: `run_process`, `run_shared`, `conversation_process`; `outcome`: `accepted`, `limited` |
 | `ironcrew_lease_losses_total` | counter | `scope`: `run`, `conversation` |
 | `ironcrew_reconciliation_cycles_total` | counter | `outcome`: `success`, `error` |
@@ -951,7 +976,11 @@ thresholds from measured traffic:
    `provider,operation` only after a minimum request volume, and use the success
    histogram for a separately tuned p95 latency threshold. Treat cancellations
    as their own signal rather than silently folding them into provider errors.
-4. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
+4. **Hook health:** investigate any sustained increase in
+   `ironcrew_hook_failures_total`, grouped by `hook,stage`. The affected task
+   continues with its original description or output, so this signal means the
+   run degraded rather than failed closed.
+5. **Capacity:** warn before a pod reaches active run/conversation/SSE limits,
    on sustained admission `limited` outcomes, and at the existing durable
    idempotency 80/90/100-percent thresholds.
 
@@ -993,7 +1022,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: docker.io/skitsanos/ironcrew:3.0.0
+        image: docker.io/skitsanos/ironcrew:4.0.0
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080
@@ -1519,7 +1548,7 @@ memory file.
 
 ### Source Dockerfile
 
-The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.97.1` builder that
+The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.98.1` builder that
 matches `Cargo.toml`'s minimum supported Rust version, builds with
 `cargo build --release --locked`, and copies the executable into
 `debian:13-slim`. The runtime is intentionally glibc-based and dynamically
@@ -1534,7 +1563,7 @@ The runtime stage:
 - supplies a runnable server `CMD`
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
-with GNU/Linux artifacts built by the release workflow using Rust `1.97.1` and
+with GNU/Linux artifacts built by the release workflow using Rust `1.98.1` and
 `--locked`. The exact tag workflow assembles one `linux/amd64` plus
 `linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
 source and OCI object hashes in a signed receipt, and publishes both as release
@@ -1732,3 +1761,9 @@ RUN cargo build --release --locked --no-default-features --features postgres
 - [ ] Container runs non-root with no privilege escalation and dropped capabilities
 - [ ] TLS terminated at ingress / router / load balancer
 - [ ] Log level set to `info` or lower (never `debug` in prod)
+## Optional provider-spend guard
+
+Set [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) consistently on replicas to
+limit each execution's admitted input-plus-output tokens. Invalid settings fail
+server startup. The policy is opt-in and not a currency or global tenant quota;
+aggregate exposure scales with concurrent admitted runs across replicas.

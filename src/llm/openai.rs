@@ -1,13 +1,18 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::time::Duration;
 
+use super::accounting::ProviderAttempt;
 use super::provider::*;
-use crate::engine::agent::ResponseFormat;
+use crate::usage::{ProviderUsage, UsageTracker};
+mod stream;
+use super::provider_http::{ProviderSseLines, RateLimiter, read_error_response, sse_field};
 use crate::utils::error::{IronCrewError, Result};
 
+#[cfg(test)]
+mod capability_tests;
 mod request_body;
+mod stream_tools;
 
 pub struct OpenAiProvider {
     client: Client,
@@ -17,44 +22,14 @@ pub struct OpenAiProvider {
     execution_policy: super::execution_policy::ProviderExecutionPolicy,
 }
 
-/// Simple token-bucket rate limiter for LLM API calls.
-struct RateLimiter {
-    min_interval: Duration,
-    last_call: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
-}
-
-impl RateLimiter {
-    fn new(min_interval_ms: u64) -> Self {
-        Self {
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_call: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
-            )),
-        }
-    }
-
-    async fn wait(&self) {
-        let mut last = self.last_call.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        *last = std::time::Instant::now();
-    }
-}
-
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
-        let client = crate::utils::network::secure_client_builder(
-            crate::utils::network::OutboundNetworkPolicy::PublicOnly,
-        )
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client");
-
         // Capture provider policy once so durable conversation identity and
         // execution cannot drift between replicas or later environment reads.
         let execution_policy = super::execution_policy::ProviderExecutionPolicy::capture();
+        let client = super::provider_http::secure_provider_client_builder(execution_policy)
+            .build()
+            .expect("Failed to build HTTP client");
         let rate_limit = execution_policy.rate_limit_ms().map(RateLimiter::new);
 
         if rate_limit.is_some() {
@@ -73,89 +48,6 @@ impl OpenAiProvider {
         }
     }
 
-    fn build_body(&self, request: &ChatRequest, tools: Option<&[ToolSchema]>) -> Value {
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let mut msg = json!({"role": m.role});
-                // When images are attached, serialize content as an array of
-                // content parts (text + image_url blocks). This is the OpenAI
-                // vision format, also used by Gemini and other OpenAI-compatible
-                // endpoints.
-                if let Some(ref images) = m.images {
-                    if !images.is_empty() {
-                        let mut parts: Vec<serde_json::Value> = Vec::new();
-                        if let Some(ref text) = m.content {
-                            parts.push(json!({"type": "text", "text": text}));
-                        }
-                        for img in images {
-                            let data_uri = format!("data:{};base64,{}", img.mime_type, img.data);
-                            parts.push(json!({
-                                "type": "image_url",
-                                "image_url": { "url": data_uri }
-                            }));
-                        }
-                        msg["content"] = json!(parts);
-                    } else if let Some(ref content) = m.content {
-                        msg["content"] = json!(content);
-                    }
-                } else if let Some(ref content) = m.content {
-                    msg["content"] = json!(content);
-                }
-                if let Some(ref tool_call_id) = m.tool_call_id {
-                    msg["tool_call_id"] = json!(tool_call_id);
-                }
-                if let Some(ref tool_calls) = m.tool_calls {
-                    msg["tool_calls"] = serde_json::to_value(tool_calls).unwrap_or_default();
-                }
-                msg
-            })
-            .collect();
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-        });
-
-        if let Some(temp) = request.temperature {
-            body["temperature"] = json!(temp);
-        }
-        request_body::insert_completion_token_limit(&mut body, &request.model, request.max_tokens);
-
-        if let Some(ref fmt) = request.response_format {
-            match fmt {
-                ResponseFormat::Text => {
-                    body["response_format"] = json!({"type": "text"});
-                }
-                ResponseFormat::JsonObject => {
-                    body["response_format"] = json!({"type": "json_object"});
-                }
-                ResponseFormat::JsonSchema { name, schema } => {
-                    body["response_format"] = json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": name,
-                            "schema": schema,
-                            "strict": true,
-                        }
-                    });
-                }
-            }
-        }
-
-        request_body::insert_tools(&mut body, &request.model, tools);
-
-        if let Some(ref key) = request.prompt_cache_key {
-            body["prompt_cache_key"] = json!(key);
-        }
-        if let Some(ref retention) = request.prompt_cache_retention {
-            body["prompt_cache_retention"] = json!(retention);
-        }
-
-        body
-    }
-
     fn prepare_request(&self, body: &Value) -> Result<Vec<u8>> {
         if self.api_key.trim().is_empty() {
             return Err(IronCrewError::Validation(
@@ -165,7 +57,11 @@ impl OpenAiProvider {
         self.execution_policy.serialize_request("OpenAI", body)
     }
 
-    async fn send_request(&self, body: Value) -> Result<ChatResponse> {
+    async fn send_request(
+        &self,
+        body: Value,
+        usage_tracker: Option<&UsageTracker>,
+    ) -> Result<ChatResponse> {
         let request_body = self.prepare_request(&body)?;
 
         // Rate limit: wait if needed
@@ -177,6 +73,7 @@ impl OpenAiProvider {
         crate::utils::network::validate_url_not_private(&url)
             .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
 
+        let mut accounting = ProviderAttempt::start(usage_tracker, ProviderUsage::OpenAiChat)?;
         let resp = self
             .client
             .post(&url)
@@ -188,18 +85,23 @@ impl OpenAiProvider {
             .map_err(IronCrewError::Http)?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(
+                read_error_response(resp, self.execution_policy, "OpenAI error response")
+                    .await?
+                    .into_accounted_error(&mut accounting),
+            );
+        }
 
         // Read with a strict byte budget before parsing. This remains resilient
         // to HTTP/2 framing quirks without allowing an unbounded allocation.
-        let response_limit = if status.is_success() {
-            self.execution_policy.response_bytes()
-        } else {
-            self.execution_policy.error_bytes()
-        };
-        let resp_bytes =
-            crate::utils::http::read_response_bytes(resp, response_limit, "OpenAI response")
-                .await
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+        let resp_bytes = crate::utils::http::read_response_bytes(
+            resp,
+            self.execution_policy.response_bytes(),
+            "OpenAI response",
+        )
+        .await
+        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
         let resp_text = String::from_utf8(resp_bytes)
             .map_err(|_| IronCrewError::Provider("OpenAI response was not valid UTF-8".into()))?;
         let resp_body: Value = serde_json::from_str(&resp_text).map_err(|e| {
@@ -211,33 +113,7 @@ impl OpenAiProvider {
             IronCrewError::Provider(format!("Invalid JSON response from LLM provider: {}", e))
         })?;
 
-        if !status.is_success() {
-            // Handle different error formats across providers:
-            // OpenAI: {"error": {"message": "..."}}
-            // Gemini: [{"error": {"message": "...", "status": "..."}}]  (array-wrapped!)
-            // Others: {"message": "..."} or plain {"error": "string"}
-            let error_root = if resp_body.is_array() {
-                // Gemini wraps errors in an array
-                resp_body.get(0).unwrap_or(&resp_body)
-            } else {
-                &resp_body
-            };
-            let error_msg = error_root["error"]["message"]
-                .as_str()
-                .or_else(|| error_root["message"].as_str())
-                .or_else(|| error_root["error"].as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    let raw = serde_json::to_string(&resp_body).unwrap_or_default();
-                    tracing::debug!("Unknown error response body: {}", raw);
-                    raw
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
-
+        accounting.observe(resp_body.get("usage"), true);
         let choice = &resp_body["choices"][0]["message"];
 
         let content = choice["content"].as_str().map(|s| s.to_string());
@@ -254,263 +130,12 @@ impl OpenAiProvider {
         // - Gemini: arguments as object (not string), may omit type/id
         let tool_calls = parse_tool_calls_lenient(choice.get("tool_calls"));
 
-        let usage = resp_body.get("usage").map(|u| TokenUsage {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-            cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-        });
-
+        let usage = accounting.finish()?;
         Ok(ChatResponse {
             content,
             reasoning,
             tool_calls,
             usage,
-            raw_blocks: None,
-        })
-    }
-
-    async fn send_request_stream(
-        &self,
-        mut body: Value,
-        tx: tokio::sync::mpsc::Sender<StreamChunk>,
-    ) -> Result<ChatResponse> {
-        body["stream"] = json!(true);
-        let request_body = self.prepare_request(&body)?;
-
-        if let Some(ref limiter) = self.rate_limit {
-            limiter.wait().await;
-        }
-
-        let url = format!("{}/chat/completions", self.base_url);
-        crate::utils::network::validate_url_not_private(&url)
-            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(request_body)
-            .send()
-            .await
-            .map_err(IronCrewError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let limit = self.execution_policy.error_bytes();
-            let bytes =
-                crate::utils::http::read_response_bytes(resp, limit, "OpenAI error response")
-                    .await
-                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-            let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let error_msg = error_body["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let raw = String::from_utf8_lossy(&bytes);
-                    crate::utils::http::utf8_prefix(raw.trim(), 512).to_owned()
-                });
-            return Err(IronCrewError::Provider(format!(
-                "HTTP {}: {}",
-                status, error_msg
-            )));
-        }
-
-        let mut full_content = String::new();
-        let mut full_reasoning = String::new();
-        let output_limit = self.execution_policy.output_bytes();
-        let mut stored_output_bytes = 0_usize;
-        // Track tool call assembly (streaming sends deltas)
-        let mut tool_call_buffers: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new(); // index -> (id, name, arguments)
-
-        // Read SSE stream
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let stream_limit = self.execution_policy.stream_bytes();
-        let mut buffer = crate::utils::http::BoundedLineBuffer::new(stream_limit, "OpenAI stream");
-        // Track terminal delivery: a mid-stream `{"error": …}` chunk or a stream
-        // that ends before `data: [DONE]` must fail rather than return whatever
-        // partial content accumulated.
-        let mut stream_error: Option<String> = None;
-        let mut saw_done = false;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(IronCrewError::Http)?;
-            let lines = buffer
-                .push(&chunk)
-                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-
-            // Process complete lines
-            for raw_line in lines {
-                let line = raw_line.trim();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if line == "data: [DONE]" {
-                    saw_done = true;
-                    let _ = tx.send(StreamChunk::Done).await;
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ")
-                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
-                {
-                    // Some OpenAI-compatible servers report failures as an inline
-                    // `{"error": {...}}` data event mid-stream.
-                    if let Some(err) = parsed.get("error").filter(|e| !e.is_null()) {
-                        let msg = err["message"]
-                            .as_str()
-                            .or_else(|| err.as_str())
-                            .unwrap_or("stream error");
-                        stream_error = Some(msg.to_string());
-                        break;
-                    }
-
-                    let delta = &parsed["choices"][0]["delta"];
-
-                    // Text content delta
-                    if let Some(content) = delta["content"].as_str() {
-                        crate::utils::http::bounded_push_str(
-                            &mut full_content,
-                            content,
-                            &mut stored_output_bytes,
-                            output_limit,
-                            "OpenAI accumulated output",
-                        )
-                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                        let _ = tx.send(StreamChunk::Text(content.to_string())).await;
-                    }
-
-                    // Reasoning delta (DeepSeek, Kimi, Moonshot use reasoning_content)
-                    if let Some(reasoning) = delta["reasoning_content"]
-                        .as_str()
-                        .or_else(|| delta["reasoning"].as_str())
-                    {
-                        crate::utils::http::bounded_push_str(
-                            &mut full_reasoning,
-                            reasoning,
-                            &mut stored_output_bytes,
-                            output_limit,
-                            "OpenAI accumulated output",
-                        )
-                        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string())).await;
-                    }
-
-                    // Tool calls delta
-                    if let Some(tc_deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                        for tc in tc_deltas {
-                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                            let entry = tool_call_buffers
-                                .entry(index)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()));
-
-                            if let Some(id) = tc["id"].as_str() {
-                                if entry.0.is_empty() {
-                                    crate::utils::http::bounded_push_str(
-                                        &mut entry.0,
-                                        id,
-                                        &mut stored_output_bytes,
-                                        output_limit,
-                                        "OpenAI accumulated output",
-                                    )
-                                    .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    if entry.1.is_empty() {
-                                        crate::utils::http::bounded_push_str(
-                                            &mut entry.1,
-                                            name,
-                                            &mut stored_output_bytes,
-                                            output_limit,
-                                            "OpenAI accumulated output",
-                                        )
-                                        .map_err(
-                                            |error| IronCrewError::Provider(error.to_string()),
-                                        )?;
-                                    }
-                                    let _ = tx.try_send(StreamChunk::ToolCallStart {
-                                        id: id.to_string(),
-                                        name: name.to_string(),
-                                    });
-                                }
-                            }
-
-                            if let Some(args_delta) = tc["function"]["arguments"].as_str() {
-                                crate::utils::http::bounded_push_str(
-                                    &mut entry.2,
-                                    args_delta,
-                                    &mut stored_output_bytes,
-                                    output_limit,
-                                    "OpenAI accumulated output",
-                                )
-                                .map_err(|error| IronCrewError::Provider(error.to_string()))?;
-                                let _ = tx.try_send(StreamChunk::ToolCallDelta {
-                                    id: entry.0.clone(),
-                                    arguments_delta: args_delta.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            if stream_error.is_some() {
-                break;
-            }
-        }
-
-        if let Some(err) = stream_error {
-            return Err(IronCrewError::Provider(format!(
-                "OpenAI stream error — {err}"
-            )));
-        }
-
-        // Assemble tool calls from buffers
-        let tool_calls: Vec<ToolCallRequest> = tool_call_buffers
-            .into_values()
-            .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
-            .map(|(id, name, arguments)| ToolCallRequest {
-                id,
-                call_type: "function".to_string(),
-                function: ToolCallFunction { name, arguments },
-            })
-            .collect();
-
-        // A stream that ended before `[DONE]` *and* produced nothing is a
-        // truncated/dropped connection — fail with a clear message instead of
-        // the misleading "Empty response from LLM" downstream. We don't fail a
-        // content-bearing stream on a missing `[DONE]`, since some
-        // OpenAI-compatible providers omit that terminal marker.
-        if !saw_done && full_content.is_empty() && tool_calls.is_empty() {
-            return Err(IronCrewError::Provider(
-                "OpenAI stream ended before [DONE] with no content (truncated response)".into(),
-            ));
-        }
-
-        let content = if full_content.is_empty() {
-            None
-        } else {
-            Some(full_content)
-        };
-
-        let reasoning = if full_reasoning.is_empty() {
-            None
-        } else {
-            Some(full_reasoning)
-        };
-
-        Ok(ChatResponse {
-            content,
-            reasoning,
-            tool_calls,
-            usage: None,
             raw_blocks: None,
         })
     }
@@ -552,6 +177,18 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
+
+    fn records_usage(&self) -> bool {
+        true
+    }
+
+    fn validate_request(&self, request: &ChatRequest, has_tools: bool) -> Result<()> {
+        self.resolve_options(request, has_tools).map(|_| ())
+    }
+
     fn metrics_family(&self) -> crate::metrics::ProviderFamily {
         crate::metrics::ProviderFamily::OpenAi
     }
@@ -561,6 +198,7 @@ impl LlmProvider for OpenAiProvider {
             "openai",
             &self.base_url,
             &serde_json::json!({
+                "capability_policy": super::capabilities::REVISION,
                 "execution_policy": self.execution_policy.definition(),
             }),
         )
@@ -575,18 +213,18 @@ impl LlmProvider for OpenAiProvider {
             tools = 0,
             "LLM request metadata"
         );
-        let body = self.build_body(&request, None);
-        let response = self.send_request(body).await?;
+        let body = self.build_body(&request, None)?;
+        let response = self
+            .send_request(body, request.usage_tracker.as_ref())
+            .await?;
         tracing::debug!(
             provider = "openai",
             content_bytes = response.content.as_ref().map_or(0, String::len),
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -605,18 +243,18 @@ impl LlmProvider for OpenAiProvider {
             tools = tools.len(),
             "LLM request metadata"
         );
-        let body = self.build_body(&request, Some(tools));
-        let response = self.send_request(body).await?;
+        let body = self.build_body(&request, Some(tools))?;
+        let response = self
+            .send_request(body, request.usage_tracker.as_ref())
+            .await?;
         tracing::debug!(
             provider = "openai",
             content_bytes = response.content.as_ref().map_or(0, String::len),
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -627,8 +265,9 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&request, None);
+        let body = self.build_body(&request, None)?;
         tracing::debug!("LLM streaming request");
-        self.send_request_stream(body, tx).await
+        self.send_request_stream(body, request.usage_tracker.as_ref(), tx)
+            .await
     }
 }

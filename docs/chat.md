@@ -4,6 +4,10 @@ Phase 1 Human-in-the-Loop turns IronCrew's existing `crew:conversation({...})`
 primitive into a first-class chat runtime — you drive it interactively from
 the terminal or over HTTP, with the same shared state and persistence layer.
 
+[Run token budgets](token-budgets.md) are opt-in. CLI chat shares one execution
+budget; standalone HTTP messages each receive a fresh budget exposed through
+`request_usage`. Session-lifetime `usage` remains separate from that allowance.
+
 Two surfaces share the underlying mechanism:
 
 - `ironcrew chat <path>` — a local REPL.
@@ -20,11 +24,19 @@ turns must enter through the keyed HTTP `/messages` endpoint. Direct Lua/CLI
 `send()` and `ask()` calls do not acquire the shared durable turn fence and
 therefore fail closed for a persistent PostgreSQL conversation.
 
+Missing, empty, and whitespace-only final model replies fail the turn rather
+than recording an empty assistant answer. The last committed transcript and
+revision remain unchanged; no completed `conversation_turn` event is emitted.
+Earlier tool effects or streamed text cannot be undone, and the failed turn is
+not automatically replayed. HTTP reports a server error under the existing
+idempotency rules; the CLI reports the error and can accept a new user turn.
+
 ## Canonical mode-guard pattern
 
 IronCrew exposes `IRONCREW_MODE` as a Lua global. It is `"run"` during a
 normal `ironcrew run` or API run, and `"chat"` while the CLI REPL or the
-HTTP `start` handler is building a session. Write your top-level script so
+HTTP `start` handler is building a session, and `"validate"` during
+`ironcrew validate --evaluate`. Write your top-level script so
 the crew is always declared, but any one-shot `crew:run()` only fires in
 run mode:
 
@@ -32,14 +44,14 @@ run mode:
 local crew = Crew.new({ goal = "...", provider = "openai", model = "gpt-5.6-luna" })
 crew:add_agent(Agent.new({ name = "tutor", goal = "..." }))
 
-if IRONCREW_MODE ~= "chat" then
-    crew:add_task({ name = "demo", agent = "tutor", description = "..." })
+crew:add_task({ name = "demo", agent = "tutor", description = "..." })
+if IRONCREW_MODE == "run" then
     crew:run()
 end
 ```
 
 That way the same `crew.lua` works for both `ironcrew run` and
-`ironcrew chat`.
+`ironcrew chat`, and its task declarations are visible to construction validation.
 
 HTTP conversation bootstrap also enforces this rule in the host. While the
 entrypoint is being evaluated to discover its declarative Crew, Agent, task,
@@ -92,6 +104,7 @@ Slash commands:
 | `/id`             | Print the session id                   |
 | `/save`           | Persist the session now                |
 | `/history`        | Dump the full transcript               |
+| `/usage`          | Print checked session usage, including the restored checkpoint |
 
 Example (full session against `examples/chat-cli`):
 
@@ -264,6 +277,12 @@ these with the `IRONCREW_API_*` variables below; the process also applies
 `IRONCREW_MAX_IMAGE_BYTES` to each loaded image.
 
 ### GET `/history`
+
+History and successful message responses include `usage`, the checked session
+snapshot described in [usage accounting](usage-accounting.md). History/list
+reads represent the last successful durable checkpoint; a live handle may also
+contain unsaved failed/cancelled attempts. Resuming does not charge historical
+usage to the new run, and `/reset` does not erase token usage.
 
 Reads directly from the store. Works even after the in-memory handle has
 been evicted:

@@ -211,6 +211,7 @@ async fn handle_slash(cmd: &str, conv: &Arc<LuaConversationInner>) -> Result<boo
             eprintln!("  /id           Show the session id");
             eprintln!("  /save         Persist the session now");
             eprintln!("  /history      Print the conversation transcript");
+            eprintln!("  /usage        Print checked session usage");
             Ok(false)
         }
         "exit" | "quit" => Ok(true),
@@ -239,6 +240,14 @@ async fn handle_slash(cmd: &str, conv: &Arc<LuaConversationInner>) -> Result<boo
                 let content = msg.content.as_deref().unwrap_or("");
                 println!("[{:>3}] {:>9}: {}", i, msg.role, content);
             }
+            Ok(false)
+        }
+        "usage" => {
+            println!(
+                "{}",
+                serde_json::to_string(&conv.usage_snapshot()?)
+                    .expect("checked scalar usage snapshot serializes")
+            );
             Ok(false)
         }
         other => {

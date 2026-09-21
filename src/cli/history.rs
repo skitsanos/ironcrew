@@ -88,8 +88,8 @@ pub async fn cmd_inspect(project: &Path, run_id: &str) -> Result<()> {
     println!("Finished: {}", record.finished_at);
     println!("Duration: {}ms", record.duration_ms);
     println!(
-        "Tokens: {} total ({} cached)",
-        record.total_tokens, record.cached_tokens
+        "Usage: {}",
+        serde_json::to_value(&record.usage).expect("usage snapshot serializes")
     );
     println!("Agents: {}", record.agent_count);
     println!(

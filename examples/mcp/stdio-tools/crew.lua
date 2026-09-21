@@ -17,12 +17,10 @@ local crew = Crew.new({
 })
 
 crew:add_agent({
-    name      = "echo_agent",
-    role      = "MCP tool user",
-    goal      = "Call the echo tool and report its response",
-    backstory = "Careful protocol integration tester.",
-    tools     = { "mcp__local_tools__echo" },
-    max_iter  = 3,
+    name          = "echo_agent",
+    goal          = "Call the echo tool and report its response",
+    system_prompt = "You are a careful protocol integration tester.",
+    tools         = { "mcp__local_tools__echo" },
 })
 
 crew:add_task({

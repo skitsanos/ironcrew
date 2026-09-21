@@ -1,35 +1,76 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:best-practices"
   ],
-  "baseBranches": [
+  "baseBranchPatterns": [
     "develop"
   ],
   "labels": [
     "dependencies"
   ],
   "dependencyDashboard": true,
+  "minimumReleaseAge": "0 days",
   "rangeStrategy": "bump",
-  "prConcurrentLimit": 5,
-  "prHourlyLimit": 2,
+  "prConcurrentLimit": 1,
+  "prHourlyLimit": 1,
   "packageRules": [
     {
-      "description": "Keep CI on the moving PostgreSQL 15 minimum-version gate",
-      "matchManagers": ["github-actions"],
-      "matchDatasources": ["docker"],
-      "matchPackageNames": ["postgres"],
-      "matchFileNames": [".github/workflows/ci.yml"],
-      "enabled": false
+      "description": "Keep sse-stream aligned with rmcp 3.4 public transport types",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "sse-stream"
+      ],
+      "allowedVersions": "<0.3.0"
     },
     {
-      "matchUpdateTypes": ["minor", "patch"],
-      "groupName": "non-major updates"
+      "description": "Keep disposable PostgreSQL CI on the moving latest-stable image",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "pinDigests": false
     },
     {
-      "matchCurrentVersion": "<1.0.0",
-      "matchUpdateTypes": ["minor"],
-      "groupName": "breaking sub-1.0 bumps"
+      "description": "Present one dependency refresh for develop instead of a PR queue",
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest",
+        "lockFileMaintenance",
+        "replacement"
+      ],
+      "groupName": "dependency refresh",
+      "groupSlug": "dependency-refresh"
+    },
+    {
+      "description": "Hold the PostgreSQL floor image at the IronCrew support window (two most recent majors); advance it only in an IronCrew major release",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "allowedVersions": "<18"
     }
   ]
 }

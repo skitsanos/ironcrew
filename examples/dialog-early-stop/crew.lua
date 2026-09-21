@@ -12,12 +12,12 @@
 --   - "reason"     → stop with the given reason string (recommended — it
 --                    shows up in dialog:stop_reason() and the SSE event)
 --
--- Requires: OPENAI_API_KEY (for gpt-5.4-mini)
+-- Requires: OPENAI_API_KEY (for gpt-5.6-luna)
 
 local crew = Crew.new({
     goal = "Negotiate a trade until consensus is reached",
     provider = "openai",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({

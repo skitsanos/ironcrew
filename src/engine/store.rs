@@ -26,11 +26,11 @@ use crate::utils::error::Result;
 pub const DEFAULT_RUN_LEASE_TTL_SECONDS: u64 = 60;
 pub const MIN_PRODUCTION_RUN_LEASE_TTL_SECONDS: u64 = 6;
 pub const MAX_RUN_LEASE_TTL_SECONDS: u64 = 86_400;
+#[cfg(any(feature = "postgres", test))]
 const MAX_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "postgres", test))]
 const MIN_RUN_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(100);
-
 static PROCESS_INSTANCE_ID: OnceLock<String> = OnceLock::new();
-
 /// Ownership configuration attached to every store handle in this process.
 ///
 /// The generated id is stable for the lifetime of the process. Deployments can
@@ -127,20 +127,20 @@ fn production_run_lease_ttl(ttl_seconds: u64) -> Result<Duration> {
 pub fn run_lease_heartbeat_interval(ttl: Duration) -> Duration {
     (ttl / 3).max(Duration::from_secs(1))
 }
-
 /// Per-operation outer bound for heartbeat and reconciliation maintenance.
 /// Two sequential operations consume at most two thirds of one cadence, with
 /// a five-second ceiling for long production leases.
+#[cfg(any(feature = "postgres", test))]
 pub fn run_maintenance_timeout(ttl: Duration) -> Duration {
     let milliseconds = (run_lease_heartbeat_interval(ttl).as_millis() / 3)
         .max(MIN_RUN_MAINTENANCE_TIMEOUT.as_millis())
         .min(MAX_RUN_MAINTENANCE_TIMEOUT.as_millis());
     Duration::from_millis(milliseconds as u64)
 }
-
 /// PostgreSQL's per-statement timeout is smaller than the aggregate Tokio
 /// bound. It resolves an individual lock/query stall inside the database;
 /// the outer watchdog still bounds pool acquisition and cumulative statements.
+#[cfg(any(feature = "postgres", test))]
 pub fn run_maintenance_database_timeout(ttl: Duration) -> Duration {
     let milliseconds = (run_maintenance_timeout(ttl).as_millis() * 4 / 5).max(50);
     Duration::from_millis(milliseconds as u64)
@@ -208,11 +208,10 @@ pub enum ConversationCoordinationScope {
 pub trait StateStore: Send + Sync {
     // ─── Run history ────────────────────────────────────────────────────────
 
-    /// Called when a run starts. Writes a RunRecord with status=Running,
-    /// empty task_results, finished_at="", duration_ms=0, total_tokens=0,
-    /// cached_tokens=0. Returns the generated run_id (or `intent.suggested_id`
-    /// if `Some` — used by the HTTP handler to pre-allocate an id before
-    /// the flow runs so SSE subscribers can join mid-flight).
+    /// Called when a run starts. Writes a Running record with empty results,
+    /// finished_at="", duration_ms=0 and unavailable usage. Returns the generated
+    /// run_id or `intent.suggested_id` when present, allowing HTTP callers to
+    /// pre-allocate an id so SSE subscribers can join mid-flight.
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String>;
 
     /// Called when a run completes (success, partial failure, or hard
@@ -634,7 +633,7 @@ pub trait StateStore: Send + Sync {
 ///
 /// `IRONCREW_STORE=json` (local default) — JSON files in the given directory
 /// `IRONCREW_STORE=sqlite` — SQLite database
-/// `IRONCREW_STORE=postgres` — PostgreSQL 15+ (requires `postgres` feature)
+/// `IRONCREW_STORE=postgres` — PostgreSQL 17+ (requires `postgres` feature)
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
 /// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases
@@ -662,25 +661,15 @@ pub async fn create_store(
     };
 
     match store_type.to_lowercase().as_str() {
-        "json" => Ok(std::sync::Arc::new(super::run_history::JsonFileStore::new(
-            default_dir,
-        )?)),
+        "json" => Ok(std::sync::Arc::new(
+            super::run_history::JsonFileStore::open(default_dir).await?,
+        )),
         "sqlite" => {
             let db_path = std::env::var("IRONCREW_STORE_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| default_dir.join("ironcrew.db"));
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
-            }
-            Ok(std::sync::Arc::new(super::sqlite_store::SqliteStore::new(
-                db_path,
-            )?))
+            let store = super::store_bootstrap::open_sqlite(db_path).await?;
+            Ok(std::sync::Arc::new(store))
         }
         #[cfg(feature = "postgres")]
         "postgres" | "postgresql" => {

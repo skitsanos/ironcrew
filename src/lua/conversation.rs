@@ -8,12 +8,14 @@
 //! The userdata is a thin handle around an `Arc<LuaConversationInner>`. All
 //! state and behavior lives on the inner type; the outer struct only exists
 //! so callers outside the Lua boundary (HTTP handlers, CLI `chat` REPL) can
-//! grab a clone of the `Arc` and call `run_turn().await` directly without
-//! bouncing back through the Lua VM.
+//! grab the `Arc` and call `run_turn().await` without a Lua VM round-trip.
 
+mod persistence;
 use std::sync::Arc;
+mod bootstrap;
+mod stream;
 
-use mlua::{Table, UserData, UserDataMethods, Value};
+use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::agent_turn::ActiveTurnGuard;
@@ -33,20 +35,8 @@ use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::IronCrewError;
 
-/// Resolve the default max_history cap when no explicit Lua-side value is
-/// provided. Honors a positive `IRONCREW_CONVERSATION_MAX_HISTORY` up to the
-/// process hard ceiling, falling back to a safe 50-message cap. Shared with non-conversation
-/// consumers (e.g. `AgentAsTool` finalization) so they apply the same
-/// policy as the user-facing `crew:conversation()` path.
-pub(crate) fn default_max_history() -> Option<usize> {
-    let env_default = std::env::var("IRONCREW_CONVERSATION_MAX_HISTORY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.min(HARD_CHAT_HISTORY_MAX_MESSAGES))
-        .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
-    Some(env_default)
-}
+mod history_limit;
+pub(crate) use history_limit::default_max_history;
 
 /// Precomputed canonical flow identity injected by HTTP/CLI runtimes before
 /// Lua executes. Keeping it in app data avoids a second blocking filesystem
@@ -79,6 +69,8 @@ pub struct LuaConversationInner {
 
     /// Provider used for all LLM calls in this conversation.
     pub provider: Arc<dyn LlmProvider>,
+    /// Inclusive session receipts, including the last persisted checkpoint.
+    usage: crate::usage::UsageTracker,
 
     /// Tool registry shared with the parent crew.
     pub tool_registry: ToolRegistry,
@@ -161,171 +153,9 @@ pub struct PreparedConversationTurn {
 }
 
 impl LuaConversationInner {
-    /// Build a fresh (or resumed) conversation inner.
-    ///
-    /// When `store` is `Some` and `id` is `Some`, the store is consulted for
-    /// a prior record with that id. On hit, the persisted history replaces
-    /// the freshly-seeded `[system]` bootstrap so the conversation picks up
-    /// where it left off. On miss, a new record will be written on the
-    /// first autosave.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new_or_resume(
-        agent: Agent,
-        provider: Arc<dyn LlmProvider>,
-        tool_registry: ToolRegistry,
-        model: String,
-        system_prompt: String,
-        max_history: Option<usize>,
-        history_max_bytes: usize,
-        stream: bool,
-        max_tool_rounds: usize,
-        eventbus: EventBus,
-        id: Option<String>,
-        store: Option<Arc<dyn StateStore>>,
-        flow_name: String,
-        flow_path: Option<String>,
-        autosave: bool,
-        project_dir: std::path::PathBuf,
-        http_client: reqwest::Client,
-        source_fingerprint: String,
-        definition_fingerprint: String,
-    ) -> Result<Self, IronCrewError> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let max_history = match max_history {
-            Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
-            Some(value) => {
-                return Err(IronCrewError::Validation(format!(
-                    "max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {value}"
-                )));
-            }
-            None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
-        };
-        // Resolve the id and decide whether the session is persistent.
-        let (id, persistent) = match id {
-            Some(s) => {
-                validate_session_id(&s)?;
-                (s, true)
-            }
-            None => (uuid::Uuid::new_v4().to_string(), false),
-        };
-
-        // Seed the message list. If we can hit the store for a resume, use
-        // the persisted messages instead of the bootstrap seed.
-        let mut messages = vec![ChatMessage::system(&system_prompt)];
-        let mut created_at = now.clone();
-        let mut revision = 0;
-        let mut execution = ConversationExecution::new(
-            source_fingerprint.clone(),
-            definition_fingerprint.clone(),
-            max_history,
-            history_max_bytes,
-        )?;
-
-        if persistent
-            && let Some(ref store) = store
-            && let Some(record) = store.get_conversation(flow_path.as_deref(), &id).await?
-        {
-            record.execution.validate()?;
-            if record.execution.source_fingerprint != source_fingerprint {
-                return Err(IronCrewError::Conflict(
-                    "Conversation flow source changed; restore the original definition or start a new conversation"
-                        .into(),
-                ));
-            }
-            if record.execution.definition_fingerprint != definition_fingerprint {
-                return Err(IronCrewError::Conflict(
-                    "Conversation definition changed; restore the original model, agent, tools, provider, and limits or start a new conversation"
-                        .into(),
-                ));
-            }
-            validate_chat_history(&record.messages, max_history, history_max_bytes, true).map_err(
-                |error| {
-                    IronCrewError::Validation(format!(
-                        "Conversation '{id}' has invalid persisted history: {error}"
-                    ))
-                },
-            )?;
-            revision = record.revision;
-            execution = record.execution;
-            messages = record.messages;
-            created_at = record.created_at;
-            tracing::info!(
-                "Resumed conversation '{}' with {} messages",
-                id,
-                messages.len()
-            );
-        }
-
-        validate_chat_history(&messages, max_history, history_max_bytes, true)?;
-
-        eventbus.emit(CrewEvent::ConversationStarted {
-            conversation_id: id.clone(),
-            agent: agent.name.clone(),
-        });
-
-        Ok(Self {
-            id,
-            persistent,
-            agent,
-            provider,
-            tool_registry,
-            model,
-            system_prompt,
-            messages: Mutex::new(messages),
-            turn_execution_lock: Arc::new(Mutex::new(())),
-            max_history: Some(max_history),
-            history_max_bytes,
-            stream,
-            max_tool_rounds,
-            eventbus,
-            store: if persistent { store } else { None },
-            flow_name,
-            flow_path,
-            autosave,
-            created_at,
-            revision: Mutex::new(revision),
-            execution,
-            project_dir,
-            http_client,
-        })
-    }
-
-    /// Persist the current state to the configured store. Safe to call even
-    /// for non-persistent sessions — it simply no-ops.
-    pub async fn persist(&self) -> Result<(), IronCrewError> {
-        let _execution_guard = self.turn_execution_lock.clone().lock_owned().await;
-        self.persist_current_snapshot().await
-    }
-
-    async fn persist_current_snapshot(&self) -> Result<(), IronCrewError> {
-        let Some(ref store) = self.store else {
-            return Ok(());
-        };
-        if !self.persistent {
-            return Ok(());
-        }
-        let mut revision = self.revision.lock().await;
-        let messages = self.messages.lock().await.clone();
-        validate_chat_history(
-            &messages,
-            self.max_history
-                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
-            self.history_max_bytes,
-            true,
-        )?;
-        let record = ConversationRecord {
-            id: self.id.clone(),
-            flow_name: self.flow_name.clone(),
-            flow_path: self.flow_path.clone(),
-            agent_name: self.agent.name.clone(),
-            execution: self.execution.clone(),
-            messages,
-            created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            revision: *revision,
-        };
-        *revision = store.save_conversation(&record).await?;
-        Ok(())
+    /// Session lifetime usage at this process checkpoint; never recharged to a new run.
+    pub fn usage_snapshot(&self) -> Result<crate::usage::UsageSnapshot, IronCrewError> {
+        crate::llm::scope::snapshot(&self.usage)
     }
 
     /// Reset history — clear all messages, keep the system prompt.
@@ -439,6 +269,14 @@ impl LuaConversationInner {
         let execution_guard = self.turn_execution_lock.clone().lock_owned().await;
         let has_tools = !self.agent.tools.is_empty();
         let helper_ctx = ToolCallContext {
+            usage_tracker: match &caller_ctx.usage_tracker {
+                Some(caller) => Some(
+                    caller
+                        .child_observed_by(&self.usage)
+                        .map_err(|error| IronCrewError::Provider(error.to_string()))?,
+                ),
+                None => self.provider.usage_tracker(),
+            },
             store: caller_ctx.store.clone().or_else(|| self.store.clone()),
             eventbus: Some(
                 caller_ctx
@@ -479,7 +317,8 @@ impl LuaConversationInner {
         //    scope), so when the caller opted into streaming and the agent
         //    has no tools, we keep the original inline branch.
         let (content, reasoning) = if self.stream && !has_tools {
-            self.run_turn_streaming_no_tools(&mut history).await?
+            self.run_turn_streaming_no_tools(&mut history, helper_ctx.usage_tracker.clone())
+                .await?
         } else {
             // 3. Non-streaming (or tools-present) path: delegate to the
             //    shared helper against the private candidate.
@@ -495,9 +334,13 @@ impl LuaConversationInner {
             .await?
         };
 
+        if let Some(tracker) = &helper_ctx.usage_tracker {
+            tracker.budget().check()?;
+        }
         let turn_count = history.iter().filter(|m| m.role == "user").count();
         let turn_index = turn_count.saturating_sub(1);
         let record = ConversationRecord {
+            usage: self.usage_snapshot()?,
             id: self.id.clone(),
             flow_name: self.flow_name.clone(),
             flow_path: self.flow_path.clone(),
@@ -558,93 +401,6 @@ impl LuaConversationInner {
         Ok((prepared.assistant, prepared.reasoning))
     }
 
-    /// Streaming no-tools turn. The user message has already been pushed
-    /// by the caller; this method issues one streaming provider call,
-    /// appends the assistant reply, and returns (content, reasoning).
-    ///
-    /// Tool-call rounds are not supported here by design — the shared
-    /// helper owns that path and does not stream. Callers must check
-    /// `has_tools` before dispatching to this method.
-    async fn run_turn_streaming_no_tools(
-        &self,
-        history: &mut Vec<ChatMessage>,
-    ) -> Result<(String, Option<String>), IronCrewError> {
-        let mut active_turn = ActiveTurnGuard::new(history);
-        let messages_snapshot: Vec<ChatMessage> = active_turn.clone();
-
-        let request = ChatRequest {
-            messages: messages_snapshot,
-            model: self.model.clone(),
-            temperature: self.agent.temperature,
-            max_tokens: self.agent.max_tokens,
-            response_format: self.agent.response_format.clone(),
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
-
-        let response = self.call_streaming(request).await?;
-
-        let content = response
-            .content
-            .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
-
-        active_turn.push(ChatMessage::assistant(Some(content.clone()), None));
-        enforce_conversation_history_limits(
-            &mut active_turn,
-            self.max_history
-                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
-            self.history_max_bytes,
-        )?;
-        active_turn.commit();
-
-        let reasoning = response.reasoning.map(|reasoning| {
-            let limit = self.tool_registry.max_reasoning_bytes();
-            let mut bounded = String::new();
-            if append_text_bounded(&mut bounded, &reasoning, limit) {
-                tracing::warn!(
-                    conversation = %self.id,
-                    limit,
-                    "Reasoning text was truncated to the configured byte limit"
-                );
-            }
-            bounded
-        });
-
-        Ok((content, reasoning))
-    }
-
-    /// Stream a request to stderr (with dim reasoning) and return the response.
-    async fn call_streaming(&self, request: ChatRequest) -> Result<ChatResponse, IronCrewError> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-
-        let print_handle = tokio::spawn(async move {
-            use std::io::Write;
-            while let Some(chunk) = rx.recv().await {
-                match chunk {
-                    StreamChunk::Text(text) => {
-                        eprint!("{}", text);
-                        std::io::stderr().flush().ok();
-                    }
-                    StreamChunk::Thinking(text) => {
-                        eprint!("\x1b[90m{}\x1b[0m", text);
-                        std::io::stderr().flush().ok();
-                    }
-                    StreamChunk::Done => {
-                        eprintln!();
-                    }
-                    StreamChunk::Error(e) => {
-                        eprintln!("\n[Stream error: {}]", e);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        let result = self.provider.chat_stream(request, tx).await;
-        print_handle.await.ok();
-        result
-    }
-
     /// Delete the persisted record (if any) for this session. Flow-scoped
     /// so a conversation can only delete its own flow's record.
     pub async fn delete(&self) -> Result<(), IronCrewError> {
@@ -672,6 +428,9 @@ impl LuaConversation {
 
 impl UserData for LuaConversation {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("usage", |lua, this, ()| {
+            super::usage::snapshot(lua, &this.0.usage)
+        });
         // conv:send(message[, opts]) → returns plain text
         // opts may include: { images = { "path/to/img.png", "https://..." } }
         methods.add_async_method("send", |_, this, args: mlua::MultiValue| async move {
@@ -822,143 +581,5 @@ async fn parse_images_from_opts(
     }
 }
 
-/// Build a LuaConversation from a Lua options table, agent lookup, provider,
-/// tool registry, and crew defaults.
-///
-/// When `store` and the caller-provided `id` are both present, the conversation
-/// is resumed from the store if a prior record exists. Autosave defaults to
-/// `true` for persistent sessions and is a no-op for ephemeral ones.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_conversation(
-    table: Table,
-    agents: &[Agent],
-    provider: Arc<dyn LlmProvider>,
-    tool_registry: ToolRegistry,
-    crew_default_model: &str,
-    source_fingerprint: &str,
-    crew_max_tool_rounds: usize,
-    eventbus: EventBus,
-    store: Option<Arc<dyn StateStore>>,
-    flow_name: String,
-    flow_path: Option<String>,
-    project_dir: std::path::PathBuf,
-    http_client: reqwest::Client,
-) -> mlua::Result<LuaConversation> {
-    // Resolve agent: either by name or inline (Agent table)
-    let agent_value: Value = table.get("agent")?;
-    let agent: Agent = match agent_value {
-        Value::String(s) => {
-            let name = s.to_str()?.to_string();
-            agents
-                .iter()
-                .find(|a| a.name == name)
-                .cloned()
-                .ok_or_else(|| {
-                    mlua::Error::external(IronCrewError::Validation(format!(
-                        "Conversation: agent '{}' not found in crew",
-                        name
-                    )))
-                })?
-        }
-        Value::Table(t) => crate::lua::parsers::agent_from_lua_table(&t)?,
-        _ => {
-            return Err(mlua::Error::external(IronCrewError::Validation(
-                "Conversation requires 'agent' (string name or Agent table)".into(),
-            )));
-        }
-    };
-
-    let model: String = table
-        .get::<String>("model")
-        .ok()
-        .or_else(|| agent.model.clone())
-        .unwrap_or_else(|| crew_default_model.to_string());
-
-    let system_prompt: String = table
-        .get::<String>("system_prompt")
-        .ok()
-        .or_else(|| agent.system_prompt.clone())
-        .unwrap_or_else(|| format!("You are {}. Your goal: {}", agent.name, agent.goal));
-
-    // max_history resolution order:
-    //   1. Explicit positive value in the Lua table
-    //   2. IRONCREW_CONVERSATION_MAX_HISTORY env var
-    //   3. Safe default of 50 messages
-    let max_history: Option<usize> = match table.get::<usize>("max_history") {
-        Ok(n) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&n) => Some(n),
-        Ok(n) => {
-            return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                "Conversation max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {n}"
-            ))));
-        }
-        Err(_) => default_max_history(),
-    };
-
-    let stream: bool = table.get::<bool>("stream").unwrap_or(false);
-
-    // Cross-run persistence: `id` is the persistence key. When omitted,
-    // the session is ephemeral (same behavior as pre-2.8 conversations).
-    let id: Option<String> = table.get::<String>("id").ok();
-    // Autosave defaults to true when persistence is active. For non-persistent
-    // sessions this value is effectively ignored.
-    //
-    // NOTE: use `Option<bool>` rather than `bool` here — `table.get::<bool>`
-    // on a missing key coerces nil to `false` (mlua's FromLua impl), which
-    // would silently disable autosave whenever the caller omits the field.
-    let autosave: bool = table
-        .get::<Option<bool>>("autosave")
-        .ok()
-        .flatten()
-        .unwrap_or(true);
-
-    let effective_max_history = max_history.unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES);
-    let history_max_bytes = tool_registry.chat_history_max_bytes();
-    let provider_execution_fingerprint = match provider.execution_fingerprint() {
-        Ok(fingerprint) => fingerprint,
-        Err(_) if id.is_none() => {
-            crate::engine::conversation_provider::unidentified_ephemeral_provider_fingerprint()
-        }
-        Err(error) => return Err(mlua::Error::external(error)),
-    };
-    let resolved_tools_fingerprint = tool_registry
-        .conversation_execution_fingerprint(&agent.tools)
-        .map_err(mlua::Error::external)?;
-    let definition_fingerprint = conversation_definition_fingerprint(&ConversationDefinition {
-        source_fingerprint,
-        agent: &agent,
-        resolved_model: &model,
-        effective_system_prompt: &system_prompt,
-        max_history: effective_max_history,
-        history_max_bytes,
-        max_tool_rounds: crew_max_tool_rounds,
-        resolved_tools_fingerprint: &resolved_tools_fingerprint,
-        provider_execution_fingerprint: &provider_execution_fingerprint,
-    })
-    .map_err(mlua::Error::external)?;
-
-    let inner = LuaConversationInner::new_or_resume(
-        agent,
-        provider,
-        tool_registry,
-        model,
-        system_prompt,
-        max_history,
-        history_max_bytes,
-        stream,
-        crew_max_tool_rounds,
-        eventbus,
-        id,
-        store,
-        flow_name,
-        flow_path,
-        autosave,
-        project_dir,
-        http_client,
-        source_fingerprint.to_string(),
-        definition_fingerprint,
-    )
-    .await
-    .map_err(mlua::Error::external)?;
-
-    Ok(LuaConversation(Arc::new(inner)))
-}
+mod construction;
+pub use construction::build_conversation;

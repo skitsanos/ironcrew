@@ -45,10 +45,13 @@ use crate::utils::error::IronCrewError;
 
 mod events;
 mod image_input;
+mod message_audit;
 pub use events::conversation_events;
 use image_input::load_message_images;
+pub use message_audit::post_message;
 
-type MessageResult = Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
+pub(super) type MessageResult =
+    Result<(HeaderMap, Json<MessageResp>), (StatusCode, Json<ErrorResponse>)>;
 
 #[derive(Clone)]
 struct MessageIdempotencyAttempt {
@@ -340,43 +343,8 @@ pub struct MessageReq {
     pub images: Option<Vec<String>>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct MessageResp {
-    pub conversation_id: String,
-    pub turn_index: usize,
-    pub assistant: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-    pub turn_count: usize,
-    pub revision: u64,
-    pub incarnation_id: String,
-    pub definition_fingerprint: String,
-}
-
-#[derive(Serialize)]
-pub struct HistoryResp {
-    pub conversation_id: String,
-    pub flow: Option<String>,
-    pub agent: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub messages: Vec<HistoryMessage>,
-    pub turn_count: usize,
-    pub truncated: bool,
-    pub revision: u64,
-    pub incarnation_id: String,
-    pub source_fingerprint: String,
-    pub definition_fingerprint: String,
-}
-
-#[derive(Serialize)]
-pub struct HistoryMessage {
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
+mod responses;
+pub use responses::{HistoryMessage, HistoryResp, MessageResp};
 
 #[derive(Deserialize)]
 pub struct ListConversationsQuery {
@@ -408,40 +376,8 @@ pub struct ConversationEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn map_err_to_response(e: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
-    if let IronCrewError::Lua(error) = e
-        && let Some(embedded) = embedded_lua_client_error(error)
-    {
-        return map_err_to_response(embedded);
-    }
-    let status = match e {
-        IronCrewError::Conflict(_) => StatusCode::CONFLICT,
-        IronCrewError::Validation(_) => StatusCode::BAD_REQUEST,
-        IronCrewError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    error_response(status, e.to_string())
-}
-
-fn embedded_lua_client_error(error: &mlua::Error) -> Option<&IronCrewError> {
-    let mut current = error;
-    loop {
-        if let Some(embedded) = current.downcast_ref::<IronCrewError>()
-            && matches!(
-                embedded,
-                IronCrewError::Validation(_) | IronCrewError::Conflict(_)
-            )
-        {
-            return Some(embedded);
-        }
-        let parent = current.parent()?;
-        current = parent;
-    }
-}
-
-fn map_lua_err_to_response(error: mlua::Error) -> (StatusCode, Json<ErrorResponse>) {
-    map_err_to_response(&IronCrewError::Lua(error))
-}
+mod errors;
+use errors::*;
 
 fn flow_segment(path: &std::path::Path) -> String {
     path.file_name()
@@ -1289,7 +1225,12 @@ async fn execute_idempotent_message(
         },
     };
     let turn_timeout = handle.conv.tool_registry.conversation_turn_timeout();
-    let caller_context = ToolCallContext::default();
+    let request_usage = crate::usage::UsageTracker::for_run()
+        .map_err(|error| map_err_to_response(&error.into()))?;
+    let caller_context = ToolCallContext {
+        usage_tracker: Some(request_usage.clone()),
+        ..Default::default()
+    };
     let turn = tokio::time::timeout(
         turn_timeout,
         handle
@@ -1353,7 +1294,7 @@ async fn execute_idempotent_message(
             Ok(Err(error)) => {
                 drop(heartbeat);
                 mark_message_indeterminate(&state, &attempt).await;
-                return Err(map_err_to_response(&error));
+                return Err(message_execution_error(&error, &request_usage));
             }
             Ok(Ok(prepared)) => prepared,
         },
@@ -1366,6 +1307,10 @@ async fn execute_idempotent_message(
         )
     })?;
     let response = MessageResp {
+        request_usage: request_usage.snapshot().map_err(|error| {
+            conversation_store_error(IronCrewError::Provider(error.to_string()))
+        })?,
+        usage: prepared.record.usage.clone(),
         conversation_id: id,
         turn_index: prepared.turn_index,
         assistant: prepared.assistant.clone(),
@@ -1460,13 +1405,14 @@ async fn execute_idempotent_message(
     Ok(response)
 }
 
-pub async fn post_message(
+pub(super) async fn post_message_inner(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
     Path((flow, id)): Path<(String, String)>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<MessageReq>,
+    audit_recorded: Arc<std::sync::atomic::AtomicBool>,
 ) -> MessageResult {
     if !state.lifecycle.is_accepting_mutations() {
         return Err(error_response(
@@ -1850,6 +1796,7 @@ pub async fn post_message(
         let audit_flow = flow.clone();
         let audit_id = id.clone();
         let audit_headers = crate::api::audit::background_headers(&headers);
+        let audit_recorded = audit_recorded.clone();
         let task = tokio::spawn(async move {
             let result = execute_idempotent_message(
                 task_state,
@@ -1893,6 +1840,7 @@ pub async fn post_message(
                 metadata,
             )
             .await;
+            audit_recorded.store(true, std::sync::atomic::Ordering::Release);
             result
         });
         let response = task.await.map_err(|error| {
@@ -1910,7 +1858,18 @@ pub async fn post_message(
 
     let turn_timeout = handle.conv.tool_registry.conversation_turn_timeout();
     let mut shutdown = handle.shutdown.subscribe();
-    let turn = tokio::time::timeout(turn_timeout, handle.conv.run_turn(&req.content, images));
+    let request_usage = crate::usage::UsageTracker::for_run()
+        .map_err(|error| map_err_to_response(&error.into()))?;
+    let caller_context = ToolCallContext {
+        usage_tracker: Some(request_usage.clone()),
+        ..Default::default()
+    };
+    let turn = tokio::time::timeout(
+        turn_timeout,
+        handle
+            .conv
+            .run_turn_with_ctx(&req.content, images, &caller_context),
+    );
     let turn_result = tokio::select! {
         biased;
         _ = shutdown.wait_for(|stopping| *stopping) => {
@@ -1931,32 +1890,22 @@ pub async fn post_message(
                 ),
             )
         })?
-        .map_err(|e| map_err_to_response(&e))?;
+        .map_err(|e| message_execution_error(&e, &request_usage))?;
 
     let turn_count = handle.conv.turn_count().await;
     let turn_index = turn_count.saturating_sub(1);
     let revision = handle.conv.revision().await;
 
-    crate::api::audit::record(
-        &state.store,
-        "conversation.message",
-        Some(&flow),
-        Some(&id),
-        &headers,
-        Some(addr),
-        true,
-        StatusCode::OK.as_u16(),
-        Some(serde_json::json!({
-            "idempotent": false,
-            "turn_index": turn_index,
-            "turn_count": turn_count,
-        })),
-    )
-    .await;
-
     Ok((
         HeaderMap::new(),
         Json(MessageResp {
+            request_usage: request_usage.snapshot().map_err(|error| {
+                conversation_store_error(IronCrewError::Provider(error.to_string()))
+            })?,
+            usage: handle
+                .conv
+                .usage_snapshot()
+                .map_err(conversation_store_error)?,
             conversation_id: id,
             turn_index,
             assistant,
@@ -2011,6 +1960,7 @@ pub async fn get_history(
         .collect();
 
     Ok(Json(HistoryResp {
+        usage: record.usage,
         conversation_id: record.id,
         flow: record.flow_path,
         agent: record.agent_name,
@@ -2285,6 +2235,8 @@ mod lua_error_mapping_tests {
         )
         .unwrap();
         let valid = MessageResp {
+            request_usage: Default::default(),
+            usage: Default::default(),
             conversation_id: "chat".into(),
             turn_index: 0,
             assistant: "answer".into(),

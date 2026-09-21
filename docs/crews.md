@@ -22,10 +22,10 @@ local crew = Crew.new({
 
     -- Model router (see below)
     models = {
-        task_execution         = "gpt-4o",
+        task_execution         = "gpt-5.6-terra",
         tool_synthesis         = "gpt-5.6-luna",
-        final_response         = "gpt-4o",
-        collaboration          = "gpt-4o",
+        final_response         = "gpt-5.6-terra",
+        collaboration          = "gpt-5.6-terra",
         collaboration_synthesis = "gpt-5.6-luna",
     },
 })
@@ -37,12 +37,12 @@ local crew = Crew.new({
 |--------------------------|----------|--------------------|-------------|
 | `goal`                   | string   | *required*         | Non-empty high-level objective shown in the system prompt; capped by `IRONCREW_CREW_GOAL_MAX_BYTES` (default 64 KiB) |
 | `provider`               | string   | `"openai"`         | LLM provider: `"openai"`, `"anthropic"`, or `"openai-responses"`; maximum 128 bytes |
-| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for extended thinking; `1..=1000000` |
+| `thinking_budget`        | number   | `nil`              | (Anthropic only) tokens allocated for manual extended thinking; `1024..=1000000`, below explicit `max_tokens`, on supported models |
 | `server_tools`           | table    | `{}`               | (Anthropic/Responses) dense, duplicate-free server-side tool list; count capped by `IRONCREW_MAX_SERVER_TOOLS` |
 | `web_search_max_uses`    | number   | `nil`              | (Anthropic) max web search calls per task; `1..=100` |
-| `reasoning_effort`       | string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
-| `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` |
-| `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` |
+| `reasoning_effort`       | string   | `nil` (`low` for official Luna) | (openai-responses) model-aware construction validation; Luna supports `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, not `minimal`; see [capability policy](model-capabilities.md) |
+| `reasoning_summary`      | string   | `nil`              | (openai-responses) `"auto"`, `"concise"`, `"detailed"` — validated at construction |
+| `web_search_context_size`| string   | `nil`              | (openai-responses) `"low"`, `"medium"`, `"high"` — validated at construction |
 | `file_search_vector_store_ids` | table | `{}`            | (openai-responses) vector store IDs for file_search |
 | `file_search_max_results`| number   | `nil`              | (openai-responses) max file_search results; `1..=1000` |
 | `model`                  | string   | `"gpt-5.6-luna"`    | Non-empty default model for task execution; maximum 1024 bytes |
@@ -70,9 +70,22 @@ capped at 4096 bytes; model-route values use the 1024-byte model-name cap.
 Lists must be dense arrays without duplicates. Invalid values fail crew
 construction rather than being silently ignored.
 
+**Unknown keys are rejected.** `Crew.new`, agent tables, and task tables each
+accept a closed set of options. An unrecognized key fails construction with a
+message naming the offending key and listing the supported ones. This is
+deliberate: a silently ignored typo in `require_approval` would disable the
+approval gate without any signal, and a typo in `depends_on` would drop a task
+dependency. Options from a provider you are not using (for example
+`thinking_budget` on OpenAI) are still accepted and simply unused.
+
 ---
 
 ## Project Defaults: `config.lua`
+
+Operator [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) applies to the whole Lua
+entrypoint, including nested work and multiple `crew:run()` calls. It is not a
+`Crew.new`/`config.lua` option and cannot be raised by flow authors. Inspect
+`crew:flow_usage().budget` for the shared capacity state.
 
 If a `config.lua` file exists at the project root (alongside `crew.lua`), it is
 loaded automatically before `crew.lua` runs. It must return a table of default
@@ -111,9 +124,10 @@ local crew = Crew.new({
   `server_tools`, `web_search_max_uses`, `reasoning_effort`, `reasoning_summary`,
   `web_search_context_size`, `file_search_vector_store_ids`,
   `file_search_max_results`
-- **Lua-powered** — config.lua runs in the same sandbox as crew.lua, so it can
-  call `env()`, `now_rfc3339()`, etc. (sensitive env vars are blocked, same as
-  crew.lua)
+- **Lua-powered but declarative** — config.lua can call non-effectful helpers
+  such as `env()` and `now_rfc3339()` (with the normal sensitive-env boundary),
+  but network, filesystem, sub-flow, PostgreSQL, and Crew execution effects are
+  rejected while the defaults table is constructed
 
 This keeps `crew.lua` focused on the workflow (goal, agents, tasks) while
 provider/model/limits move to a single project-wide file. Useful for switching
@@ -133,17 +147,19 @@ workflows inside a Lua script.
 > **Guard top-level `crew:run()` when mixing chat and task execution.**
 > IronCrew sets `IRONCREW_MODE` as a Lua global before `crew.lua` runs:
 > `"run"` under `ironcrew run` and `"chat"` under `ironcrew chat` (and the
-> HTTP conversation endpoints). If your script defines tasks and also
+> HTTP conversation endpoints), or `"validate"` during `validate --evaluate`.
+> If your script defines tasks and also
 > exposes a conversational agent, wrap the bootstrapping call:
 >
 > ```lua
-> if IRONCREW_MODE ~= "chat" then
+> if IRONCREW_MODE == "run" then
 >     crew:run()
 > end
 > ```
 >
 > This prevents chat-mode boot-up (REPL or HTTP `/start`) from triggering a
-> full task execution just to instantiate the crew.
+> full task execution just to instantiate the crew, and lets construction
+> validation check declarations without executing them.
 
 Create a conversation bound to a crew (it inherits the crew's provider, model,
 and tool registry):
@@ -189,6 +205,15 @@ conv:reset()
 **Limitations (current):**
 
 - Single-agent only (use `crew:dialog({})` below for two-agent conversations)
+
+An absent, empty, or whitespace-only final model reply fails `send`/`ask`,
+including streaming and tool-assisted turns. The failed turn is not committed
+to history, does not advance the durable revision, and emits no
+`conversation_turn` event. Reasoning alone is not a final answer. Already-run
+tools and already-streamed deltas cannot be undone; IronCrew does not
+automatically replay the turn. A later explicit call starts a new turn from
+the last committed history. Dialogs retain their separate graceful
+`empty_response` stop behavior.
 
 ### Image input
 
@@ -533,12 +558,18 @@ debate has converged). The `max_turns` value still acts as a hard safety
 ceiling — it bounds the worst case if the callback never returns a stop
 signal.
 
+IronCrew also stops a dialog when the model returns a blank final reply. This
+includes whitespace-only content and applies after zero or more tool rounds.
+The blank reply is not appended to the transcript or counted as a turn, and
+the dialog stops with reason `"empty_response"`. A missing final reply
+(`content: nil`) remains a provider error.
+
 **Querying state from Lua:**
 
 | Method                   | Returns |
 |--------------------------|---------|
-| `dialog:stopped()`       | `true` if `should_stop` requested termination |
-| `dialog:stop_reason()`   | The reason string, or `nil` for normal completion |
+| `dialog:stopped()`       | `true` if any early-stop condition ended the dialog |
+| `dialog:stop_reason()`   | The early-stop reason, or `nil` for normal completion |
 
 When the dialog stops early, the `dialog_completed` SSE event carries the
 reason:
@@ -605,6 +636,16 @@ event includes a stable `dialog_id` and `turn_index`. See
 [REST API](rest-api.md#sse-event-stream) for the full event schema.
 
 ---
+
+## Usage snapshots
+
+For process-local token accounting, use `crew:usage()` for the latest executing
+run and `crew:flow_usage()` for the enclosing flow total. Conversations and
+dialogs expose their own `:usage()` snapshots. Counts are decimal strings, with
+explicit coverage and unknown values; these snapshots include failed/retried
+provider attempts. Run results and session checkpoints persist the same contract;
+resumed sessions do not charge past usage to a new run. See [usage accounting](usage-accounting.md#lua-snapshots)
+for the wire contract and resume/ownership boundaries.
 
 ## Memory System
 
@@ -936,10 +977,10 @@ local crew = Crew.new({
     goal  = "Multi-model workflow",
     model = "gpt-5.6-luna",         -- fallback for unrouted purposes
     models = {
-        task_execution          = "gpt-4o",
+        task_execution          = "gpt-5.6-terra",
         tool_synthesis          = "gpt-5.6-luna",
-        final_response          = "gpt-4o",
-        collaboration           = "gpt-4o",
+        final_response          = "gpt-5.6-terra",
+        collaboration           = "gpt-5.6-terra",
         collaboration_synthesis = "gpt-5.6-luna",
     },
 })
@@ -986,9 +1027,11 @@ These values are passed through to the LLM provider.
 
 ## Token Usage Tracking
 
-Each task result includes a `token_usage` table with `prompt_tokens`,
-`completion_tokens`, `total_tokens`, and `cached_tokens`. Totals are persisted
-in run history and visible via `ironcrew inspect`.
+Each task result includes a checked `usage` snapshot with request count,
+coverage, and primary/reasoning/cache token subtotals. Counts are decimal strings
+or explicit nulls, never guessed zeros. Retries and failed attempts are included.
+Run history and `ironcrew inspect` expose the same snapshot contract; see
+[usage accounting](usage-accounting.md) for inclusive scope and storage boundaries.
 
 ---
 

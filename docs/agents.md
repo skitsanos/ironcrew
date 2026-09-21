@@ -55,6 +55,7 @@ not need to call `crew:add_agent()` for file-based agents.
 | `temperature`     | number            | no       | nil (provider default)             | LLM sampling temperature                              |
 | `max_tokens`      | integer           | no       | nil (provider default)             | Maximum tokens in LLM response                        |
 | `model`           | string            | no       | nil (uses crew default)            | Per-agent model override (highest priority)            |
+| `reasoning_effort`| string            | no       | nil (crew default / provider default) | Per-agent reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` — validated at parse time (see below) |
 | `expected_output` | string            | no       | nil                                | Description of what this agent should produce          |
 | `response_format` | table             | no       | nil                                | Controls LLM output format (see below)                |
 | `before_task`     | function          | no       | nil                                | Hook called before each task execution (see below)    |
@@ -62,13 +63,27 @@ not need to call `crew:add_agent()` for file-based agents.
 
 > **GPT-5.6 Luna temperature:** Luna accepts only its provider-default
 > temperature. Omit `temperature` whenever `gpt-5.6-luna` is the effective
-> model. IronCrew forwards explicit values; it does not silently discard them,
-> so a non-default value is rejected by the provider.
+> model, or use its default `1`. IronCrew rejects non-default values locally;
+> it does not silently discard them.
 
 > **GPT-5.6 Luna tools:** Chat Completions rejects Luna function tools while
 > reasoning is enabled. When an agent has tools, IronCrew explicitly sends
 > `reasoning_effort = "none"`; use `openai-responses` for an explicitly
 > reasoning-oriented OpenAI task.
+
+> **Per-agent `reasoning_effort`:** overrides the crew-level value for that
+> agent's requests. On `openai-responses` it maps to `reasoning.effort`; on the
+> plain `openai` provider it is forwarded as `reasoning_effort`, except that an
+> agent with tools on Luna may only set `"none"` (any other value fails
+> construction or the request, pointing at `openai-responses`). The `anthropic`
+> provider rejects it outright — its equivalent is the crew-level
+> `thinking_budget`. Nothing is ever silently dropped.
+
+On the official OpenAI endpoint, omitted Luna effort is `low` (`none` when
+Chat Completions function tools require it). `minimal` is not supported by
+Luna. Model-aware validation runs when the agent is attached to a crew and
+again for the final request, including model overrides. See the
+[capability policy](model-capabilities.md) for custom-endpoint behavior.
 
 ## Response Format
 
@@ -113,6 +128,19 @@ response_format = {
 
 This is particularly useful for data extraction pipelines where downstream tasks
 expect a specific JSON structure.
+
+**Provider support.** All three provider types enforce `response_format`, but
+they express it differently:
+
+| Provider | Mechanism |
+|----------|-----------|
+| `openai` (Chat Completions) | Native top-level `response_format` |
+| `openai-responses` | Native `text.format` (json_schema / json_object / text) |
+| `anthropic` | `json_schema` is enforced by defining a single-purpose tool and forcing the model to call it; the tool input is returned as the task output |
+
+Because Anthropic enforces a schema through a forced tool call, an agent using
+`json_schema` on that provider spends one tool definition on the schema. Its own
+tools continue to work normally, and their calls are unaffected.
 
 ## Agent Selection Heuristics
 
@@ -182,7 +210,7 @@ resolution chain):
 crew:add_agent(Agent.new({
     name = "deep_thinker",
     goal = "Perform complex reasoning tasks",
-    model = "gpt-4o",      -- uses gpt-4o even if crew default is gpt-5.6-luna
+    model = "gpt-5.6-terra",      -- uses gpt-5.6-terra even if crew default is gpt-5.6-luna
     temperature = 0.2,
 }))
 ```
@@ -190,19 +218,17 @@ crew:add_agent(Agent.new({
 ## Task Hooks
 
 Agents can define `before_task` and `after_task` callback functions that run
-around every task the agent executes. Hooks are useful for logging, metrics,
-input preprocessing, and output postprocessing.
+around every task the agent executes. Hooks are useful for input preprocessing
+and output postprocessing.
 
 ```lua
 crew:add_agent(Agent.new({
     name = "researcher",
     goal = "Research topics thoroughly",
     before_task = function(task_name, task_description)
-        log("info", "Starting: " .. task_name)
-        return task_description  -- return modified description, or nil for no change
+        return "Task " .. task_name .. ":\n" .. task_description
     end,
     after_task = function(task_name, output, success)
-        log("info", "Done: " .. task_name .. " (" .. (success and "ok" or "fail") .. ")")
         return output  -- return modified output, or nil for no change
     end,
 }))
@@ -225,7 +251,9 @@ or `nil` to keep it unchanged.
 - Hooks run in an isolated Lua VM per invocation (no access to the crew's
   globals or memory).
 - Hook errors are logged as warnings and do **not** fail the task -- the
-  original description or output is used instead.
+  original description or output is used instead. Every initialization, load,
+  execution, or invalid-return failure also increments
+  `ironcrew_hook_failures_total` on the authenticated HTTP metrics surface.
 - Hooks are stored as Lua bytecode on the `Crew`, so they work across all
   execution modes: standard tasks, foreach tasks, and retry loops.
 - Hooks do **not** run for error handler tasks or collaborative task synthesis

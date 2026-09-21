@@ -1,6 +1,11 @@
 //! Production-safety regression tests for API admission, lifecycle, probes,
-//! flow isolation, and terminal SSE delivery. Fixtures suspend before any LLM
-//! call, so the suite is deterministic and provider-free.
+//! flow isolation, and terminal SSE delivery. Usage fixtures use only a local
+//! mock provider; no paid or external provider calls are made.
+
+#[path = "api_safety/budget.rs"]
+mod budget;
+#[path = "api_safety/usage.rs"]
+mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ironcrew::api::{AppState, create_router};
+use ironcrew::engine::audit::AuditFilter;
 use ironcrew::engine::run_history::{JsonFileStore, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
@@ -134,6 +140,8 @@ async fn spawn_server_with_idempotency(
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(max_conversations)),
         max_active_runs: max_runs,
         run_permits: Arc::new(tokio::sync::Semaphore::new(max_runs)),
+        max_active_inspections: 4,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(4)),
         max_sse_connections: 100,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(100)),
         max_run_lifetime: max_lifetime,
@@ -234,7 +242,33 @@ async fn concurrent_run_admission_never_exceeds_cap() {
         .unwrap();
     assert_eq!(aborted.status(), reqwest::StatusCode::OK);
     wait_for_status(&server.store, &run_id, RunStatus::Aborted).await;
-    assert_eq!(server.state.run_permits.available_permits(), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while server.state.run_permits.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run admission permit should follow durable terminalization");
+}
+
+#[tokio::test]
+async fn flow_inspection_fails_fast_when_dedicated_capacity_is_exhausted() {
+    let server = spawn_server(1, 1, Duration::from_secs(60)).await;
+    server.state.inspection_permits.close();
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/flows/flow-a/validate", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("flow-inspection limit")
+    );
 }
 
 #[tokio::test]
@@ -504,6 +538,27 @@ async fn overlapping_conversation_message_fails_fast_instead_of_queueing() {
         body["error"],
         "Conversation is busy; retry after the active operation completes"
     );
+    let audits = server
+        .store
+        .list_audit_events(
+            &AuditFilter {
+                flow_path: Some("chat".into()),
+                action: Some("conversation.message".into()),
+                success: Some(false),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].target.as_deref(), Some("busy"));
+    assert_eq!(audits[0].status_code, 409);
+    assert_eq!(
+        audits[0].metadata,
+        Some(serde_json::json!({ "idempotent": false }))
+    );
 }
 
 #[tokio::test]
@@ -616,24 +671,25 @@ async fn abort_is_persisted_and_terminal_sse_is_delivered_with_flow_isolation() 
 
 #[tokio::test]
 async fn timeout_and_pre_intent_error_are_persisted() {
-    let server = spawn_server(2, 4, Duration::from_millis(50)).await;
+    let timeout_server = spawn_server(2, 4, Duration::from_millis(50)).await;
     let client = reqwest::Client::new();
 
-    let timed_out: serde_json::Value = start_run(&client, &server, "flow-a")
+    let timed_out: serde_json::Value = start_run(&client, &timeout_server, "flow-a")
         .await
         .json()
         .await
         .unwrap();
     let timed_out_id = timed_out["run_id"].as_str().unwrap();
-    wait_for_status(&server.store, timed_out_id, RunStatus::TimedOut).await;
+    wait_for_status(&timeout_server.store, timed_out_id, RunStatus::TimedOut).await;
 
-    let failed: serde_json::Value = start_run(&client, &server, "error")
+    let failure_server = spawn_server(2, 4, Duration::from_secs(60)).await;
+    let failed: serde_json::Value = start_run(&client, &failure_server, "error")
         .await
         .json()
         .await
         .unwrap();
     let failed_id = failed["run_id"].as_str().unwrap();
-    wait_for_status(&server.store, failed_id, RunStatus::Failed).await;
+    wait_for_status(&failure_server.store, failed_id, RunStatus::Failed).await;
 }
 
 #[tokio::test]

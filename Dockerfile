@@ -1,14 +1,17 @@
 # Keep the builder aligned with `package.rust-version` in Cargo.toml. Using an
 # exact toolchain tag prevents a future `rust:latest` release from changing the
 # build underneath us.
-FROM rust:1.97.1-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY examples ./examples
-COPY tests ./tests
+# `src/cli` embeds the graph viewer assets with include_str!, so this subtree is
+# a real build input. The rest of `examples/` is Lua and `tests/` is not built
+# by `cargo build`; copying them would invalidate this layer on every docs or
+# example edit.
+COPY examples/graph-prototype/assets ./examples/graph-prototype/assets
 
 RUN cargo build --release --locked
 

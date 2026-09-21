@@ -1,88 +1,20 @@
 use std::collections::HashMap;
 
 mod hooks;
+mod prompt;
 
 use hooks::{run_after_hook, run_before_hook};
+use prompt::BoundedPrompt;
 
 use crate::engine::agent::Agent;
 use crate::engine::interpolate::{interpolate_bounded, prompt_char_limit};
-use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::engine::task::{Task, TaskResult};
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
 use crate::tools::ToolCallContext;
 use crate::tools::registry::ToolRegistry;
+use crate::usage::UsageSnapshot;
 use crate::utils::error::{IronCrewError, Result};
-
-const PROMPT_TRUNCATION_MARKER: &str = "\n\n[... prompt truncated due to size limit]";
-
-/// Incrementally builds a character-bounded prompt. This avoids first joining
-/// every dependency/tool output into one unbounded temporary allocation and
-/// only then truncating it.
-struct BoundedPrompt {
-    text: String,
-    max_chars: usize,
-    chars: usize,
-    truncated: bool,
-}
-
-impl BoundedPrompt {
-    fn new(max_chars: usize) -> Self {
-        Self {
-            text: String::with_capacity(max_chars.min(16 * 1024)),
-            max_chars,
-            chars: 0,
-            truncated: false,
-        }
-    }
-
-    fn push(&mut self, value: &str) {
-        if self.truncated || self.chars >= self.max_chars {
-            self.truncated |= !value.is_empty();
-            return;
-        }
-
-        let remaining = self.max_chars - self.chars;
-        let mut count = 0usize;
-        let mut boundary = value.len();
-        for (byte_index, _) in value.char_indices() {
-            if count == remaining {
-                boundary = byte_index;
-                self.truncated = true;
-                break;
-            }
-            count += 1;
-        }
-        self.text.push_str(&value[..boundary]);
-        self.chars += count.min(remaining);
-    }
-
-    fn section(&mut self, label: &str, value: &str) {
-        if !self.text.is_empty() {
-            self.push("\n\n");
-        }
-        self.push(label);
-        self.push(value);
-    }
-
-    fn finish(mut self) -> (String, bool) {
-        if self.truncated {
-            let marker_chars = PROMPT_TRUNCATION_MARKER.chars().count();
-            let keep_chars = self.max_chars.saturating_sub(marker_chars);
-            if let Some((boundary, _)) = self.text.char_indices().nth(keep_chars) {
-                self.text.truncate(boundary);
-            }
-            let remaining = self.max_chars.saturating_sub(self.text.chars().count());
-            let marker_boundary = PROMPT_TRUNCATION_MARKER
-                .char_indices()
-                .nth(remaining)
-                .map(|(index, _)| index)
-                .unwrap_or(PROMPT_TRUNCATION_MARKER.len());
-            self.text
-                .push_str(&PROMPT_TRUNCATION_MARKER[..marker_boundary]);
-        }
-        self.text.shrink_to_fit();
-        (self.text, self.truncated)
-    }
-}
 
 pub struct TaskExecutionContext<'a> {
     pub task: &'a Task,
@@ -104,7 +36,9 @@ pub struct TaskExecutionContext<'a> {
 }
 
 impl<'a> TaskExecutionContext<'a> {
-    pub async fn execute(&self) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+    pub async fn execute(&self) -> Result<(String, Option<String>, UsageSnapshot)> {
+        let tracker = crate::llm::scope::child_scope(self.provider)?;
+        let provider = crate::llm::scope::borrow_with_usage_tracker(self.provider, tracker.clone());
         let max_prompt_chars = prompt_char_limit();
         // Run before_task hook if present
         let raw_description = interpolate_bounded(
@@ -120,7 +54,6 @@ impl<'a> TaskExecutionContext<'a> {
         };
 
         let mut messages = Vec::new();
-        let mut total_usage = TaskTokenUsage::default();
         let mut accumulated_reasoning = String::new();
         let reasoning_limit = max_reasoning_bytes();
         let mut reasoning_truncated = false;
@@ -192,15 +125,11 @@ impl<'a> TaskExecutionContext<'a> {
                 history_max_bytes,
                 true,
             )?;
-            let request = ChatRequest {
-                messages: messages.clone(),
-                model: self.model.to_string(),
-                temperature: self.agent.temperature,
-                max_tokens: self.agent.max_tokens,
-                response_format: self.agent.response_format.clone(),
-                prompt_cache_key: self.prompt_cache_key.clone(),
-                prompt_cache_retention: self.prompt_cache_retention.clone(),
-            };
+            let mut request = self
+                .agent
+                .chat_request(self.model.to_string(), messages.clone());
+            request.prompt_cache_key = self.prompt_cache_key.clone();
+            request.prompt_cache_retention = self.prompt_cache_retention.clone();
 
             let response = if self.should_stream && !has_tools {
                 // Stream mode: print chunks to stderr as they arrive
@@ -230,31 +159,14 @@ impl<'a> TaskExecutionContext<'a> {
                     }
                 });
 
-                let result = self.provider.chat_stream(request, tx).await;
+                let result = provider.chat_stream(request, tx).await;
                 print_handle.await.ok();
                 result?
             } else if has_tools {
-                self.provider
-                    .chat_with_tools(request, &tool_schemas)
-                    .await?
+                provider.chat_with_tools(request, &tool_schemas).await?
             } else {
-                self.provider.chat(request).await?
+                provider.chat(request).await?
             };
-
-            // Accumulate token usage
-            if let Some(usage) = &response.usage {
-                total_usage.prompt_tokens = total_usage
-                    .prompt_tokens
-                    .saturating_add(usage.prompt_tokens);
-                total_usage.completion_tokens = total_usage
-                    .completion_tokens
-                    .saturating_add(usage.completion_tokens);
-                total_usage.total_tokens =
-                    total_usage.total_tokens.saturating_add(usage.total_tokens);
-                total_usage.cached_tokens = total_usage
-                    .cached_tokens
-                    .saturating_add(usage.cached_tokens);
-            }
 
             // Accumulate reasoning content across tool-call rounds
             if let Some(ref reasoning) = response.reasoning {
@@ -268,10 +180,7 @@ impl<'a> TaskExecutionContext<'a> {
 
             // If no tool calls, return the content
             if response.tool_calls.is_empty() {
-                let has_usage = total_usage.total_tokens > 0;
-                let content = response
-                    .content
-                    .ok_or_else(|| IronCrewError::Provider("Empty response from LLM".into()))?;
+                let content = require_final_content(response.content)?;
 
                 // Run after_task hook if present
                 let final_output = if let Some(bytecode) = self.after_task_hook {
@@ -296,7 +205,7 @@ impl<'a> TaskExecutionContext<'a> {
                 return Ok((
                     final_output,
                     reasoning,
-                    if has_usage { Some(total_usage) } else { None },
+                    crate::llm::scope::snapshot(&tracker)?,
                 ));
             }
 
@@ -337,8 +246,24 @@ impl<'a> TaskExecutionContext<'a> {
                     self.task.name
                 );
 
-                let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let args = match crate::llm::tool_arguments::parse(&tool_call.function.arguments) {
+                    Ok(args) => args,
+                    Err(result) => {
+                        tracing::warn!(
+                            task = %self.task.name,
+                            tool = %tool_call.function.name,
+                            "Provider returned malformed JSON tool arguments"
+                        );
+                        messages.push(ChatMessage::tool(&tool_call.id, result));
+                        validate_chat_history(
+                            &messages,
+                            HARD_CHAT_HISTORY_MAX_MESSAGES,
+                            history_max_bytes,
+                            false,
+                        )?;
+                        continue;
+                    }
+                };
 
                 let tool_timeout = self
                     .tool_registry
@@ -352,7 +277,7 @@ impl<'a> TaskExecutionContext<'a> {
                     caller_agent: Some(self.agent.name.clone()),
                     caller_scope: Some(self.task.name.clone()),
                     ask_human: self.ask_human.cloned(),
-                    ..ToolCallContext::default()
+                    ..crate::llm::scope::tool_context(&provider)
                 };
                 let tool_result = match tokio::time::timeout(
                     tool_timeout,
@@ -398,7 +323,7 @@ pub async fn execute_task_standalone(
     memory_context: &str,
     messages_context: &str,
     should_stream: bool,
-) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, UsageSnapshot)> {
     execute_task_standalone_with_hooks(
         task,
         agent,
@@ -437,7 +362,7 @@ pub async fn execute_task_standalone_with_hooks(
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
     ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
-) -> Result<(String, Option<String>, Option<TaskTokenUsage>)> {
+) -> Result<(String, Option<String>, UsageSnapshot)> {
     let ctx = TaskExecutionContext {
         task,
         agent,
@@ -456,29 +381,4 @@ pub async fn execute_task_standalone_with_hooks(
         ask_human,
     };
     ctx.execute().await
-}
-
-#[cfg(test)]
-mod bounded_prompt_tests {
-    use super::*;
-
-    #[test]
-    fn unicode_prompt_truncation_is_character_safe_and_bounded() {
-        let mut prompt = BoundedPrompt::new(12);
-        prompt.section("Task: ", "🦀🦀🦀🦀🦀🦀🦀🦀");
-        let (text, truncated) = prompt.finish();
-        assert!(truncated);
-        assert!(text.chars().count() <= 12);
-        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn prompt_builder_stops_copying_after_limit() {
-        let mut prompt = BoundedPrompt::new(64);
-        prompt.section("Task: ", &"x".repeat(1_000_000));
-        prompt.section("Result: ", &"y".repeat(1_000_000));
-        let (text, truncated) = prompt.finish();
-        assert!(truncated);
-        assert!(text.len() <= 64);
-    }
 }

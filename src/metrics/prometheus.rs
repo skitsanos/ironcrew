@@ -3,9 +3,9 @@ use std::fmt::Write;
 use super::histogram::{DURATION_BUCKET_LABELS, Histogram};
 use super::state::Metrics;
 use super::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, ToolOutcome,
 };
 
 pub(crate) fn append(body: &mut String, metrics: &Metrics) {
@@ -40,6 +40,20 @@ pub(crate) fn append(body: &mut String, metrics: &Metrics) {
             .zip(metrics.tool_durations.iter()),
     );
 
+    writeln!(body, "# TYPE ironcrew_hook_failures_total counter").unwrap();
+    for &hook in HookKind::ALL {
+        for &stage in HookFailureStage::ALL {
+            let value = Metrics::counter(&metrics.hook_failures[hook.index()][stage.index()]);
+            writeln!(
+                body,
+                "ironcrew_hook_failures_total{{hook=\"{}\",stage=\"{}\"}} {value}",
+                hook.as_str(),
+                stage.as_str()
+            )
+            .unwrap();
+        }
+    }
+
     writeln!(body, "# TYPE ironcrew_provider_requests_total counter").unwrap();
     writeln!(
         body,
@@ -69,19 +83,7 @@ pub(crate) fn append(body: &mut String, metrics: &Metrics) {
         }
     }
 
-    writeln!(body, "# TYPE ironcrew_provider_tokens_total counter").unwrap();
-    for &family in ProviderFamily::ALL {
-        for &kind in TokenKind::ALL {
-            let value = Metrics::counter(&metrics.provider_tokens[family.index()][kind.index()]);
-            writeln!(
-                body,
-                "ironcrew_provider_tokens_total{{provider=\"{}\",type=\"{}\"}} {value}",
-                family.as_str(),
-                kind.as_str()
-            )
-            .unwrap();
-        }
-    }
+    metrics.usage.append(body);
 
     writeln!(body, "# TYPE ironcrew_sse_connections_total counter").unwrap();
     for &scope in SseScope::ALL {

@@ -1,3 +1,7 @@
+#[path = "support/usage.rs"]
+mod usage_fixture;
+use usage_fixture::fixture_usage;
+
 use ironcrew::engine::run_history::{
     JsonFileStore, ListRunsFilter, RunCompletion, RunIntent, RunRecord, RunStatus, RunTransition,
 };
@@ -32,8 +36,7 @@ async fn save_completed_run(
                 finished_at: record.finished_at.clone(),
                 duration_ms: record.duration_ms,
                 task_results: record.task_results.clone(),
-                total_tokens: record.total_tokens,
-                cached_tokens: record.cached_tokens,
+                usage: record.usage.clone(),
             },
         )
         .await
@@ -52,8 +55,7 @@ fn make_record(id: &str, status: RunStatus, started: &str, tags: Vec<String>) ->
         task_results: vec![],
         agent_count: 1,
         task_count: 1,
-        total_tokens: 0,
-        cached_tokens: 0,
+        usage: fixture_usage(0, 0),
         tags,
         owner_instance_id: String::new(),
         lease_expires_at: String::new(),
@@ -79,13 +81,12 @@ async fn test_save_and_load_run() {
             output: "done".into(),
             success: true,
             duration_ms: 3000,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
         }],
         agent_count: 1,
         task_count: 1,
-        total_tokens: 0,
-        cached_tokens: 0,
+        usage: fixture_usage(0, 0),
         tags: vec![],
         owner_instance_id: String::new(),
         lease_expires_at: String::new(),
@@ -131,8 +132,7 @@ async fn test_delete_run() {
         task_results: vec![],
         agent_count: 0,
         task_count: 0,
-        total_tokens: 0,
-        cached_tokens: 0,
+        usage: fixture_usage(0, 0),
         tags: vec![],
         owner_instance_id: String::new(),
         lease_expires_at: String::new(),
@@ -341,11 +341,10 @@ async fn json_store_intent_completion_roundtrip() {
                     output: "hi".into(),
                     success: true,
                     duration_ms: 4500,
-                    token_usage: None,
+                    usage: Default::default(),
                     reasoning: None,
                 }],
-                total_tokens: 100,
-                cached_tokens: 20,
+                usage: fixture_usage(100, 20),
             },
         )
         .await
@@ -356,8 +355,8 @@ async fn json_store_intent_completion_roundtrip() {
     assert_eq!(r.finished_at, "2026-04-23T10:00:05Z");
     assert_eq!(r.duration_ms, 5000);
     assert_eq!(r.task_results.len(), 1);
-    assert_eq!(r.total_tokens, 100);
-    assert_eq!(r.cached_tokens, 20);
+    assert_eq!(r.usage.settled.total_tokens().known(), Some(100));
+    assert_eq!(r.usage.settled.cached_tokens().known(), Some(20));
 }
 
 #[tokio::test]
@@ -490,8 +489,7 @@ async fn json_store_owner_lease_and_exactly_once_terminal_transition() {
                 finished_at: "9999-01-01T00:00:02Z".into(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -534,8 +532,7 @@ async fn json_store_persists_abort_once() {
                 finished_at: "2026-07-18T10:00:01Z".into(),
                 duration_ms: 1_000,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -553,8 +550,7 @@ async fn json_store_persists_abort_once() {
                 finished_at: "2026-07-18T10:00:02Z".into(),
                 duration_ms: 2_000,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -577,8 +573,7 @@ async fn json_store_reads_and_reconciles_legacy_unleased_run() {
         "task_results": [],
         "agent_count": 1,
         "task_count": 1,
-        "total_tokens": 0,
-        "cached_tokens": 0,
+        "usage": ironcrew::usage::UsageSnapshot::unavailable(),
         "tags": []
     });
     std::fs::write(

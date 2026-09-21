@@ -5,7 +5,7 @@ use crate::engine::agent::Agent;
 use crate::engine::executor::execute_task_standalone_with_hooks;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
-use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::engine::task::{Task, TaskResult};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
 use crate::utils::error::Result;
@@ -301,6 +301,30 @@ fn build_item_task(
     })
 }
 
+/// Result of a foreach task plus the per-item accounting the orchestrator
+/// needs to tell a wholly failed foreach (every item errored, so dependents
+/// would run on nothing) from a partial one (some items produced output).
+pub struct ForeachOutcome {
+    pub result: TaskResult,
+    pub executed_items: usize,
+    pub failed_items: usize,
+}
+
+impl ForeachOutcome {
+    /// A foreach that ran items and had every one of them fail.
+    pub fn is_wholly_failed(&self) -> bool {
+        self.executed_items > 0 && self.failed_items == self.executed_items
+    }
+
+    fn skipped(result: TaskResult) -> Self {
+        Self {
+            result,
+            executed_items: 0,
+            failed_items: 0,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_foreach_task(
     task: &Task,
@@ -317,7 +341,10 @@ pub async fn execute_foreach_task(
     before_task_hook: Option<&[u8]>,
     after_task_hook: Option<&[u8]>,
     ask_human: Option<&crate::engine::input_bridge::AskHumanContext>,
-) -> Result<TaskResult> {
+) -> Result<ForeachOutcome> {
+    let tracker = crate::llm::scope::child_scope(provider)?;
+    let scoped = crate::llm::scope::borrow_with_usage_tracker(provider, tracker.clone());
+    let provider: &dyn LlmProvider = &scoped;
     let item_var = task.foreach_as.as_deref().unwrap_or("item");
     validate_item_var(task, item_var)?;
 
@@ -339,28 +366,28 @@ pub async fn execute_foreach_task(
             serde_json::from_str::<Vec<serde_json::Value>>(s).unwrap_or_default()
         }
         _ => {
-            return Ok(TaskResult {
+            return Ok(ForeachOutcome::skipped(TaskResult {
                 task: task.name.clone(),
                 agent: String::new(),
                 output: format!("Skipped: foreach source '{}' is not an array", source_key),
                 success: false,
                 duration_ms: 0,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: None,
-            });
+            }));
         }
     };
 
     if items.is_empty() {
-        return Ok(TaskResult {
+        return Ok(ForeachOutcome::skipped(TaskResult {
             task: task.name.clone(),
             agent: String::new(),
             output: "Skipped: foreach source is empty".into(),
             success: true,
             duration_ms: 0,
-            token_usage: None,
+            usage: Default::default(),
             reasoning: None,
-        });
+        }));
     }
 
     let max_items = positive_env_usize(
@@ -406,7 +433,7 @@ pub async fn execute_foreach_task(
     // retaining the raw output, keeping the final serialized result bounded.
     let mut encoded_output_bytes = 2usize;
     let mut all_success = true;
-    let mut accumulated_usage = TaskTokenUsage::default();
+    let mut failed_items = 0usize;
     let start = Instant::now();
     let item_count = items.len();
 
@@ -464,21 +491,7 @@ pub async fn execute_foreach_task(
         let mut idx = 0usize;
         while let Some(result) = parallel_results.next().await {
             match result {
-                Ok((output, _reasoning, item_usage)) => {
-                    if let Some(u) = &item_usage {
-                        accumulated_usage.prompt_tokens = accumulated_usage
-                            .prompt_tokens
-                            .saturating_add(u.prompt_tokens);
-                        accumulated_usage.completion_tokens = accumulated_usage
-                            .completion_tokens
-                            .saturating_add(u.completion_tokens);
-                        accumulated_usage.total_tokens = accumulated_usage
-                            .total_tokens
-                            .saturating_add(u.total_tokens);
-                        accumulated_usage.cached_tokens = accumulated_usage
-                            .cached_tokens
-                            .saturating_add(u.cached_tokens);
-                    }
+                Ok((output, _reasoning, _item_usage)) => {
                     reserve_foreach_output(
                         &task.name,
                         &output,
@@ -498,6 +511,7 @@ pub async fn execute_foreach_task(
                     )?;
                     foreach_outputs.push(output);
                     all_success = false;
+                    failed_items += 1;
                 }
             }
             idx += 1;
@@ -544,21 +558,7 @@ pub async fn execute_foreach_task(
             )
             .await
             {
-                Ok((output, _reasoning, item_usage)) => {
-                    if let Some(u) = &item_usage {
-                        accumulated_usage.prompt_tokens = accumulated_usage
-                            .prompt_tokens
-                            .saturating_add(u.prompt_tokens);
-                        accumulated_usage.completion_tokens = accumulated_usage
-                            .completion_tokens
-                            .saturating_add(u.completion_tokens);
-                        accumulated_usage.total_tokens = accumulated_usage
-                            .total_tokens
-                            .saturating_add(u.total_tokens);
-                        accumulated_usage.cached_tokens = accumulated_usage
-                            .cached_tokens
-                            .saturating_add(u.cached_tokens);
-                    }
+                Ok((output, _reasoning, _item_usage)) => {
                     reserve_foreach_output(
                         &task.name,
                         &output,
@@ -578,6 +578,7 @@ pub async fn execute_foreach_task(
                     )?;
                     foreach_outputs.push(output);
                     all_success = false;
+                    failed_items += 1;
                 }
             }
         }
@@ -592,8 +593,9 @@ pub async fn execute_foreach_task(
         tracing::warn!("foreach task '{}' had some failures", task.name);
     }
 
-    // Store in memory
-    memory
+    // Store in memory. Best-effort: the items already ran, so a value that
+    // exceeds the memory cap must not discard the completed work.
+    if let Err(e) = memory
         .set(
             format!("task:{}", task.name),
             serde_json::json!({
@@ -602,78 +604,29 @@ pub async fn execute_foreach_task(
                 "count": item_count,
             }),
         )
-        .await?;
+        .await
+    {
+        tracing::warn!(
+            "foreach task '{}' result was not stored in memory: {}",
+            task.name,
+            e
+        );
+    }
 
-    let has_usage = accumulated_usage.total_tokens > 0;
-    Ok(TaskResult {
-        task: task.name.clone(),
-        agent: agent.name.clone(),
-        output: combined,
-        success: all_success,
-        duration_ms,
-        token_usage: if has_usage {
-            Some(accumulated_usage)
-        } else {
-            None
+    Ok(ForeachOutcome {
+        result: TaskResult {
+            task: task.name.clone(),
+            agent: agent.name.clone(),
+            output: combined,
+            success: all_success,
+            duration_ms,
+            usage: crate::llm::scope::snapshot(&tracker)?,
+            reasoning: None,
         },
-        reasoning: None,
+        executed_items: foreach_outputs.len(),
+        failed_items,
     })
 }
 
 #[cfg(test)]
-mod resource_limit_tests {
-    use super::*;
-
-    #[test]
-    fn encoded_output_budget_counts_json_escaping() {
-        let mut bytes = 2;
-        reserve_foreach_output("foreach", "\\\"", &mut bytes, 16).unwrap();
-        assert_eq!(bytes, serde_json::to_string(&vec!["\\\""]).unwrap().len());
-
-        let cap = bytes + 2;
-        let error = reserve_foreach_output("foreach", "too large", &mut bytes, cap).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("IRONCREW_FOREACH_MAX_OUTPUT_BYTES")
-        );
-    }
-
-    #[test]
-    fn repeated_item_expansion_is_bounded_without_splitting_utf8() {
-        let template = "${item}".repeat(10_000);
-        let replacement = "🦀".repeat(10_000);
-
-        let (expanded, truncated) = replace_bounded(&template, "${item}", &replacement, 128);
-
-        assert!(truncated);
-        assert_eq!(expanded.chars().count(), 128);
-        assert!(expanded.ends_with(FOREACH_TRUNCATION_MARKER));
-        assert!(std::str::from_utf8(expanded.as_bytes()).is_ok());
-        assert!(expanded.len() < 1024);
-    }
-
-    #[test]
-    fn non_string_item_serialization_respects_field_budget() {
-        let item = serde_json::json!({"payload": "é".repeat(100_000)});
-        let (text, truncated) = bounded_item_text(&item, 96);
-
-        assert!(truncated);
-        assert!(text.chars().count() <= 96);
-        assert!(text.ends_with(FOREACH_TRUNCATION_MARKER));
-        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn item_variable_name_has_a_fixed_hard_limit() {
-        let task = Task {
-            name: "foreach".into(),
-            ..Task::default()
-        };
-        let oversized = "x".repeat(HARD_FOREACH_ITEM_VAR_BYTES + 1);
-
-        let error = validate_item_var(&task, &oversized).unwrap_err();
-
-        assert!(error.to_string().contains("foreach_as"));
-    }
-}
+mod resource_limit_tests;

@@ -30,6 +30,9 @@ use async_trait::async_trait;
 /// built-in tools ignore the whole thing.
 #[derive(Default, Clone)]
 pub struct ToolCallContext {
+    /// Shared execution accounting, inherited unchanged through delegation.
+    pub usage_tracker: Option<crate::usage::UsageTracker>,
+
     /// Persistent session store (conversation/dialog records). `None`
     /// in CLI one-shot paths that don't need persistence.
     pub store: Option<Arc<dyn StateStore>>,
@@ -119,4 +122,52 @@ pub trait Tool: Send + Sync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCallContext) -> Result<String>;
+}
+
+/// Build a registry holding every built-in tool, for catalog listings.
+///
+/// This is the single source of truth for "what tools ship with IronCrew",
+/// shared by `ironcrew nodes` and `GET /nodes` so the two listings cannot
+/// drift. Tools are constructed with default (unscoped) policies because the
+/// catalog only reports names, descriptions, and schemas — it never executes
+/// them. Execution registries are built separately by the runtime, which
+/// applies filesystem roots, HTTP policy, and the `shell` opt-in.
+pub fn builtin_tool_catalog() -> registry::ToolRegistry {
+    let mut registry = registry::ToolRegistry::new();
+    registry.register(Box::new(file_read::FileReadTool::new(None)));
+    registry.register(Box::new(file_read_glob::FileReadGlobTool::new(None)));
+    registry.register(Box::new(file_write::FileWriteTool::new(None, None)));
+    registry.register(Box::new(web_scrape::WebScrapeTool::new(None)));
+    registry.register(Box::new(shell::ShellTool::new()));
+    registry.register(Box::new(http_request::HttpRequestTool::new()));
+    registry.register(Box::new(hash::HashTool::new()));
+    registry.register(Box::new(template_render::TemplateRenderTool::new()));
+    registry.register(Box::new(validate_schema::ValidateSchemaTool::new()));
+    registry.register(Box::new(ask_human::AskHumanTool::new()));
+    registry
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    #[test]
+    fn catalog_lists_every_built_in_tool() {
+        let mut names = super::builtin_tool_catalog().list();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "ask_human",
+                "file_read",
+                "file_read_glob",
+                "file_write",
+                "hash",
+                "http_request",
+                "shell",
+                "template_render",
+                "validate_schema",
+                "web_scrape",
+            ],
+            "the built-in catalog changed; update the CLI and HTTP docs together"
+        );
+    }
 }

@@ -37,10 +37,11 @@ helpers that live alongside `Crew.new` / `Agent.new`:
   `tools/*.lua` custom tools, conversational agents' tool-call handlers —
   without going through a `Crew` instance.
 - **`IRONCREW_MODE`** — Lua global set to `"run"` by `ironcrew run` and
-  `"chat"` by `ironcrew chat` before the entrypoint script executes. Flows
+  `"chat"` by `ironcrew chat`, and `"validate"` by `validate --evaluate`
+  before the entrypoint script executes. Flows
   that mix task-based and conversational use should guard their top-level
-  `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so
-  chat-mode boot-up doesn't trigger a full task execution.
+  `crew:run()` with `if IRONCREW_MODE == "run" then crew:run() end` so
+  chat boot-up and construction validation do not trigger task execution.
 - **`IRONCREW_MAX_FLOW_DEPTH`** — environment variable (default `5`) that
   caps recursive `run_flow`/`crew:subworkflow` nesting. Each child VM
   inherits `depth + 1`; exceeding the cap fails fast with a validation
@@ -265,7 +266,7 @@ When executing a task, the model is resolved through a priority chain:
 local crew = Crew.new({
     model = "gpt-5.6-luna",        -- default fallback
     models = {
-        task_execution = "gpt-4o",
+        task_execution = "gpt-5.6-terra",
         collaboration = "gpt-5.6-luna",
     },
 })
@@ -302,7 +303,7 @@ message bus. JSON is the only transfer medium between VMs.
 ### Server-wide Store Singleton
 
 `ironcrew serve` bootstraps a single `Arc<dyn StateStore>` at startup
-(`cmd_serve` in `src/api/mod.rs`) and hands the same handle to every
+(`cmd_serve` in `src/cli/server.rs`) and hands the same handle to every
 request via `AppState.store`. This keeps Postgres migrations and table
 checks one-shot, shares a single connection pool across conversations and
 runs, and ensures all handlers see a consistent view of persisted state.
