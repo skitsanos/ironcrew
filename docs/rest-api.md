@@ -135,7 +135,7 @@ be exactly `sha256:` followed by 64 lowercase hexadecimal characters.
 
 ```json
 {
-  "version": "4.0.0",
+  "version": "4.0.1",
   "instance_id": "replica-a",
   "process_start_id": "9b0d1822-c5e8-4bf1-8b78-8133f9287710",
   "deployment": {
@@ -1157,7 +1157,7 @@ curl http://localhost:3000/health
 ```json
 {
   "status": "ok",
-  "version": "4.0.0"
+  "version": "4.0.1"
 }
 ```
 
@@ -1172,7 +1172,7 @@ lifecycle withdrawal, readiness returns `503` with the exact current phase:
   "status": "not_ready",
   "component": "lifecycle",
   "lifecycle_state": "draining",
-  "version": "4.0.0"
+  "version": "4.0.1"
 }
 ```
 
