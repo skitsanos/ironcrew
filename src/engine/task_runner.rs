@@ -2,16 +2,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::engine::agent::{Agent, AgentSelector};
-use crate::engine::executor::{execute_task_standalone, execute_task_standalone_with_hooks};
-use crate::engine::task::{Task, TaskResult, TaskTokenUsage};
+use crate::engine::agent::Agent;
+use crate::engine::executor::execute_task_standalone_with_hooks;
+use crate::engine::task::{Task, TaskResult};
 use crate::llm::provider::LlmProvider;
 use crate::tools::registry::ToolRegistry;
+use crate::usage::UsageSnapshot;
 use crate::utils::error::IronCrewError;
 
 use crate::engine::input_bridge::AskHumanContext;
 use crate::engine::memory::MemoryStore;
 use crate::engine::messagebus::MessageBus;
+
+mod error_handler;
+pub use error_handler::handle_task_error;
 
 const DEFAULT_MAX_RETRY_BACKOFF_SECS: f64 = 300.0;
 const HARD_MAX_RETRY_BACKOFF_SECS: f64 = 3_600.0;
@@ -73,7 +77,7 @@ where
 
 /// Execute a single task with retry/timeout logic inside a spawned context.
 ///
-/// Returns `(task_name, agent_name, result, duration_ms, token_usage, reasoning)`.
+/// Returns `(task_name, agent_name, result, duration_ms, usage, reasoning)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_single_task(
     task: &Task,
@@ -94,9 +98,23 @@ pub async fn run_single_task(
     String,
     std::result::Result<String, IronCrewError>,
     u64,
-    Option<TaskTokenUsage>,
+    UsageSnapshot,
     Option<String>,
 ) {
+    let tracker = match crate::llm::scope::child_scope(provider.as_ref()) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            return (
+                task.name.clone(),
+                agent.name.clone(),
+                Err(error),
+                0,
+                UsageSnapshot::unavailable(),
+                None,
+            );
+        }
+    };
+    let provider = crate::llm::scope::with_usage_tracker(provider, tracker.clone());
     let task_observation = crate::engine::task_observation::TaskObservation::start();
     // Build memory context for this task
     let memory_context = memory.build_context(&task.description, 5).await;
@@ -131,7 +149,7 @@ pub async fn run_single_task(
         .unwrap_or(std::time::Duration::from_secs(300));
 
     let mut attempt = 0u32;
-    let (output, reasoning, token_usage) = loop {
+    let (mut output, reasoning) = loop {
         let result = execute_task_standalone_with_hooks(
             &task_owned,
             &agent_owned,
@@ -150,10 +168,10 @@ pub async fn run_single_task(
             ask_human.as_ref(),
         );
         match timeout_excluding_human_wait(timeout_dur, ask_human.as_ref(), result).await {
-            Ok(Ok((out, reas, usage))) => break (Ok(out), reas, usage),
+            Ok(Ok((out, reas, _usage))) => break (Ok(out), reas),
             Ok(Err(e)) => {
-                if attempt >= max_retries {
-                    break (Err(e), None, None);
+                if !e.allows_task_retry() || attempt >= max_retries {
+                    break (Err(e), None);
                 }
                 let backoff = retry_backoff(attempt, base_backoff);
                 tracing::warn!(
@@ -175,7 +193,6 @@ pub async fn run_single_task(
                             message: format!("Timed out after {}s", timeout_dur.as_secs()),
                         }),
                         None,
-                        None,
                     );
                 }
                 let backoff = retry_backoff(attempt, base_backoff);
@@ -192,6 +209,13 @@ pub async fn run_single_task(
         }
     };
 
+    let usage = match crate::llm::scope::snapshot(&tracker) {
+        Ok(usage) => usage,
+        Err(error) => {
+            output = Err(error);
+            UsageSnapshot::unavailable()
+        }
+    };
     let duration = start.elapsed().as_millis() as u64;
     task_observation.finish(if output.is_ok() {
         crate::metrics::TaskOutcome::Success
@@ -203,134 +227,7 @@ pub async fn run_single_task(
         agent_owned.name.clone(),
         output,
         duration,
-        token_usage,
+        usage,
         reasoning,
     )
-}
-
-/// Handle a task error by running the on_error handler task if one is configured.
-///
-/// Returns `Some((recovered_result, handler_result))` if the error was handled successfully.
-/// Returns `None` if no handler was found or the handler itself failed.
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_task_error(
-    task: &Task,
-    agent_name: &str,
-    error_msg: &str,
-    crew_tasks: &[Task],
-    crew_agents: &[Agent],
-    provider: Arc<dyn LlmProvider>,
-    tool_registry: &ToolRegistry,
-    results: &HashMap<String, TaskResult>,
-    memory: &MemoryStore,
-    model: &str,
-    max_tool_rounds: usize,
-) -> Option<(TaskResult, Option<TaskResult>)> {
-    let error_handler_name = task.on_error.as_ref()?;
-
-    tracing::info!(
-        "Task '{}' failed, routing to error handler '{}'",
-        task.name,
-        error_handler_name
-    );
-
-    let error_handler = crew_tasks.iter().find(|t| t.name == *error_handler_name);
-    let error_handler = match error_handler {
-        Some(h) => h,
-        None => {
-            tracing::warn!(
-                "on_error handler '{}' not found for task '{}'",
-                error_handler_name,
-                task.name
-            );
-            return None;
-        }
-    };
-
-    let mut error_task = error_handler.clone();
-    let error_context = format!(
-        "Error from task '{}' (agent: {}): {}",
-        task.name, agent_name, error_msg
-    );
-    error_task.context = Some(
-        error_task
-            .context
-            .as_ref()
-            .map_or(error_context.clone(), |existing| {
-                format!("{}\n\n{}", existing, error_context)
-            }),
-    );
-
-    let error_agent = if let Some(ref ea_name) = error_task.agent {
-        crew_agents.iter().find(|a| a.name == *ea_name).unwrap_or(
-            crew_agents
-                .iter()
-                .find(|a| a.name == agent_name)
-                .unwrap_or(&crew_agents[0]),
-        )
-    } else {
-        AgentSelector::select(crew_agents, &error_task)
-    };
-
-    let error_model = error_agent
-        .model
-        .clone()
-        .unwrap_or_else(|| model.to_string());
-    let error_start = Instant::now();
-
-    // Provide empty memory_context placeholder (consistent with original)
-    let _memory = memory;
-
-    let task_observation = crate::engine::task_observation::TaskObservation::start();
-    match execute_task_standalone(
-        &error_task,
-        error_agent,
-        provider.as_ref(),
-        tool_registry,
-        results,
-        &error_model,
-        max_tool_rounds,
-        "",
-        "",
-        false,
-    )
-    .await
-    {
-        Ok((output, reasoning, token_usage)) => {
-            task_observation.finish(crate::metrics::TaskOutcome::Success);
-            tracing::info!(
-                "Error handler '{}' succeeded, task '{}' recovered",
-                error_handler_name,
-                task.name
-            );
-            let recovered_result = TaskResult {
-                task: task.name.clone(),
-                agent: agent_name.to_string(),
-                output: format!("Recovered via '{}': {}", error_handler_name, output),
-                success: true,
-                duration_ms: 0, // caller sets actual duration
-                token_usage: None,
-                reasoning: None,
-            };
-            let handler_result = TaskResult {
-                task: error_handler_name.clone(),
-                agent: error_agent.name.clone(),
-                output,
-                success: true,
-                duration_ms: error_start.elapsed().as_millis() as u64,
-                token_usage,
-                reasoning,
-            };
-            Some((recovered_result, Some(handler_result)))
-        }
-        Err(handler_err) => {
-            task_observation.finish(crate::metrics::TaskOutcome::Error);
-            tracing::error!(
-                "Error handler '{}' also failed: {}",
-                error_handler_name,
-                handler_err
-            );
-            None
-        }
-    }
 }

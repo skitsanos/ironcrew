@@ -181,6 +181,9 @@ impl Tool for LuaScriptTool {
             lua.set_app_data(context.clone());
         }
         lua.set_app_data(SubflowDepth(ctx.depth));
+        if let Some(tracker) = &ctx.usage_tracker {
+            lua.set_app_data(tracker.clone());
+        }
         if let Some(ref eventbus) = ctx.eventbus {
             lua.set_app_data(eventbus.clone());
         }

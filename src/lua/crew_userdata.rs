@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::engine::crew::Crew;
 use crate::engine::eventbus::EventBus;
 use crate::engine::messagebus::{Message, MessageType};
-use crate::engine::run_history::{RunCompletion, RunTransition};
+use crate::engine::run_history::RunCompletion;
 use crate::engine::runtime::Runtime;
 use crate::engine::store::{StateStore, create_store};
 use crate::llm::provider::LlmProvider;
@@ -23,58 +23,10 @@ use super::json::{json_value_to_lua, lua_value_to_json};
 use super::parsers::{agent_from_lua_table, task_from_lua_table};
 use super::subflow::{SubflowContext, SubflowDepth, invoke_subflow};
 
-// ---------------------------------------------------------------------------
-// API-owned run lifecycle
-// ---------------------------------------------------------------------------
-
-/// Completion produced by `crew:run()` while the enclosing HTTP-owned Lua
-/// entrypoint is still executing.
-///
-/// CLI runs do not install this context and continue to persist completion
-/// directly from `crew:run()`. The HTTP runner installs it so flow-level Lua
-/// can safely continue after the crew finishes (including suspending on a
-/// later `crew:ask_human()`) without making the durable run terminal early.
-#[derive(Debug, Clone)]
-pub(crate) struct StagedRunCompletion {
-    pub(crate) run_id: String,
-    pub(crate) completion: RunCompletion,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StagedRunSummary {
-    pub(crate) run_id: String,
-    pub(crate) status: crate::engine::run_history::RunStatus,
-    pub(crate) duration_ms: u64,
-    pub(crate) total_tokens: u32,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ApiRunLifecycle {
-    completion: Arc<Mutex<Option<StagedRunCompletion>>>,
-}
-
-impl ApiRunLifecycle {
-    async fn stage(&self, run_id: String, completion: RunCompletion) {
-        *self.completion.lock().await = Some(StagedRunCompletion { run_id, completion });
-    }
-
-    pub(crate) async fn take_completion(&self) -> Option<StagedRunCompletion> {
-        self.completion.lock().await.take()
-    }
-
-    pub(crate) async fn completion_summary(&self) -> Option<StagedRunSummary> {
-        self.completion
-            .lock()
-            .await
-            .as_ref()
-            .map(|staged| StagedRunSummary {
-                run_id: staged.run_id.clone(),
-                status: staged.completion.status.clone(),
-                duration_ms: staged.completion.duration_ms,
-                total_tokens: staged.completion.total_tokens,
-            })
-    }
-}
+mod output;
+mod run_lifecycle;
+mod usage;
+pub(crate) use run_lifecycle::ApiRunLifecycle;
 
 // ---------------------------------------------------------------------------
 // LuaCrew — Lua userdata wrapping a Crew + Runtime
@@ -95,6 +47,8 @@ pub struct LuaCrew {
     /// most for PostgreSQL, where each `create_store()` call would
     /// otherwise spin up a fresh connection pool.
     pub store: OnceCell<Arc<dyn StateStore>>,
+    /// Process-local snapshot of the latest run that entered execution.
+    pub(crate) last_run_usage: std::sync::Mutex<Option<crate::usage::UsageTracker>>,
     /// Parsed MCP server configuration (set at Crew.new() time).
     #[cfg(feature = "mcp")]
     pub mcp_config: Option<McpConfig>,
@@ -289,31 +243,8 @@ pub(crate) async fn finalize_agent_tools(
 
 impl UserData for LuaCrew {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // Use add_async_method for all methods to avoid block_on inside Tokio
-        methods.add_async_method("add_agent", |_, this, table: Table| async move {
-            let agent = agent_from_lua_table(&table)?;
-            let agent_name = agent.name.clone();
-
-            let mut crew = this.crew.lock().await;
-
-            // Validate uniqueness/count before mutating hook maps so a
-            // rejected agent leaves the existing crew unchanged.
-            crew.add_agent(agent).map_err(mlua::Error::external)?;
-
-            // Extract before_task hook if present and store as bytecode
-            if let Ok(func) = table.get::<mlua::Function>("before_task") {
-                let bytecode = func.dump(false);
-                crew.before_task_hooks.insert(agent_name.clone(), bytecode);
-            }
-
-            // Extract after_task hook if present and store as bytecode
-            if let Ok(func) = table.get::<mlua::Function>("after_task") {
-                let bytecode = func.dump(false);
-                crew.after_task_hooks.insert(agent_name.clone(), bytecode);
-            }
-
-            Ok(())
-        });
+        agent_construction::register(methods);
+        usage::register(methods);
 
         methods.add_async_method("add_task", |_, this, table: Table| async move {
             let task = task_from_lua_table(&table)?;
@@ -373,6 +304,7 @@ impl UserData for LuaCrew {
                     .map(|context| context.clone());
 
                 let ctx = SubflowContext {
+                    usage_tracker: super::usage::tracker(&lua)?,
                     runtime: this.runtime.clone(),
                     project_dir: Arc::new(this.project_dir.clone()),
                     depth,
@@ -722,6 +654,7 @@ impl UserData for LuaCrew {
             };
 
             let conv = build_conversation(
+                &lua,
                 table,
                 &agents,
                 provider,
@@ -804,6 +737,12 @@ impl UserData for LuaCrew {
 
         methods.add_async_method("run", |lua, this, ()| async move {
             super::bootstrap::reject_effect(&lua, "crew:run")?;
+            let provider = this
+                .custom_provider
+                .as_ref()
+                .unwrap_or(&this.runtime.provider)
+                .clone();
+            let provider = super::usage::bind(&lua, provider)?;
             let run_start = chrono::Utc::now();
             let api_lifecycle = lua
                 .app_data_ref::<ApiRunLifecycle>()
@@ -899,12 +838,16 @@ impl UserData for LuaCrew {
                 });
             }
 
-            let provider: Arc<dyn LlmProvider> = match &this.custom_provider {
-                Some(p) => p.clone(),
-                None => this.runtime.provider.clone(),
+            *this.last_run_usage.lock().expect("usage lock poisoned") = provider.usage_tracker();
+            let tracker = provider.usage_tracker().expect("run provider is scoped");
+            let mut run_outcome = crew.run(provider, &tool_registry).await;
+            let usage = match crate::llm::scope::snapshot(&tracker) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    run_outcome = Err(error);
+                    crate::usage::UsageSnapshot::unavailable()
+                }
             };
-
-            let run_outcome = crew.run(provider, &tool_registry).await;
 
             let run_end = chrono::Utc::now();
             let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
@@ -918,6 +861,7 @@ impl UserData for LuaCrew {
                         &run_start.to_rfc3339(),
                         &run_end.to_rfc3339(),
                         total_ms,
+                        usage.clone(),
                     );
                     record.tags = tags.clone();
                     let completion = RunCompletion {
@@ -929,51 +873,16 @@ impl UserData for LuaCrew {
                         // Transfer that owned copy into persistence instead of
                         // deep-cloning every TaskResult a second time.
                         task_results: std::mem::take(&mut record.task_results),
-                        total_tokens: record.total_tokens,
-                        cached_tokens: record.cached_tokens,
+                        usage: record.usage,
                     };
-                    if let Some(lifecycle) = api_lifecycle.as_ref() {
-                        lifecycle.stage(run_id.clone(), completion).await;
-                    } else {
-                        // CLI-owned runs finish at `crew:run()`, so preserve
-                        // their historical immediate persistence behavior.
-                        let status = completion.status.clone();
-                        let transition = store
-                            .update_run_completion(&run_id, completion)
-                            .await
-                            .map_err(|error| {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Error,
-                                );
-                                crate::metrics::record_store_failure(
-                                    crate::metrics::StoreOperation::TerminalPersistence,
-                                );
-                                mlua::Error::external(error)
-                            })?;
-                        match transition {
-                            RunTransition::Applied => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Success,
-                                );
-                                if let Some(outcome) =
-                                    crate::metrics::RunOutcome::from_status(&status)
-                                {
-                                    crate::metrics::record_run(
-                                        outcome,
-                                        Some(std::time::Duration::from_millis(total_ms)),
-                                    );
-                                }
-                            }
-                            RunTransition::AlreadyTerminal(_) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Fenced,
-                                );
-                            }
-                        }
-                    }
+                    run_lifecycle::complete_run(
+                        &store,
+                        api_lifecycle.as_ref(),
+                        &run_id,
+                        completion,
+                    )
+                    .await
+                    .map_err(mlua::Error::external)?;
                     results
                 }
                 Err(e) => {
@@ -982,68 +891,23 @@ impl UserData for LuaCrew {
                         finished_at: run_end.to_rfc3339(),
                         duration_ms: total_ms,
                         task_results: Vec::new(),
-                        total_tokens: 0,
-                        cached_tokens: 0,
+                        usage,
                     };
-                    if let Some(lifecycle) = api_lifecycle.as_ref() {
-                        lifecycle.stage(run_id.clone(), completion).await;
-                    } else {
-                        // Best-effort completion on the error path: swallow
-                        // persistence errors because the crew failure takes
-                        // precedence for CLI callers.
-                        match store.update_run_completion(&run_id, completion).await {
-                            Ok(RunTransition::Applied) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Success,
-                                );
-                                crate::metrics::record_run(
-                                    crate::metrics::RunOutcome::Failed,
-                                    Some(std::time::Duration::from_millis(total_ms)),
-                                );
-                            }
-                            Ok(RunTransition::AlreadyTerminal(_)) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Fenced,
-                                );
-                            }
-                            Err(_) => {
-                                crate::metrics::record_terminal_persistence(
-                                    crate::metrics::TerminalScope::RunRecord,
-                                    crate::metrics::TerminalOutcome::Error,
-                                );
-                                crate::metrics::record_store_failure(
-                                    crate::metrics::StoreOperation::TerminalPersistence,
-                                );
-                            }
-                        }
-                    }
+                    // Retain the execution error if best-effort persistence fails.
+                    let _ = run_lifecycle::complete_run(
+                        &store,
+                        api_lifecycle.as_ref(),
+                        &run_id,
+                        completion,
+                    )
+                    .await;
                     return Err(mlua::Error::external(e));
                 }
             };
 
-            // Convert results to Lua table
-            let results_table = lua.create_table()?;
-            for (i, result) in results.iter().enumerate() {
-                let entry = lua.create_table()?;
-                entry.set("task", result.task.clone())?;
-                entry.set("agent", result.agent.clone())?;
-                entry.set("output", result.output.clone())?;
-                entry.set("success", result.success)?;
-                entry.set("duration_ms", result.duration_ms)?;
-                if let Some(ref usage) = result.token_usage {
-                    let usage_table = lua.create_table()?;
-                    usage_table.set("prompt_tokens", usage.prompt_tokens)?;
-                    usage_table.set("completion_tokens", usage.completion_tokens)?;
-                    usage_table.set("total_tokens", usage.total_tokens)?;
-                    usage_table.set("cached_tokens", usage.cached_tokens)?;
-                    entry.set("token_usage", usage_table)?;
-                }
-                results_table.set(i + 1, entry)?;
-            }
-
-            Ok(results_table)
+            output::results_to_lua(&lua, &results)
         });
     }
 }
+
+mod agent_construction;

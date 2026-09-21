@@ -101,6 +101,8 @@ async fn spawn_server(root: &Path) -> Server {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         max_active_runs: 2,
         run_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+        max_active_inspections: 2,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
         max_sse_connections: 2,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(2)),
         max_run_lifetime: Duration::from_secs(10),
@@ -142,7 +144,7 @@ async fn start(client: &reqwest::Client, server: &Server, flow: &str) -> reqwest
     .expect("conversation bootstrap request")
 }
 
-async fn assert_blocked(response: reqwest::Response, capability: &str) {
+async fn assert_blocked(response: reqwest::Response, capability: &str, phase: &str) {
     let status = response.status();
     let body: serde_json::Value = response.json().await.unwrap();
     let error = body["error"].as_str().unwrap();
@@ -152,10 +154,7 @@ async fn assert_blocked(response: reqwest::Response, capability: &str) {
         "unexpected error: {error}"
     );
     assert!(error.contains(capability), "unexpected error: {error}");
-    assert!(
-        error.contains("HTTP conversation bootstrap"),
-        "unexpected error: {error}"
-    );
+    assert!(error.contains(phase), "unexpected error: {error}");
 }
 
 fn crew_definition(goal: &str, extra: &str) -> String {
@@ -312,23 +311,46 @@ return {{
     let server = spawn_server(root).await;
     let client = reqwest::Client::new();
 
-    assert_blocked(start(&client, &server, "http-effect").await, "http.get").await;
-    assert_blocked(start(&client, &server, "subflow-effect").await, "run_flow").await;
-    assert_blocked(start(&client, &server, "run-effect").await, "crew:run").await;
+    assert_blocked(
+        start(&client, &server, "http-effect").await,
+        "http.get",
+        "HTTP conversation bootstrap",
+    )
+    .await;
+    assert_blocked(
+        start(&client, &server, "subflow-effect").await,
+        "run_flow",
+        "HTTP conversation bootstrap",
+    )
+    .await;
+    assert_blocked(
+        start(&client, &server, "run-effect").await,
+        "crew:run",
+        "HTTP conversation bootstrap",
+    )
+    .await;
     assert_blocked(
         start(&client, &server, "memory-effect").await,
         "crew:memory_set",
+        "HTTP conversation bootstrap",
     )
     .await;
-    assert_blocked(start(&client, &server, "config-effect").await, "http.get").await;
+    assert_blocked(
+        start(&client, &server, "config-effect").await,
+        "http.get",
+        "config.lua evaluation",
+    )
+    .await;
     assert_blocked(
         start(&client, &server, "definition-effect").await,
         "http.get",
+        "HTTP conversation bootstrap",
     )
     .await;
     assert_blocked(
         start(&client, &server, "tool-definition-effect").await,
         "http.get",
+        "HTTP conversation bootstrap",
     )
     .await;
 

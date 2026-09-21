@@ -29,6 +29,7 @@ fn conv(
         ));
     }
     ConversationRecord {
+        usage: Default::default(),
         id: id.into(),
         flow_name: "flow".into(),
         flow_path: flow_path.map(|s| s.into()),

@@ -1,5 +1,5 @@
 -- OpenAI Responses API — with reasoning and streaming
--- Model: gpt-5.4-nano (cheapest reasoning-capable model)
+-- Model: gpt-5.6-luna (cheap, fast, reasoning-capable)
 -- Reasoning summary is captured in the run record under `reasoning`.
 -- With stream=true, reasoning summary deltas appear dim on stderr.
 -- Requires: OPENAI_API_KEY
@@ -7,9 +7,8 @@
 local crew = Crew.new({
     goal = "Verify OpenAI Responses reasoning + streaming",
     provider = "openai-responses",
-    model = "gpt-5.4-nano",
-    api_key = env("OPENAI_API_KEY"),
-    reasoning_effort = "medium",
+    model = "gpt-5.6-luna",
+    reasoning_effort = "low",
     reasoning_summary = "auto",
     stream = true,
 })
@@ -25,4 +24,6 @@ crew:add_task({
     agent = "solver",
 })
 
+-- Construction validation needs no credential and stops before paid execution.
+if IRONCREW_MODE == "validate" then return end
 crew:run()

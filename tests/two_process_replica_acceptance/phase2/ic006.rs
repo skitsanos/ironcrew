@@ -250,7 +250,8 @@ async fn scenario(pair: &mut ProcessPair) {
     let terminal = wait_for_status(pair, &run_id, "Aborted").await;
     assert_eq!(terminal["owner_instance_id"], pair.owner_a_id);
     assert_eq!(terminal["lease_expires_at"], "");
-    assert_eq!(terminal["total_tokens"], 0);
+    assert_eq!(terminal["usage"]["settled"]["requests"], "0");
+    assert_eq!(terminal["usage"]["coverage"], "complete");
     assert_eq!(terminal["task_results"].as_array().map(Vec::len), Some(1));
     assert_eq!(terminal["task_results"][0]["task"], "skipped");
     assert_eq!(terminal["task_results"][0]["success"], true);

@@ -1,4 +1,3 @@
-use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +25,7 @@ pub async fn serve_with_lifecycle(
     state: Arc<AppState>,
     heartbeat_handle: tokio::task::JoinHandle<()>,
     idle_eviction_handle: tokio::task::JoinHandle<()>,
+    http_limits: super::http_limits::HttpLimits,
     config: ShutdownConfig,
 ) -> Result<()> {
     let ShutdownConfig {
@@ -33,28 +33,22 @@ pub async fn serve_with_lifecycle(
         teardown_timeout,
         background_drain,
     } = config;
-    let (stop_listener_tx, mut stop_listener_rx) = tokio::sync::watch::channel(false);
+    let (stop_listener_tx, stop_listener_rx) = tokio::sync::watch::channel(false);
     let (stopping_tx, mut stopping_rx) = tokio::sync::oneshot::channel();
     let signal_state = state.clone();
     let mut coordinator = tokio::spawn(async move {
         coordinate_signals(signal_state, routing_grace, stop_listener_tx, stopping_tx).await
     });
 
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = stop_listener_rx.wait_for(|stopping| *stopping).await;
-    })
-    .into_future();
+    let serve = super::http_server::serve(listener, app, stop_listener_rx, http_limits);
     tokio::pin!(serve);
 
     let outcome = tokio::select! {
-        result = &mut serve => {
-            coordinator.abort();
-            result.map_err(|error| IronCrewError::Validation(format!("Server error: {error}")))
-        }
+        // The coordinator sends `stopping` immediately before it closes the
+        // listener. If both futures become ready in the same scheduler turn,
+        // teardown must win; aborting the coordinator here could otherwise
+        // leave an active durable run to expire as Abandoned.
+        biased;
         stopping = &mut stopping_rx => {
             if stopping.is_err() {
                 match coordinator.await {
@@ -91,6 +85,10 @@ pub async fn serve_with_lifecycle(
                     }
                 }
             }
+        }
+        result = &mut serve => {
+            coordinator.abort();
+            result.map_err(|error| IronCrewError::Validation(format!("Server error: {error}")))
         }
     };
 

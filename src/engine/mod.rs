@@ -1,4 +1,8 @@
 pub mod agent;
+// This module is a public library contract; the binary declares the same
+// module tree privately and does not consume every public surface directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod app_db;
 pub mod audit;
 pub mod collaborative;
 pub mod condition;
@@ -19,10 +23,14 @@ pub mod human_input;
 pub mod idempotency;
 pub mod input_bridge;
 pub mod interpolate;
+mod json_file_store;
+mod json_file_store_core_ops;
+mod json_file_store_runtime;
 pub mod memory;
 pub mod messagebus;
 pub mod model_router;
 pub mod orchestrator;
+pub mod pg_runtime;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 pub mod reconciler;
@@ -33,9 +41,11 @@ pub(crate) mod run_event_timing;
 pub mod run_events;
 pub mod run_history;
 pub mod runtime;
+pub(crate) mod session_usage;
 pub mod sessions;
 pub mod sqlite_store;
 pub mod store;
+mod store_bootstrap;
 pub mod store_sql;
 pub mod task;
 pub(crate) mod task_observation;

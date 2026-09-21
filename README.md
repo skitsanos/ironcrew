@@ -4,6 +4,10 @@
 
 Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native), Google Gemini, Groq, Kimi K2.5, DeepSeek, xAI/Grok, Ollama, and any OpenAI-compatible API. Supports reasoning/thinking capture across providers. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
+IronCrew **4.0.0** introduces checked usage accounting and shared token budgets.
+Read the [release and upgrade notes](docs/releases/v4.0.0.md) before moving
+existing clients or stored runs to the new usage-accounting contract.
+
 ```lua
 local crew = Crew.new({
     goal = "Research and summarize a topic",
@@ -59,7 +63,7 @@ local results = crew:run()
 
 ## Quick Start
 
-> **Prerequisites:** Rust **1.97.1** or newer is the minimum supported toolchain
+> **Prerequisites:** Rust **1.98.1** or newer is the minimum supported toolchain
 > (some dependencies require it to compile). Install via [rustup](https://rustup.rs)
 > and run `rustup update stable`.
 
@@ -106,8 +110,15 @@ ironcrew run .
 | [Crew Effectiveness Evaluation](evaluations/crew-effectiveness/README.md) | Reproducible single-agent vs DAG vs collaborative quality, latency, and token comparison |
 | [Storage](docs/storage.md) | Storage backends — JSON files, SQLite, configuration, schema |
 | [Providers](docs/providers.md) | OpenAI, Anthropic, OpenAI Responses, Gemini, Groq, Kimi, DeepSeek, xAI, Ollama — configuration, reasoning, server-side tools |
+| [Run Token Budgets](docs/token-budgets.md) | Opt-in shared input/output ceilings, conservative reservations, supported providers and scope boundaries |
+| [Live Compatibility Smoke](evaluations/live-smoke/README.md) | Opt-in bounded Luna CLI/HTTP/HITL checks, offline regressions and protected nightly setup |
 | [Cloud Deployment](docs/cloud-deployment.md) | Kubernetes, OpenShift, Railway — graceful shutdown, resource limits, security posture |
 | [Best Practices](docs/best-practices.md) | Prompt design, error handling, performance, security |
+
+Construction can be checked before a paid run with `ironcrew validate --evaluate`.
+It uses the real Lua constructors without provider, tool, or storage effects;
+execution-dependent paths return an explicit nonzero incomplete result. See
+[validation boundaries and exit codes](docs/cli.md#validate).
 
 ## Examples
 

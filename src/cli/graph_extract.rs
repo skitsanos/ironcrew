@@ -624,6 +624,28 @@ fn register_stub_globals(lua: &mlua::Lua) -> mlua::Result<()> {
     http.set("request", http_stub)?;
     lua.globals().set("http", http)?;
 
+    // postgres.execute / query / query_one — the graph-extraction VM never
+    // talks to a real database; stub every method so a script that touches
+    // the app-data capability before reaching Crew.new() gets captured
+    // instead of crashing on a nil index.
+    let postgres = lua.create_table()?;
+    postgres.set(
+        "execute",
+        lua.create_function(|_, _args: mlua::MultiValue| Ok(0i64))?,
+    )?;
+    postgres.set(
+        "query",
+        lua.create_function(|lua, _args: mlua::MultiValue| lua.create_table())?,
+    )?;
+    postgres.set(
+        "query_one",
+        lua.create_function(|lua, _args: mlua::MultiValue| {
+            let deep_nil: mlua::Function = lua.globals().get("__ironcrew_deep_nil")?;
+            deep_nil.call::<mlua::Value>(())
+        })?,
+    )?;
+    lua.globals().set("postgres", postgres)?;
+
     // json_parse — returns an empty table for any input
     lua.globals().set(
         "json_parse",

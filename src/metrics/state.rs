@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use super::histogram::{Histogram, saturating_add};
 use super::{
-    LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome, ReconciliationOutcome,
-    RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome, TerminalOutcome, TerminalScope,
-    TokenKind, ToolOutcome,
+    HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
+    ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
+    TerminalOutcome, TerminalScope, ToolOutcome,
 };
 
 pub(crate) struct Metrics {
@@ -15,11 +15,12 @@ pub(crate) struct Metrics {
     pub(crate) task_durations: [Histogram; TaskOutcome::COUNT],
     pub(crate) tool_counts: [AtomicU64; ToolOutcome::COUNT],
     pub(crate) tool_durations: [Histogram; ToolOutcome::COUNT],
+    pub(crate) hook_failures: [[AtomicU64; HookFailureStage::COUNT]; HookKind::COUNT],
     pub(crate) provider_counts:
         [[[AtomicU64; ProviderOutcome::COUNT]; ProviderOperation::COUNT]; ProviderFamily::COUNT],
     pub(crate) provider_durations:
         [[[Histogram; ProviderOutcome::COUNT]; ProviderOperation::COUNT]; ProviderFamily::COUNT],
-    pub(crate) provider_tokens: [[AtomicU64; TokenKind::COUNT]; ProviderFamily::COUNT],
+    pub(crate) usage: super::usage::UsageMetrics,
     pub(crate) sse_counts: [[AtomicU64; SseOutcome::COUNT]; SseScope::COUNT],
     pub(crate) lease_losses: [AtomicU64; LeaseScope::COUNT],
     pub(crate) reconciliation_cycles: [AtomicU64; ReconciliationOutcome::COUNT],
@@ -37,13 +38,14 @@ impl Default for Metrics {
             task_durations: std::array::from_fn(|_| Histogram::default()),
             tool_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             tool_durations: std::array::from_fn(|_| Histogram::default()),
+            hook_failures: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             provider_counts: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
             }),
             provider_durations: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::array::from_fn(|_| Histogram::default()))
             }),
-            provider_tokens: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            usage: super::usage::UsageMetrics::default(),
             sse_counts: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             lease_losses: std::array::from_fn(|_| AtomicU64::new(0)),
             reconciliation_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -76,6 +78,10 @@ impl Metrics {
         self.tool_durations[outcome.index()].record(duration);
     }
 
+    pub(crate) fn record_hook_failure(&self, hook: HookKind, stage: HookFailureStage) {
+        saturating_add(&self.hook_failures[hook.index()][stage.index()], 1);
+    }
+
     pub(crate) fn record_provider(
         &self,
         family: ProviderFamily,
@@ -87,12 +93,6 @@ impl Metrics {
         saturating_add(counter, 1);
         self.provider_durations[family.index()][operation.index()][outcome.index()]
             .record(duration);
-    }
-
-    pub(crate) fn record_provider_tokens(&self, family: ProviderFamily, values: [u64; 3]) {
-        for (kind, value) in TokenKind::ALL.iter().copied().zip(values) {
-            saturating_add(&self.provider_tokens[family.index()][kind.index()], value);
-        }
     }
 
     pub(crate) fn record_sse(&self, scope: SseScope, outcome: SseOutcome) {

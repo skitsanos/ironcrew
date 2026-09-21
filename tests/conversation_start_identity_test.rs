@@ -68,6 +68,8 @@ fn app_state(root: &Path, store: Arc<dyn StateStore>) -> Arc<AppState> {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_active_runs: 1,
         run_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_active_inspections: 1,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_sse_connections: 1,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_run_lifetime: Duration::from_secs(60),

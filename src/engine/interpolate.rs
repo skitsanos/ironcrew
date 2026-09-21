@@ -158,7 +158,7 @@ mod bounded_tests {
                 output: "é".repeat(1024 * 1024),
                 success: true,
                 duration_ms: 1,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: None,
             },
         );

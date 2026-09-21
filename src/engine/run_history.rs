@@ -21,6 +21,8 @@ use crate::engine::sessions::{
 use crate::engine::task::TaskResult;
 use crate::utils::error::{IronCrewError, Result};
 
+pub use super::json_file_store::JsonFileStore;
+use super::json_file_store_runtime::JsonFileStoreCore;
 use super::store::StateStore;
 
 type JsonRunLockRegistry = Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>;
@@ -229,7 +231,7 @@ fn write_serialized_record_create_new<T: Serialize>(
 /// runtime. Share one process-local lock per runs directory so their
 /// read-modify-write cycles cannot resurrect a record that another handle just
 /// terminalized.
-fn shared_json_run_lock(runs_dir: &Path) -> Arc<Mutex<()>> {
+pub(super) fn shared_json_run_lock(runs_dir: &Path) -> Arc<Mutex<()>> {
     let key = std::fs::canonicalize(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
     let registry = JSON_RUN_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut registry = registry
@@ -422,27 +424,8 @@ fn flow_filter_matches(record: &ConversationRecord, flow_path: Option<&str>) -> 
 
 // ── Dialog on-disk helpers (mirror the conversation helpers above) ──────
 
-fn dialog_file_path(dialogs_dir: &Path, flow_path: Option<&str>, id: &str) -> PathBuf {
-    match flow_path {
-        Some(flow) => {
-            let flow_dir = dialogs_dir.join(encode_flow_component(flow));
-            let _ = std::fs::create_dir_all(&flow_dir);
-            flow_dir.join(format!("{}.json", id))
-        }
-        None => dialogs_dir.join(format!("{}.json", id)),
-    }
-}
-
-fn load_dialog_file(path: &Path, id: &str) -> Result<Option<DialogStateRecord>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = read_json_record(path)?;
-    let record: DialogStateRecord = serde_json::from_str(&data).map_err(|e| {
-        IronCrewError::Validation(format!("Failed to parse dialog state '{}': {}", id, e))
-    })?;
-    Ok(Some(record))
-}
+mod dialog_files;
+use dialog_files::{dialog_file_path, load_dialog_file};
 
 fn walk_dialog_records(
     dialogs_dir: &Path,
@@ -484,7 +467,9 @@ fn walk_dialog_records(
 
 fn read_dialog_for_walk(path: &Path) -> Option<DialogStateRecord> {
     let data = read_json_record(path).ok()?;
-    serde_json::from_str::<DialogStateRecord>(&data).ok()
+    let record = serde_json::from_str::<DialogStateRecord>(&data).ok()?;
+    super::session_usage::validate(&record.usage).ok()?;
+    Some(record)
 }
 
 fn dialog_flow_matches(record: &DialogStateRecord, flow_path: Option<&str>) -> bool {
@@ -513,10 +498,7 @@ pub struct RunRecord {
     pub task_results: Vec<TaskResult>,
     pub agent_count: usize,
     pub task_count: usize,
-    #[serde(default)]
-    pub total_tokens: u32,
-    #[serde(default)]
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Runtime instance that currently owns this in-flight run. Empty for
@@ -612,10 +594,7 @@ pub struct RunSummary {
     pub duration_ms: u64,
     pub agent_count: usize,
     pub task_count: usize,
-    #[serde(default)]
-    pub total_tokens: u32,
-    #[serde(default)]
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -632,8 +611,7 @@ impl From<&RunRecord> for RunSummary {
             duration_ms: record.duration_ms,
             agent_count: record.agent_count,
             task_count: record.task_count,
-            total_tokens: record.total_tokens,
-            cached_tokens: record.cached_tokens,
+            usage: record.usage.clone(),
             tags: record.tags.clone(),
         }
     }
@@ -682,8 +660,7 @@ pub struct RunCompletion {
     pub finished_at: String,
     pub duration_ms: u64,
     pub task_results: Vec<TaskResult>,
-    pub total_tokens: u32,
-    pub cached_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
 }
 
 /// Result of an atomic terminal transition. A second finalizer can observe
@@ -696,6 +673,14 @@ pub enum RunTransition {
 
 impl RunCompletion {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.usage
+            .validate()
+            .map_err(|error| IronCrewError::Validation(error.into()))?;
+        for task in &self.task_results {
+            task.usage
+                .validate()
+                .map_err(|error| IronCrewError::Validation(error.into()))?;
+        }
         if !self.status.is_terminal() {
             return Err(IronCrewError::Validation(format!(
                 "Run completion status must be terminal, got '{}'",
@@ -744,26 +729,6 @@ fn filter_matches(record: &RunRecord, filter: &ListRunsFilter) -> bool {
         return false;
     }
     true
-}
-
-/// JSON file-based store rooted at an `.ironcrew/` directory.
-///
-/// Each record type gets its own subdirectory: `runs/`, `conversations/`,
-/// `dialogs/`, `audit_events/`, and `idempotency/`. All five are owner-only
-/// (0o700) on Unix since they may contain sensitive model output or request
-/// fingerprints.
-pub struct JsonFileStore {
-    runs_dir: PathBuf,
-    conversations_dir: PathBuf,
-    dialogs_dir: PathBuf,
-    audit_events_dir: PathBuf,
-    /// Persistent request-idempotency records. These share `run_lock` with
-    /// conversations so a completed message response and its revised
-    /// conversation snapshot can be published as one process-local critical
-    /// section.
-    idempotency_dir: PathBuf,
-    lease: super::store::RunLeaseConfig,
-    run_lock: Arc<Mutex<()>>,
 }
 
 fn idempotency_path(dir: &Path, key_hash: &str) -> Result<PathBuf> {
@@ -1100,54 +1065,8 @@ fn complete_json_run_idempotency(dir: &Path, run_id: &str, completed_at: &str) -
     })
 }
 
-impl JsonFileStore {
-    /// Create (or open) a JSON-backed store inside the given `.ironcrew/`
-    /// directory. The directory — and the four subdirectories it contains
-    /// — are created with `create_dir_all` if they don't already exist.
-    pub fn new(ironcrew_dir: PathBuf) -> Result<Self> {
-        Self::new_with_lease_config(ironcrew_dir, super::store::RunLeaseConfig::from_env()?)
-    }
-
-    pub fn new_with_lease_config(
-        ironcrew_dir: PathBuf,
-        lease: super::store::RunLeaseConfig,
-    ) -> Result<Self> {
-        let runs_dir = ironcrew_dir.join("runs");
-        let conversations_dir = ironcrew_dir.join("conversations");
-        let dialogs_dir = ironcrew_dir.join("dialogs");
-        let audit_events_dir = ironcrew_dir.join("audit_events");
-        let idempotency_dir = ironcrew_dir.join("idempotency");
-
-        for dir in [
-            &runs_dir,
-            &conversations_dir,
-            &dialogs_dir,
-            &audit_events_dir,
-            &idempotency_dir,
-        ] {
-            std::fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-
-        let run_lock = shared_json_run_lock(&runs_dir);
-        Ok(Self {
-            runs_dir,
-            conversations_dir,
-            dialogs_dir,
-            audit_events_dir,
-            idempotency_dir,
-            lease,
-            run_lock,
-        })
-    }
-}
-
 #[async_trait]
-impl StateStore for JsonFileStore {
+impl StateStore for JsonFileStoreCore {
     async fn save_run_intent(&self, intent: RunIntent) -> Result<String> {
         if let Some(run_id) = intent.suggested_id.as_deref() {
             validate_run_id(run_id)?;
@@ -1223,8 +1142,7 @@ impl StateStore for JsonFileStore {
             task_results: Vec::new(),
             agent_count: intent.agent_count,
             task_count: intent.task_count,
-            total_tokens: 0,
-            cached_tokens: 0,
+            usage: crate::usage::UsageSnapshot::unavailable(),
             tags: intent.tags,
             owner_instance_id: self.lease.instance_id().to_string(),
             lease_expires_at: proposed_lease,
@@ -1290,8 +1208,7 @@ impl StateStore for JsonFileStore {
             record.finished_at = completion.finished_at;
             record.duration_ms = completion.duration_ms;
             record.task_results = completion.task_results;
-            record.total_tokens = completion.total_tokens;
-            record.cached_tokens = completion.cached_tokens;
+            record.usage = completion.usage;
             record.lease_expires_at.clear();
             write_run_record_atomic(&path, &record)?;
             RunTransition::Applied
@@ -1467,8 +1384,7 @@ impl StateStore for JsonFileStore {
                         task_results: Vec::new(),
                         agent_count: 0,
                         task_count: 0,
-                        total_tokens: 0,
-                        cached_tokens: 0,
+                        usage: crate::usage::UsageSnapshot::unavailable(),
                         tags: Vec::new(),
                         owner_instance_id: idempotency.owner_instance_id.clone(),
                         lease_expires_at: String::new(),
@@ -2458,6 +2374,7 @@ impl StateStore for JsonFileStore {
     }
 
     async fn save_dialog_state(&self, record: &DialogStateRecord) -> Result<u64> {
+        super::session_usage::validate(&record.usage)?;
         validate_session_id(&record.id)?;
         let _guard = self.run_lock.lock().map_err(|error| {
             IronCrewError::Validation(format!("JSON store lock error: {error}"))

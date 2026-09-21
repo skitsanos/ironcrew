@@ -1,12 +1,12 @@
 -- OpenAI Chat Completions API — baseline test
--- Model: gpt-5.4-mini (cost-effective)
+-- Model: gpt-5.6-luna (cost-effective)
+-- Omitted effort defaults to low; function tools select none on Chat Completions.
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({
     goal = "Verify OpenAI Chat Completions API works",
     provider = "openai",
-    model = "gpt-5.4-mini",
-    api_key = env("OPENAI_API_KEY"),
+    model = "gpt-5.6-luna",
 })
 
 crew:add_agent(Agent.new({
@@ -21,4 +21,6 @@ crew:add_task({
     agent = "assistant",
 })
 
+-- Construction validation needs no credential and stops before paid execution.
+if IRONCREW_MODE == "validate" then return end
 crew:run()

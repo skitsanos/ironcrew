@@ -24,7 +24,7 @@ impl LlmProvider for EchoProvider {
             content: Some(format!("echo:{content}")),
             reasoning: None,
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Default::default(),
             raw_blocks: None,
         })
     }

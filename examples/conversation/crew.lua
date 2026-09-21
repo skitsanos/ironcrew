@@ -24,6 +24,7 @@ local conv = crew:conversation({
 })
 
 -- Turn 1
+if IRONCREW_MODE == "validate" then return end
 print("Q1: What is ownership in Rust?")
 local r1 = conv:send("What is ownership in Rust?")
 print("A1: " .. r1)

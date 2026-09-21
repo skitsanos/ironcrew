@@ -102,6 +102,6 @@ def container_contract(container: str) -> str:
         text=True,
         timeout=10,
     ).stdout.strip()
-    if result != "true|postgres:15":
-        raise RuntimeError(f"expected a running postgres:15 container, observed {result!r}")
-    return "postgres:15"
+    if result != "true|postgres:latest":
+        raise RuntimeError(f"expected a running postgres:latest container, observed {result!r}")
+    return "postgres:latest"

@@ -373,7 +373,7 @@ fn validate_run_tags(input: Option<&serde_json::Value>) -> Result<Vec<String>, I
     Ok(validated)
 }
 
-fn flow_status(err: &IronCrewError) -> StatusCode {
+pub(super) fn flow_status(err: &IronCrewError) -> StatusCode {
     if err.to_string().contains("not found") {
         StatusCode::NOT_FOUND
     } else {
@@ -383,7 +383,7 @@ fn flow_status(err: &IronCrewError) -> StatusCode {
 
 /// Sanitize an error for API responses: log the full detail, return a safe message.
 /// Strips filesystem paths and internal details that could leak server structure.
-fn sanitize_error(err: &IronCrewError) -> String {
+pub(super) fn sanitize_error(err: &IronCrewError) -> String {
     let full = err.to_string();
     tracing::warn!("API error: {}", full);
 
@@ -407,6 +407,16 @@ fn sanitize_error(err: &IronCrewError) -> String {
         IronCrewError::Io(_) => "Internal storage error".into(),
         _ => "Internal server error".into(),
     }
+}
+
+/// Build a 500 response whose body carries no backend detail. The full error is
+/// logged, not returned, so store and filesystem internals stay server-side.
+fn internal_error(err: &IronCrewError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%err, "internal server error");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -634,6 +644,21 @@ fn run_not_found(error: &IronCrewError, run_id: &str) -> bool {
         error,
         IronCrewError::Validation(message)
             if message == &format!("Run '{}' not found", run_id)
+    )
+}
+
+/// Map a run-store error to a response. A genuinely missing run is 404; every
+/// other failure (outage, pool exhaustion) is a 503 with no backend detail, so
+/// a client cannot mistake a transient outage for "this run never existed" and
+/// re-execute paid work under a fresh idempotency key.
+fn run_lookup_error(error: &IronCrewError, run_id: &str) -> (StatusCode, Json<ErrorResponse>) {
+    if run_not_found(error, run_id) {
+        return error_response(StatusCode::NOT_FOUND, format!("Run '{}' not found", run_id));
+    }
+    tracing::error!(%error, run_id, "run store lookup failed");
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Run store is unavailable".to_string(),
     )
 }
 
@@ -891,113 +916,20 @@ impl TerminalResultRetention {
     }
 }
 
-/// Persist one terminal transition for an HTTP-owned run. A normal
-/// `crew:run()` contributes its staged, result-bearing completion only after
-/// the enclosing Lua entrypoint ends. If a task failed before Lua could create
-/// the intent, create a minimal fallback record only after confirming the run
-/// is genuinely absent.
-struct TerminalPersistence<'a> {
-    run_id: &'a str,
-    flow: &'a str,
-    started_at: &'a str,
-    tags: &'a [String],
-    status: RunStatus,
-    duration_ms: u64,
-    total_tokens: u32,
-    /// Full crew completion retained by the API lifecycle until the enclosing
-    /// Lua entrypoint has returned. Absent for pre-crew failures, aborts,
-    /// timeouts, and flows that never call `crew:run()`.
-    completion: Option<&'a RunCompletion>,
-}
-
-async fn persist_terminal_outcome(
-    store: &Arc<dyn crate::engine::store::StateStore>,
-    terminal: TerminalPersistence<'_>,
-) -> Result<(RunStatus, bool), IronCrewError> {
-    let synthesized;
-    let completion = match terminal.completion {
-        Some(completion) => completion,
-        None => {
-            synthesized = RunCompletion {
-                status: terminal.status.clone(),
-                finished_at: chrono::Utc::now().to_rfc3339(),
-                duration_ms: terminal.duration_ms,
-                task_results: Vec::new(),
-                total_tokens: terminal.total_tokens,
-                cached_tokens: 0,
-            };
-            &synthesized
-        }
-    };
-    let completion_status = completion.status.clone();
-
-    match store
-        .update_run_completion(terminal.run_id, completion.clone())
-        .await
-    {
-        Ok(RunTransition::Applied) => return Ok((completion_status.clone(), true)),
-        Ok(RunTransition::AlreadyTerminal(status)) => return Ok((status, false)),
-        Err(update_error) => match store.get_run(terminal.run_id).await {
-            Ok(record) if record.status.is_terminal() => return Ok((record.status, false)),
-            Ok(record) => {
-                return Err(IronCrewError::Validation(format!(
-                    "Failed to persist terminal outcome for run '{}': {}; durable status remains '{}'",
-                    terminal.run_id, update_error, record.status
-                )));
-            }
-            Err(get_error) if run_not_found(&get_error, terminal.run_id) => {}
-            Err(get_error) => {
-                return Err(IronCrewError::Validation(format!(
-                    "Could not verify run '{}' after terminal update failed (update: {}; read: {})",
-                    terminal.run_id, update_error, get_error
-                )));
-            }
-        },
-    }
-
-    let fallback = RunIntent {
-        suggested_id: Some(terminal.run_id.to_string()),
-        flow_name: terminal.flow.to_string(),
-        flow: terminal.flow.to_string(),
-        started_at: terminal.started_at.to_string(),
-        agent_count: 0,
-        task_count: 0,
-        tags: terminal.tags.to_vec(),
-    };
-    if let Err(error) = store.save_run_intent(fallback).await {
-        if matches!(error, IronCrewError::OwnerDraining { .. }) {
-            return Err(error);
-        }
-        return Err(IronCrewError::Validation(format!(
-            "Failed to create fallback intent for terminal run '{}': {}",
-            terminal.run_id, error
-        )));
-    }
-
-    match store
-        .update_run_completion(terminal.run_id, completion.clone())
-        .await
-    {
-        Ok(RunTransition::Applied) => Ok((completion_status, true)),
-        Ok(RunTransition::AlreadyTerminal(status)) => Ok((status, false)),
-        Err(error) => Err(IronCrewError::Validation(format!(
-            "Failed to persist terminal outcome for fallback run '{}': {}",
-            terminal.run_id, error
-        ))),
-    }
-}
+mod terminal_persistence;
+use terminal_persistence::{TerminalPersistence, persist_terminal_outcome};
 
 struct WorkOutcome {
     status: RunStatus,
     duration_ms: u64,
-    total_tokens: u32,
+    usage: crate::usage::UsageSnapshot,
     error_message: Option<String>,
 }
 
 struct RunWorkResult {
     status: String,
     duration_ms: u64,
-    total_tokens: u32,
+    usage: crate::usage::UsageSnapshot,
 }
 
 struct RunExecutionContext {
@@ -1005,6 +937,7 @@ struct RunExecutionContext {
     input_bridge: Option<Arc<crate::engine::input_bridge::InputBridge>>,
     run_intent_signal: Option<RunIntentSignal>,
     api_lifecycle: crate::lua::crew_userdata::ApiRunLifecycle,
+    usage_tracker: crate::usage::UsageTracker,
 }
 
 /// Tokio detaches a task when its `JoinHandle` is dropped. The run monitor is
@@ -1049,52 +982,8 @@ where
     work.await
 }
 
-fn classify_work_result(
-    join_result: std::result::Result<
-        std::result::Result<RunWorkResult, IronCrewError>,
-        tokio::task::JoinError,
-    >,
-    elapsed_ms: u64,
-) -> WorkOutcome {
-    match join_result {
-        Ok(Ok(work)) => {
-            let RunWorkResult {
-                status: response_status,
-                duration_ms: response_duration_ms,
-                total_tokens: response_total_tokens,
-            } = work;
-            let status = response_status
-                .parse::<RunStatus>()
-                .ok()
-                .filter(RunStatus::is_terminal)
-                .unwrap_or(RunStatus::Success);
-            WorkOutcome {
-                status,
-                duration_ms: response_duration_ms,
-                total_tokens: response_total_tokens,
-                error_message: None,
-            }
-        }
-        Ok(Err(error)) => WorkOutcome {
-            status: RunStatus::Failed,
-            duration_ms: elapsed_ms,
-            total_tokens: 0,
-            error_message: Some(error.to_string()),
-        },
-        Err(join_error) if join_error.is_cancelled() => WorkOutcome {
-            status: RunStatus::Aborted,
-            duration_ms: elapsed_ms,
-            total_tokens: 0,
-            error_message: None,
-        },
-        Err(join_error) => WorkOutcome {
-            status: RunStatus::Failed,
-            duration_ms: elapsed_ms,
-            total_tokens: 0,
-            error_message: Some(format!("Task panicked: {join_error}")),
-        },
-    }
-}
+mod work_outcome;
+use work_outcome::classify_work_result;
 
 // ---------------------------------------------------------------------------
 // Flow execution
@@ -1108,6 +997,8 @@ pub async fn run_flow(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Option<Json<serde_json::Value>>,
 ) -> RunFlowResult {
+    let usage_tracker = crate::usage::UsageTracker::for_run()
+        .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let input = body.map(|Json(v)| v);
     let request_key =
         super::idempotency::request_key(&headers, state.idempotency.require_key, principal.id())
@@ -1389,6 +1280,7 @@ pub async fn run_flow(
     // times out after `crew:run()` completed, the monitor can still preserve
     // those task results while applying the authoritative terminal status.
     let api_lifecycle = crate::lua::crew_userdata::ApiRunLifecycle::default();
+    let usage_for_work = usage_tracker.clone();
 
     // Prepare the work task, then register it while holding the active-map
     // write lock. Rechecking readiness under that lock closes the race where
@@ -1455,6 +1347,7 @@ pub async fn run_flow(
                         input_bridge: Some(bridge_for_work),
                         run_intent_signal,
                         api_lifecycle: lifecycle_for_work,
+                        usage_tracker: usage_for_work,
                     },
                 )
                 .await
@@ -1547,7 +1440,7 @@ pub async fn run_flow(
             (None, None) => None,
         };
 
-        let (requested_status, duration_ms, total_tokens, error_message, fence_result) = tokio::select! {
+        let (mut requested_status, duration_ms, usage, mut error_message, fence_result) = tokio::select! {
             biased;
             outcome = async {
                 match immediate_fence_outcome {
@@ -1566,7 +1459,7 @@ pub async fn run_flow(
                         (
                             RunStatus::Aborted,
                             started.elapsed().as_millis() as u64,
-                            0,
+                            crate::usage::UsageSnapshot::unavailable(),
                             None,
                             Some(RunFenceHeartbeat::CancelRequested),
                         )
@@ -1574,13 +1467,13 @@ pub async fn run_flow(
                     RunFenceHeartbeat::Terminal(status) => {
                         tracing::debug!(run_id = %run_id_clone, %status, "Run worker stopped after its durable record became terminal");
                         let terminal_result = RunFenceHeartbeat::Terminal(status.clone());
-                        let (duration_ms, total_tokens) = match state_clone
+                        let (duration_ms, usage) = match state_clone
                             .store
                             .get_run(&run_id_clone)
                             .await
                         {
                             Ok(record) if record.status.is_terminal() => {
-                                (record.duration_ms, record.total_tokens)
+                                (record.duration_ms, record.usage)
                             }
                             Ok(record) => {
                                 tracing::warn!(
@@ -1588,7 +1481,7 @@ pub async fn run_flow(
                                     durable_status = %record.status,
                                     "Run-fence heartbeat reported a terminal status but the follow-up read was in-flight"
                                 );
-                                (started.elapsed().as_millis() as u64, 0)
+                                (started.elapsed().as_millis() as u64, crate::usage::UsageSnapshot::unavailable())
                             }
                             Err(error) => {
                                 crate::metrics::record_store_failure(
@@ -1599,13 +1492,13 @@ pub async fn run_flow(
                                     %error,
                                     "Failed to read terminal run metrics after a run-fence heartbeat"
                                 );
-                                (started.elapsed().as_millis() as u64, 0)
+                                (started.elapsed().as_millis() as u64, crate::usage::UsageSnapshot::unavailable())
                             }
                         };
                         (
                             status,
                             duration_ms,
-                            total_tokens,
+                            usage,
                             None,
                             Some(terminal_result),
                         )
@@ -1615,7 +1508,7 @@ pub async fn run_flow(
                         (
                             RunStatus::Abandoned,
                             started.elapsed().as_millis() as u64,
-                            0,
+                            crate::usage::UsageSnapshot::unavailable(),
                             Some("Run stopped after its durable execution fence was lost".into()),
                             Some(RunFenceHeartbeat::Lost),
                         )
@@ -1630,7 +1523,7 @@ pub async fn run_flow(
                 (
                     outcome.status,
                     outcome.duration_ms,
-                    outcome.total_tokens,
+                    outcome.usage,
                     outcome.error_message,
                     None,
                 )
@@ -1644,10 +1537,22 @@ pub async fn run_flow(
                 (
                     RunStatus::TimedOut,
                     started.elapsed().as_millis() as u64,
-                    0,
+                    crate::usage::UsageSnapshot::unavailable(),
                     None,
                     None,
                 )
+            }
+        };
+        let usage = if matches!(&fence_result, Some(RunFenceHeartbeat::Terminal(_))) {
+            usage
+        } else {
+            match usage_tracker.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    requested_status = RunStatus::Failed;
+                    error_message = Some(error.to_string());
+                    crate::usage::UsageSnapshot::unavailable()
+                }
             }
         };
         if matches!(fence_result, Some(RunFenceHeartbeat::Lost)) {
@@ -1663,6 +1568,7 @@ pub async fn run_flow(
                 staged.completion.status = requested_status.clone();
                 staged.completion.finished_at = chrono::Utc::now().to_rfc3339();
                 staged.completion.duration_ms = started.elapsed().as_millis() as u64;
+                staged.completion.usage = usage.clone();
                 staged.completion
             })
         };
@@ -1670,10 +1576,6 @@ pub async fn run_flow(
             .as_ref()
             .map(|completion| completion.duration_ms)
             .unwrap_or(duration_ms);
-        let total_tokens = run_completion
-            .as_ref()
-            .map(|completion| completion.total_tokens)
-            .unwrap_or(total_tokens);
         let mut terminal_results = TerminalResultRetention::new(run_completion);
         let expired_questions = bridge_for_monitor.expire_all();
         if expired_questions > 0 {
@@ -1712,7 +1614,7 @@ pub async fn run_flow(
         let mut persistence_degraded = false;
         let mut retry_delay = std::time::Duration::from_millis(250);
         let mut owner_drain_rejected_intent = false;
-        let terminal_status = loop {
+        let _terminal_status = loop {
             match persist_terminal_outcome(
                 &state_clone.store,
                 TerminalPersistence {
@@ -1722,7 +1624,7 @@ pub async fn run_flow(
                     tags: &tags_for_terminal,
                     status: requested_status.clone(),
                     duration_ms,
-                    total_tokens,
+                    usage: usage.clone(),
                     completion: terminal_results.completion(),
                 },
             )
@@ -1813,14 +1715,26 @@ pub async fn run_flow(
         }
         drop(run_heartbeat);
 
-        let event_persistence = eventbus
-            .emit_terminal(CrewEvent::RunComplete {
-                run_id: run_id_clone.clone(),
-                status: terminal_status.to_string(),
-                duration_ms,
-                total_tokens,
-            })
-            .await;
+        // Read the winning terminal payload: another writer may have won the
+        // completion CAS after our worker snapshot. Never publish local usage
+        // as if it were that writer's authoritative durable checkpoint.
+        let event_persistence = match state_clone.store.get_run(&run_id_clone).await {
+            Ok(record) if record.status.is_terminal() => {
+                eventbus
+                    .emit_terminal(CrewEvent::RunComplete {
+                        run_id: run_id_clone.clone(),
+                        status: record.status.to_string(),
+                        duration_ms: record.duration_ms,
+                        usage: record.usage,
+                    })
+                    .await
+            }
+            _ => {
+                crate::metrics::record_store_failure(crate::metrics::StoreOperation::Run);
+                tracing::warn!(run_id = %run_id_clone, "Terminal checkpoint could not be read; omitting unverified terminal event");
+                DurableEventPersistence::Failed
+            }
+        };
         if matches!(
             event_persistence,
             DurableEventPersistence::Dropped
@@ -1877,7 +1791,6 @@ async fn execute_crew_from_path_with_events(
     input: Option<&serde_json::Value>,
     context: RunExecutionContext,
 ) -> std::result::Result<RunWorkResult, IronCrewError> {
-    use crate::cli::project::{load_project, setup_crew_runtime};
     use crate::lua::api::json_value_to_lua;
 
     let RunExecutionContext {
@@ -1885,6 +1798,7 @@ async fn execute_crew_from_path_with_events(
         input_bridge,
         run_intent_signal,
         api_lifecycle,
+        usage_tracker,
     } = context;
 
     // A Lua entrypoint may perform asynchronous setup (including
@@ -1942,8 +1856,7 @@ async fn execute_crew_from_path_with_events(
         }
     }
 
-    let loader = load_project(flow_path)?;
-    let (lua, _runtime) = setup_crew_runtime(&loader)?;
+    let (loader, lua, _runtime, script) = load_http_crew_runtime(flow_path.to_path_buf()).await?;
 
     // Unlike a CLI invocation, an HTTP run owns the complete Lua entrypoint.
     // `crew:run()` stages its rich completion here so flow-level Lua can keep
@@ -1951,6 +1864,7 @@ async fn execute_crew_from_path_with_events(
     // remains in-flight. The API monitor performs the terminal write after
     // this worker returns.
     lua.set_app_data(api_lifecycle.clone());
+    lua.set_app_data(usage_tracker.clone());
 
     // Store the eventbus in a Lua global so LuaCrew::run() can pick it up
     lua.set_app_data(eventbus.clone());
@@ -1990,18 +1904,13 @@ async fn execute_crew_from_path_with_events(
             .map_err(IronCrewError::Lua)?;
     }
 
-    // Execute the Lua script
-    let entrypoint = loader
-        .entrypoint()
-        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = crate::lua::source::read_lua_source(entrypoint)?;
-
     let exec_err = {
         let _execution =
             crate::lua::limits::LuaExecutionGuard::begin(&lua).map_err(IronCrewError::Lua)?;
         lua.load(&script).exec_async().await.err()
     };
 
+    usage_tracker.budget().check()?;
     // Even if post-run Lua code failed (e.g., json_parse on skipped output),
     // the crew may have completed successfully. Prefer its staged completion,
     // preserving the historical behavior where that crew outcome wins.
@@ -2031,14 +1940,11 @@ async fn execute_crew_from_path_with_events(
             .as_ref()
             .map(|staged| staged.duration_ms)
             .unwrap_or(run.duration_ms);
-        let total_tokens = staged_completion
-            .as_ref()
-            .map(|staged| staged.total_tokens)
-            .unwrap_or(run.total_tokens);
+        let usage = crate::llm::scope::snapshot(&usage_tracker)?;
         return Ok(RunWorkResult {
             status,
             duration_ms,
-            total_tokens,
+            usage,
         });
     }
 
@@ -2050,7 +1956,7 @@ async fn execute_crew_from_path_with_events(
     Ok(RunWorkResult {
         status: "completed".into(),
         duration_ms: 0,
-        total_tokens: 0,
+        usage: crate::llm::scope::snapshot(&usage_tracker)?,
     })
 }
 
@@ -2059,16 +1965,7 @@ async fn execute_crew_from_path_with_events(
 pub async fn execute_crew_from_path(
     flow_path: &std::path::Path,
 ) -> std::result::Result<RunCrewResponse, IronCrewError> {
-    use crate::cli::project::{load_project, setup_crew_runtime};
-
-    let loader = load_project(flow_path)?;
-    let (lua, _runtime) = setup_crew_runtime(&loader)?;
-
-    // Execute
-    let entrypoint = loader
-        .entrypoint()
-        .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
-    let script = crate::lua::source::read_lua_source(entrypoint)?;
+    let (loader, lua, _runtime, script) = load_http_crew_runtime(flow_path.to_path_buf()).await?;
 
     {
         let _execution =
@@ -2091,7 +1988,7 @@ pub async fn execute_crew_from_path(
             flow_name: run.flow_name.clone(),
             status: run.status.to_string(),
             duration_ms: run.duration_ms,
-            total_tokens: run.total_tokens,
+            usage: run.usage,
             results: run
                 .task_results
                 .iter()
@@ -2101,6 +1998,7 @@ pub async fn execute_crew_from_path(
                     output: r.output.clone(),
                     success: r.success,
                     duration_ms: r.duration_ms,
+                    usage: r.usage.clone(),
                 })
                 .collect(),
         });
@@ -2111,9 +2009,35 @@ pub async fn execute_crew_from_path(
         flow_name: "unknown".into(),
         status: "completed".into(),
         duration_ms: 0,
-        total_tokens: 0,
+        usage: crate::usage::UsageSnapshot::unavailable(),
         results: vec![],
     })
+}
+
+async fn load_http_crew_runtime(
+    flow_path: std::path::PathBuf,
+) -> std::result::Result<
+    (
+        crate::lua::loader::ProjectLoader,
+        mlua::Lua,
+        Arc<crate::engine::runtime::Runtime>,
+        String,
+    ),
+    IronCrewError,
+> {
+    tokio::task::spawn_blocking(move || {
+        let loader = crate::cli::project::load_project(&flow_path)?;
+        let (lua, runtime) = crate::cli::project::setup_crew_runtime(&loader)?;
+        let entrypoint = loader
+            .entrypoint()
+            .ok_or_else(|| IronCrewError::Validation("No entrypoint found".into()))?;
+        let script = crate::lua::source::read_lua_source(entrypoint)?;
+        Ok((loader, lua, runtime, script))
+    })
+    .await
+    .map_err(|error| {
+        IronCrewError::Validation(format!("flow runtime blocking task failed: {error}"))
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -2575,7 +2499,7 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
             duration_ms,
             success,
             output,
-            token_usage,
+            usage,
         } if output.len() > max => Some(CrewEvent::TaskCompleted {
             task: task.clone(),
             agent: agent.clone(),
@@ -2586,7 +2510,7 @@ fn maybe_truncate_event(event: &CrewEvent, max_chars: Option<usize>) -> Option<C
                 truncate_utf8(output, max),
                 output.len()
             ),
-            token_usage: token_usage.clone(),
+            usage: usage.clone(),
         }),
         CrewEvent::CollaborationTurn {
             task,
@@ -2903,7 +2827,7 @@ pub async fn flow_events(
                                     "run_id": run_id_for_stream.clone(),
                                     "status": terminal.status.to_string(),
                                     "duration_ms": terminal.duration_ms,
-                                    "total_tokens": terminal.total_tokens,
+                                    "usage": terminal.usage,
                                     "journal_complete": false,
                                     "synthesized_from_run_record": true,
                                 }
@@ -2969,7 +2893,7 @@ pub async fn flow_events(
                     run_id: record.run_id,
                     status: record.status.to_string(),
                     duration_ms: record.duration_ms,
-                    total_tokens: record.total_tokens,
+                    usage: record.usage,
                 })],
                 None,
             ),
@@ -3067,6 +2991,11 @@ pub fn max_active_runs() -> usize {
     positive_bounded_env("IRONCREW_MAX_ACTIVE_RUNS", 4, 1024)
 }
 
+/// Process-wide cap for filesystem/Lua flow-inspection work.
+pub fn max_active_inspections() -> usize {
+    positive_bounded_env("IRONCREW_MAX_ACTIVE_INSPECTIONS", 4, 64)
+}
+
 /// Process-wide cap for long-lived run and conversation SSE connections.
 pub fn max_sse_connections() -> usize {
     positive_bounded_env("IRONCREW_MAX_SSE_CONNECTIONS", 16, 1024)
@@ -3132,12 +3061,12 @@ pub async fn list_runs(
     let runs = store
         .list_runs_summary(&filter, limit, offset)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     let total = store
         .count_runs(&filter)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     Ok(Json(ListRunsResponse {
         runs,
@@ -3161,7 +3090,7 @@ pub async fn get_run(
         .store
         .get_run(&id)
         .await
-        .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(|e| run_lookup_error(&e, &id))?;
 
     // Scope by flow: a run launched under a different flow is invisible here,
     // reported as 404 rather than confirming it exists elsewhere.
@@ -3195,7 +3124,7 @@ pub async fn delete_run(
             .store
             .get_run(&id)
             .await
-            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+            .map_err(|e| run_lookup_error(&e, &id))?;
         if record.flow != flow_slug {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
@@ -3220,7 +3149,7 @@ pub async fn delete_run(
             .store
             .delete_run(&id)
             .await
-            .map_err(|e| error_response(StatusCode::NOT_FOUND, e.to_string()))?;
+            .map_err(|e| run_lookup_error(&e, &id))?;
         Ok(Json(serde_json::json!({"deleted": id})))
     }
     .await;
@@ -3254,88 +3183,54 @@ pub async fn validate_flow(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
-
-    use crate::lua::api::*;
-    use crate::lua::loader::ProjectLoader;
-    use crate::lua::sandbox::create_tool_lua;
-
-    let loader = if flow_path.is_file() {
-        ProjectLoader::from_file(&flow_path)
-    } else {
-        ProjectLoader::from_directory(&flow_path)
-    }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    let lua = create_tool_lua()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let tool_defs = load_tool_defs_from_files(loader.tool_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    // Check entrypoint syntax
-    let entrypoint_valid = if let Some(ep) = loader.entrypoint() {
-        if let Ok(script) = crate::lua::source::read_lua_source(ep) {
-            lua.load(&script).into_function().is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    Ok(Json(serde_json::json!({
-        "flow": flow,
-        "valid": entrypoint_valid,
-        "agents": agents.iter().map(|a| serde_json::json!({
-            "name": a.name,
-            "goal": a.goal,
-            "capabilities": a.capabilities,
-            "tools": a.tools,
-        })).collect::<Vec<_>>(),
-        "custom_tools": tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>(),
-        "entrypoint": loader.entrypoint().map(|p| p.display().to_string()),
-    })))
+    let _permit = state
+        .inspection_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| inspection_limit_error(&state))?;
+    let worker_state = Arc::clone(&state);
+    let value =
+        tokio::task::spawn_blocking(move || super::inspection::validate_flow(&worker_state, flow))
+            .await
+            .map_err(inspection_join_error)?
+            .map_err(|(status, message)| error_response(status, message))?;
+    Ok(Json(value))
 }
 
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     Path(flow): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
-    let flow_path = resolve_flow_path(&state, &flow)
-        .map_err(|e| error_response(flow_status(&e), sanitize_error(&e)))?;
+    let _permit = state
+        .inspection_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| inspection_limit_error(&state))?;
+    let worker_state = Arc::clone(&state);
+    let agents =
+        tokio::task::spawn_blocking(move || super::inspection::list_agents(&worker_state, flow))
+            .await
+            .map_err(inspection_join_error)?
+            .map_err(|(status, message)| error_response(status, message))?;
+    Ok(Json(agents))
+}
 
-    use crate::lua::api::*;
-    use crate::lua::loader::ProjectLoader;
+fn inspection_limit_error(state: &AppState) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "Active flow-inspection limit reached ({} requests). Raise IRONCREW_MAX_ACTIVE_INSPECTIONS or retry after current inspections finish.",
+            state.max_active_inspections
+        ),
+    )
+}
 
-    let loader = if flow_path.is_file() {
-        ProjectLoader::from_file(&flow_path)
-    } else {
-        ProjectLoader::from_directory(&flow_path)
-    }
-    .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    let agents = load_agents_from_files(loader.agent_files())
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = agents
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "name": a.name,
-                "goal": a.goal,
-                "capabilities": a.capabilities,
-                "tools": a.tools,
-                "temperature": a.temperature,
-                "model": a.model,
-            })
-        })
-        .collect();
-
-    Ok(Json(result))
+fn inspection_join_error(error: tokio::task::JoinError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%error, "flow-inspection blocking task failed");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3343,24 +3238,8 @@ pub async fn list_agents(
 // ---------------------------------------------------------------------------
 
 pub async fn list_nodes() -> Json<Vec<serde_json::Value>> {
-    use crate::tools::registry::ToolRegistry;
-    use crate::tools::{
-        file_read::FileReadTool, file_read_glob::FileReadGlobTool, file_write::FileWriteTool,
-        hash::HashTool, http_request::HttpRequestTool, shell::ShellTool,
-        template_render::TemplateRenderTool, validate_schema::ValidateSchemaTool,
-        web_scrape::WebScrapeTool,
-    };
-
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new(None)));
-    registry.register(Box::new(FileReadGlobTool::new(None)));
-    registry.register(Box::new(FileWriteTool::new(None, None)));
-    registry.register(Box::new(WebScrapeTool::new(None)));
-    registry.register(Box::new(ShellTool::new()));
-    registry.register(Box::new(HttpRequestTool::new()));
-    registry.register(Box::new(HashTool::new()));
-    registry.register(Box::new(TemplateRenderTool::new()));
-    registry.register(Box::new(ValidateSchemaTool::new()));
+    // Shared with `ironcrew nodes` so the two catalogs cannot drift.
+    let registry = crate::tools::builtin_tool_catalog();
 
     let mut tools: Vec<serde_json::Value> = Vec::new();
     let mut names = registry.list();
@@ -3603,11 +3482,18 @@ mod truncate_tests {
                 output: "x".repeat(output_bytes),
                 success: true,
                 duration_ms: 100,
-                token_usage: None,
+                usage: Default::default(),
                 reasoning: Some("reasoning".into()),
             }],
-            total_tokens: 42,
-            cached_tokens: 7,
+            usage: crate::usage::UsageSnapshot::from_receipt(
+                crate::usage::UsageReceipt::from_counts(
+                    crate::usage::UsageCounts {
+                        total_tokens: Some(42),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+            ),
         }
     }
 
@@ -3628,8 +3514,7 @@ mod truncate_tests {
         assert!(completion.task_results.is_empty());
         assert_eq!(completion.status, RunStatus::Success);
         assert_eq!(completion.duration_ms, 123);
-        assert_eq!(completion.total_tokens, 42);
-        assert_eq!(completion.cached_tokens, 7);
+        assert_eq!(completion.usage.settled.total_tokens().known(), Some(42));
     }
 
     #[test]
@@ -3672,7 +3557,7 @@ mod truncate_tests {
                 tags: &[],
                 status: outcome.status,
                 duration_ms: outcome.duration_ms,
-                total_tokens: outcome.total_tokens,
+                usage: outcome.usage,
                 completion: None,
             },
         )
@@ -3740,12 +3625,12 @@ pub async fn list_audit(
         .store
         .list_audit_events(&filter, limit, offset)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
     let total = state
         .store
         .count_audit_events(&filter)
         .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(&e))?;
 
     Ok(Json(ListAuditResponse {
         events,

@@ -19,7 +19,10 @@ return {
     memory = "ephemeral",
 
     -- Default model router applied across all crews in this project.
-    -- crew.lua can still override individual purposes.
+    -- The defaults merge is shallow: if crew.lua passes its own `models`
+    -- table it replaces this one wholesale, so that table must list every
+    -- purpose it needs — unlisted purposes fall back to `model`, not to the
+    -- entries below.
     models = {
         task_execution = "claude-haiku-4-5-20251001",
         collaboration = "claude-haiku-4-5-20251001",

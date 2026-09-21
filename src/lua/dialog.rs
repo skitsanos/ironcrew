@@ -6,8 +6,7 @@
 //! opponent's name for context.
 //!
 //! Created via `crew:dialog({})`. Reuses the crew's provider, model, and tool
-//! registry. Streams to stderr (with dim reasoning) and captures reasoning per
-//! turn.
+//! registry. Streams to stderr and captures reasoning per turn.
 //!
 //! ## Future work
 //! - Cross-run persistence
@@ -15,6 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+mod persistence;
 
 use mlua::{Table, UserData, UserDataMethods, Value};
 use serde::{Deserialize, Serialize};
@@ -231,6 +231,7 @@ pub struct AgentDialog {
     pub agents: Vec<Agent>,
 
     pub provider: Arc<dyn LlmProvider>,
+    usage: crate::usage::UsageTracker,
     pub tool_registry: ToolRegistry,
     pub model: String,
 
@@ -277,7 +278,7 @@ pub struct AgentDialog {
     /// runs until `max_turns` is reached.
     pub should_stop_key: Option<mlua::RegistryKey>,
 
-    /// Set to true once a `should_stop` callback has requested termination.
+    /// Set to true once an early-stop condition has requested termination.
     /// `has_turns_remaining` consults this flag so manual `next_turn` loops
     /// also respect the stop condition.
     pub stopped: Mutex<bool>,
@@ -345,6 +346,13 @@ impl AgentDialog {
         flow_path: Option<String>,
         autosave: bool,
     ) -> Result<Self, IronCrewError> {
+        let provider = crate::llm::scope::ensure_scope(provider)?;
+        for agent in &agents {
+            provider.validate_request(
+                &agent.chat_request(model.clone(), vec![]),
+                !tool_registry.schemas_for(&agent.tools).is_empty(),
+            )?;
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let participant_limit = configured_dialog_max_participants();
         if !(2..=participant_limit).contains(&agents.len()) {
@@ -403,6 +411,7 @@ impl AgentDialog {
         let mut stop_reason: Option<String> = None;
         let mut created_at = now.clone();
         let mut revision = 0;
+        let mut usage = crate::usage::UsageTracker::default();
 
         if persistent
             && let Some(ref store) = store
@@ -424,6 +433,8 @@ impl AgentDialog {
                 )));
             }
             revision = record.revision;
+            usage = crate::usage::UsageTracker::from_snapshot(record.usage)
+                .map_err(|error| IronCrewError::Validation(error.into()))?;
             transcript = record.transcript.into();
             next_index = record.next_index;
             stopped = record.stopped;
@@ -473,7 +484,9 @@ impl AgentDialog {
             max_turns,
         });
 
+        let provider = crate::llm::scope::observe_session(provider, &usage)?;
         Ok(Self {
+            usage,
             id,
             agents,
             provider,
@@ -504,50 +517,8 @@ impl AgentDialog {
         })
     }
 
-    /// Persist the current dialog state to the configured store.
-    /// No-ops for non-persistent sessions.
-    pub async fn persist(&self) -> Result<(), IronCrewError> {
-        let Some(ref store) = self.store else {
-            return Ok(());
-        };
-        if !self.persistent {
-            return Ok(());
-        }
-        let mut revision = self.revision.lock().await;
-        let next_index = *self.next_index.lock().await;
-        let transcript_guard = self.transcript.lock().await;
-        validate_transcript(
-            &transcript_guard,
-            &self.agents,
-            self.max_history.unwrap_or(DEFAULT_DIALOG_MAX_HISTORY),
-            self.max_turns,
-            self.history_max_bytes,
-            next_index,
-        )?;
-        let transcript: Vec<DialogTurn> = transcript_guard.iter().cloned().collect();
-        drop(transcript_guard);
-        let stopped = *self.stopped.lock().await;
-        let stop_reason = self.stop_reason.lock().await.clone();
-        let record = DialogStateRecord {
-            id: self.id.clone(),
-            flow_name: self.flow_name.clone(),
-            flow_path: self.flow_path.clone(),
-            agent_names: self.agents.iter().map(|a| a.name.clone()).collect(),
-            starter: self.starter.clone(),
-            transcript,
-            next_index,
-            stopped,
-            stop_reason,
-            created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            revision: *revision,
-        };
-        *revision = store.save_dialog_state(&record).await?;
-        Ok(())
-    }
-
-    /// Returns `true` if the dialog has not reached `max_turns` yet AND no
-    /// `should_stop` callback has requested termination.
+    /// Returns `true` if the dialog has not reached `max_turns` yet and no
+    /// early-stop condition has requested termination.
     async fn has_turns_remaining(&self) -> bool {
         if *self.stopped.lock().await {
             return false;
@@ -632,6 +603,12 @@ impl AgentDialog {
             return Ok(());
         };
 
+        self.stop_with_reason(reason).await;
+        Ok(())
+    }
+
+    /// Record an early-stop condition and emit `DialogCompleted` exactly once.
+    async fn stop_with_reason(&self, reason: String) {
         *self.stopped.lock().await = true;
         *self.stop_reason.lock().await = Some(reason.clone());
 
@@ -645,7 +622,6 @@ impl AgentDialog {
                 stop_reason: Some(reason),
             });
         }
-        Ok(())
     }
 
     /// Default round-robin speaker selection.
@@ -812,14 +788,17 @@ impl AgentDialog {
     }
 
     /// Run a single turn with automatic speaker selection (round-robin or callback).
-    /// Returns `None` if the dialog has already reached max_turns or was
-    /// stopped by a `should_stop` callback on a previous turn.
+    /// Returns `None` if the dialog has already reached max_turns, was stopped
+    /// previously, or the provider returns a blank final reply.
     pub async fn run_one_turn(&self, lua: &mlua::Lua) -> Result<Option<DialogTurn>, IronCrewError> {
         if !self.has_turns_remaining().await {
             return Ok(None);
         }
         let speaker_index = self.select_speaker(lua).await?;
-        let turn = self.execute_turn(speaker_index).await?;
+        let Some(turn) = self.execute_turn(speaker_index).await? else {
+            self.autosave_if_enabled().await?;
+            return Ok(None);
+        };
         self.maybe_stop_after_turn(lua, &turn).await?;
         self.autosave_if_enabled().await?;
         Ok(Some(turn))
@@ -827,7 +806,8 @@ impl AgentDialog {
 
     /// Run a turn for a specific agent by name. Useful for moderator-driven
     /// loops where the caller picks who speaks next.
-    /// Returns `None` if max_turns is reached or a prior turn triggered stop.
+    /// Returns `None` if max_turns is reached, a prior turn triggered stop, or
+    /// the provider returns a blank final reply.
     pub async fn run_turn_for(
         &self,
         lua: &mlua::Lua,
@@ -837,7 +817,10 @@ impl AgentDialog {
             return Ok(None);
         }
         let speaker_index = self.agent_index(agent_name)?;
-        let turn = self.execute_turn(speaker_index).await?;
+        let Some(turn) = self.execute_turn(speaker_index).await? else {
+            self.autosave_if_enabled().await?;
+            return Ok(None);
+        };
         self.maybe_stop_after_turn(lua, &turn).await?;
         self.autosave_if_enabled().await?;
         Ok(Some(turn))
@@ -855,7 +838,10 @@ impl AgentDialog {
 
     /// Execute a turn for the agent at `speaker_index`. Increments the turn
     /// counter and emits SSE events.
-    async fn execute_turn(&self, speaker_index: usize) -> Result<DialogTurn, IronCrewError> {
+    async fn execute_turn(
+        &self,
+        speaker_index: usize,
+    ) -> Result<Option<DialogTurn>, IronCrewError> {
         let agent = self.agents[speaker_index].clone();
         let messages = self.build_messages(speaker_index).await?;
         let tool_schemas = self.tool_registry.schemas_for(&agent.tools);
@@ -896,15 +882,7 @@ impl AgentDialog {
                 self.history_max_bytes,
                 true,
             )?;
-            let request = ChatRequest {
-                messages: working_messages.clone(),
-                model: self.model.clone(),
-                temperature: agent.temperature,
-                max_tokens: agent.max_tokens,
-                response_format: agent.response_format.clone(),
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-            };
+            let request = agent.chat_request(self.model.clone(), working_messages.clone());
 
             let response: ChatResponse = if self.stream && !has_tools {
                 self.call_streaming(request).await?
@@ -966,6 +944,19 @@ impl AgentDialog {
                     self.history_max_bytes,
                 )?);
             }
+        }
+
+        // A blank final reply cannot advance a dialog meaningfully. This
+        // applies after zero or more tool rounds: tool calls may have side
+        // effects, but their blank final response is not recorded as a turn.
+        if accumulated_content.trim().is_empty() {
+            tracing::warn!(
+                dialog = %self.id,
+                agent = %agent.name,
+                "Dialog stopped: the model returned an empty final reply"
+            );
+            self.stop_with_reason("empty_response".into()).await;
+            return Ok(None);
         }
 
         let turn = DialogTurn {
@@ -1053,9 +1044,9 @@ impl AgentDialog {
         }
 
         // If this turn was the last one, emit dialog_completed for the
-        // natural max-turns path. Early `should_stop` termination is handled
-        // in `maybe_stop_after_turn`, and `completed_emitted` guarantees only
-        // one of the two paths actually fires the event.
+        // natural max-turns path. Early termination is handled by
+        // `stop_with_reason`, and `completed_emitted` guarantees only one of
+        // the paths actually fires the event.
         if turn_idx + 1 >= self.max_turns {
             let mut emitted = self.completed_emitted.lock().await;
             if !*emitted {
@@ -1068,7 +1059,7 @@ impl AgentDialog {
             }
         }
 
-        Ok(turn)
+        Ok(Some(turn))
     }
 
     async fn call_streaming(&self, request: ChatRequest) -> Result<ChatResponse, IronCrewError> {
@@ -1100,58 +1091,6 @@ impl AgentDialog {
         result
     }
 
-    async fn execute_tool_call(
-        &self,
-        tool_call: &ToolCallRequest,
-        caller_agent: &str,
-        turn_idx: usize,
-    ) -> String {
-        let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-        let tool_timeout = self
-            .tool_registry
-            .dispatch_timeout(&tool_call.function.name, &args)
-            .unwrap_or_else(|| Duration::from_secs(crate::lua::agent_turn::tool_timeout_secs()));
-
-        // Reuse the dialog's store + eventbus so LuaScriptTool-hosted custom
-        // tools can see them on their sandbox VMs (needed for sandbox-level
-        // primitives like `run_flow`). `caller_scope` uses the
-        // `<dialog_id>:t<turn_idx>` shape so nested events (agent-as-tool,
-        // run_flow, etc.) attribute to the exact turn that triggered them.
-        let tool_ctx = ToolCallContext {
-            store: self.store.clone(),
-            eventbus: Some(self.eventbus.clone()),
-            depth: 0,
-            tool_registry: Some(self.tool_registry.clone()),
-            caller_agent: Some(caller_agent.to_string()),
-            caller_scope: Some(format!("{}:t{}", self.id, turn_idx)),
-            // Dialogs don't carry a human-input transport yet — human
-            // steering happens via should_stop/turn_selector callbacks
-            // (which run in flow scope and can call crew:ask_human).
-            ask_human: None,
-        };
-
-        let tool_result = match tokio::time::timeout(
-            tool_timeout,
-            self.tool_registry
-                .execute(&tool_call.function.name, args, &tool_ctx),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(IronCrewError::ToolExecution {
-                tool: tool_call.function.name.clone(),
-                message: format!("Tool timed out after {}s", tool_timeout.as_secs()),
-            }),
-        };
-
-        match tool_result {
-            Ok(output) => output,
-            Err(e) => format!("Tool error: {}", e),
-        }
-    }
-
     /// Run all remaining turns sequentially.
     pub async fn run_all(&self, lua: &mlua::Lua) -> Result<Vec<DialogTurn>, IronCrewError> {
         loop {
@@ -1166,6 +1105,9 @@ impl AgentDialog {
 
 impl UserData for AgentDialog {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("usage", |lua, this, ()| {
+            super::usage::snapshot(lua, &this.usage)
+        });
         // dialog:run() — run all turns and return the full transcript
         methods.add_async_method("run", |lua, this, ()| async move {
             let transcript = this.run_all(&lua).await.map_err(mlua::Error::external)?;
@@ -1250,7 +1192,7 @@ impl UserData for AgentDialog {
         // dialog:max_turns() — configured turn limit
         methods.add_method("max_turns", |_, this, ()| Ok(this.max_turns));
 
-        // dialog:stopped() — true if a should_stop callback has requested termination
+        // dialog:stopped() — true if an early-stop condition ended the dialog
         methods.add_async_method("stopped", |_, this, ()| async move {
             Ok(*this.stopped.lock().await)
         });
@@ -1286,341 +1228,13 @@ impl UserData for AgentDialog {
     }
 }
 
-fn turn_to_lua(lua: &mlua::Lua, turn: &DialogTurn) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    table.set("index", turn.index)?;
-    table.set("speaker", speaker_label(turn.speaker_index))?;
-    table.set("agent", turn.agent_name.clone())?;
-    table.set("content", turn.content.clone())?;
-    if let Some(ref r) = turn.reasoning {
-        table.set("reasoning", r.clone())?;
-    }
-    Ok(table)
-}
+mod output;
+use output::{transcript_to_lua, turn_to_lua};
 
-fn transcript_to_lua(lua: &mlua::Lua, transcript: &[DialogTurn]) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    for (i, turn) in transcript.iter().enumerate() {
-        table.set(i + 1, turn_to_lua(lua, turn)?)?;
-    }
-    Ok(table)
-}
-
-/// Build an AgentDialog from a Lua options table. Participants are given via
-/// the `agents = {"name", ...}` array (two or more).
-///
-/// When `store` and the caller-provided `id` are both present, the dialog is
-/// resumed from the store if a prior record exists (transcript, `next_index`,
-/// and stop state). Autosave defaults to `true` for persistent sessions.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_dialog(
-    lua: &mlua::Lua,
-    table: Table,
-    crew_agents: &[Agent],
-    provider: Arc<dyn LlmProvider>,
-    tool_registry: ToolRegistry,
-    crew_default_model: &str,
-    crew_max_tool_rounds: usize,
-    eventbus: EventBus,
-    store: Option<Arc<dyn StateStore>>,
-    flow_name: String,
-    flow_path: Option<String>,
-) -> mlua::Result<AgentDialog> {
-    let agents_table = table.get::<Table>("agents").map_err(|_| {
-        mlua::Error::external(IronCrewError::Validation(
-            "Dialog requires an `agents = {\"name\", ...}` array of two or more \
-             participants"
-                .into(),
-        ))
-    })?;
-    let mut dialog_agents: Vec<Agent> = Vec::new();
-    for value in agents_table.sequence_values::<Value>() {
-        let value = value?;
-        dialog_agents.push(resolve_agent(value, crew_agents, "agents")?);
-    }
-
-    if dialog_agents.len() < 2 {
-        return Err(mlua::Error::external(IronCrewError::Validation(
-            "Dialog requires at least 2 agents".into(),
-        )));
-    }
-    let participant_limit = configured_dialog_max_participants();
-    if dialog_agents.len() > participant_limit {
-        return Err(mlua::Error::external(IronCrewError::Validation(format!(
-            "Dialog supports at most {participant_limit} participants, got {}",
-            dialog_agents.len()
-        ))));
-    }
-
-    // Reject duplicate names — each agent must be distinct
-    {
-        let mut seen = std::collections::HashSet::new();
-        for a in &dialog_agents {
-            if !seen.insert(a.name.as_str()) {
-                return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                    "Dialog: agent '{}' is listed more than once",
-                    a.name
-                ))));
-            }
-        }
-    }
-
-    let starter: String = table.get("starter").map_err(|_| {
-        mlua::Error::external(IronCrewError::Validation(
-            "Dialog requires a 'starter' string".into(),
-        ))
-    })?;
-
-    let max_turns: usize = table
-        .get::<usize>("max_turns")
-        .unwrap_or(dialog_agents.len() * 2);
-    let turn_limit = configured_dialog_max_turns();
-    if max_turns == 0 || max_turns > turn_limit {
-        return Err(mlua::Error::external(IronCrewError::Validation(format!(
-            "Dialog max_turns must be between 1 and {turn_limit}, got {max_turns}"
-        ))));
-    }
-    // max_history resolution order (same pattern as LuaConversation):
-    //   1. Explicit positive value in the Lua table
-    //   2. IRONCREW_DIALOG_MAX_HISTORY env var
-    //   3. Safe default of 100 turns
-    let max_history: Option<usize> = match table.get::<usize>("max_history") {
-        Ok(n) if (1..=HARD_DIALOG_MAX_HISTORY).contains(&n) => Some(n),
-        Ok(n) => {
-            return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                "Dialog max_history must be between 1 and {HARD_DIALOG_MAX_HISTORY}, got {n}"
-            ))));
-        }
-        Err(_) => Some(default_dialog_max_history()),
-    };
-    let stream: bool = table.get::<bool>("stream").unwrap_or(false);
-
-    // starting_speaker accepts:
-    //   - an agent name (preferred for multi-party)
-    //   - a positional letter "a", "b", "c", ...
-    //   - default: first agent (index 0)
-    let starting_speaker: usize = match table.get::<String>("starting_speaker").ok() {
-        Some(s) => {
-            // Try as agent name first
-            if let Some(idx) = dialog_agents.iter().position(|a| a.name == s) {
-                idx
-            } else if s.len() == 1 {
-                let c = s.chars().next().unwrap().to_ascii_lowercase();
-                if c.is_ascii_alphabetic() {
-                    let idx = (c as u8 - b'a') as usize;
-                    if idx < dialog_agents.len() {
-                        idx
-                    } else {
-                        return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                            "Dialog: starting_speaker '{}' is out of range (only {} agents)",
-                            s,
-                            dialog_agents.len()
-                        ))));
-                    }
-                } else {
-                    0
-                }
-            } else {
-                return Err(mlua::Error::external(IronCrewError::Validation(format!(
-                    "Dialog: starting_speaker '{}' does not match any agent in this dialog",
-                    s
-                ))));
-            }
-        }
-        None => 0,
-    };
-
-    let model: String = table
-        .get::<String>("model")
-        .ok()
-        .unwrap_or_else(|| crew_default_model.to_string());
-
-    // Optional turn_selector callback — stored in the Lua registry for thread safety
-    let turn_selector_key: Option<mlua::RegistryKey> =
-        if let Ok(func) = table.get::<mlua::Function>("turn_selector") {
-            Some(lua.create_registry_value(func)?)
-        } else {
-            None
-        };
-
-    // Optional should_stop callback — same registry-key pattern as turn_selector
-    let should_stop_key: Option<mlua::RegistryKey> =
-        if let Ok(func) = table.get::<mlua::Function>("should_stop") {
-            Some(lua.create_registry_value(func)?)
-        } else {
-            None
-        };
-
-    // Cross-run persistence: `id` is the persistence key. When omitted the
-    // dialog is ephemeral (pre-2.8 behavior — a fresh UUID is generated).
-    let id: Option<String> = table.get::<String>("id").ok();
-    let autosave: bool = table.get::<bool>("autosave").unwrap_or(true);
-
-    AgentDialog::new_or_resume(
-        dialog_agents,
-        provider,
-        tool_registry,
-        model,
-        starter,
-        max_turns,
-        max_history,
-        stream,
-        crew_max_tool_rounds,
-        starting_speaker,
-        eventbus,
-        turn_selector_key,
-        should_stop_key,
-        id,
-        store,
-        flow_name,
-        flow_path,
-        autosave,
-    )
-    .await
-    .map_err(mlua::Error::external)
-}
-
-fn resolve_agent(value: Value, agents: &[Agent], field: &str) -> mlua::Result<Agent> {
-    match value {
-        Value::String(s) => {
-            let name = s.to_str()?.to_string();
-            agents
-                .iter()
-                .find(|a| a.name == name)
-                .cloned()
-                .ok_or_else(|| {
-                    mlua::Error::external(IronCrewError::Validation(format!(
-                        "Dialog: {} agent '{}' not found in crew",
-                        field, name
-                    )))
-                })
-        }
-        Value::Table(t) => crate::lua::parsers::agent_from_lua_table(&t),
-        _ => Err(mlua::Error::external(IronCrewError::Validation(format!(
-            "Dialog: {} must be a string (agent name) or Agent table",
-            field
-        )))),
-    }
-}
+mod construction;
+mod tools;
+pub use construction::build_dialog;
 
 #[cfg(test)]
-mod interpret_stop_tests {
-    use super::*;
-    use crate::llm::provider::{ToolCallFunction, ToolCallRequest};
-
-    fn lua() -> mlua::Lua {
-        mlua::Lua::new()
-    }
-
-    #[test]
-    fn nil_means_continue() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Nil).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn false_means_continue() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(false)).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn true_means_stop_with_default_reason() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Boolean(true)).unwrap();
-        assert_eq!(result.as_deref(), Some("custom_stop"));
-    }
-
-    #[test]
-    fn string_means_stop_with_that_reason() {
-        let lua = lua();
-        let s = lua.create_string("consensus reached").unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
-        assert_eq!(result.as_deref(), Some("consensus reached"));
-    }
-
-    #[test]
-    fn empty_string_falls_back_to_default_reason() {
-        let lua = lua();
-        let s = lua.create_string("").unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::String(s)).unwrap();
-        assert_eq!(result.as_deref(), Some("custom_stop"));
-    }
-
-    #[test]
-    fn number_is_rejected_as_usage_error() {
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Integer(42));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("must return nil, bool, or string"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn table_is_rejected_as_usage_error() {
-        let lua = lua();
-        let t = lua.create_table().unwrap();
-        let result = AgentDialog::interpret_stop_value(mlua::Value::Table(t));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn dialog_tool_history_evicts_only_prior_transcript_messages() {
-        let tool_call = ToolCallRequest {
-            id: "call-1".into(),
-            call_type: "function".into(),
-            function: ToolCallFunction {
-                name: "lookup".into(),
-                arguments: "{}".into(),
-            },
-        };
-        let protected = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("starter"),
-            ChatMessage::assistant(None, Some(vec![tool_call.clone()])),
-            ChatMessage::tool("call-1", "result"),
-        ];
-        let max_bytes = chat_history_estimated_bytes(&protected);
-        let mut working = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("starter"),
-            ChatMessage::user(&"old".repeat(1_000)),
-            ChatMessage::assistant(None, Some(vec![tool_call])),
-            ChatMessage::tool("call-1", "result"),
-        ];
-
-        let active = enforce_dialog_working_history(&mut working, 3, max_bytes).unwrap();
-
-        assert_eq!(active, 2);
-        assert_eq!(working.len(), 4);
-        assert_eq!(working[2].role, "assistant");
-        assert_eq!(working[3].role, "tool");
-    }
-
-    #[test]
-    fn resumed_dialog_indices_must_match_retained_window() {
-        let agents = vec![
-            Agent {
-                name: "a".into(),
-                ..Default::default()
-            },
-            Agent {
-                name: "b".into(),
-                ..Default::default()
-            },
-        ];
-        let transcript = VecDeque::from([DialogTurn {
-            index: 7,
-            speaker_index: 0,
-            agent_name: "a".into(),
-            content: "hello".into(),
-            reasoning: None,
-        }]);
-
-        let error = validate_transcript(&transcript, &agents, 10, 10, 1024 * 1024, 7)
-            .expect_err("turn index must precede next_index");
-        assert!(error.to_string().contains("expected"));
-    }
-}
+#[path = "dialog_stop_tests.rs"]
+mod interpret_stop_tests;

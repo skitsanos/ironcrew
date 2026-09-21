@@ -15,9 +15,20 @@ use crate::utils::error::IronCrewError;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HttpConversationBootstrap;
 
+/// Marker installed while `config.lua` is evaluated. Configuration is a
+/// declarative defaults table, not an execution phase, so effectful
+/// capabilities must fail before starting physical work.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConfigEvaluation;
+
 /// Reject an effectful Lua capability before it starts physical work while
 /// the HTTP conversation bootstrap marker is installed.
 pub(crate) fn reject_effect(lua: &Lua, capability: &str) -> LuaResult<()> {
+    if lua.app_data_ref::<ConfigEvaluation>().is_some() {
+        return Err(mlua::Error::external(IronCrewError::Validation(format!(
+            "Lua capability '{capability}' is unavailable during config.lua evaluation; config.lua may only return declarative Crew defaults"
+        ))));
+    }
     if lua.app_data_ref::<HttpConversationBootstrap>().is_some() {
         return Err(mlua::Error::external(IronCrewError::Validation(format!(
             "Lua capability '{capability}' is unavailable during HTTP conversation bootstrap; the entrypoint may only construct declarative Crew, Agent, and task definitions"
@@ -28,7 +39,7 @@ pub(crate) fn reject_effect(lua: &Lua, capability: &str) -> LuaResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpConversationBootstrap, reject_effect};
+    use super::{ConfigEvaluation, HttpConversationBootstrap, reject_effect};
     use crate::lua::sandbox::create_tool_lua_with_base_dir;
 
     #[test]
@@ -43,6 +54,14 @@ mod tests {
 
         assert!(lua.remove_app_data::<HttpConversationBootstrap>().is_some());
         reject_effect(&lua, "http.get").unwrap();
+
+        lua.set_app_data(ConfigEvaluation);
+        let error = reject_effect(&lua, "postgres.query")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("postgres.query"));
+        assert!(error.contains("config.lua evaluation"));
+        assert!(lua.remove_app_data::<ConfigEvaluation>().is_some());
     }
 
     #[tokio::test]

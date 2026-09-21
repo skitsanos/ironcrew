@@ -40,6 +40,10 @@ const MAX_WEB_SEARCH_USES: u32 = 100;
 const MAX_FILE_SEARCH_RESULTS: u32 = 1_000;
 const MAX_THINKING_BUDGET: u32 = 1_000_000;
 
+use crate::lua::config_choices::{
+    REASONING_EFFORTS, REASONING_SUMMARIES, WEB_SEARCH_CONTEXT_SIZES, validate_config_choice,
+};
+
 fn config_limit(name: &str, default: usize, hard_max: usize) -> LuaResult<usize> {
     match std::env::var(name) {
         Ok(raw) => {
@@ -87,23 +91,8 @@ fn validate_api_key_value(value: &str) -> LuaResult<()> {
     Ok(())
 }
 
-fn trusted_provider_key_env_name(base_url: &str) -> Option<&'static str> {
-    let parsed = reqwest::Url::parse(base_url).ok()?;
-    if parsed.scheme() != "https" {
-        return None;
-    }
-    match parsed.host_str()?.to_ascii_lowercase().as_str() {
-        "api.openai.com" => Some("OPENAI_API_KEY"),
-        "generativelanguage.googleapis.com" => Some("GEMINI_API_KEY"),
-        "api.groq.com" => Some("GROQ_API_KEY"),
-        "api.moonshot.ai" | "api.moonshot.cn" => Some("MOONSHOT_API_KEY"),
-        "api.deepseek.com" => Some("DEEPSEEK_API_KEY"),
-        "api.x.ai" => Some("XAI_API_KEY"),
-        "api.openrouter.ai" => Some("OPENROUTER_API_KEY"),
-        "api.anthropic.com" => Some("ANTHROPIC_API_KEY"),
-        _ => None,
-    }
-}
+mod provider_key;
+use provider_key::trusted_provider_key_env_name;
 
 fn resolve_custom_provider_key(
     base_url: Option<&str>,
@@ -176,9 +165,7 @@ fn strict_string_list(
     Ok(values)
 }
 
-// Re-export everything that was previously defined here so that existing
-// import paths (`crate::lua::api::…`) continue to work unchanged.
-// Some re-exports are only consumed by integration tests or downstream crates.
+// Preserve the established `crate::lua::api` import surface.
 #[allow(unused_imports)]
 pub use super::crew_userdata::LuaCrew;
 #[allow(unused_imports)]
@@ -188,10 +175,6 @@ pub use super::parsers::{
     LuaToolDef, agent_from_lua_table, load_agents_from_files, load_tool_defs_from_files,
     task_from_lua_table, tool_def_from_lua_table,
 };
-
-// ---------------------------------------------------------------------------
-// Global registrations
-// ---------------------------------------------------------------------------
 
 /// Marker type — when set as app-data on a Lua VM, signals that the VM is
 /// being driven in chat REPL / HTTP conversation mode rather than the default
@@ -210,7 +193,7 @@ pub struct ChatMode;
 pub const CHAT_CREW_REGISTRY_KEY: &str = "__ironcrew_chat_crew";
 
 /// Set the canonical `IRONCREW_MODE` Lua global. Users guard top-level
-/// `crew:run()` with `if IRONCREW_MODE ~= "chat" then crew:run() end` so the
+/// `crew:run()` with `if IRONCREW_MODE == "run" then crew:run() end` so the
 /// same `crew.lua` works for both `ironcrew run` and `ironcrew chat`.
 pub fn set_ironcrew_mode(lua: &Lua, mode: &str) -> LuaResult<()> {
     lua.globals().set("IRONCREW_MODE", mode.to_string())
@@ -263,22 +246,21 @@ pub fn register_crew_constructor(
         lua.set_app_data(crate::lua::subflow::SubflowDepth(0));
     }
 
-    let new_fn = lua.create_function(move |lua, table: Table| {
+    let new_fn = lua.create_async_function(move |lua, table: Table| {
+        let agents = Arc::clone(&agents);
         let project_dir = (*project_dir).clone();
+        let runtime = Arc::clone(&runtime);
+        async move {
 
         // Shallow-merge defaults from config.lua (if present) into the user's
         // table. Only keys not already present are added — user values win.
-        if let Ok(defaults) = lua.globals().get::<Table>("__ironcrew_config_defaults") {
-            for pair in defaults.pairs::<mlua::Value, mlua::Value>() {
-                let (key, value) = pair?;
-                if let mlua::Value::String(ref s) = key
-                    && !table.contains_key(s.clone())?
-                {
-                    table.set(key, value)?;
-                }
-            }
-        }
+        construction_support::merge_defaults(&lua, &table)?;
 
+        crate::lua::parsers::reject_unknown_keys(
+            &table,
+            crate::lua::parsers::CREW_KEYS,
+            "Crew.new",
+        )?;
         let goal: String = table.get("goal")?;
         let provider = table
             .get::<Option<String>>("provider")?
@@ -290,6 +272,13 @@ pub fn register_crew_constructor(
         let api_key: Option<String> = table.get("api_key")?;
         let max_concurrent: Option<usize> = table.get("max_concurrent")?;
         let normalized_provider = provider.to_lowercase();
+        if normalized_provider != "openai-responses"
+            && table.get::<Option<String>>("reasoning_effort")?.is_some()
+        {
+            return Err(mlua::Error::external(IronCrewError::Validation(
+                "Crew.new reasoning_effort requires provider = \"openai-responses\"; for Chat Completions set reasoning_effort on the agent".into(),
+            )));
+        }
 
         validate_config_string("goal", &goal, MAX_GOAL_BYTES)?;
         validate_config_string("provider", &provider, MAX_PROVIDER_NAME_BYTES)?;
@@ -301,8 +290,11 @@ pub fn register_crew_constructor(
         if let Some(key) = api_key.as_deref() {
             validate_api_key_value(key)?;
         }
-        let custom_provider_key =
-            resolve_custom_provider_key(base_url.as_deref(), api_key.as_deref())?;
+        let custom_provider_key = if crate::lua::construction::active(&lua) {
+            Some("validation-only".to_owned())
+        } else {
+            resolve_custom_provider_key(base_url.as_deref(), api_key.as_deref())?
+        };
 
         if !matches!(
             normalized_provider.as_str(),
@@ -414,18 +406,10 @@ pub fn register_crew_constructor(
                 let reasoning_effort: Option<String> = table.get("reasoning_effort")?;
                 let reasoning_summary: Option<String> = table.get("reasoning_summary")?;
                 if let Some(value) = reasoning_effort.as_deref() {
-                    validate_config_string(
-                        "reasoning_effort",
-                        value,
-                        MAX_CONFIG_ITEM_BYTES,
-                    )?;
+                    validate_config_choice("Crew.new reasoning_effort", value, REASONING_EFFORTS)?;
                 }
                 if let Some(value) = reasoning_summary.as_deref() {
-                    validate_config_string(
-                        "reasoning_summary",
-                        value,
-                        MAX_CONFIG_ITEM_BYTES,
-                    )?;
+                    validate_config_choice("Crew.new reasoning_summary", value, REASONING_SUMMARIES)?;
                 }
 
                 let max_server_tools = config_limit(
@@ -472,10 +456,10 @@ pub fn register_crew_constructor(
                 let web_search_context_size: Option<String> =
                     table.get("web_search_context_size")?;
                 if let Some(value) = web_search_context_size.as_deref() {
-                    validate_config_string(
-                        "web_search_context_size",
+                    validate_config_choice(
+                        "Crew.new web_search_context_size",
                         value,
-                        MAX_CONFIG_ITEM_BYTES,
+                        WEB_SEARCH_CONTEXT_SIZES,
                     )?;
                 }
 
@@ -575,15 +559,7 @@ pub fn register_crew_constructor(
             }),
         };
 
-        let memory = match memory_mode.as_str() {
-            "persistent" => {
-                let memory_path = project_dir.join(".ironcrew").join("memory.json");
-                MemoryStore::persistent_with_config(memory_path, memory_config)
-                    .map_err(mlua::Error::external)?
-            }
-            "ephemeral" => MemoryStore::ephemeral_with_config(memory_config),
-            _ => unreachable!("memory mode was validated above"),
-        };
+        let memory = construction_support::memory(&lua, &memory_mode, &project_dir, memory_config).await?;
 
         let stream = table.get::<Option<bool>>("stream")?.unwrap_or(false);
 
@@ -658,6 +634,9 @@ pub fn register_crew_constructor(
         for agent in agents.iter() {
             crew.add_agent(agent.clone()).map_err(mlua::Error::external)?;
         }
+        let effective_provider = custom_provider.as_ref().unwrap_or(&runtime.provider);
+        crate::lua::provider_validation::crew(effective_provider.as_ref(), &crew)
+            .map_err(mlua::Error::external)?;
 
         // ── MCP config (feature-gated) ──────────────────────────────────
         #[cfg(feature = "mcp")]
@@ -681,6 +660,7 @@ pub fn register_crew_constructor(
             custom_provider,
             project_dir,
             store: store_cell,
+            last_run_usage: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_config,
             #[cfg(feature = "mcp")]
@@ -689,6 +669,10 @@ pub fn register_crew_constructor(
             mcp_tool_registry: Arc::new(tokio::sync::Mutex::new(None)),
             agent_tools_finalized: tokio::sync::OnceCell::new(),
         };
+
+        if crate::lua::construction::active(&lua) {
+            return crate::lua::construction::capture(&lua, lua_crew);
+        }
 
         // In chat mode, stash the userdata in the registry so the CLI/HTTP
         // harness can pick it back up once the entrypoint script returns.
@@ -702,6 +686,7 @@ pub fn register_crew_constructor(
 
         let ud = lua.create_userdata(lua_crew)?;
         Ok(mlua::Value::UserData(ud))
+        }
     })?;
 
     crew_table.set("new", new_fn)?;
@@ -709,75 +694,6 @@ pub fn register_crew_constructor(
     Ok(())
 }
 
+mod construction_support;
 #[cfg(test)]
-mod tests {
-    use super::{
-        resolve_custom_provider_key, strict_string_list, trusted_provider_key_env_name,
-        validate_api_key_value, validate_config_string,
-    };
-    use mlua::Lua;
-
-    #[test]
-    fn strict_string_list_rejects_sparse_mixed_and_duplicate_values() {
-        let lua = Lua::new();
-
-        let sparse = lua.create_table().unwrap();
-        sparse.raw_set(1, "one").unwrap();
-        sparse.raw_set(3, "three").unwrap();
-        assert!(strict_string_list(&sparse, "items", 8, 32).is_err());
-
-        let mixed = lua.create_table().unwrap();
-        mixed.raw_set(1, "one").unwrap();
-        mixed.set("extra", "two").unwrap();
-        assert!(strict_string_list(&mixed, "items", 8, 32).is_err());
-
-        let duplicate = lua.create_sequence_from(["one", "one"]).unwrap();
-        assert!(strict_string_list(&duplicate, "items", 8, 32).is_err());
-    }
-
-    #[test]
-    fn strict_string_list_preserves_valid_dense_order() {
-        let lua = Lua::new();
-        let table = lua.create_sequence_from(["one", "two"]).unwrap();
-        assert_eq!(
-            strict_string_list(&table, "items", 2, 8).unwrap(),
-            vec!["one", "two"]
-        );
-    }
-
-    #[test]
-    fn config_strings_and_api_keys_are_bounded() {
-        assert!(validate_config_string("goal", "", 10).is_err());
-        assert!(validate_config_string("goal", "eleven bytes", 10).is_err());
-        assert!(validate_config_string("goal", "valid", 10).is_ok());
-        assert!(validate_api_key_value(" padded").is_err());
-        assert!(validate_api_key_value("valid-key").is_ok());
-    }
-
-    #[test]
-    fn custom_provider_url_never_inherits_a_process_secret_for_untrusted_hosts() {
-        assert!(resolve_custom_provider_key(Some("https://attacker.example/v1"), None).is_err());
-        assert!(
-            resolve_custom_provider_key(
-                Some("https://attacker.example/v1"),
-                Some("caller-owned-key")
-            )
-            .is_ok()
-        );
-        assert!(resolve_custom_provider_key(None, None).is_ok());
-        assert_eq!(
-            trusted_provider_key_env_name(
-                "https://generativelanguage.googleapis.com/v1beta/openai"
-            ),
-            Some("GEMINI_API_KEY")
-        );
-        assert_eq!(
-            trusted_provider_key_env_name("https://api.openai.com.attacker.example/v1"),
-            None
-        );
-        assert_eq!(
-            trusted_provider_key_env_name("http://api.openai.com/v1"),
-            None
-        );
-    }
-}
+mod tests;

@@ -1,4 +1,5 @@
 pub mod admission;
+mod admission_paths;
 pub mod audit;
 pub mod auth;
 pub mod conversation_lifecycle;
@@ -6,6 +7,7 @@ pub mod conversations;
 pub mod deployment;
 pub mod handlers;
 pub mod idempotency;
+mod inspection;
 pub mod lifecycle;
 mod metrics;
 mod resource_metrics;
@@ -33,7 +35,7 @@ pub struct RunCrewResponse {
     pub status: String,
     pub duration_ms: u64,
     /// Aggregate token usage across all tasks in this run.
-    pub total_tokens: u32,
+    pub usage: crate::usage::UsageSnapshot,
     pub results: Vec<TaskResultResponse>,
 }
 
@@ -44,6 +46,7 @@ pub struct TaskResultResponse {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    pub usage: crate::usage::UsageSnapshot,
 }
 
 /// Query params for listing runs.
@@ -73,10 +76,18 @@ pub struct ListRunsResponse {
 #[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget: Option<crate::usage::budget::BudgetSnapshot>,
 }
 
 pub fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error: message }))
+    (
+        status,
+        Json(ErrorResponse {
+            error: message,
+            budget: None,
+        }),
+    )
 }
 
 /// Run-event and human-input payloads (including validation errors) can carry

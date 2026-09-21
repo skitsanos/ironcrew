@@ -45,6 +45,8 @@ pub struct AppState {
     pub conversation_permits: Arc<Semaphore>,
     pub max_active_runs: usize,
     pub run_permits: Arc<Semaphore>,
+    pub max_active_inspections: usize,
+    pub inspection_permits: Arc<Semaphore>,
     pub max_sse_connections: usize,
     pub sse_permits: Arc<Semaphore>,
     pub max_run_lifetime: std::time::Duration,

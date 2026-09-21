@@ -58,6 +58,7 @@ pub struct SubflowContext {
     pub project_dir: Arc<PathBuf>,
     pub depth: usize,
     pub eventbus: Option<EventBus>,
+    pub usage_tracker: crate::usage::UsageTracker,
     /// Immutable source and lexical directory for HTTP conversations. `None`
     /// preserves the ordinary filesystem-backed CLI/runtime behavior.
     pub source_context: Option<ConversationSourceContext>,
@@ -142,6 +143,10 @@ pub async fn invoke_subflow(
             .await?
     };
 
+    ctx.usage_tracker
+        .budget()
+        .check()
+        .map_err(mlua::Error::external)?;
     // ── Marshal the result back across VMs via JSON ───────────────────────
     let output = match ctx.output_key.clone() {
         Some(key) => {
@@ -240,6 +245,7 @@ pub fn register_run_flow(lua: &Lua) -> LuaResult<()> {
             };
 
             let ctx = SubflowContext {
+                usage_tracker: super::usage::tracker(&lua)?,
                 runtime,
                 project_dir,
                 depth,

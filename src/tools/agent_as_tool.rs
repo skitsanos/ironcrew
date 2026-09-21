@@ -156,6 +156,7 @@ impl Tool for AgentAsTool {
         //    so nested events attribute correctly; `caller_scope`
         //    propagates unchanged so the whole chain shares one scope.
         let sub_ctx = ToolCallContext {
+            usage_tracker: ctx.usage_tracker.clone(),
             store: ctx.store.clone(),
             eventbus: ctx.eventbus.clone(),
             depth: ctx.depth + 1,

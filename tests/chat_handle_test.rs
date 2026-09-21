@@ -35,6 +35,7 @@ async fn restart_after_eviction_rehydrates_from_store() {
     // persisted record is the source of truth.
     let (_dir, store) = fresh_store();
     let record = ConversationRecord {
+        usage: Default::default(),
         id: "s1".into(),
         flow_name: "chat-cli".into(),
         flow_path: Some("chat-cli".into()),
@@ -111,6 +112,7 @@ async fn capped_out_start_must_not_leak_persisted_record() {
 
     // Meanwhile a successful start still shows up (sanity check).
     let accepted = ConversationRecord {
+        usage: Default::default(),
         id: "accepted".into(),
         flow_name: "flow-a-goal".into(),
         flow_path: Some("flow-a".into()),

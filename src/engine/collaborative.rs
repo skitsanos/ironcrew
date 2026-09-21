@@ -4,13 +4,11 @@ use std::sync::Arc;
 use crate::engine::agent::Agent;
 use crate::engine::eventbus::{CrewEvent, EventBus};
 use crate::engine::interpolate::prompt_char_limit;
-use crate::engine::task::{TaskResult, TaskTokenUsage};
+use crate::engine::task::TaskResult;
+use crate::llm::final_response::require_final_content;
 use crate::llm::provider::*;
+use crate::usage::UsageSnapshot;
 use crate::utils::error::{IronCrewError, Result};
-
-mod usage;
-
-use usage::UsageAccumulator;
 
 const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const HARD_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -124,7 +122,9 @@ pub async fn execute_collaborative_task(
     model: &str,
     synthesis_model: &str,
     eventbus: &EventBus,
-) -> Result<(String, Option<TaskTokenUsage>)> {
+) -> Result<(String, UsageSnapshot)> {
+    let tracker = crate::llm::scope::child_scope(provider.as_ref())?;
+    let provider = crate::llm::scope::with_usage_tracker(provider, tracker.clone());
     if agents.len() < 2 {
         return Err(IronCrewError::Validation(
             "Collaborative task requires at least 2 agents".into(),
@@ -159,9 +159,6 @@ pub async fn execute_collaborative_task(
     .min(transcript_limit);
     let prompt_limit = prompt_char_limit();
 
-    let mut total_usage = UsageAccumulator::default();
-
-    // Build conversation history shared across all agents
     let mut conversation = Transcript::new(transcript_limit);
     conversation.push(task_name, "Task: ", task_description)?;
 
@@ -169,7 +166,6 @@ pub async fn execute_collaborative_task(
         conversation.push(task_name, "Context:\n", memory_context)?;
     }
 
-    // Add dependency results as context
     for (name, result) in completed_results {
         if result.success {
             let label = format!("Result from '{name}': ");
@@ -211,19 +207,10 @@ pub async fn execute_collaborative_task(
 
             let agent_model = agent.model.clone().unwrap_or_else(|| model.to_string());
 
-            let request = ChatRequest {
-                messages,
-                model: agent_model,
-                temperature: agent.temperature,
-                max_tokens: agent.max_tokens,
-                response_format: agent.response_format.clone(),
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-            };
+            let request = agent.chat_request(agent_model, messages);
 
             let response = provider.chat(request).await?;
-            total_usage.observe(response.usage.as_ref());
-            let content = response.content.unwrap_or_default();
+            let content = require_final_content(response.content)?;
             if content.len() > turn_limit {
                 return Err(IronCrewError::Task {
                     task: task_name.to_string(),
@@ -272,30 +259,22 @@ pub async fn execute_collaborative_task(
         );
     }
 
-    let request = ChatRequest {
-        messages: vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&synthesis_prompt),
-        ],
-        model: synth_agent
+    let request = synth_agent.chat_request(
+        synth_agent
             .model
             .clone()
             .unwrap_or_else(|| synthesis_model.to_string()),
-        temperature: synth_agent.temperature,
-        max_tokens: synth_agent.max_tokens,
-        response_format: synth_agent.response_format.clone(),
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-    };
+        vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&synthesis_prompt),
+        ],
+    );
 
     validate_chat_history(&request.messages, 1, chat_history_max_bytes(), true)?;
 
     let response = provider.chat(request).await?;
-    total_usage.observe(response.usage.as_ref());
-    response
-        .content
-        .map(|content| (content, total_usage.finish()))
-        .ok_or_else(|| IronCrewError::Provider("Empty synthesis response".into()))
+    let content = require_final_content(response.content)?;
+    Ok((content, crate::llm::scope::snapshot(&tracker)?))
 }
 
 #[cfg(test)]

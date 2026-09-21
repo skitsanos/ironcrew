@@ -1,11 +1,11 @@
 -- OpenAI Responses API — built-in web_search
--- Model: gpt-5.4-mini
+-- Model: gpt-5.6-luna
 -- Requires: OPENAI_API_KEY
 
 local crew = Crew.new({
     goal = "Verify OpenAI Responses web_search tool",
     provider = "openai-responses",
-    model = "gpt-5.4-mini",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
     server_tools = { "web_search" },
     web_search_context_size = "medium",

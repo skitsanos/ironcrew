@@ -13,6 +13,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use crate::engine::audit::AuditEvent;
 use crate::engine::store::StateStore;
 
+mod forwarded;
+
 /// Maximum allowed serialized size of the `metadata` field.
 const METADATA_MAX_BYTES: usize = 2 * 1024;
 
@@ -29,12 +31,7 @@ pub(crate) fn background_headers(headers: &HeaderMap) -> HeaderMap {
     {
         retained.insert("x-audit-actor", value);
     }
-    if let Some(forwarded_ip) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+    if let Some(forwarded_ip) = forwarded::rightmost_ip(headers)
         && let Ok(value) = HeaderValue::from_str(&forwarded_ip.to_string())
     {
         retained.insert("x-forwarded-for", value);
@@ -89,20 +86,10 @@ fn extract_actor(headers: &HeaderMap) -> Option<String> {
 }
 
 fn extract_source_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> Option<String> {
-    // Behind a trusted proxy, prefer the first hop of X-Forwarded-For.
-    // Gated by IRONCREW_TRUST_PROXY=1 to prevent spoofing in direct-
-    // exposure deployments.
-    if std::env::var("IRONCREW_TRUST_PROXY")
+    let trust_proxy = std::env::var("IRONCREW_TRUST_PROXY")
         .map(|v| v == "1")
-        .unwrap_or(false)
-        && let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok())
-    {
-        let first = xff.split(',').next().unwrap_or("").trim();
-        if let Ok(ip) = first.parse::<std::net::IpAddr>() {
-            return Some(ip.to_string());
-        }
-    }
-    addr.map(|a| a.ip().to_string())
+        .unwrap_or(false);
+    forwarded::source_ip(headers, addr, trust_proxy)
 }
 
 fn clamp_metadata(value: serde_json::Value) -> Option<serde_json::Value> {
@@ -386,7 +373,10 @@ mod tests {
             "raw-recovery-key".parse().unwrap(),
         );
         headers.insert("x-audit-actor", "alice".parse().unwrap());
-        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "192.0.2.44, 203.0.113.9".parse().unwrap(),
+        );
 
         let retained = background_headers(&headers);
         assert_eq!(retained.len(), 2);

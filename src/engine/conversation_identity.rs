@@ -88,6 +88,8 @@ pub fn conversation_mutation_scope(flow: &str, id: &str, incarnation_id: &str) -
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationRecord {
+    /// Checked usage at the same revision as this transcript checkpoint.
+    pub usage: crate::usage::UsageSnapshot,
     pub id: String,
     pub flow_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +106,7 @@ pub struct ConversationRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
+    pub usage: crate::usage::UsageSnapshot,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_path: Option<String>,
@@ -116,6 +119,7 @@ pub struct ConversationSummary {
 impl From<&ConversationRecord> for ConversationSummary {
     fn from(record: &ConversationRecord) -> Self {
         Self {
+            usage: record.usage.clone(),
             id: record.id.clone(),
             flow_path: record.flow_path.clone(),
             agent_name: record.agent_name.clone(),

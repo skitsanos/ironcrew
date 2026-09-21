@@ -2,8 +2,18 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum IronCrewError {
+    #[error("{0}")]
+    TokenBudget(#[from] crate::usage::budget::BudgetError),
+    #[error("Construction validation INCOMPLETE: {0}")]
+    ValidationIncomplete(String),
+
     #[error("LLM provider error: {0}")]
     Provider(String),
+
+    /// A final reply cannot complete the operation. Retrying the whole task
+    /// could replay tool effects from earlier provider rounds.
+    #[error("LLM provider error: Empty response from LLM")]
+    EmptyProviderResponse,
 
     #[error(
         "{provider} request body is {actual} bytes, exceeding the configured {limit}-byte limit"
@@ -43,6 +53,27 @@ pub enum IronCrewError {
     #[cfg(feature = "mcp")]
     #[error("MCP error [{server}]: {message}")]
     Mcp { server: String, message: String },
+}
+
+impl IronCrewError {
+    pub(crate) fn allows_task_retry(&self) -> bool {
+        if let Self::Lua(error) = self {
+            let mut current = Some(error);
+            while let Some(error) = current {
+                if error
+                    .downcast_ref::<crate::usage::budget::BudgetError>()
+                    .is_some()
+                    || error
+                        .downcast_ref::<Self>()
+                        .is_some_and(|inner| !inner.allows_task_retry())
+                {
+                    return false;
+                }
+                current = error.parent();
+            }
+        }
+        !matches!(self, Self::EmptyProviderResponse | Self::TokenBudget(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, IronCrewError>;

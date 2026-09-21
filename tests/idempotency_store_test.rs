@@ -1,3 +1,7 @@
+#[path = "support/usage.rs"]
+mod usage_fixture;
+use usage_fixture::fixture_usage;
+
 use std::sync::Arc;
 
 use ironcrew::api::{AppState, create_router};
@@ -452,6 +456,7 @@ async fn exercise_principal_usage_lifecycle(store: Arc<dyn StateStore>) {
 
 fn conversation(id: &str) -> ConversationRecord {
     ConversationRecord {
+        usage: Default::default(),
         id: id.into(),
         flow_name: "Flow A".into(),
         flow_path: Some("flow-a".into()),
@@ -485,6 +490,7 @@ async fn exercise_idempotency_contract(
     assert_eq!(initial.revision, 1);
     let mut candidate = initial.clone();
     candidate.messages.push(ChatMessage::user("hello"));
+    candidate.usage = fixture_usage(5_000_000_000, 7);
 
     let claim = conversation_claim('a', 'b', "attempt-a", "conversation-a");
     let left_store = Arc::clone(&store);
@@ -556,6 +562,7 @@ async fn exercise_idempotency_contract(
         .unwrap();
     assert_eq!(stored.revision, 2);
     assert_eq!(stored.messages.len(), 2);
+    assert_eq!(stored.usage, candidate.usage);
 
     assert!(matches!(
         store
@@ -1064,8 +1071,7 @@ async fn exercise_run_lifecycle_reconciliation(store: Arc<dyn StateStore>) {
                 finished_at: "2026-07-19T12:00:30Z".into(),
                 duration_ms: 30_000,
                 task_results: Vec::new(),
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -1427,8 +1433,7 @@ async fn exercise_idempotent_run_heartbeat(store: Arc<dyn StateStore>) {
                 finished_at: "2099-07-19T12:05:10Z".into(),
                 duration_ms: 10,
                 task_results: Vec::new(),
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await
@@ -1876,6 +1881,8 @@ async fn metrics_omit_persisted_principal_identifiers() {
         conversation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_active_runs: 1,
         run_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        max_active_inspections: 1,
+        inspection_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_sse_connections: 1,
         sse_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         max_run_lifetime: std::time::Duration::from_secs(60),
@@ -1947,7 +1954,7 @@ async fn metrics_omit_persisted_principal_identifiers() {
     ] {
         assert!(
             !body.contains(secret_identifier),
-            "metrics exposed principal identifier {secret_identifier}"
+            "metrics exposed a principal identifier"
         );
     }
 

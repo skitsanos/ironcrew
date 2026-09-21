@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal = "Solve a complex reasoning problem using extended thinking",
     provider = "anthropic",
-    model = "claude-sonnet-4-20250514",
+    model = "claude-sonnet-4-5-20250929",
     api_key = env("ANTHROPIC_API_KEY"),
     thinking_budget = 5000,
     stream = true,  -- watch the reasoning unfold in real-time on stderr

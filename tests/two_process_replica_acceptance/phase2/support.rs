@@ -1,3 +1,7 @@
+#[path = "../../support/usage.rs"]
+mod usage_fixture;
+use usage_fixture::fixture_usage;
+
 use ironcrew::engine::postgres_store::PostgresStore;
 use ironcrew::engine::run_history::{RunCompletion, RunStatus, RunTransition};
 use ironcrew::engine::store::{RunLeaseConfig, StateStore};
@@ -190,8 +194,7 @@ pub(super) async fn assert_stale_completion_fenced(pair: &ProcessPair, run_id: &
                 finished_at: chrono::Utc::now().to_rfc3339(),
                 duration_ms: 1,
                 task_results: vec![],
-                total_tokens: 0,
-                cached_tokens: 0,
+                usage: fixture_usage(0, 0),
             },
         )
         .await

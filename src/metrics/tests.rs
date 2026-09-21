@@ -52,8 +52,19 @@ fn labels_are_a_closed_vocabulary() {
 #[test]
 fn provider_tokens_are_aggregated_by_fixed_family_and_kind() {
     let metrics = Metrics::default();
-    metrics.record_provider_tokens(ProviderFamily::Anthropic, [10, 4, 3]);
-    metrics.record_provider_tokens(ProviderFamily::Anthropic, [5, 2, 1]);
+    for (prompt, completion, cached) in [(10, 4, 3), (5, 2, 1)] {
+        let receipt = crate::usage::UsageReceipt::from_counts(
+            crate::usage::UsageCounts {
+                prompt_tokens: Some(prompt),
+                completion_tokens: Some(completion),
+                total_tokens: Some(prompt + completion),
+                cached_tokens: Some(cached),
+                ..Default::default()
+            },
+            true,
+        );
+        metrics.usage.record(ProviderFamily::Anthropic, &receipt);
+    }
     let body = render(&metrics);
     assert!(
         body.contains(

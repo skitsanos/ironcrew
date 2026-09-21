@@ -148,6 +148,132 @@ fn concurrent_symlink_swap_never_hashes_an_outside_target() {
     assert_eq!(flow_source_fingerprint(&flow).unwrap(), baseline);
 }
 
+#[cfg(unix)]
+#[test]
+fn sql_files_participate_in_the_source_fingerprint() {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    for dir in [&left, &right] {
+        write(dir.path(), "crew.lua", "return 1");
+        write(dir.path(), "sql/save.sql", "-- ironcrew:op\nSELECT 1;");
+    }
+    let a = capture_flow_source(left.path()).unwrap();
+    let b = capture_flow_source(right.path()).unwrap();
+    assert_eq!(
+        a.fingerprint(),
+        b.fingerprint(),
+        "identical trees must match"
+    );
+    assert_eq!(a.sql_sources().len(), 1);
+    assert_eq!(a.sql_sources()[0].0, "save");
+
+    write(right.path(), "sql/save.sql", "-- ironcrew:op\nSELECT 2;");
+    let c = capture_flow_source(right.path()).unwrap();
+    assert_ne!(
+        a.fingerprint(),
+        c.fingerprint(),
+        "sql edit must change the fingerprint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sql_sources_is_flat_while_fingerprint_covers_nested_sql_files() {
+    let directory = TempDir::new().unwrap();
+    write(directory.path(), "crew.lua", "return 1");
+    write(
+        directory.path(),
+        "sql/save.sql",
+        "-- ironcrew:op\nSELECT 1;",
+    );
+    write(
+        directory.path(),
+        "sql/sub/nested.sql",
+        "-- ironcrew:op\nSELECT 2;",
+    );
+    write(
+        directory.path(),
+        "queries/outside.sql",
+        "-- ironcrew:op\nSELECT 3;",
+    );
+    let snapshot = capture_flow_source(directory.path()).unwrap();
+
+    // sql_sources() must match the non-recursive filesystem discovery in
+    // read_sql_dir: only direct children of sql/ qualify as operations.
+    let mut stems: Vec<_> = snapshot
+        .sql_sources()
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .collect();
+    stems.sort();
+    assert_eq!(
+        stems,
+        vec!["save"],
+        "sql_sources() is flat: sql/sub/nested.sql is not a direct child of sql/"
+    );
+
+    let baseline = snapshot.fingerprint().to_owned();
+
+    // Fingerprint capture stays recursive: an edit to the nested (excluded)
+    // file must still change the fingerprint.
+    write(
+        directory.path(),
+        "sql/sub/nested.sql",
+        "-- ironcrew:op\nSELECT 4;",
+    );
+    let changed_nested = capture_flow_source(directory.path()).unwrap();
+    assert_ne!(
+        baseline,
+        changed_nested.fingerprint(),
+        "sql/sub/nested.sql still participates in the fingerprint though excluded from sql_sources()"
+    );
+    assert_eq!(
+        changed_nested.sql_sources().len(),
+        1,
+        "nested sql files remain excluded from sql_sources() after an edit"
+    );
+
+    write(
+        directory.path(),
+        "queries/outside.sql",
+        "-- ironcrew:op\nSELECT 5;",
+    );
+    let changed_outside = capture_flow_source(directory.path()).unwrap();
+    assert_ne!(
+        baseline,
+        changed_outside.fingerprint(),
+        "queries/ sql files still participate in the fingerprint"
+    );
+    assert_eq!(
+        changed_outside.sql_sources().len(),
+        1,
+        "queries/ sql files are excluded from sql_sources()"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn misplaced_sql_files_do_not_enter_lua_roles() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "crew.lua", "return 1");
+    write(dir.path(), "agents/helper.lua", "return 2");
+    write(dir.path(), "agents/lookup.sql", "-- ironcrew:op\nSELECT 1;");
+    let snapshot = capture_flow_source(dir.path()).unwrap();
+    let roles = snapshot.roles().unwrap();
+    let agent_paths: Vec<_> = roles
+        .agents
+        .iter()
+        .map(|source| source.relative_path().to_path_buf())
+        .collect();
+    assert_eq!(agent_paths, vec![Path::new("agents/helper.lua")]);
+    // The stray file still participates in the fingerprint.
+    assert_eq!(
+        snapshot.sql_sources().len(),
+        0,
+        "not under sql/ so not an operation"
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn platforms_without_guaranteed_no_follow_fail_closed() {

@@ -7,7 +7,7 @@
 local crew = Crew.new({
     goal = "Demonstrate basic OpenAI Responses API usage",
     provider = "openai-responses",
-    model = "gpt-5.4",
+    model = "gpt-5.6-luna",
     api_key = env("OPENAI_API_KEY"),
 })
 

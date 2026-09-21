@@ -421,10 +421,10 @@ fn harden_downstream_rate_response(mut response: Response) -> Response {
 }
 
 pub(crate) fn classify_mutation(method: &Method, path: &str) -> Option<MutationClass> {
-    // Polling a shared question mailbox performs indexed database reads plus
-    // bounded ciphertext decryption. Give it an independently bounded bucket
-    // so an aggressive UI poll loop cannot starve answer/abort capacity.
-    if method == Method::GET && is_question_poll_path(path) {
+    // Bound expensive read-side polling independently from mutations.
+    if method == Method::GET
+        && (is_question_poll_path(path) || super::admission_paths::is_flow_inspection(path))
+    {
         return Some(MutationClass::Observation);
     }
     if method == Method::DELETE {

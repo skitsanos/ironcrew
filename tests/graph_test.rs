@@ -1,5 +1,35 @@
 use std::path::Path;
 
+/// Regression test: `postgres.*` calls embedded in crew.lua (even inline
+/// inside the `Crew.new()` argument table) must not crash graph extraction.
+/// The capture-mode VM stubs `http`, `json_parse`, `print`, `error`, etc. for
+/// exactly this reason, but previously lacked a `postgres` stub, so a script
+/// that called `postgres.execute/query/query_one` before or while building
+/// its `Crew.new()` table hit a nil-index and lost the capture (both the
+/// direct pass and the `Crew.new(`-only fallback pass re-hit the same crash).
+#[test]
+fn graph_extraction_survives_postgres_calls_in_crew_new_args() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("crew.lua"),
+        r#"
+Crew.new({
+    goal = "processed " .. tostring(postgres.execute("noop", {})) .. " rows",
+    provider = "openai",
+    api_key = "test",
+})
+"#,
+    )
+    .unwrap();
+
+    let data = ironcrew::cli::graph_extract::extract_graph_data(dir.path()).unwrap();
+    assert_eq!(
+        data.goal, "processed 0 rows",
+        "postgres.* stub should let Crew.new()'s goal expression evaluate instead of \
+         silently losing the capture to a nil-index crash"
+    );
+}
+
 #[test]
 fn extract_research_crew_data() {
     let data =

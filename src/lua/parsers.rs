@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::lua::config_choices::{REASONING_EFFORTS, validate_config_choice};
 use mlua::{Function, Result as LuaResult, Table, Value};
 
 use crate::engine::agent::{Agent, ResponseFormat, validate_agent_tool_name};
@@ -13,6 +14,8 @@ use crate::utils::error::{IronCrewError, Result};
 
 use super::json::lua_table_to_json;
 
+pub(crate) mod option_keys;
+
 const MAX_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_NAME_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
@@ -21,10 +24,122 @@ const MAX_LIST_ITEM_BYTES: usize = 256;
 const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_AGENT_TOKENS: u32 = 1_000_000;
-
 fn validation_error(message: impl Into<String>) -> mlua::Error {
     mlua::Error::external(IronCrewError::Validation(message.into()))
 }
+/// Reject configuration keys the runtime does not read.
+///
+/// Every option table here is a closed set. Ignoring an unrecognized key makes
+/// a typo silently do nothing, which is merely confusing for `temperature` but
+/// unsafe for security options such as `require_approval` — a misspelling would
+/// quietly disable the approval gate. Failing loudly is the only way a typo is
+/// visible before a run starts.
+pub(crate) fn reject_unknown_keys(
+    table: &Table,
+    accepted: &[&str],
+    context: &str,
+) -> LuaResult<()> {
+    let mut unknown: Vec<String> = Vec::new();
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            // Non-string keys (array parts) are not configuration options.
+            continue;
+        };
+        let key = key.to_str()?.to_string();
+        // Internal keys are runtime-injected, never author-supplied.
+        if key.starts_with("__ironcrew") {
+            continue;
+        }
+        if !accepted.contains(&key.as_str()) {
+            unknown.push(key);
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    let mut accepted_sorted: Vec<&str> = accepted.to_vec();
+    accepted_sorted.sort_unstable();
+    Err(validation_error(format!(
+        "{context}: unknown option{} {}. Supported options: {}",
+        if unknown.len() == 1 { "" } else { "s" },
+        unknown
+            .iter()
+            .map(|key| format!("'{key}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        accepted_sorted.join(", "),
+    )))
+}
+
+/// Options accepted by `Crew.new` (and, through the defaults merge, by
+/// `config.lua`). A misspelled key here would silently do nothing, which for
+/// `require_approval` would mean a disabled approval gate — so unknown keys are
+/// rejected rather than ignored.
+pub(crate) const CREW_KEYS: &[&str] = &[
+    "goal",
+    "provider",
+    "model",
+    "base_url",
+    "api_key",
+    "memory",
+    "models",
+    "stream",
+    "max_concurrent",
+    "max_memory_items",
+    "max_memory_tokens",
+    "require_approval",
+    "mcp_servers",
+    "server_tools",
+    "thinking_budget",
+    "reasoning_effort",
+    "reasoning_summary",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "web_search_max_uses",
+    "web_search_context_size",
+    "file_search_max_results",
+    "file_search_vector_store_ids",
+];
+
+/// Options accepted on an agent table (`Agent.new` / `crew:add_agent`).
+pub(crate) const AGENT_KEYS: &[&str] = &[
+    "name",
+    "goal",
+    "expected_output",
+    "system_prompt",
+    "temperature",
+    "max_tokens",
+    "model",
+    "capabilities",
+    "tools",
+    "response_format",
+    "reasoning_effort",
+];
+
+/// Options accepted on a task table (`crew:add_task` / `add_foreach_task`).
+pub(crate) const TASK_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "agent",
+    "agents",
+    "expected_output",
+    "context",
+    "depends_on",
+    "max_retries",
+    "retry_backoff_secs",
+    "timeout_secs",
+    "condition",
+    "on_error",
+    "task_type",
+    "max_turns",
+    "foreach",
+    "foreach_as",
+    "foreach_parallel",
+    "stream",
+    "model",
+];
 
 fn validate_text(value: &str, field: &str) -> LuaResult<()> {
     if value.len() > MAX_TEXT_BYTES {
@@ -191,6 +306,7 @@ fn validate_schema_size(schema: &serde_json::Value, field: &str) -> LuaResult<()
 
 /// Parse an Agent from a Lua table.
 pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
+    reject_unknown_keys(table, AGENT_KEYS, "agent")?;
     let name: String = table.raw_get("name")?;
     let goal: String = table.raw_get("goal")?;
     let expected_output: Option<String> =
@@ -199,12 +315,18 @@ pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
     let temperature: Option<f32> = table.raw_get::<Option<f32>>("temperature")?.or(None);
     let max_tokens: Option<u32> = table.raw_get::<Option<u32>>("max_tokens")?.or(None);
     let model: Option<String> = table.raw_get::<Option<String>>("model")?.or(None);
+    let reasoning_effort: Option<String> = table
+        .raw_get::<Option<String>>("reasoning_effort")?
+        .or(None);
 
     validate_name(&name, "agent.name")?;
     validate_text(&goal, "agent.goal")?;
     validate_optional_text(expected_output.as_deref(), "agent.expected_output")?;
     validate_optional_text(system_prompt.as_deref(), "agent.system_prompt")?;
     validate_optional_control_free(model.as_deref(), "agent.model", MAX_MODEL_BYTES)?;
+    if let Some(effort) = reasoning_effort.as_deref() {
+        validate_config_choice("agent.reasoning_effort", effort, REASONING_EFFORTS)?;
+    }
     if let Some(temperature) = temperature
         && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
     {
@@ -239,6 +361,7 @@ pub fn agent_from_lua_table(table: &Table) -> LuaResult<Agent> {
         temperature,
         max_tokens,
         model,
+        reasoning_effort,
         response_format,
     })
 }
@@ -287,6 +410,7 @@ fn parse_response_format(table: &Table) -> LuaResult<Option<ResponseFormat>> {
 
 /// Parse a Task from a Lua table.
 pub fn task_from_lua_table(table: &Table) -> LuaResult<Task> {
+    reject_unknown_keys(table, TASK_KEYS, "task")?;
     let name: String = table.raw_get("name")?;
     let description: String = table.raw_get("description")?;
     let agent: Option<String> = table.raw_get::<Option<String>>("agent")?.or(None);
@@ -613,249 +737,8 @@ fn parse_agent_source(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod parser_agent_tool_validation {
-    use super::*;
-    use mlua::Lua;
-    use std::path::Path;
-
-    fn base_agent(lua: &Lua) -> Table {
-        let table = lua.create_table().unwrap();
-        table.set("name", "coordinator").unwrap();
-        table.set("goal", "route asks").unwrap();
-        table
-    }
-
-    fn base_task(lua: &Lua) -> Table {
-        let table = lua.create_table().unwrap();
-        table.set("name", "research").unwrap();
-        table.set("description", "Research the topic").unwrap();
-        table
-    }
-
-    #[test]
-    fn agent_from_lua_table_rejects_malformed_agent_tool_name() {
-        let lua = Lua::new();
-        let table = base_agent(&lua);
-        let tools = lua.create_sequence_from(vec!["agent__BadCase"]).unwrap();
-        table.set("tools", tools).unwrap();
-
-        let result = agent_from_lua_table(&table);
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("agent__BadCase"),
-            "error should mention the malformed name, got: {err}"
-        );
-    }
-
-    #[test]
-    fn agent_from_lua_table_accepts_valid_agent_tool_name() {
-        let lua = Lua::new();
-        let table = base_agent(&lua);
-        let tools = lua.create_sequence_from(vec!["agent__researcher"]).unwrap();
-        table.set("tools", tools).unwrap();
-
-        let result = agent_from_lua_table(&table);
-        assert!(
-            result.is_ok(),
-            "valid agent tool name rejected: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn agent_rejects_invalid_scalar_limits() {
-        let lua = Lua::new();
-
-        let table = base_agent(&lua);
-        table.set("name", "bad\nname").unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("control")
-        );
-
-        let table = base_agent(&lua);
-        table.set("temperature", f64::NAN).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("temperature")
-        );
-
-        let table = base_agent(&lua);
-        table.set("max_tokens", 0).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("max_tokens")
-        );
-
-        let table = base_agent(&lua);
-        table
-            .set("system_prompt", "x".repeat(MAX_TEXT_BYTES + 1))
-            .unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("system_prompt")
-        );
-    }
-
-    #[test]
-    fn agent_lists_are_strict_contiguous_and_bounded() {
-        let lua = Lua::new();
-
-        let table = base_agent(&lua);
-        let tools = lua.create_table().unwrap();
-        tools.set(1, "file_read").unwrap();
-        tools.set(2, true).unwrap();
-        table.set("tools", tools).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("must be a string")
-        );
-
-        let table = base_agent(&lua);
-        let capabilities = lua.create_table().unwrap();
-        capabilities.set(2, "analysis").unwrap();
-        table.set("capabilities", capabilities).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("contiguous")
-        );
-
-        let table = base_agent(&lua);
-        let capabilities = lua.create_table().unwrap();
-        for index in 1..=MAX_LIST_ITEMS + 1 {
-            capabilities.set(index, "analysis").unwrap();
-        }
-        table.set("capabilities", capabilities).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("maximum")
-        );
-
-        let table = base_agent(&lua);
-        let tools = lua.create_sequence_from(["not.provider.safe"]).unwrap();
-        table.set("tools", tools).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("ASCII")
-        );
-    }
-
-    #[test]
-    fn response_schema_name_and_size_are_bounded() {
-        let lua = Lua::new();
-
-        let table = base_agent(&lua);
-        let format = lua.create_table().unwrap();
-        format.set("type", "json_schema").unwrap();
-        format.set("name", "invalid.schema").unwrap();
-        format.set("schema", lua.create_table().unwrap()).unwrap();
-        table.set("response_format", format).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("ASCII")
-        );
-
-        let table = base_agent(&lua);
-        let format = lua.create_table().unwrap();
-        format.set("type", "json_schema").unwrap();
-        format.set("name", "valid_schema").unwrap();
-        let schema = lua.create_table().unwrap();
-        schema
-            .set("description", "x".repeat(MAX_SCHEMA_BYTES + 1))
-            .unwrap();
-        format.set("schema", schema).unwrap();
-        table.set("response_format", format).unwrap();
-        assert!(
-            agent_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("serialized size")
-        );
-    }
-
-    #[test]
-    fn task_rejects_bad_names_lists_and_boolean_fields() {
-        let lua = Lua::new();
-
-        let table = base_task(&lua);
-        table.set("name", "").unwrap();
-        assert!(
-            task_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("must not be empty")
-        );
-
-        let table = base_task(&lua);
-        let dependencies = lua.create_table().unwrap();
-        dependencies.set(1, "setup").unwrap();
-        dependencies.set(3, "missing-middle").unwrap();
-        table.set("depends_on", dependencies).unwrap();
-        assert!(
-            task_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("contiguous")
-        );
-
-        let table = base_task(&lua);
-        table.set("stream", "yes").unwrap();
-        assert!(
-            task_from_lua_table(&table)
-                .unwrap_err()
-                .to_string()
-                .contains("boolean")
-        );
-    }
-
-    #[test]
-    fn custom_tool_name_and_parameter_definitions_are_strict() {
-        let lua = Lua::new();
-        let table = lua.create_table().unwrap();
-        table.set("name", "bad.tool").unwrap();
-        table.set("description", "description").unwrap();
-        table
-            .set("parameters", lua.create_table().unwrap())
-            .unwrap();
-        table
-            .set("execute", lua.create_function(|_, ()| Ok(())).unwrap())
-            .unwrap();
-        assert!(
-            tool_def_from_lua_table(&table, Path::new("tool.lua"), Arc::from("return {}"))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("ASCII")
-        );
-
-        table.set("name", "valid_tool").unwrap();
-        let parameters = lua.create_table().unwrap();
-        parameters.set("query", "not a table").unwrap();
-        table.set("parameters", parameters).unwrap();
-        assert!(
-            tool_def_from_lua_table(&table, Path::new("tool.lua"), Arc::from("return {}"))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("definition must be an object")
-        );
-    }
-}
+mod agent_effort_tests;
+#[cfg(test)]
+mod parser_agent_tool_validation;
+#[cfg(test)]
+mod unknown_key_tests;

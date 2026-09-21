@@ -45,7 +45,7 @@ do not bypass that temporal check when pages are renamed or retired.
 1. Run focused tests while iterating, including negative, concurrency,
    cancellation, and resource-boundary cases appropriate to the issue.
 2. Finish Rust work with formatting, exact all-target Clippy, and all-target tests.
-3. Use disposable PostgreSQL 15 with `IRONCREW_TEST_PG_URL` when the issue
+3. Use freshly pulled `postgres:latest` with `IRONCREW_TEST_PG_URL` when the issue
    touches shared storage or replica behavior. A skipped test is not evidence.
 4. Validate Lua examples when the runtime, docs, tools, crew DSL, or examples change.
 5. Before closing the issue, use `$check-ironcrew` for every affected gate,
