@@ -4,8 +4,8 @@
 
 Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native), Google Gemini, Groq, Kimi K2.5, DeepSeek, xAI/Grok, Ollama, and any OpenAI-compatible API. Supports reasoning/thinking capture across providers. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
-IronCrew **4.0.0** introduces checked usage accounting and shared token budgets.
-Read the [release and upgrade notes](docs/releases/v4.0.0.md) before moving
+IronCrew **4.0.1** introduces checked usage accounting and shared token budgets.
+Read the [release and upgrade notes](docs/releases/v4.0.1.md) before moving
 existing clients or stored runs to the new usage-accounting contract.
 
 ```lua

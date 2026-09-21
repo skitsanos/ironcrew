@@ -220,6 +220,43 @@ fn first_sse_id(body: &str) -> String {
         .to_string()
 }
 
+async fn wait_for_terminal_sequence<F, Read>(timeout: Duration, mut read: F) -> u64
+where
+    F: FnMut() -> Read,
+    Read: std::future::Future<Output = Option<u64>>,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(sequence) = read().await {
+                return sequence;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for numbered terminal journal event")
+}
+
+#[tokio::test]
+async fn terminal_journal_barrier_waits_through_pending_appends() {
+    let mut snapshots = std::collections::VecDeque::from([None, None, Some(7)]);
+    let sequence = wait_for_terminal_sequence(Duration::from_secs(1), || {
+        std::future::ready(snapshots.pop_front().expect("bounded snapshot fixture"))
+    })
+    .await;
+    assert_eq!(sequence, 7);
+    assert!(snapshots.is_empty());
+}
+
+#[tokio::test]
+#[should_panic(expected = "timed out waiting for numbered terminal journal event")]
+async fn terminal_journal_barrier_bounds_stalled_reads() {
+    wait_for_terminal_sequence(Duration::from_millis(20), || {
+        std::future::pending::<Option<u64>>()
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn keyed_human_input_can_be_listed_and_answered_through_a_peer_replica() {
     let Some(url) = pg_url() else {
@@ -491,6 +528,18 @@ async fn keyed_run_can_be_replayed_observed_and_cancelled_from_a_peer_replica() 
     assert_eq!(cancellation_body["control_scope"], "shared_store");
 
     wait_for_status(&peer_store, &run_id, RunStatus::Aborted).await;
+    // Terminal status precedes the best-effort terminal journal append. This
+    // test requires a numbered replay, so wait for that stronger condition;
+    // the documented unnumbered fallback remains valid before this barrier.
+    wait_for_terminal_sequence(Duration::from_secs(12), || async {
+        peer_store
+            .read_run_events("park", &run_id, 0)
+            .await
+            .expect("read terminal journal barrier")
+            .terminal
+            .and_then(|terminal| terminal.event_sequence)
+    })
+    .await;
     let terminal_sse = client
         .get(format!("{}/flows/park/events/{run_id}", peer.base))
         .header("Last-Event-ID", &resume_cursor)

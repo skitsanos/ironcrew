@@ -33,9 +33,10 @@ spec:
         - name: ironcrew
           # Bootstrap template only: after publishing, replace this tag with
           # docker.io/skitsanos/ironcrew@sha256:<signed-release-digest> before
-          # applying the production manifest. The publish workflow signs that
-          # immutable digest and emits provenance/SBOM attestations.
-          image: docker.io/skitsanos/ironcrew:4.0.0
+          # applying the production manifest. Match the digest to the signed
+          # release image receipt and OCI archive; promotion copies that archive
+          # without rebuilding it. The release also includes a signed SBOM.
+          image: docker.io/skitsanos/ironcrew:4.0.1
           imagePullPolicy: Always
           args: ["serve", "--flows-dir", "/flows"]
           ports:

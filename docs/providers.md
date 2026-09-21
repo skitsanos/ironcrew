@@ -436,7 +436,7 @@ Model capability is only half the picture — crews can also attach
 **Model Context Protocol (MCP) servers** to expose external tools to every
 agent. Pass `mcp_servers = {...}` to `Crew.new({...})` with either a stdio
 spawn spec or a Streamable HTTP URL for a server implementing MCP
-`2026-07-28` discovery. This is the latest published MCP revision for v4.0.0;
+`2026-07-28` discovery. This is the latest published MCP revision for v4.0.1;
 each later IronCrew release targets the then-current official revision only and
 removes the superseded protocol. IronCrew does not support legacy initialize/SSE
 lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
