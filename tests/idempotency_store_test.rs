@@ -1954,7 +1954,7 @@ async fn metrics_omit_persisted_principal_identifiers() {
     ] {
         assert!(
             !body.contains(secret_identifier),
-            "metrics exposed principal identifier {secret_identifier}"
+            "metrics exposed a principal identifier"
         );
     }
 
