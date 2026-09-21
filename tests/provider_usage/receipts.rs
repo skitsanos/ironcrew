@@ -65,8 +65,12 @@ fn nonstreaming_receipts_preserve_large_counts_and_detail() {
                     Server::new(200, "application/json", response.to_string(), false).await;
                 let tracker = UsageTracker::default();
                 let provider = kind.create(server.base.clone());
-                provider.chat(request(&tracker)).await.unwrap();
+                let response = provider.chat(request(&tracker)).await.unwrap();
                 let usage = tracker.snapshot().unwrap();
+                assert_eq!(
+                    ironcrew::usage::UsageSnapshot::from_receipt(response.usage),
+                    usage
+                );
                 assert_eq!(usage.in_flight, 0);
                 assert_eq!(usage.settled.requests(), 1);
                 assert_eq!(usage.coverage, UsageCoverage::Complete);
@@ -132,6 +136,9 @@ fn http_errors_missing_and_malformed_receipts_remain_truthful() {
                     .chat(request(&local))
                     .await;
                 assert_eq!(result.is_ok(), status == 200);
+                if let Ok(response) = result {
+                    assert_eq!(response.usage.coverage(), coverage);
+                }
                 assert_eq!(local.snapshot().unwrap().coverage, coverage);
                 assert_eq!(local.snapshot().unwrap().settled.requests(), 1);
             }

@@ -1,3 +1,5 @@
+#[path = "execution_usage/budgets.rs"]
+mod budgets;
 #[path = "execution_usage/fixture.rs"]
 mod fixture;
 #[path = "execution_usage/lua.rs"]
@@ -8,3 +10,5 @@ mod public;
 mod results;
 #[path = "execution_usage/scopes.rs"]
 mod scopes;
+#[path = "execution_usage/sessions.rs"]
+mod sessions;

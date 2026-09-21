@@ -2,6 +2,9 @@
 -- Model: gpt-5.6-luna
 -- Omitted effort defaults to low, including when function tools are present.
 -- Requires: OPENAI_API_KEY
+-- Optional shared run ceiling:
+-- IRONCREW_MAX_RUN_TOKENS=100000 ironcrew run examples/providers/02-openai-responses.lua
+-- With a ceiling enabled, omitted max_tokens uses a 4096-token output bound.
 
 local crew = Crew.new({
     goal = "Verify OpenAI Responses API works",
@@ -24,3 +27,4 @@ crew:add_task({
 -- Construction validation needs no credential and stops before paid execution.
 if IRONCREW_MODE == "validate" then return end
 crew:run()
+print("Run token budget:", json_stringify(crew:flow_usage().budget))

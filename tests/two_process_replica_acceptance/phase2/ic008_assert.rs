@@ -25,6 +25,10 @@ pub(super) fn execution_identity(started: &serde_json::Value) {
 }
 
 pub(super) fn message_identity(message: &serde_json::Value, started: &serde_json::Value) {
+    let usage: ironcrew::usage::UsageSnapshot = serde_json::from_value(message["usage"].clone())
+        .expect("checked session usage in successful HTTP messages");
+    assert_eq!(usage.in_flight, 0);
+    assert_eq!(usage.coverage, ironcrew::usage::UsageCoverage::Complete);
     assert_eq!(message["incarnation_id"], started["incarnation_id"]);
     assert_eq!(
         message["definition_fingerprint"],
@@ -50,6 +54,11 @@ pub(super) fn history(
     assert_eq!(history["flow"], FLOW);
     assert_eq!(history["agent"], "coordinator");
     assert_eq!(history["turn_count"], turns);
+    assert_eq!(history["usage"], latest["usage"]);
+    let usage: ironcrew::usage::UsageSnapshot = serde_json::from_value(history["usage"].clone())
+        .expect("checked session usage survives peer reads and process replacement");
+    assert_eq!(usage.settled.requests(), turns);
+    assert_eq!(usage.settled.total_tokens().known(), Some(2 * turns));
     assert_eq!(history["revision"], latest["revision"]);
     assert_eq!(history["incarnation_id"], started["incarnation_id"]);
     assert_eq!(history["source_fingerprint"], started["source_fingerprint"]);

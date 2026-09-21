@@ -76,6 +76,10 @@ fn final_stream_receipts_replace_cumulative_snapshots() {
                     .unwrap();
                 assert_eq!(response.content.as_deref(), Some("ready"));
                 let snapshot = tracker.snapshot().unwrap();
+                assert_eq!(
+                    ironcrew::usage::UsageSnapshot::from_receipt(response.usage),
+                    snapshot
+                );
                 assert_eq!(snapshot.in_flight, 0);
                 assert_eq!(snapshot.settled.requests(), 1);
                 assert_eq!(snapshot.coverage, UsageCoverage::Complete);

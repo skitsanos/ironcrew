@@ -41,7 +41,8 @@ impl PostgresStore {
                     octet_length(c.created_at)::BIGINT AS created_at_bytes, \
                     CASE WHEN octet_length(c.updated_at) <= $4 THEN c.updated_at END \
                          AS bounded_updated_at, \
-                    octet_length(c.updated_at)::BIGINT AS updated_at_bytes \
+                    octet_length(c.updated_at)::BIGINT AS updated_at_bytes, \
+                    CASE WHEN octet_length(c.usage::text) <= 4096 THEN c.usage::text END AS usage \
              FROM {} AS c \
              WHERE ($1::TEXT IS NULL OR c.flow_path = $1) \
              ORDER BY bounded_updated_at DESC \

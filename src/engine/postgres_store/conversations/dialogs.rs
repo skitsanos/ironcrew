@@ -11,6 +11,7 @@ impl PostgresStore {
         &self,
         record: &DialogStateRecord,
     ) -> Result<u64> {
+        let usage_json = crate::engine::session_usage::encode(&record.usage)?;
         let agents_json = serde_json::to_string(&record.agent_names).map_err(|e| {
             IronCrewError::Validation(format!("Failed to serialize agent_names: {}", e))
         })?;
@@ -43,8 +44,8 @@ impl PostgresStore {
             None if expected_revision == 0 => {
                 let insert_sql = format!(
                     "INSERT INTO {} \
-                     (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision) \
-                     VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, 1) \
+                     (id, flow_name, flow_path, agent_names, starter, transcript, next_index, stopped, stop_reason, created_at, updated_at, revision, usage) \
+                     VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, 1, $12::jsonb) \
                      ON CONFLICT (flow_path, id) DO NOTHING RETURNING revision",
                     self.dialogs_table
                 );
@@ -60,6 +61,7 @@ impl PostgresStore {
                     .bind(&record.stop_reason)
                     .bind(&record.created_at)
                     .bind(&record.updated_at)
+                    .bind(&usage_json)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| {
@@ -73,7 +75,7 @@ impl PostgresStore {
                     "UPDATE {} SET flow_name = $3, agent_names = $4::jsonb, \
                      starter = $5, transcript = $6::jsonb, next_index = $7, \
                      stopped = $8, stop_reason = $9, created_at = $10, \
-                     updated_at = $11, revision = revision + 1 \
+                     updated_at = $11, revision = revision + 1, usage = $13::jsonb \
                      WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $12 \
                      RETURNING revision",
                     self.dialogs_table
@@ -91,6 +93,7 @@ impl PostgresStore {
                     .bind(&record.created_at)
                     .bind(&record.updated_at)
                     .bind(expected_revision)
+                    .bind(&usage_json)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| {
@@ -121,7 +124,8 @@ impl PostgresStore {
     ) -> Result<Option<DialogStateRecord>> {
         let sql = format!(
             "SELECT id, flow_name, flow_path, agent_names::text, starter, transcript::text, \
-             next_index, stopped, stop_reason, created_at, updated_at, revision \
+             next_index, stopped, stop_reason, created_at, updated_at, revision, \
+             CASE WHEN octet_length(usage::text) <= 4096 THEN usage::text END AS usage \
              FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.dialogs_table
         );
@@ -146,6 +150,7 @@ impl PostgresStore {
             .try_get("next_index")
             .map_err(|e| IronCrewError::Validation(e.to_string()))?;
         Ok(Some(DialogStateRecord {
+            usage: super::super::codecs::session_usage(&row)?,
             id: row
                 .try_get("id")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,

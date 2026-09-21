@@ -82,6 +82,11 @@ dependency. Options from a provider you are not using (for example
 
 ## Project Defaults: `config.lua`
 
+Operator [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) applies to the whole Lua
+entrypoint, including nested work and multiple `crew:run()` calls. It is not a
+`Crew.new`/`config.lua` option and cannot be raised by flow authors. Inspect
+`crew:flow_usage().budget` for the shared capacity state.
+
 If a `config.lua` file exists at the project root (alongside `crew.lua`), it is
 loaded automatically before `crew.lua` runs. It must return a table of default
 settings — any field set there becomes a default for `Crew.new()`.
@@ -638,7 +643,8 @@ For process-local token accounting, use `crew:usage()` for the latest executing
 run and `crew:flow_usage()` for the enclosing flow total. Conversations and
 dialogs expose their own `:usage()` snapshots. Counts are decimal strings, with
 explicit coverage and unknown values; these snapshots include failed/retried
-provider attempts but are not yet persisted. See [usage accounting](usage-accounting.md#lua-snapshots)
+provider attempts. Run results and session checkpoints persist the same contract;
+resumed sessions do not charge past usage to a new run. See [usage accounting](usage-accounting.md#lua-snapshots)
 for the wire contract and resume/ownership boundaries.
 
 ## Memory System

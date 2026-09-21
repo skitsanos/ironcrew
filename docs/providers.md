@@ -1,5 +1,6 @@
 # LLM Providers
 
+
 IronCrew supports three provider types:
 
 1. **`openai`** — OpenAI Chat Completions API (and any OpenAI-compatible endpoint: Gemini, Groq, Kimi, DeepSeek, Ollama, Azure, OpenRouter)
@@ -383,7 +384,8 @@ attempts, reasoning/cache detail and explicit unknowns. Counts are decimal strin
 or null; inspect coverage before treating a subtotal as complete. These are not
 invoices. See [usage accounting](usage-accounting.md) for scope boundaries,
 provider semantics, Lua accessors and durable storage. Direct Rust
-`ChatResponse.usage` and persisted session history remain pending migrations.
+`ChatResponse.usage` returns a checked receipt; sessions restore their checked
+checkpoint without charging prior usage to a new run.
 
 For providers that support prompt caching, enable it at the crew level:
 
@@ -433,3 +435,8 @@ removes the superseded protocol. IronCrew does not support legacy initialize/SSE
 lifecycle fallback. Registered tools show up alongside built-ins. See the MCP
 section of [docs/crews.md](crews.md) for the full config schema, transport
 details, and examples.
+## Opt-in run budgets
+
+[`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) enables shared pre-dispatch
+admission. The initial bounded transport is native OpenAI Responses without
+provider-hosted tools; unsupported transports fail closed only when enabled.

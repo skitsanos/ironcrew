@@ -67,7 +67,7 @@ impl ironcrew::llm::provider::LlmProvider for StubProvider {
             content: Some("reconciler-test-output".into()),
             reasoning: None,
             tool_calls: vec![],
-            usage: None,
+            usage: Default::default(),
             raw_blocks: None,
         })
     }

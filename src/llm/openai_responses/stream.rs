@@ -8,17 +8,8 @@ impl OpenAiResponsesProvider {
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
         body["stream"] = json!(true);
-        let request_body = self.prepare_request(&body)?;
-
-        if let Some(ref limiter) = self.rate_limit {
-            limiter.wait().await;
-        }
-
+        let (request_body, mut accounting) = self.prepare_dispatch(body, usage_tracker).await?;
         let url = format!("{}/v1/responses", self.base_url);
-        crate::utils::network::validate_url_not_private(&url)
-            .map_err(|error| IronCrewError::Provider(format!("Unsafe provider URL: {error}")))?;
-
-        let mut accounting = ProviderAttempt::start(usage_tracker, ProviderUsage::OpenAiResponses)?;
         let resp = self
             .client
             .post(&url)
@@ -45,7 +36,6 @@ impl OpenAiResponsesProvider {
         let mut stored_output_bytes = 0_usize;
         let mut item_states: BTreeMap<usize, ItemState> = BTreeMap::new();
         let mut item_indexes: HashMap<String, usize> = HashMap::new();
-        let mut usage_data: Option<Value> = None;
 
         let mut lines =
             ProviderSseLines::new(resp, self.execution_policy, "OpenAI Responses stream");
@@ -187,9 +177,6 @@ impl OpenAiResponsesProvider {
                 }
                 "response.completed" => {
                     saw_completed = true;
-                    if let Some(usage) = parsed["response"].get("usage").cloned() {
-                        usage_data = Some(usage);
-                    }
                     let _ = tx.send(StreamChunk::Done).await;
                 }
                 "response.failed" | "response.incomplete" | "error" => {
@@ -250,16 +237,7 @@ impl OpenAiResponsesProvider {
             Some(full_reasoning)
         };
 
-        let usage = usage_data.map(|u| TokenUsage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-            cached_tokens: u["input_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-        });
-
-        accounting.finish()?;
+        let usage = accounting.finish()?;
         Ok(ChatResponse {
             content,
             reasoning,

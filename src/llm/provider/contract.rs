@@ -3,6 +3,11 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Implementations opting in must reserve exact input plus bounded output
+    /// before every dispatch and reconcile even on failure/cancellation.
+    fn supports_token_budget(&self) -> bool {
+        false
+    }
     /// Explicit execution scope. Shared Runtime providers must remain unbound.
     fn usage_tracker(&self) -> Option<crate::usage::UsageTracker> {
         None
@@ -12,6 +17,12 @@ pub trait LlmProvider: Send + Sync {
     /// retaining receipts on errors/cancellation without re-adding nested work.
     /// Otherwise execution wrappers count each invocation as unavailable.
     fn records_usage(&self) -> bool {
+        false
+    }
+
+    /// Dispatch-level metrics are owned by the implementation, including
+    /// failure/cancellation. Forwarding wrappers must preserve this capability.
+    fn records_usage_metrics(&self) -> bool {
         false
     }
 

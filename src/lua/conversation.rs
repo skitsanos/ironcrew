@@ -10,7 +10,9 @@
 //! so callers outside the Lua boundary (HTTP handlers, CLI `chat` REPL) can
 //! grab the `Arc` and call `run_turn().await` without a Lua VM round-trip.
 
+mod persistence;
 use std::sync::Arc;
+mod bootstrap;
 mod stream;
 
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
@@ -67,6 +69,8 @@ pub struct LuaConversationInner {
 
     /// Provider used for all LLM calls in this conversation.
     pub provider: Arc<dyn LlmProvider>,
+    /// Inclusive session receipts, including the last persisted checkpoint.
+    usage: crate::usage::UsageTracker,
 
     /// Tool registry shared with the parent crew.
     pub tool_registry: ToolRegistry,
@@ -149,176 +153,9 @@ pub struct PreparedConversationTurn {
 }
 
 impl LuaConversationInner {
-    /// Build a fresh (or resumed) conversation inner.
-    ///
-    /// When `store` is `Some` and `id` is `Some`, the store is consulted for
-    /// a prior record with that id. On hit, the persisted history replaces
-    /// the freshly-seeded `[system]` bootstrap so the conversation picks up
-    /// where it left off. On miss, a new record will be written on the
-    /// first autosave.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new_or_resume(
-        agent: Agent,
-        provider: Arc<dyn LlmProvider>,
-        tool_registry: ToolRegistry,
-        model: String,
-        system_prompt: String,
-        max_history: Option<usize>,
-        history_max_bytes: usize,
-        stream: bool,
-        max_tool_rounds: usize,
-        eventbus: EventBus,
-        id: Option<String>,
-        store: Option<Arc<dyn StateStore>>,
-        flow_name: String,
-        flow_path: Option<String>,
-        autosave: bool,
-        project_dir: std::path::PathBuf,
-        http_client: reqwest::Client,
-        source_fingerprint: String,
-        definition_fingerprint: String,
-    ) -> Result<Self, IronCrewError> {
-        let provider = crate::llm::scope::ensure_scope(provider);
-        provider.validate_request(
-            &agent.chat_request(model.clone(), vec![]),
-            !tool_registry.schemas_for(&agent.tools).is_empty(),
-        )?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let max_history = match max_history {
-            Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
-            Some(value) => {
-                return Err(IronCrewError::Validation(format!(
-                    "max_history must be between 1 and {HARD_CHAT_HISTORY_MAX_MESSAGES}, got {value}"
-                )));
-            }
-            None => DEFAULT_CHAT_HISTORY_MAX_MESSAGES,
-        };
-        // Resolve the id and decide whether the session is persistent.
-        let (id, persistent) = match id {
-            Some(s) => {
-                validate_session_id(&s)?;
-                (s, true)
-            }
-            None => (uuid::Uuid::new_v4().to_string(), false),
-        };
-
-        // Seed the message list. If we can hit the store for a resume, use
-        // the persisted messages instead of the bootstrap seed.
-        let mut messages = vec![ChatMessage::system(&system_prompt)];
-        let mut created_at = now.clone();
-        let mut revision = 0;
-        let mut execution = ConversationExecution::new(
-            source_fingerprint.clone(),
-            definition_fingerprint.clone(),
-            max_history,
-            history_max_bytes,
-        )?;
-
-        if persistent
-            && let Some(ref store) = store
-            && let Some(record) = store.get_conversation(flow_path.as_deref(), &id).await?
-        {
-            record.execution.validate()?;
-            if record.execution.source_fingerprint != source_fingerprint {
-                return Err(IronCrewError::Conflict(
-                    "Conversation flow source changed; restore the original definition or start a new conversation"
-                        .into(),
-                ));
-            }
-            if record.execution.definition_fingerprint != definition_fingerprint {
-                return Err(IronCrewError::Conflict(
-                    "Conversation definition changed; restore the original model, agent, tools, provider, and limits or start a new conversation"
-                        .into(),
-                ));
-            }
-            validate_chat_history(&record.messages, max_history, history_max_bytes, true).map_err(
-                |error| {
-                    IronCrewError::Validation(format!(
-                        "Conversation '{id}' has invalid persisted history: {error}"
-                    ))
-                },
-            )?;
-            revision = record.revision;
-            execution = record.execution;
-            messages = record.messages;
-            created_at = record.created_at;
-            tracing::info!(
-                "Resumed conversation '{}' with {} messages",
-                id,
-                messages.len()
-            );
-        }
-
-        validate_chat_history(&messages, max_history, history_max_bytes, true)?;
-
-        eventbus.emit(CrewEvent::ConversationStarted {
-            conversation_id: id.clone(),
-            agent: agent.name.clone(),
-        });
-
-        Ok(Self {
-            id,
-            persistent,
-            agent,
-            provider,
-            tool_registry,
-            model,
-            system_prompt,
-            messages: Mutex::new(messages),
-            turn_execution_lock: Arc::new(Mutex::new(())),
-            max_history: Some(max_history),
-            history_max_bytes,
-            stream,
-            max_tool_rounds,
-            eventbus,
-            store: if persistent { store } else { None },
-            flow_name,
-            flow_path,
-            autosave,
-            created_at,
-            revision: Mutex::new(revision),
-            execution,
-            project_dir,
-            http_client,
-        })
-    }
-
-    /// Persist the current state to the configured store. Safe to call even
-    /// for non-persistent sessions — it simply no-ops.
-    pub async fn persist(&self) -> Result<(), IronCrewError> {
-        let _execution_guard = self.turn_execution_lock.clone().lock_owned().await;
-        self.persist_current_snapshot().await
-    }
-
-    async fn persist_current_snapshot(&self) -> Result<(), IronCrewError> {
-        let Some(ref store) = self.store else {
-            return Ok(());
-        };
-        if !self.persistent {
-            return Ok(());
-        }
-        let mut revision = self.revision.lock().await;
-        let messages = self.messages.lock().await.clone();
-        validate_chat_history(
-            &messages,
-            self.max_history
-                .unwrap_or(DEFAULT_CHAT_HISTORY_MAX_MESSAGES),
-            self.history_max_bytes,
-            true,
-        )?;
-        let record = ConversationRecord {
-            id: self.id.clone(),
-            flow_name: self.flow_name.clone(),
-            flow_path: self.flow_path.clone(),
-            agent_name: self.agent.name.clone(),
-            execution: self.execution.clone(),
-            messages,
-            created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            revision: *revision,
-        };
-        *revision = store.save_conversation(&record).await?;
-        Ok(())
+    /// Session lifetime usage at this process checkpoint; never recharged to a new run.
+    pub fn usage_snapshot(&self) -> Result<crate::usage::UsageSnapshot, IronCrewError> {
+        crate::llm::scope::snapshot(&self.usage)
     }
 
     /// Reset history — clear all messages, keep the system prompt.
@@ -432,10 +269,14 @@ impl LuaConversationInner {
         let execution_guard = self.turn_execution_lock.clone().lock_owned().await;
         let has_tools = !self.agent.tools.is_empty();
         let helper_ctx = ToolCallContext {
-            usage_tracker: caller_ctx
-                .usage_tracker
-                .clone()
-                .or_else(|| self.provider.usage_tracker()),
+            usage_tracker: match &caller_ctx.usage_tracker {
+                Some(caller) => Some(
+                    caller
+                        .child_observed_by(&self.usage)
+                        .map_err(|error| IronCrewError::Provider(error.to_string()))?,
+                ),
+                None => self.provider.usage_tracker(),
+            },
             store: caller_ctx.store.clone().or_else(|| self.store.clone()),
             eventbus: Some(
                 caller_ctx
@@ -493,9 +334,13 @@ impl LuaConversationInner {
             .await?
         };
 
+        if let Some(tracker) = &helper_ctx.usage_tracker {
+            tracker.budget().check()?;
+        }
         let turn_count = history.iter().filter(|m| m.role == "user").count();
         let turn_index = turn_count.saturating_sub(1);
         let record = ConversationRecord {
+            usage: self.usage_snapshot()?,
             id: self.id.clone(),
             flow_name: self.flow_name.clone(),
             flow_path: self.flow_path.clone(),
@@ -584,7 +429,7 @@ impl LuaConversation {
 impl UserData for LuaConversation {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("usage", |lua, this, ()| {
-            super::usage::provider_snapshot(lua, this.0.provider.as_ref())
+            super::usage::snapshot(lua, &this.0.usage)
         });
         // conv:send(message[, opts]) → returns plain text
         // opts may include: { images = { "path/to/img.png", "https://..." } }

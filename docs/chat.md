@@ -4,6 +4,10 @@ Phase 1 Human-in-the-Loop turns IronCrew's existing `crew:conversation({...})`
 primitive into a first-class chat runtime — you drive it interactively from
 the terminal or over HTTP, with the same shared state and persistence layer.
 
+[Run token budgets](token-budgets.md) are opt-in. CLI chat shares one execution
+budget; standalone HTTP messages each receive a fresh budget exposed through
+`request_usage`. Session-lifetime `usage` remains separate from that allowance.
+
 Two surfaces share the underlying mechanism:
 
 - `ironcrew chat <path>` — a local REPL.
@@ -100,6 +104,7 @@ Slash commands:
 | `/id`             | Print the session id                   |
 | `/save`           | Persist the session now                |
 | `/history`        | Dump the full transcript               |
+| `/usage`          | Print checked session usage, including the restored checkpoint |
 
 Example (full session against `examples/chat-cli`):
 
@@ -272,6 +277,12 @@ these with the `IRONCREW_API_*` variables below; the process also applies
 `IRONCREW_MAX_IMAGE_BYTES` to each loaded image.
 
 ### GET `/history`
+
+History and successful message responses include `usage`, the checked session
+snapshot described in [usage accounting](usage-accounting.md). History/list
+reads represent the last successful durable checkpoint; a live handle may also
+contain unsaved failed/cancelled attempts. Resuming does not charge historical
+usage to the new run, and `/reset` does not erase token usage.
 
 Reads directly from the store. Works even after the in-memory handle has
 been evicted:

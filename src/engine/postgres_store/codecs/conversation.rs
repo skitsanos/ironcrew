@@ -134,6 +134,7 @@ pub(in crate::engine::postgres_store) fn conversation_summary(
         ))
     })?;
     Ok(ConversationSummary {
+        usage: super::session_usage(row)?,
         id,
         flow_path: bounded_optional_metadata(row, "flow_path", "flow_path_bytes", "flow path")?,
         agent_name: bounded_metadata(row, "agent_name", "agent_name_bytes", "agent name")?,

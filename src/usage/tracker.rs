@@ -3,13 +3,23 @@ use std::sync::{Arc, Mutex};
 
 /// An inclusive scope. Descendants update this scope directly; callers never
 /// merge their results back into a parent that already includes them.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct UsageTracker(Arc<Node>);
+
+impl std::fmt::Debug for UsageTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageTracker")
+            .field("depth", &self.0.depth)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Default)]
 struct Node {
+    budget: super::budget::TokenBudget,
     state: Mutex<State>,
     parent: Option<UsageTracker>,
+    observer: Option<UsageTracker>,
     depth: usize,
 }
 
@@ -21,32 +31,104 @@ struct State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("usage scope nesting exceeds the supported depth of 64")]
+#[error("usage scope ancestry exceeds the supported bounds of 64 levels and 128 nodes")]
 pub struct UsageScopeDepth;
 
 impl UsageTracker {
+    pub fn for_run() -> Result<Self, super::budget::BudgetError> {
+        Ok(Self::with_budget(
+            super::budget::TokenBudget::from_environment()?,
+        ))
+    }
+
+    pub fn with_budget(budget: super::budget::TokenBudget) -> Self {
+        Self(Arc::new(Node {
+            budget,
+            ..Node::default()
+        }))
+    }
+
+    pub fn budget(&self) -> &super::budget::TokenBudget {
+        &self.0.budget
+    }
+
     /// Create a disjoint child view while retaining inclusive ancestor totals.
-    /// Nesting is bounded and all lineage locks are acquired root-first.
+    /// Nesting is bounded and shared lineage nodes are locked exactly once.
     pub fn child(&self) -> Result<Self, UsageScopeDepth> {
-        if self.0.depth >= 64 {
+        self.new_child(None)
+    }
+
+    /// Observe the same new attempts in a second inclusive scope without
+    /// re-adding history. Useful for session totals alongside a caller's run.
+    /// Shared ancestors are deduplicated; an independent observer does not
+    /// inject its historical receipts into the caller's scope.
+    pub fn child_observed_by(&self, observer: &Self) -> Result<Self, UsageScopeDepth> {
+        self.new_child(Some(observer.clone()))
+    }
+
+    fn new_child(&self, observer: Option<Self>) -> Result<Self, UsageScopeDepth> {
+        let depth = self
+            .0
+            .depth
+            .max(observer.as_ref().map_or(0, |scope| scope.0.depth))
+            + 1;
+        if depth > 64 {
             return Err(UsageScopeDepth);
         }
-        Ok(Self(Arc::new(Node {
+        let child = Self(Arc::new(Node {
+            budget: self.0.budget.clone(),
             state: Mutex::default(),
             parent: Some(self.clone()),
-            depth: self.0.depth + 1,
+            observer,
+            depth,
+        }));
+        child.ancestry()?;
+        Ok(child)
+    }
+
+    /// Restore a settled checkpoint into an independent root. Historical
+    /// receipts must never be replayed into a newly created run's ancestors.
+    pub fn from_snapshot(snapshot: UsageSnapshot) -> Result<Self, &'static str> {
+        snapshot.validate()?;
+        if snapshot.in_flight != 0 {
+            return Err("cannot resume an in-flight usage checkpoint");
+        }
+        Ok(Self(Arc::new(Node {
+            state: Mutex::new(State {
+                settled: snapshot.settled,
+                ..State::default()
+            }),
+            ..Node::default()
         })))
     }
 
-    fn lineage(&self) -> Vec<&Mutex<State>> {
-        let mut nodes = Vec::with_capacity(self.0.depth + 1);
-        let mut current = Some(self);
-        while let Some(tracker) = current {
-            nodes.push(&tracker.0.state);
-            current = tracker.0.parent.as_ref();
+    fn ancestry(&self) -> Result<Vec<&Node>, UsageScopeDepth> {
+        let mut nodes: Vec<&Node> = Vec::with_capacity(self.0.depth + 1);
+        let mut pending = vec![self.0.as_ref()];
+        while let Some(node) = pending.pop() {
+            if nodes.iter().any(|other| std::ptr::eq(*other, node)) {
+                continue;
+            }
+            if nodes.len() == 128 {
+                return Err(UsageScopeDepth);
+            }
+            nodes.push(node);
+            for parent in [&node.parent, &node.observer].into_iter().flatten() {
+                pending.push(parent.0.as_ref());
+            }
         }
-        nodes.reverse();
-        nodes
+        // A global address order prevents opposite observer links from taking
+        // the same immutable DAG's locks in different orders.
+        nodes.sort_unstable_by_key(|node| std::ptr::from_ref(*node) as usize);
+        Ok(nodes)
+    }
+
+    fn lineage(&self) -> Vec<&Mutex<State>> {
+        self.ancestry()
+            .expect("usage ancestry validated at construction")
+            .into_iter()
+            .map(|node| &node.state)
+            .collect()
     }
 
     /// Start one dispatch, atomically registering it in this scope and each
@@ -82,7 +164,9 @@ impl UsageTracker {
         if state.overflowed {
             return Err(UsageOverflow);
         }
-        Ok(UsageSnapshot::new(state.settled.clone(), state.in_flight))
+        let mut snapshot = UsageSnapshot::new(state.settled.clone(), state.in_flight);
+        snapshot.budget = self.0.budget.snapshot();
+        Ok(snapshot)
     }
 
     fn settle(&self, receipt: &UsageReceipt) -> Result<(), UsageOverflow> {

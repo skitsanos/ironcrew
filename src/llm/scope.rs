@@ -18,12 +18,15 @@ pub fn with_usage_tracker(
     })
 }
 
-pub(crate) fn ensure_scope(provider: Arc<dyn LlmProvider>) -> Arc<dyn LlmProvider> {
+pub(crate) fn ensure_scope(provider: Arc<dyn LlmProvider>) -> Result<Arc<dyn LlmProvider>> {
     if provider.records_usage() && provider.usage_tracker().is_some() {
-        provider
+        Ok(provider)
     } else {
-        let tracker = provider.usage_tracker().unwrap_or_default();
-        with_usage_tracker(provider, tracker)
+        let tracker = match provider.usage_tracker() {
+            Some(tracker) => tracker,
+            None => UsageTracker::for_run()?,
+        };
+        Ok(with_usage_tracker(provider, tracker))
     }
 }
 
@@ -32,6 +35,18 @@ pub(crate) fn tool_context(provider: &dyn LlmProvider) -> crate::tools::ToolCall
         usage_tracker: provider.usage_tracker(),
         ..Default::default()
     }
+}
+
+pub(crate) fn observe_session(
+    provider: Arc<dyn LlmProvider>,
+    session: &UsageTracker,
+) -> Result<Arc<dyn LlmProvider>> {
+    let tracker = provider
+        .usage_tracker()
+        .unwrap_or_default()
+        .child_observed_by(session)
+        .map_err(|error| IronCrewError::Provider(error.to_string()))?;
+    Ok(with_usage_tracker(provider, tracker))
 }
 
 pub(crate) fn borrow_with_usage_tracker(
@@ -49,7 +64,7 @@ pub(crate) fn child_scope(provider: &dyn LlmProvider) -> Result<UsageTracker> {
         Some(parent) => parent
             .child()
             .map_err(|error| IronCrewError::Provider(error.to_string())),
-        None => Ok(UsageTracker::default()),
+        None => Ok(UsageTracker::for_run()?),
     }
 }
 
@@ -88,6 +103,15 @@ impl ScopedProvider<'_> {
             .usage_tracker
             .take()
             .unwrap_or_else(|| self.tracker.clone());
+        tracker.budget().check()?;
+        if tracker.budget().enabled()
+            && (!self.inner.supports_token_budget() || !self.inner.records_usage())
+        {
+            return Err(tracker
+                .budget()
+                .block(crate::usage::budget::BudgetError::Unsupported)
+                .into());
+        }
         let attempt = if self.inner.records_usage() {
             request.usage_tracker = Some(tracker);
             None
@@ -115,6 +139,13 @@ fn settle(result: Result<ChatResponse>, attempt: Option<UsageAttempt>) -> Result
 
 #[async_trait]
 impl LlmProvider for ScopedProvider<'_> {
+    fn supports_token_budget(&self) -> bool {
+        self.inner.supports_token_budget()
+    }
+    fn records_usage_metrics(&self) -> bool {
+        self.inner.records_usage_metrics()
+    }
+
     fn usage_tracker(&self) -> Option<UsageTracker> {
         Some(self.tracker.clone())
     }

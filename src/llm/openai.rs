@@ -130,16 +130,7 @@ impl OpenAiProvider {
         // - Gemini: arguments as object (not string), may omit type/id
         let tool_calls = parse_tool_calls_lenient(choice.get("tool_calls"));
 
-        let usage = resp_body.get("usage").map(|u| TokenUsage {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-            cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-        });
-
-        accounting.finish()?;
+        let usage = accounting.finish()?;
         Ok(ChatResponse {
             content,
             reasoning,
@@ -186,6 +177,10 @@ fn parse_tool_calls_lenient(tool_calls_value: Option<&Value>) -> Vec<ToolCallReq
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
+
     fn records_usage(&self) -> bool {
         true
     }
@@ -228,10 +223,8 @@ impl LlmProvider for OpenAiProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)
@@ -260,10 +253,8 @@ impl LlmProvider for OpenAiProvider {
             reasoning_bytes = response.reasoning.as_ref().map_or(0, String::len),
             tool_calls = response.tool_calls.len(),
             raw_blocks = response.raw_blocks.as_ref().map_or(0, Vec::len),
-            total_tokens = response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.total_tokens),
+            total_tokens = ?response.usage.counts().total_tokens,
+            usage_coverage = ?response.usage.coverage(),
             "LLM response metadata"
         );
         Ok(response)

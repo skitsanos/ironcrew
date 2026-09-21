@@ -304,7 +304,7 @@ impl UserData for LuaCrew {
                     .map(|context| context.clone());
 
                 let ctx = SubflowContext {
-                    usage_tracker: super::usage::tracker(&lua),
+                    usage_tracker: super::usage::tracker(&lua)?,
                     runtime: this.runtime.clone(),
                     project_dir: Arc::new(this.project_dir.clone()),
                     depth,

@@ -1,7 +1,7 @@
 use super::fixture::{Recorder, assert_usage};
 use async_trait::async_trait;
 use ironcrew::engine::agent::Agent;
-use ironcrew::llm::provider::{ChatRequest, ChatResponse, LlmProvider, TokenUsage, ToolSchema};
+use ironcrew::llm::provider::{ChatRequest, ChatResponse, LlmProvider, ToolSchema};
 use ironcrew::llm::scope::with_usage_tracker;
 use ironcrew::usage::{UsageCoverage, UsageTracker};
 use ironcrew::utils::error::{IronCrewError, Result};
@@ -28,12 +28,16 @@ impl LlmProvider for OpaqueProvider {
         }
         Ok(ChatResponse {
             content: Some("opaque".into()),
-            usage: Some(TokenUsage {
-                prompt_tokens: 10,
-                completion_tokens: 3,
-                total_tokens: 13,
-                cached_tokens: 0,
-            }),
+            usage: ironcrew::usage::UsageReceipt::from_counts(
+                ironcrew::usage::UsageCounts {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(3),
+                    total_tokens: Some(13),
+                    cached_tokens: Some(0),
+                    ..Default::default()
+                },
+                true,
+            ),
             ..Default::default()
         })
     }

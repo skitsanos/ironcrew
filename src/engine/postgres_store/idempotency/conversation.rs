@@ -25,6 +25,7 @@ impl PostgresStore {
         validate_conversation_record_for_write(conversation)?;
         let messages_json = serialize_conversation_messages(&conversation.messages)?;
         let execution_json = serialize_conversation_execution(&conversation.execution)?;
+        let usage_json = crate::engine::session_usage::encode(&conversation.usage)?;
         let expected_revision = i64::try_from(conversation.revision).map_err(|_| {
             IronCrewError::Validation("Conversation revision is out of range".into())
         })?;
@@ -149,7 +150,7 @@ impl PostgresStore {
                 let update_sql = format!(
                     "UPDATE {} SET flow_name = $3, agent_name = $4, \
                      execution = $5::jsonb, messages = $6::jsonb, created_at = $7, updated_at = $8, \
-                     revision = revision + 1 \
+                     revision = revision + 1, usage = $10::jsonb \
                      WHERE id = $1 AND flow_path IS NOT DISTINCT FROM $2 AND revision = $9 \
                      RETURNING revision",
                     self.conversations_table
@@ -164,6 +165,7 @@ impl PostgresStore {
                     .bind(&conversation.created_at)
                     .bind(&conversation.updated_at)
                     .bind(expected_revision)
+                    .bind(&usage_json)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|error| {

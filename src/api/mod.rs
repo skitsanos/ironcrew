@@ -76,10 +76,18 @@ pub struct ListRunsResponse {
 #[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget: Option<crate::usage::budget::BudgetSnapshot>,
 }
 
 pub fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error: message }))
+    (
+        status,
+        Json(ErrorResponse {
+            error: message,
+            budget: None,
+        }),
+    )
 }
 
 /// Run-event and human-input payloads (including validation errors) can carry

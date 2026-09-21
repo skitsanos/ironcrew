@@ -21,6 +21,7 @@ fn fresh_store() -> (tempfile::TempDir, JsonFileStore) {
 
 fn sample_conversation(id: &str) -> ConversationRecord {
     ConversationRecord {
+        usage: Default::default(),
         id: id.into(),
         flow_name: "test flow".into(),
         flow_path: None,
@@ -50,6 +51,7 @@ fn conversation_execution() -> ConversationExecution {
 
 fn sample_dialog(id: &str) -> DialogStateRecord {
     DialogStateRecord {
+        usage: Default::default(),
         id: id.into(),
         flow_name: "debate".into(),
         flow_path: None,

@@ -73,14 +73,11 @@ pub(super) fn parse_responses_response(resp: &Value) -> Result<ChatResponse> {
         }
     }
 
-    let usage = resp.get("usage").map(|u| TokenUsage {
-        prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-        total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-        cached_tokens: u["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32,
-    });
+    let terminal = matches!(
+        resp["status"].as_str(),
+        Some("completed" | "failed" | "incomplete" | "cancelled")
+    );
+    let usage = ProviderUsage::OpenAiResponses.parse(resp.get("usage"), terminal);
 
     let content = if text_parts.is_empty() {
         None

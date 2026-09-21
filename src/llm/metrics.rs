@@ -108,15 +108,17 @@ struct ProviderObservation {
     operation: ProviderOperation,
     started_at: Instant,
     completed: bool,
+    record_usage: bool,
 }
 
 impl ProviderObservation {
-    fn start(family: ProviderFamily, operation: ProviderOperation) -> Self {
+    fn start(family: ProviderFamily, operation: ProviderOperation, record_usage: bool) -> Self {
         Self {
             family,
             operation,
             started_at: Instant::now(),
             completed: false,
+            record_usage,
         }
     }
 
@@ -132,10 +134,12 @@ impl ProviderObservation {
             outcome,
             self.started_at.elapsed(),
         );
-        if let Ok(response) = result
-            && let Some(usage) = &response.usage
-        {
-            crate::metrics::record_provider_tokens(self.family, usage);
+        if self.record_usage {
+            let unavailable = crate::usage::UsageReceipt::default();
+            let usage = result
+                .as_ref()
+                .map_or(&unavailable, |response| &response.usage);
+            crate::metrics::record_provider_usage(self.family, usage);
         }
         self.completed = true;
     }
@@ -144,6 +148,9 @@ impl ProviderObservation {
 impl Drop for ProviderObservation {
     fn drop(&mut self) {
         if !self.completed {
+            if self.record_usage {
+                crate::metrics::record_provider_usage(self.family, &Default::default());
+            }
             crate::metrics::record_provider(
                 self.family,
                 self.operation,
@@ -156,6 +163,12 @@ impl Drop for ProviderObservation {
 
 #[async_trait]
 impl LlmProvider for ObservedProvider {
+    fn supports_token_budget(&self) -> bool {
+        self.inner.supports_token_budget()
+    }
+    fn records_usage_metrics(&self) -> bool {
+        true
+    }
     fn usage_tracker(&self) -> Option<crate::usage::UsageTracker> {
         self.inner.usage_tracker()
     }
@@ -177,7 +190,11 @@ impl LlmProvider for ObservedProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let _guard = self.metrics.enter();
-        let observation = ProviderObservation::start(self.family, ProviderOperation::Chat);
+        let observation = ProviderObservation::start(
+            self.family,
+            ProviderOperation::Chat,
+            !self.inner.records_usage_metrics(),
+        );
         let result = self.inner.chat(request).await;
         observation.finish(&result);
         result
@@ -189,7 +206,11 @@ impl LlmProvider for ObservedProvider {
         tools: &[ToolSchema],
     ) -> Result<ChatResponse> {
         let _guard = self.metrics.enter();
-        let observation = ProviderObservation::start(self.family, ProviderOperation::ChatWithTools);
+        let observation = ProviderObservation::start(
+            self.family,
+            ProviderOperation::ChatWithTools,
+            !self.inner.records_usage_metrics(),
+        );
         let result = self.inner.chat_with_tools(request, tools).await;
         observation.finish(&result);
         result
@@ -201,7 +222,11 @@ impl LlmProvider for ObservedProvider {
         tx: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<ChatResponse> {
         let _guard = self.metrics.enter();
-        let observation = ProviderObservation::start(self.family, ProviderOperation::ChatStream);
+        let observation = ProviderObservation::start(
+            self.family,
+            ProviderOperation::ChatStream,
+            !self.inner.records_usage_metrics(),
+        );
         let result = self.inner.chat_stream(request, tx).await;
         observation.finish(&result);
         result

@@ -143,6 +143,10 @@ pub async fn invoke_subflow(
             .await?
     };
 
+    ctx.usage_tracker
+        .budget()
+        .check()
+        .map_err(mlua::Error::external)?;
     // ── Marshal the result back across VMs via JSON ───────────────────────
     let output = match ctx.output_key.clone() {
         Some(key) => {
@@ -241,7 +245,7 @@ pub fn register_run_flow(lua: &Lua) -> LuaResult<()> {
             };
 
             let ctx = SubflowContext {
-                usage_tracker: super::usage::tracker(&lua),
+                usage_tracker: super::usage::tracker(&lua)?,
                 runtime,
                 project_dir,
                 depth,

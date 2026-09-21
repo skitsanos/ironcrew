@@ -83,3 +83,71 @@ fn scope_depth_is_bounded_without_mutating_the_parent() {
     leaf.start().unwrap().finish(receipt(1, 0)).unwrap();
     assert_eq!(root.snapshot().unwrap().settled.requests(), 1);
 }
+
+#[test]
+fn restored_session_observes_new_calls_without_recharging_history_to_run() {
+    let session = UsageTracker::from_snapshot(ironcrew::usage::UsageSnapshot::from_receipt(
+        receipt(100, 20),
+    ))
+    .unwrap();
+    let run = UsageTracker::default();
+    let call = run.child_observed_by(&session).unwrap();
+    call.start().unwrap().finish(receipt(10, 3)).unwrap();
+    assert_eq!(
+        session.snapshot().unwrap().settled.total_tokens().known(),
+        Some(133)
+    );
+    assert_eq!(
+        run.snapshot().unwrap().settled.total_tokens().known(),
+        Some(13)
+    );
+    assert_eq!(call.snapshot().unwrap().settled.requests(), 1);
+    let pending = run.start().unwrap();
+    assert!(UsageTracker::from_snapshot(run.snapshot().unwrap()).is_err());
+    drop(pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_and_opposite_observer_lineages_settle_once_without_deadlock() {
+    let root = UsageTracker::default();
+    let a = root.child().unwrap();
+    let b = root.child().unwrap();
+    let mut workers = tokio::task::JoinSet::new();
+    for scope in [
+        a.child_observed_by(&b).unwrap(),
+        b.child_observed_by(&a).unwrap(),
+    ] {
+        workers.spawn(async move {
+            for _ in 0..100 {
+                scope.start().unwrap().finish(receipt(1, 1)).unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    for scope in [&root, &a, &b] {
+        assert_eq!(scope.snapshot().unwrap().settled.requests(), 200);
+        assert_eq!(
+            scope.snapshot().unwrap().settled.total_tokens().known(),
+            Some(400)
+        );
+    }
+}
+
+#[test]
+fn observer_fanout_has_a_hard_node_bound() {
+    let mut a = UsageTracker::default();
+    let mut b = UsageTracker::default();
+    for _ in 0..63 {
+        a = a.child().unwrap();
+        b = b.child().unwrap();
+    }
+    assert!(a.child_observed_by(&b).is_err());
+    assert_eq!(a.snapshot().unwrap().settled.requests(), 0);
+}

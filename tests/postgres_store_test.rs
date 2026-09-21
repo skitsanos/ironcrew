@@ -539,6 +539,7 @@ fn messages_with_oversized_raw_blocks_container() -> String {
 
 fn conversation_fixture(id: &str) -> ConversationRecord {
     ConversationRecord {
+        usage: Default::default(),
         id: id.into(),
         flow_name: "chat".into(),
         flow_path: Some("flow-a".into()),
@@ -569,6 +570,7 @@ async fn pg_rejects_stale_session_snapshots() {
     let store = PostgresStore::new(&url, prefix).await.unwrap();
 
     let mut conversation = ConversationRecord {
+        usage: Default::default(),
         id: "shared".into(),
         flow_name: "chat".into(),
         flow_path: Some("flow-a".into()),
@@ -598,6 +600,7 @@ async fn pg_rejects_stale_session_snapshots() {
     );
 
     let mut dialog = DialogStateRecord {
+        usage: Default::default(),
         id: "shared-dialog".into(),
         flow_name: "dialog".into(),
         flow_path: Some("flow-a".into()),
@@ -3121,6 +3124,7 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
     let mut candidate = conversation.clone();
     candidate.messages.push(ChatMessage::user("hello"));
     candidate.updated_at = "2026-07-19T12:01:00Z".into();
+    candidate.usage = fixture_usage(5_000_000_000, 7);
     assert!(matches!(
         store.save_conversation(&candidate).await,
         Err(ironcrew::utils::error::IronCrewError::Conflict(_))
@@ -3151,6 +3155,7 @@ async fn pg_conversation_commit_is_atomic_and_blocks_unguarded_writes() {
         .unwrap();
     assert_eq!(persisted.revision, 2);
     assert_eq!(persisted.messages.len(), 2);
+    assert_eq!(persisted.usage, candidate.usage);
     assert_eq!(persisted.messages[1].role, "user");
     assert_eq!(persisted.messages[1].content.as_deref(), Some("hello"));
 

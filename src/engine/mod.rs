@@ -41,6 +41,7 @@ pub(crate) mod run_event_timing;
 pub mod run_events;
 pub mod run_history;
 pub mod runtime;
+pub(crate) mod session_usage;
 pub mod sessions;
 pub mod sqlite_store;
 pub mod store;

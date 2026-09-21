@@ -89,6 +89,16 @@ impl PostgresStore {
                 })?;
         }
 
+        let unavailable = serde_json::to_string(&crate::usage::UsageSnapshot::unavailable())
+            .expect("scalar usage snapshot serializes");
+        for table in [ct, dt] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS usage JSONB NOT NULL DEFAULT '{unavailable}'"
+            )))
+            .execute(&mut **tx).await
+            .map_err(|error| IronCrewError::Validation(format!("Session usage migration: {error}")))?;
+        }
+
         // Enforce the documented `(flow_path, id)` uniqueness for sessions.
         // Earlier versions used `id` as the sole PRIMARY KEY, which meant a
         // save from flow-B would overwrite flow-A's session with the same

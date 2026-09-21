@@ -3,6 +3,8 @@
 mod execution;
 #[path = "provider_usage/fixture.rs"]
 mod fixture;
+#[path = "provider_usage/metrics.rs"]
+mod metrics;
 #[path = "provider_usage/receipts.rs"]
 mod receipts;
 #[path = "provider_usage/streams.rs"]

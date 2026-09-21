@@ -1,5 +1,6 @@
 # CLI Reference
 
+
 IronCrew provides a single binary, `ironcrew`, with subcommands for scaffolding,
 running, validating, inspecting, and serving crew workflows.
 
@@ -77,7 +78,7 @@ ironcrew chat examples/chat-cli --agent tutor --id onboarding-2026-04
   so guard any top-level one-shot `crew:run()` with
   `if IRONCREW_MODE == "run" then ... end` (also safe for construction validation).
 - Slash commands: `/help`, `/exit`, `/quit`, `/reset`, `/id`, `/save`,
-  `/history`.
+  `/history`, `/usage` (checked session checkpoint plus live receipts).
 - See [docs/chat.md](chat.md) for the full reference and
   [examples/chat-cli/](../examples/chat-cli/) for a runnable example.
 
@@ -819,3 +820,9 @@ Pass `-v` on any command to set the log level to `debug`, overriding
 ```
 ironcrew run . -v
 ```
+## Run token ceiling
+
+Set [`IRONCREW_MAX_RUN_TOKENS`](token-budgets.md) to enable a process-local
+execution ceiling. It is unset/disabled by default, strictly validated, and
+shared across nested work. Inspect `usage.budget` in run history; CLI chat uses
+one budget for the interactive execution, not a fresh allowance per message.

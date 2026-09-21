@@ -49,7 +49,8 @@ impl PostgresStore {
                     CASE WHEN octet_length(created_at) <= $3 THEN created_at END AS created_at, \
                     octet_length(created_at)::BIGINT AS created_at_bytes, \
                     CASE WHEN octet_length(updated_at) <= $3 THEN updated_at END AS updated_at, \
-                    octet_length(updated_at)::BIGINT AS updated_at_bytes, revision \
+                    octet_length(updated_at)::BIGINT AS updated_at_bytes, revision, \
+                    CASE WHEN octet_length(usage::text) <= 4096 THEN usage::text END AS usage \
              FROM {} WHERE id = $1 AND ($2::TEXT IS NULL OR flow_path = $2)",
             self.conversations_table
         );
@@ -115,6 +116,7 @@ impl PostgresStore {
         preflight_conversation_execution_json(&execution_json)?;
         preflight_conversation_messages_json(&messages_json)?;
         let record = ConversationRecord {
+            usage: super::super::codecs::session_usage(&row)?,
             id: row
                 .try_get("id")
                 .map_err(|e| IronCrewError::Validation(e.to_string()))?,

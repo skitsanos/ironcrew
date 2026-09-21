@@ -83,14 +83,6 @@ fn estimated_json_bytes(value: &serde_json::Value) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
-    pub cached_tokens: u32,
-}
-
 /// An image attachment for a chat message. Always carries base64 data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageInput {
@@ -551,7 +543,7 @@ pub struct ChatResponse {
     /// Providers: Anthropic (thinking blocks), OpenAI-compat (reasoning_content).
     pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCallRequest>,
-    pub usage: Option<TokenUsage>,
+    pub usage: crate::usage::UsageReceipt,
     /// Provider-native reasoning blocks to replay verbatim on the next turn
     /// (see [`ChatMessage::raw_blocks`]). The tool loop copies these onto the
     /// assistant `ChatMessage` it appends to history.

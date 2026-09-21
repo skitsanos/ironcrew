@@ -5,7 +5,7 @@ use super::state::Metrics;
 use super::{
     HookFailureStage, HookKind, LeaseScope, ProviderFamily, ProviderOperation, ProviderOutcome,
     ReconciliationOutcome, RunOutcome, SseOutcome, SseScope, StoreOperation, TaskOutcome,
-    TerminalOutcome, TerminalScope, TokenKind, ToolOutcome,
+    TerminalOutcome, TerminalScope, ToolOutcome,
 };
 
 pub(crate) fn append(body: &mut String, metrics: &Metrics) {
@@ -83,19 +83,7 @@ pub(crate) fn append(body: &mut String, metrics: &Metrics) {
         }
     }
 
-    writeln!(body, "# TYPE ironcrew_provider_tokens_total counter").unwrap();
-    for &family in ProviderFamily::ALL {
-        for &kind in TokenKind::ALL {
-            let value = Metrics::counter(&metrics.provider_tokens[family.index()][kind.index()]);
-            writeln!(
-                body,
-                "ironcrew_provider_tokens_total{{provider=\"{}\",type=\"{}\"}} {value}",
-                family.as_str(),
-                kind.as_str()
-            )
-            .unwrap();
-        }
-    }
+    metrics.usage.append(body);
 
     writeln!(body, "# TYPE ironcrew_sse_connections_total counter").unwrap();
     for &scope in SseScope::ALL {
