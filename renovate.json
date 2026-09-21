@@ -17,16 +17,28 @@
   "packageRules": [
     {
       "description": "Keep sse-stream aligned with rmcp 3.4 public transport types",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["sse-stream"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "sse-stream"
+      ],
       "allowedVersions": "<0.3.0"
     },
     {
       "description": "Keep disposable PostgreSQL CI on the moving latest-stable image",
-      "matchManagers": ["github-actions"],
-      "matchDatasources": ["docker"],
-      "matchPackageNames": ["postgres"],
-      "matchFileNames": [".github/workflows/ci.yml"],
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
       "pinDigests": false
     },
     {
@@ -43,6 +55,22 @@
       ],
       "groupName": "dependency refresh",
       "groupSlug": "dependency-refresh"
+    },
+    {
+      "description": "Hold the PostgreSQL floor image at the IronCrew support window (two most recent majors); advance it only in an IronCrew major release",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "allowedVersions": "<18"
     }
   ]
 }

@@ -73,7 +73,7 @@ Two replicas have this shape:
                   control objects        control objects
                              \            /
                               \          /
-                           PostgreSQL 15+
+                           PostgreSQL 17+
              records + ledgers + leases + run events
 ```
 
@@ -702,9 +702,14 @@ routing must not be marketed as execution failover before this phase exists.
 Run this matrix with two separate `ironcrew serve` processes, `replica-a` and
 `replica-b`, using identical flows and authentication policy, unique
 `IRONCREW_INSTANCE_ID` values, `IRONCREW_STORE=postgres`, the same PostgreSQL
-15+ schema, and `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true` except for the
+17+ schema, and `IRONCREW_REQUIRE_IDEMPOTENCY_KEY=true` except for the
 deliberately unkeyed case 4 pair. Use direct per-replica addresses first;
 repeat the applicable cases through the real platform load balancer afterward.
+
+For IronCrew 4.x, local acceptance covers both `postgres:17` and
+`postgres:latest` under the [PostgreSQL support policy](storage.md#postgresql-support-policy).
+Keep the dated PostgreSQL 15 results below as historical evidence, not as a
+current server requirement or validation of the 4.x floor.
 
 For a platform run, require the complete deployment-evidence tuple on each
 process. Match the active platform inventory to distinct instance/process-start

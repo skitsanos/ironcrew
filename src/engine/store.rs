@@ -633,7 +633,7 @@ pub trait StateStore: Send + Sync {
 ///
 /// `IRONCREW_STORE=json` (local default) — JSON files in the given directory
 /// `IRONCREW_STORE=sqlite` — SQLite database
-/// `IRONCREW_STORE=postgres` — PostgreSQL 15+ (requires `postgres` feature)
+/// `IRONCREW_STORE=postgres` — PostgreSQL 17+ (requires `postgres` feature)
 /// `IRONCREW_STORE_PATH=<path>` — path for SQLite db (default: `<default_dir>/ironcrew.db`)
 /// `DATABASE_URL=postgres://...` — PostgreSQL connection string
 /// `IRONCREW_PG_TABLE_PREFIX=prefix_` — table prefix for shared databases

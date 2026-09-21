@@ -19,6 +19,10 @@ The PostgreSQL cross-replica HITL mailbox and run-event journal described here
 require IronCrew v3.0.0 or newer. The legacy `2.22.0` image does not contain
 those capabilities.
 
+The current source tree prepares v4.0.0. Its image references below are release
+targets, not evidence that the image has been published. Read the
+[v4 upgrade notes](releases/v4.0.0.md) before upgrading existing stores or clients.
+
 ---
 
 ## Binary profile
@@ -534,7 +538,7 @@ the run ID and dropped-result count.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | — | PostgreSQL 15+ DSN. Required. |
+| `DATABASE_URL` | — | PostgreSQL 17+ DSN for IronCrew 4.x. Required; see the [support policy](storage.md#postgresql-support-policy). |
 | `IRONCREW_PG_TABLE_PREFIX` | empty | Prefix for shared databases (e.g. `tenant1_`), max 37 lowercase ASCII alphanumeric/underscore bytes. |
 | `IRONCREW_DB_POOL_SIZE` | `10` | Connection pool size (range 1–128). Raise only for measured concurrent load. |
 | `IRONCREW_DB_CONNECT_RETRIES` | `10` | Connection retries after the initial attempt (range 0–100). |
@@ -559,11 +563,14 @@ the run ID and dropped-result count.
 | `IRONCREW_ADMISSION_OBSERVATION_RATE_PER_MINUTE` | `600` | Per-principal/process rate for question-list observation; range 1–60000. |
 | `IRONCREW_ADMISSION_OBSERVATION_BURST` | `20` | Per-principal/process observation burst; range 1–1000. |
 
-Use the latest stable PostgreSQL for new deployments and acceptance tests.
-The runtime's SQL feature floor is PostgreSQL 15+, not a recommendation to
-install that major. Choose extension-capable installations such as `pgvector`
-when needed. Plan upgrades of existing databases separately; never reuse an
-older data volume with a new major image without PostgreSQL's upgrade procedure.
+Use the latest stable PostgreSQL for new deployments. IronCrew 4.x retains a
+PostgreSQL 17 floor throughout its lifetime; the floor is chosen from the two
+latest stable majors when an IronCrew major ships, not raised whenever
+PostgreSQL releases a new major. See the [support policy](storage.md#postgresql-support-policy).
+CI and local acceptance cover both `postgres:17` and `postgres:latest`.
+Choose extension-capable installations such as `pgvector` when needed. Plan
+upgrades of existing databases separately; never reuse an older data volume
+with a new major image without PostgreSQL's upgrade procedure.
 
 ### Deployment evidence and replica parity
 
@@ -647,7 +654,7 @@ sequentially. At the default TTL they are bounded to 5 seconds each outside the
 database and 4 seconds per statement inside it. The inner limit resolves one
 blocked statement; the outer limit also covers cumulative statement latency.
 If the outer watchdog wins before core reconciliation commits, the owned SQLx
-transaction is dropped and rolled back. PostgreSQL 15 regressions verify that
+transaction is dropped and rolled back. The PostgreSQL integration suite (run on the floor image and `postgres:latest`) verifies that
 atomic rollback and pool recovery. Best-effort run-event pruning happens in a
 later non-authoritative transaction: a timeout there cannot undo committed
 run/idempotency/HITL recovery, although readiness can remain down until the
@@ -1015,7 +1022,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: docker.io/skitsanos/ironcrew:3.0.0
+        image: docker.io/skitsanos/ironcrew:4.0.0
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080

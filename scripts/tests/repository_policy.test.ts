@@ -176,11 +176,45 @@ describe("repository integration policy", () => {
 
     expect(guard).toContain("evaluations/crew-effectiveness/evaluate.py");
     expect(guard).toContain("IRONCREW_TEST_PG_URL");
-    expect(guard).toContain("--test two_process_replica_acceptance_test");
-    expect(guard).toContain("--test usage_storage_test");
+    expect(guard).toContain('bun --no-env-file run scripts/check-postgres.ts --check-only');
+    expect(guard).toContain('run "PostgreSQL floor/latest integration tests" bun --no-env-file run scripts/check-postgres.ts');
+    expect(guard.indexOf("scripts/check-postgres.ts --check-only")).toBeLessThan(
+      guard.indexOf('run "Rust all-target tests"'),
+    );
+    expect(guard).toContain("env -u IRONCREW_TEST_PG_URL -u IRONCREW_TEST_PG_FLOOR_URL cargo test --all-targets");
     expect(guard).toContain("evaluations/replica-soak/soak.py");
-    expect(guard).toContain("PostgreSQL integration not run");
+    expect(guard).not.toContain("PostgreSQL integration not run");
     expect(guard).toContain("GitHub CI remains authoritative for macOS, Windows");
+  });
+
+  test("the PostgreSQL support floor is consistent across runtime, docs, and CI", async () => {
+    const runtime = await Bun.file(join(repository, "src/engine/pg_runtime.rs")).text();
+    const floor = runtime.match(/MINIMUM_POSTGRES_MAJOR: u32 = (\d+);/)?.[1];
+    expect(floor).toBe("17");
+    for (const doc of ["docs/storage.md", "docs/cli.md", "docs/cloud-deployment.md", "AGENTS.md"]) {
+      const text = await Bun.file(join(repository, doc)).text();
+      expect(text).toContain(`PostgreSQL ${floor}+`);
+      expect(text).not.toMatch(/PostgreSQL 1[0-6]\+/);
+    }
+    const ci = Bun.YAML.parse(await Bun.file(join(repository, ".github/workflows/ci.yml")).text()) as {
+      jobs: Record<string, {
+        name: string;
+        env: Record<string, string>;
+        services: Record<string, { image: string; ports: string[] }>;
+        steps: Array<{ run?: string; uses?: string; with?: Record<string, string> }>;
+      }>;
+    };
+    const job = ci.jobs["postgres-integration"];
+    expect(job.name).toBe("PostgreSQL integration");
+    expect(job.services["postgres-floor"].image).toBe(`postgres:${floor}`);
+    expect(job.services.postgres.image).toBe("postgres:latest");
+    expect(job.services["postgres-floor"].ports).toEqual(["5433:5432"]);
+    expect(job.services.postgres.ports).toEqual(["5432:5432"]);
+    expect(new URL(job.env.IRONCREW_TEST_PG_FLOOR_URL).port).toBe("5433");
+    expect(new URL(job.env.IRONCREW_TEST_PG_URL).port).toBe("5432");
+    expect(job.steps.filter((step) => step.run === "bun --no-env-file run scripts/check-postgres.ts")).toHaveLength(1);
+    expect(job.steps.some((step) => step.uses?.startsWith("oven-sh/setup-bun@") &&
+      step.with?.["bun-version"] === "latest")).toBeTrue();
   });
 
   test("worktree validation covers untracked, staged, and committed whitespace", async () => {
@@ -345,6 +379,17 @@ describe("repository integration policy", () => {
     const version = manifest.match(/^version = "([^"]+)"$/m)?.[1];
     expect(version).toBeDefined();
 
+    const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
+    expect(lockfile).toContain(`name = "ironcrew"\nversion = "${version}"`);
+    const readme = await Bun.file(join(repository, "README.md")).text();
+    expect(readme).toContain(`docs/releases/v${version}.md`);
+    const notes = await Bun.file(join(repository, `docs/releases/v${version}.md`)).text();
+    expect(notes).toStartWith(`# IronCrew ${version}\n`);
+    for (const name of ["tools", "providers"]) {
+      const source = await Bun.file(join(repository, `docs/${name}.md`)).text();
+      expect(source).toContain(`v${version}`);
+    }
+
     const rest = await Bun.file(join(repository, "docs/rest-api.md")).text();
     const cloud = await Bun.file(join(repository, "docs/cloud-deployment.md")).text();
     const openshift = await Bun.file(join(repository, "deploy/openshift.yaml")).text();
@@ -385,8 +430,7 @@ describe("repository integration policy", () => {
       },
     ]);
     const commands = postgres.steps.map((step) => step.run ?? "").join("\n");
-    expect(commands).toContain("--test two_process_replica_acceptance_test");
-    expect(commands).toContain("--test usage_storage_test");
+    expect(commands).toContain("bun --no-env-file run scripts/check-postgres.ts");
     expect(commands).toContain("evaluations/replica-soak/soak.py");
     expect(commands).toContain("-s evaluations/replica-lifecycle");
     expect(agents).toContain("Pull the moving `postgres:latest` tag");

@@ -73,6 +73,27 @@ pub(crate) async fn connect_pool(
     }
 }
 
+/// Oldest PostgreSQL major IronCrew accepts. Policy: the two most recent
+/// PostgreSQL major releases are supported; this floor advances only at an
+/// IronCrew major release and is listed in that release's breaking changes.
+pub(crate) const MINIMUM_POSTGRES_MAJOR: u32 = 17;
+
+/// Apply the support-window floor to a `server_version_num` value.
+pub(crate) fn check_postgres_version_num(version_num: i32) -> Result<()> {
+    let minimum = (MINIMUM_POSTGRES_MAJOR * 10_000) as i32;
+    if version_num < minimum {
+        // server_version_num is MMmmmm (e.g. 160015 = 16.15); show it readably.
+        let major = version_num / 10_000;
+        let minor = version_num % 10_000;
+        return Err(IronCrewError::Validation(format!(
+            "PostgreSQL {MINIMUM_POSTGRES_MAJOR}+ is required (IronCrew supports the two most \
+             recent PostgreSQL major releases); connected server reports version {major}.{minor}. \
+             Upgrade the database server before starting IronCrew against it."
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn ensure_supported_postgres_version(pool: &PgPool) -> Result<()> {
     let version_str: String = sqlx::query("SHOW server_version_num")
         .fetch_one(pool)
@@ -93,21 +114,23 @@ pub(crate) async fn ensure_supported_postgres_version(pool: &PgPool) -> Result<(
         ))
     })?;
 
-    if version_num < 150000 {
-        return Err(IronCrewError::Validation(format!(
-            "PostgreSQL 15+ is required; connected server reports version {}. \
-IronCrew relies on PostgreSQL 15 features for flow-scoped session uniqueness \
-and targets extension-capable deployments such as pgvector-enabled installs.",
-            version_str
-        )));
-    }
-
-    Ok(())
+    check_postgres_version_num(version_num)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_floor_rejects_below_minimum_and_names_the_policy() {
+        let error = check_postgres_version_num(160_009).unwrap_err().to_string();
+        assert!(error.contains("PostgreSQL 17+"), "{error}");
+        assert!(error.contains("two most recent"), "{error}");
+        assert!(error.contains("version 16.9"), "{error}");
+        assert!(check_postgres_version_num(170_000).is_ok());
+        assert!(check_postgres_version_num(180_006).is_ok());
+        assert_eq!(MINIMUM_POSTGRES_MAJOR, 17);
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

@@ -90,8 +90,10 @@ jobs:
     name: PostgreSQL integration
     runs-on: ubuntu-latest
     services:
+      # Both ends of the support window run inside this one job so the
+      # ruleset's required check name stays "PostgreSQL integration".
       postgres:
-        # Exercise the latest stable PostgreSQL; historical receipts keep their versions.
+        # Latest stable PostgreSQL; historical receipts keep their versions.
         image: postgres:latest
         env:
           POSTGRES_USER: postgres
@@ -104,17 +106,36 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      postgres-floor:
+        # Release-time floor, retained throughout IronCrew 4.x.
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ironcrew_ci_admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       IRONCREW_TEST_PG_URL: postgres://ironcrew_ci:ironcrew_ci_password@localhost:5432/ironcrew_test
+      IRONCREW_TEST_PG_FLOOR_URL: postgres://ironcrew_ci:ironcrew_ci_password@localhost:5433/ironcrew_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Create isolated test database
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Create isolated test databases (latest and floor)
         env:
           PGPASSWORD: ironcrew_ci_admin
         run: |
-          psql --host localhost --username postgres --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          for port in 5432 5433; do
+            psql --host localhost --port "$port" --username postgres --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
           CREATE ROLE ironcrew_ci LOGIN PASSWORD 'ironcrew_ci_password'
             NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
           CREATE DATABASE ironcrew_test OWNER ironcrew_ci;
@@ -122,16 +143,11 @@ jobs:
           GRANT USAGE, CREATE ON SCHEMA public TO ironcrew_ci;
           SELECT version();
           SQL
+          done
       - name: Test replica lifecycle harness contracts
         run: python3 -B -m unittest discover -s evaluations/replica-lifecycle -p 'test_*.py'
-      - name: Run PostgreSQL integration tests
-        run: >-
-          cargo test --locked --all-features
-          --test postgres_store_test
-          --test usage_storage_test
-          --test multi_replica_http_test
-          --test two_process_replica_acceptance_test
-          -- --test-threads=1
+      - name: Run PostgreSQL integration tests on floor and latest stable
+        run: bun --no-env-file run scripts/check-postgres.ts
       - name: Run replica soak contract smoke
         run: |
           python3 -m unittest discover \
