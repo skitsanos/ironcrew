@@ -319,7 +319,11 @@ describe("repository integration policy", () => {
     expect(manifest).toContain('rust-version = "1.98.1"');
     expect(toolchain).toContain('channel = "1.98.1"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
-    expect(dockerfile).toContain("FROM rust:1.98.1-bookworm AS builder");
+    // The builder tag must mirror rust-version; Renovate may additionally pin
+    // the tag to an immutable image digest (config:best-practices).
+    expect(dockerfile).toMatch(
+      /^FROM rust:1\.98\.1-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
+    );
     expect(release).toContain(
       "dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1",
     );
