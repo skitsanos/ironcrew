@@ -348,7 +348,7 @@ impl MemoryStore {
 
     fn allocate_revision(&self) -> u64 {
         self.next_revision
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(1))
             })
             .unwrap_or(u64::MAX)
