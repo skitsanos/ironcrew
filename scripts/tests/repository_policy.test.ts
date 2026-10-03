@@ -19,11 +19,11 @@ const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-  "anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26",
+  "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
   "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
-  "dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e",
+  "dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
@@ -313,22 +313,22 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo test --doc");
     expect(
       source.match(
-        /dtolnay\/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e/g,
+        /dtolnay\/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91/g,
       ),
     ).toHaveLength(8);
-    expect(manifest).toContain('rust-version = "1.98.1"');
-    expect(toolchain).toContain('channel = "1.98.1"');
+    expect(manifest).toContain('rust-version = "1.99.0"');
+    expect(toolchain).toContain('channel = "1.99.0"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
     // The builder tag must mirror rust-version; Renovate may additionally pin
     // the tag to an immutable image digest (config:best-practices).
     expect(dockerfile).toMatch(
-      /^FROM rust:1\.98\.1-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
+      /^FROM rust:1\.99\.0-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
     );
     expect(release).toContain(
-      "dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1",
+      "dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0",
     );
     expect(release).toContain(
-      "anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2",
+      "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3",
     );
   });
 

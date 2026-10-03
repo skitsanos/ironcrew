@@ -171,6 +171,11 @@ pub(super) async fn run() {
                 ic019_support::assert_aborted(pair, &run_b).await;
 
                 for base_url in [&base_a, &base_b] {
+                    // The durable abort checkpoint precedes journal finalization
+                    // and admission-permit release. Observe physical cleanup
+                    // before asserting that the process has no active runs.
+                    ic019_http::wait_for_sample(pair, base_url, "ironcrew_process_active_runs", 0)
+                        .await;
                     let metrics = ic019_http::scrape(pair, base_url).await;
                     ic019_http::assert_sample(&metrics, "ironcrew_process_active_runs", 0);
                     ic019_http::assert_sample(&metrics, "ironcrew_process_active_conversations", 0);
