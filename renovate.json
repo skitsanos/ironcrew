@@ -6,6 +6,7 @@
   "baseBranchPatterns": [
     "develop"
   ],
+  "useBaseBranchConfig": "merge",
   "labels": [
     "dependencies"
   ],
