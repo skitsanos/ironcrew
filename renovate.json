@@ -21,6 +21,19 @@
     "**/__fixtures__/**",
     "evaluations/platform-canary/**/*-assembly.Dockerfile"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep the release receipt base-image digest in the same refresh as docker/runtime.Dockerfile",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/release\\.yml$/"
+      ],
+      "matchStrings": [
+        "BASE_IMAGE_REFERENCE: (?<depName>\\S+)\\n\\s+BASE_IMAGE_INDEX_DIGEST: (?<currentDigest>sha256:[0-9a-f]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
   "minimumReleaseAge": "0 days",
   "rangeStrategy": "bump",
   "prConcurrentLimit": 1,

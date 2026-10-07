@@ -1572,6 +1572,12 @@ archive; it does not rebuild a historical release from the current default
 branch. The release image retains the source image's permissions, numeric user,
 environment, and command contract.
 
+The release workflow records the Wolfi base as `BASE_IMAGE_REFERENCE` and
+`BASE_IMAGE_INDEX_DIGEST`, which must equal the runtime Dockerfile's `FROM`
+pin. Renovate reads both pins as the same digest-only dependency, so one grouped
+dependency refresh advances them together. Repository policy rejects any
+mismatch.
+
 This promotion protocol is resolved under [IC-015](issues/IC-015.md). On
 2026-08-12, Docker Hub's production repository was changed to the exact
 stable-semver-only immutability rule while leaving `latest` mutable. A
