@@ -10,6 +10,17 @@
     "dependencies"
   ],
   "dependencyDashboard": true,
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/examples/**",
+    "**/__tests__/**",
+    "**/test/**",
+    "**/tests/**",
+    "**/__fixtures__/**",
+    "evaluations/platform-canary/**/*-assembly.Dockerfile"
+  ],
   "minimumReleaseAge": "0 days",
   "rangeStrategy": "bump",
   "prConcurrentLimit": 1,
