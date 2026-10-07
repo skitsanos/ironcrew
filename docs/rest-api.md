@@ -135,7 +135,7 @@ be exactly `sha256:` followed by 64 lowercase hexadecimal characters.
 
 ```json
 {
-  "version": "4.0.1",
+  "version": "4.0.2",
   "instance_id": "replica-a",
   "process_start_id": "9b0d1822-c5e8-4bf1-8b78-8133f9287710",
   "deployment": {
@@ -1157,7 +1157,7 @@ curl http://localhost:3000/health
 ```json
 {
   "status": "ok",
-  "version": "4.0.1"
+  "version": "4.0.2"
 }
 ```
 
@@ -1172,7 +1172,7 @@ lifecycle withdrawal, readiness returns `503` with the exact current phase:
   "status": "not_ready",
   "component": "lifecycle",
   "lifecycle_state": "draining",
-  "version": "4.0.1"
+  "version": "4.0.2"
 }
 ```
 
@@ -1344,7 +1344,7 @@ docker run -p 3000:3000 \
   ironcrew
 ```
 
-The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.98.1` with
+The Dockerfile uses a locked-toolchain multi-stage build: Rust `1.99.0` with
 `cargo build --release --locked`, then a `debian:13-slim` runtime with only CA
 certificates. Those tags and the runtime package repositories are not a
 bit-for-bit reproducibility guarantee. The image runs as numeric non-root UID

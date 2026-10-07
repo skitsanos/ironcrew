@@ -81,6 +81,16 @@ platform revision/pod identity, resources, lifecycle, and cleanup separately.
 Equal advertised strings or repeated load-balancer samples are not parity
 proof, and none of this proves conversation portability or execution takeover.
 
+## Retained assembly assets
+
+`ic008-openshift-assembly.Dockerfile` and `reports/ic007-*-assembly.Dockerfile`
+are retained evidence, not live build inputs. Their assembly-context receipts
+pin each file's size and SHA-256, so any edit, including a base-image digest
+refresh, relabels a historical canary. Renovate excludes them through
+`ignorePaths`, and `scripts/tests/canary_evidence.test.ts` fails when a file
+drifts from its receipt. A new canary run adds new assembly files and receipts
+instead of editing retained ones.
+
 ## Local runtime smoke
 
 Static Lua validation does not execute conditional tasks or human-input

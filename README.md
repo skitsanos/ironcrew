@@ -4,8 +4,8 @@
 
 Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native), Google Gemini, Groq, Kimi K2.5, DeepSeek, xAI/Grok, Ollama, and any OpenAI-compatible API. Supports reasoning/thinking capture across providers. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
-IronCrew **4.0.1** introduces checked usage accounting and shared token budgets.
-Read the [release and upgrade notes](docs/releases/v4.0.1.md) before moving
+IronCrew **4.0.2** introduces checked usage accounting and shared token budgets.
+Read the [release and upgrade notes](docs/releases/v4.0.2.md) before moving
 existing clients or stored runs to the new usage-accounting contract.
 
 ```lua
@@ -63,7 +63,7 @@ local results = crew:run()
 
 ## Quick Start
 
-> **Prerequisites:** Rust **1.98.1** or newer is the minimum supported toolchain
+> **Prerequisites:** Rust **1.99.0** or newer is the minimum supported toolchain
 > (some dependencies require it to compile). Install via [rustup](https://rustup.rs)
 > and run `rustup update stable`.
 

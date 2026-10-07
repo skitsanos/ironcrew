@@ -19,9 +19,9 @@ The PostgreSQL cross-replica HITL mailbox and run-event journal described here
 require IronCrew v3.0.0 or newer. The legacy `2.22.0` image does not contain
 those capabilities.
 
-The current source tree prepares v4.0.1. Its image references below are release
+The current source tree prepares v4.0.2. Its image references below are release
 targets, not evidence that the image has been published. Read the
-[v4 upgrade notes](releases/v4.0.1.md) before upgrading existing stores or clients.
+[v4 upgrade notes](releases/v4.0.2.md) before upgrading existing stores or clients.
 
 ---
 
@@ -1022,7 +1022,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
       - name: ironcrew
-        image: docker.io/skitsanos/ironcrew:4.0.1
+        image: docker.io/skitsanos/ironcrew:4.0.2
         args: ["serve", "--host", "0.0.0.0", "--port", "8080", "--flows-dir", "/flows"]
         ports:
         - containerPort: 8080
@@ -1548,7 +1548,7 @@ memory file.
 
 ### Source Dockerfile
 
-The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.98.1` builder that
+The root [`Dockerfile`](../Dockerfile) uses the exact Rust `1.99.0` builder that
 matches `Cargo.toml`'s minimum supported Rust version, builds with
 `cargo build --release --locked`, and copies the executable into
 `debian:13-slim`. The runtime is intentionally glibc-based and dynamically
@@ -1563,7 +1563,7 @@ The runtime stage:
 - supplies a runnable server `CMD`
 
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
-with GNU/Linux artifacts built by the release workflow using Rust `1.98.1` and
+with GNU/Linux artifacts built by the release workflow using Rust `1.99.0` and
 `--locked`. The exact tag workflow assembles one `linux/amd64` plus
 `linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
 source and OCI object hashes in a signed receipt, and publishes both as release
@@ -1571,6 +1571,12 @@ assets. The separately authorized Docker workflow verifies and promotes that
 archive; it does not rebuild a historical release from the current default
 branch. The release image retains the source image's permissions, numeric user,
 environment, and command contract.
+
+The release workflow records the Wolfi base as `BASE_IMAGE_REFERENCE` and
+`BASE_IMAGE_INDEX_DIGEST`, which must equal the runtime Dockerfile's `FROM`
+pin. Renovate reads both pins as the same digest-only dependency, so one grouped
+dependency refresh advances them together. Repository policy rejects any
+mismatch.
 
 This promotion protocol is resolved under [IC-015](issues/IC-015.md). On
 2026-08-12, Docker Hub's production repository was changed to the exact
