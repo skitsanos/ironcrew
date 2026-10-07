@@ -346,6 +346,7 @@ describe("repository integration policy", () => {
     const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
       extends: string[];
       baseBranchPatterns: string[];
+      useBaseBranchConfig: string;
       minimumReleaseAge: string;
       prConcurrentLimit: number;
       prHourlyLimit: number;
@@ -354,6 +355,9 @@ describe("repository integration policy", () => {
 
     expect(renovate.extends).toEqual(["config:best-practices"]);
     expect(renovate.baseBranchPatterns).toEqual(["develop"]);
+    // Hosted Renovate reads config from the default branch, main. Merging the
+    // develop config applies develop-only Renovate changes before release.
+    expect(renovate.useBaseBranchConfig).toBe("merge");
     expect(renovate.minimumReleaseAge).toBe("0 days");
     expect(renovate.prConcurrentLimit).toBe(1);
     expect(renovate.prHourlyLimit).toBe(1);
