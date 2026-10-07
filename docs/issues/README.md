@@ -6,7 +6,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 49
+- Total findings: 51
 - Active findings: 0
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
@@ -62,3 +62,5 @@ priority, area, and title. The registry is generated with
 | [IC-047](./IC-047.md) | P2 | Resolved | Execution budgets | Runs lack a shared token budget across provider requests |
 | [IC-048](./IC-048.md) | P2 | Resolved | Provider acceptance | Current builds lack recurring bounded live-provider compatibility smoke |
 | [IC-049](./IC-049.md) | P2 | Resolved | Replica acceptance | Replica SSE acceptance races the terminal journal append |
+| [IC-050](./IC-050.md) | P2 | Resolved | Evidence integrity | Renovate rewrites receipt-bound canary assembly Dockerfiles |
+| [IC-051](./IC-051.md) | P2 | Resolved | Release automation | Renovate refreshes the release base image without its receipt digest |
