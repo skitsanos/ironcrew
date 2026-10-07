@@ -36,7 +36,7 @@ spec:
           # applying the production manifest. Match the digest to the signed
           # release image receipt and OCI archive; promotion copies that archive
           # without rebuilding it. The release also includes a signed SBOM.
-          image: docker.io/skitsanos/ironcrew:4.0.1
+          image: docker.io/skitsanos/ironcrew:4.0.2
           imagePullPolicy: Always
           args: ["serve", "--flows-dir", "/flows"]
           ports:
