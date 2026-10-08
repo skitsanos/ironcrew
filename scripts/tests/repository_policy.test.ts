@@ -17,8 +17,8 @@ function isolatedGitEnvironment(excluded: string[] = []) {
 
 const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+  "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
   "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
