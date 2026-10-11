@@ -17,13 +17,13 @@ function isolatedGitEnvironment(excluded: string[] = []) {
 
 const trustedReleaseActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+  "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
   "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
   "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
-  "dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91",
+  "dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
@@ -313,7 +313,7 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo test --doc");
     expect(
       source.match(
-        /dtolnay\/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91/g,
+        /dtolnay\/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1/g,
       ),
     ).toHaveLength(8);
     expect(manifest).toContain('rust-version = "1.99.0"');
@@ -325,7 +325,7 @@ describe("repository integration policy", () => {
       /^FROM rust:1\.99\.0-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
     );
     expect(release).toContain(
-      "dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0",
+      "dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0",
     );
     expect(release).toContain(
       "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3",
