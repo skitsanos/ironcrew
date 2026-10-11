@@ -15,7 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   BASE_IMAGE_REFERENCE: cgr.dev/chainguard/wolfi-base
-  BASE_IMAGE_INDEX_DIGEST: sha256:238642d42c5613936474d00b900c4e65fb6f637d8991c913403ff09a09cf43a3
+  BASE_IMAGE_INDEX_DIGEST: sha256:1c451d46a0d5c4e9f2b38e0e8d3e299564a1aa95c21973efcc1980a9d1d2e73e
 
 jobs:
   guard:
@@ -125,7 +125,7 @@ jobs:
 
       # Keep release artifacts aligned with Cargo.toml's rust-version and the
       # source Dockerfile instead of silently moving with the stable channel.
-      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           targets: ${{ matrix.target }}
 
@@ -155,7 +155,7 @@ jobs:
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -188,7 +188,7 @@ jobs:
           ref: ${{ needs.guard.outputs.commit_sha }}
 
       - name: Download release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ironcrew-*
           path: artifacts
@@ -280,7 +280,7 @@ jobs:
           upload-release-assets: false
 
       - name: Upload bounded release image assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ironcrew-release-image
           if-no-files-found: error
@@ -371,7 +371,7 @@ jobs:
           --tag "$RELEASE_TAG"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
