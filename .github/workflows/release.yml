@@ -15,7 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   BASE_IMAGE_REFERENCE: cgr.dev/chainguard/wolfi-base
-  BASE_IMAGE_INDEX_DIGEST: sha256:05d24163df148be377275af8374c16523a1dc7e19bf4f1c689784791553c5e45
+  BASE_IMAGE_INDEX_DIGEST: sha256:1c451d46a0d5c4e9f2b38e0e8d3e299564a1aa95c21973efcc1980a9d1d2e73e
 
 jobs:
   guard:
@@ -125,7 +125,7 @@ jobs:
 
       # Keep release artifacts aligned with Cargo.toml's rust-version and the
       # source Dockerfile instead of silently moving with the stable channel.
-      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           targets: ${{ matrix.target }}
 

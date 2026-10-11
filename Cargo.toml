@@ -24,13 +24,13 @@ mlua = { version = "0.12.2", features = ["lua54", "async", "send", "serialize", 
 tokio = { version = "1.53.2", features = ["full"] }
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.152"
 clap = { version = "4.6.7", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 scraper = "0.27.0"
 dotenvy = "0.15.7"
-uuid = { version = "1.27.0", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
