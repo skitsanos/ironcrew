@@ -1,7 +1,7 @@
 # Keep the builder aligned with `package.rust-version` in Cargo.toml. Using an
 # exact toolchain tag prevents a future `rust:latest` release from changing the
 # build underneath us.
-FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
+FROM rust:1.99.1-bookworm@sha256:665b6e0a9290a7298236c08c6e4f1e754e3f0d9b70421c434daa3dfba888d63e AS builder
 
 WORKDIR /app
 
