@@ -1,4 +1,64 @@
+use super::TaskExecutionContext;
+use crate::engine::interpolate::interpolate_bounded;
+
 const PROMPT_TRUNCATION_MARKER: &str = "\n\n[... prompt truncated due to size limit]";
+
+/// Keep trusted flow templates separate from literal diagnostics, including their budgets.
+pub(super) fn user_prompt(
+    context: &TaskExecutionContext<'_>,
+    description: &str,
+    literal_context: Option<(&str, &str)>,
+    max_chars: usize,
+) -> (String, bool) {
+    let mut prompt = BoundedPrompt::new(max_chars);
+    prompt.section("Task: ", description);
+    for (label, template) in [
+        ("Expected output: ", &context.task.expected_output),
+        ("Additional context: ", &context.task.context),
+    ] {
+        if let Some(template) = template {
+            let (text, _) = interpolate_bounded(template, context.completed_results, max_chars);
+            prompt.section(label, &text);
+        }
+    }
+    if !context.memory_context.is_empty() {
+        prompt.section("Relevant memory:\n", &context.memory_context);
+    }
+    if !context.messages_context.is_empty() {
+        prompt.section("", &context.messages_context);
+    }
+    for dep_name in &context.task.depends_on {
+        if let Some(result) = context.completed_results.get(dep_name)
+            && result.success
+        {
+            prompt.section(&format!("Result from '{}': ", dep_name), &result.output);
+        }
+    }
+    let (text, truncated) = prompt.finish();
+    let (text, diagnostic_truncated) = append_literal_context(text, literal_context, max_chars);
+    (text, truncated || diagnostic_truncated)
+}
+
+fn append_literal_context(
+    mut text: String,
+    literal_context: Option<(&str, &str)>,
+    max_chars: usize,
+) -> (String, bool) {
+    let Some((label, diagnostic)) = literal_context else {
+        return (text, false);
+    };
+    // A separate remaining-budget buffer keeps its truncation marker from removing
+    // previously admitted evidence, even when fewer than one marker's characters remain.
+    let mut tail = BoundedPrompt::new(max_chars.saturating_sub(text.chars().count()));
+    if !text.is_empty() {
+        tail.push("\n\n");
+    }
+    tail.push(label);
+    tail.push(diagnostic);
+    let (tail, truncated) = tail.finish();
+    text.push_str(&tail);
+    (text, truncated)
+}
 
 /// Incrementally builds a character-bounded prompt. This avoids first joining
 /// every dependency/tool output into one unbounded temporary allocation and
@@ -92,5 +152,21 @@ mod tests {
         let (text, truncated) = prompt.finish();
         assert!(truncated);
         assert!(text.len() <= 64);
+    }
+
+    #[test]
+    fn literal_diagnostic_tail_never_trims_admitted_evidence() {
+        let evidence = "Complete dependency evidence 🧪";
+        for remaining in 0..128 {
+            let limit = evidence.chars().count() + remaining;
+            let (text, truncated) = append_literal_context(
+                evidence.into(),
+                Some(("Untrusted diagnostic: ", &"é🧪".repeat(256))),
+                limit,
+            );
+            assert!(truncated);
+            assert!(text.starts_with(evidence));
+            assert!(text.chars().count() <= limit);
+        }
     }
 }
