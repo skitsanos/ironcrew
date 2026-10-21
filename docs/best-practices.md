@@ -143,6 +143,12 @@ and dialog turns in real time alongside task events.
 **`on_error` routing.** Set `on_error` on a task to name another task that should
 run when the primary task fails. This lets you build fallback chains.
 
+Keep recovery instructions in the handler's configured template. Provider errors
+are appended as literal, untrusted diagnostics after dependency evidence; runtime
+environment/result expressions inside those errors are never expanded. Diagnostics
+use the remaining prompt budget and can be truncated. See
+[Error Recovery](tasks.md#error-recovery) for invocation and cancellation boundaries.
+
 **Retries.** Set `max_retries` and `retry_backoff_secs` on tasks that may fail
 due to transient issues (rate limits, network errors). The engine emits
 `task_retry` events so you can monitor retry behavior.
@@ -424,7 +430,7 @@ execution flow.
 **`.dockerignore`.** The project includes a `.dockerignore` that excludes `target/`,
 `.git/`, `.env`, `docs/`, and other non-essential files from the build context.
 
-**Multi-arch builds.** The Dockerfile pins Rust `1.99.0`, builds with
+**Multi-arch builds.** The Dockerfile pins Rust `1.99.1`, builds with
 `--locked`, and uses `debian:13-slim` for the runtime. Build for multiple
 architectures with:
 

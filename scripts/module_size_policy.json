@@ -59,8 +59,8 @@
     },
     {
       "path": "src/engine/executor.rs",
-      "max_lines": 384,
-      "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility. Agent-level reasoning_effort (Agent::chat_request) adjusted this count."
+      "max_lines": 359,
+      "rationale": "IC-035 ratchet after extracting bounded prompt assembly: task context, provider/tool-loop dispatch, and standalone task dispatch form the current executor boundary; extract provider-round handling before adding another responsibility. IC-052 moves trusted/literal prompt assembly into executor/prompt.rs and ratchets the ceiling."
     },
     {
       "path": "src/engine/foreach.rs",

@@ -163,10 +163,22 @@ crew:add_task({
 When `risky_task` fails:
 
 1. The engine finds the `fallback` task definition
-2. Error context is injected: `"Error from task 'risky_task' (agent: ...): <error>"`
-3. The fallback task executes
-4. If the fallback succeeds, `risky_task` is marked as recovered: `"Recovered via 'fallback': <output>"`
-5. If the fallback also fails, `risky_task` remains failed
+2. The fallback's configured description, expected output and context keep their normal trusted-template interpolation
+3. The engine appends `"Error from task 'risky_task' (agent: ...): <error>"` as a separately labelled, literal diagnostic after declared dependency evidence
+4. The fallback task executes
+5. If the fallback succeeds, `risky_task` is marked as recovered: `"Recovered via 'fallback': <output>"`
+6. If the fallback also fails, `risky_task` remains failed
+
+Provider error text is untrusted data: `${env.NAME}` and `${results.task.output}`
+inside diagnostics remain literal. Diagnostics bypass interpolation and task hooks,
+using only the remaining aggregate prompt-character budget. A large diagnostic can
+be truncated or omitted without removing already-admitted dependency evidence.
+This does not increase the configured prompt limit or change normal task templates.
+
+The handler is still invoked once directly, using its selected agent/model and the
+provider request deadline. Its task-level retry/timeout fields are not applied to
+that direct recovery call; enclosing run cancellation and lifetime limits remain.
+No new environment setting is required for literal diagnostic handling.
 
 Error handlers that are never triggered are marked as skipped at the end of the run.
 
