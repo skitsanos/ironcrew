@@ -8,7 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| [IC-054](docs/issues/IC-054.md) | P3 | In progress | Toolchain and verification policy | Repository toolchain pins fail the required latest-stable gate |
+| — | — | — | — | No active findings |
 
 ## Working agreement
 
