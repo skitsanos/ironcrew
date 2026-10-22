@@ -8,7 +8,7 @@
 # This multi-architecture Wolfi index includes glibc, OpenSSL, and the Mozilla
 # CA bundle needed by the GNU release binaries. Keep it pinned by index digest:
 # historical tag builds must never resolve a moving base or package index.
-FROM cgr.dev/chainguard/wolfi-base@sha256:238642d42c5613936474d00b900c4e65fb6f637d8991c913403ff09a09cf43a3
+FROM cgr.dev/chainguard/wolfi-base@sha256:81211e15a86ea1d5357f284482af45730c51de45eaf10ad9ce205d6bfc2df323
 
 # Provided automatically by buildx per target platform (amd64 / arm64).
 ARG TARGETARCH
