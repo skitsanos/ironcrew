@@ -38,6 +38,9 @@ reconcile files only when the user also asks for changes.
   dependencies, and fails closed when refresh changes need a commit or the
   Rust, cargo-audit, actionlint, or immutable GitHub Action pins do not match
   current latest-stable policy.
+- Put the PostgreSQL client `psql` on `PATH` for the replica soak. The gate
+  checks for it before dependency refresh or compilation. For a Homebrew
+  keg-only `libpq` installation, add its `bin` directory to the gate's `PATH`.
 - The complete pre-push gate requires both `IRONCREW_TEST_PG_FLOOR_URL` for a
   disposable `postgres:17` database and `IRONCREW_TEST_PG_URL` for disposable
   `postgres:latest`. The shared runner checks both connections before any
