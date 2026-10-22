@@ -2,6 +2,7 @@ use super::ic017_http::{
     assert_error_cache_policy, assert_exact_ids, assert_no_forbidden, assert_sse_cache_policy,
     event_url,
 };
+use super::ic017_sse::get_sse_when_available;
 use super::ic017_support::{
     lock_journal_reads, parse_sse_frames, read_until_sse_event, unlock_journal_reads,
 };
@@ -70,10 +71,10 @@ pub(super) async fn assert_read_deadline_contract(pair: &mut ProcessPair, run_id
     assert!(ended.is_none(), "timeout stream must close after its error");
 
     wait_ready(pair).await;
-    let mut recovered = authenticated(pair.client.get(event_url(pair, run_id)))
-        .send()
-        .await
-        .expect("reconnect IC-017 stream after read timeout");
+    // Readiness does not promise that this run's journal read will finish
+    // within the deliberately short 100 ms deadline after lock release.
+    let mut recovered =
+        get_sse_when_available(pair, run_id, None, "reconnect after read timeout").await;
     assert_eq!(recovered.status(), StatusCode::OK);
     assert_sse_cache_policy(&recovered);
     let recovered_body = read_until_sse_event(&mut recovered, "human_input_requested").await;

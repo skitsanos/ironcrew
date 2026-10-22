@@ -4,7 +4,6 @@ mod hooks;
 mod prompt;
 
 use hooks::{run_after_hook, run_before_hook};
-use prompt::BoundedPrompt;
 
 use crate::engine::agent::Agent;
 use crate::engine::interpolate::{interpolate_bounded, prompt_char_limit};
@@ -37,6 +36,14 @@ pub struct TaskExecutionContext<'a> {
 
 impl<'a> TaskExecutionContext<'a> {
     pub async fn execute(&self) -> Result<(String, Option<String>, UsageSnapshot)> {
+        self.execute_with_literal_context(None).await
+    }
+
+    /// Recovery diagnostics are appended only after trusted templates and dependency evidence.
+    pub(crate) async fn execute_with_literal_context(
+        &self,
+        literal_context: Option<(&str, &str)>,
+    ) -> Result<(String, Option<String>, UsageSnapshot)> {
         let tracker = crate::llm::scope::child_scope(self.provider)?;
         let provider = crate::llm::scope::borrow_with_usage_tracker(self.provider, tracker.clone());
         let max_prompt_chars = prompt_char_limit();
@@ -67,41 +74,8 @@ impl<'a> TaskExecutionContext<'a> {
             )
         });
         messages.push(ChatMessage::system(&system_content));
-        let expected_output = self
-            .task
-            .expected_output
-            .as_ref()
-            .map(|s| interpolate_bounded(s, self.completed_results, max_prompt_chars).0);
-        let context = self
-            .task
-            .context
-            .as_ref()
-            .map(|s| interpolate_bounded(s, self.completed_results, max_prompt_chars).0);
-
-        // Cap total prompt size while constructing it, so a large collection
-        // of dependency outputs never creates an unbounded temporary string.
-        let mut prompt = BoundedPrompt::new(max_prompt_chars);
-        prompt.section("Task: ", &description);
-        if let Some(ref expected) = expected_output {
-            prompt.section("Expected output: ", expected);
-        }
-        if let Some(ref ctx) = context {
-            prompt.section("Additional context: ", ctx);
-        }
-        if !self.memory_context.is_empty() {
-            prompt.section("Relevant memory:\n", &self.memory_context);
-        }
-        if !self.messages_context.is_empty() {
-            prompt.section("", &self.messages_context);
-        }
-        for dep_name in &self.task.depends_on {
-            if let Some(dep_result) = self.completed_results.get(dep_name)
-                && dep_result.success
-            {
-                prompt.section(&format!("Result from '{}': ", dep_name), &dep_result.output);
-            }
-        }
-        let (user_prompt, truncated) = prompt.finish();
+        let (user_prompt, truncated) =
+            prompt::user_prompt(self, &description, literal_context, max_prompt_chars);
         if truncated {
             tracing::warn!(
                 "Task '{}': prompt truncated to {} chars",
@@ -311,7 +285,8 @@ impl<'a> TaskExecutionContext<'a> {
 }
 
 /// Backward-compatible wrapper that creates a TaskExecutionContext and executes it.
-#[allow(clippy::too_many_arguments)]
+// Public library entry; the binary calls the hook/scoped-context paths directly.
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn execute_task_standalone(
     task: &Task,
     agent: &Agent,
