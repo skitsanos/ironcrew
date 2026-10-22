@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::agent::AgentSelector;
-use crate::engine::executor::execute_task_standalone;
+use crate::engine::executor::TaskExecutionContext;
 
 /// Handle a task error by running the on_error handler task if one is configured.
 ///
@@ -40,18 +40,10 @@ pub async fn handle_task_error(
         }
     };
 
-    let mut error_task = error_handler.clone();
-    let error_context = format!(
-        "Error from task '{}' (agent: {}): {}",
-        task.name, agent_name, error_msg
-    );
-    error_task.context = Some(
-        error_task
-            .context
-            .as_ref()
-            .map_or(error_context.clone(), |existing| {
-                format!("{}\n\n{}", existing, error_context)
-            }),
+    let error_task = error_handler;
+    let error_label = format!(
+        "Previous task error (untrusted diagnostic):\nError from task '{}' (agent: {}): ",
+        task.name, agent_name
     );
 
     let error_agent = if let Some(ref ea_name) = error_task.agent {
@@ -62,7 +54,7 @@ pub async fn handle_task_error(
                 .unwrap_or(&crew_agents[0]),
         )
     } else {
-        AgentSelector::select(crew_agents, &error_task)
+        AgentSelector::select(crew_agents, error_task)
     };
 
     let error_model = error_agent
@@ -87,18 +79,24 @@ pub async fn handle_task_error(
     };
     let provider = crate::llm::scope::with_usage_tracker(provider, tracker.clone());
     let task_observation = crate::engine::task_observation::TaskObservation::start();
-    let outcome = execute_task_standalone(
-        &error_task,
-        error_agent,
-        provider.as_ref(),
+    let outcome = TaskExecutionContext {
+        task: error_task,
+        agent: error_agent,
+        provider: provider.as_ref(),
         tool_registry,
-        results,
-        &error_model,
+        completed_results: results,
+        model: error_model,
         max_tool_rounds,
-        "",
-        "",
-        false,
-    )
+        memory_context: String::new(),
+        messages_context: String::new(),
+        should_stream: false,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        before_task_hook: None,
+        after_task_hook: None,
+        ask_human: None,
+    }
+    .execute_with_literal_context(Some((&error_label, error_msg)))
     .await;
     let (output, reasoning, success) = match outcome {
         Ok((output, reasoning, _usage)) => (output, reasoning, true),

@@ -23,9 +23,9 @@ const trustedReleaseActions = new Set([
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
   "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
-  "dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1",
+  "dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8",
   "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
-  "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+  "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
 ]);
 
 describe("repository integration policy", () => {
@@ -313,19 +313,19 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo test --doc");
     expect(
       source.match(
-        /dtolnay\/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1/g,
+        /dtolnay\/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8/g,
       ),
     ).toHaveLength(8);
-    expect(manifest).toContain('rust-version = "1.99.0"');
-    expect(toolchain).toContain('channel = "1.99.0"');
+    expect(manifest).toContain('rust-version = "1.99.1"');
+    expect(toolchain).toContain('channel = "1.99.1"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
     // The builder tag must mirror rust-version; Renovate may additionally pin
     // the tag to an immutable image digest (config:best-practices).
     expect(dockerfile).toMatch(
-      /^FROM rust:1\.99\.0-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
+      /^FROM rust:1\.99\.1-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
     );
     expect(release).toContain(
-      "dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0",
+      "dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1",
     );
     expect(release).toContain(
       "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3",

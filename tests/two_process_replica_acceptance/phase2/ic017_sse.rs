@@ -14,8 +14,17 @@ pub(super) async fn get_sse_when_available(
     cursor: Option<HeaderValue>,
     context: &str,
 ) -> Response {
+    get_sse_at_url_when_available(&pair.client, &event_url(pair, run_id), cursor, context).await
+}
+
+async fn get_sse_at_url_when_available(
+    client: &Client,
+    url: &str,
+    cursor: Option<HeaderValue>,
+    context: &str,
+) -> Response {
     for attempt in 1..=SSE_READ_ATTEMPTS {
-        let mut request = authenticated(pair.client.get(event_url(pair, run_id)));
+        let mut request = authenticated(client.get(url));
         if let Some(cursor) = cursor.as_ref() {
             request = request.header("Last-Event-ID", cursor.clone());
         }
@@ -43,6 +52,10 @@ pub(super) async fn get_sse_when_available(
     }
     unreachable!("bounded IC-017 SSE read loop must return or fail")
 }
+
+#[cfg(test)]
+#[path = "ic017_sse_retry_tests.rs"]
+mod retry_tests;
 
 fn is_journal_temporarily_unavailable(status: StatusCode, body: &str) -> bool {
     status == StatusCode::SERVICE_UNAVAILABLE
