@@ -48,6 +48,7 @@ require_command cargo "Install the repository Rust toolchain before running the 
 require_command rustc "Install the repository Rust toolchain before running the gate."
 require_command rustup "Install rustup before running the IronCrew validation gate."
 require_command actionlint "Install actionlint before running the gate."
+require_command psql "Install the PostgreSQL client (psql) and add its bin directory to PATH before running the gate."
 
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf '%s\n' \
