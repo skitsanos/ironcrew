@@ -4,6 +4,8 @@
 
 #[path = "api_safety/budget.rs"]
 mod budget;
+#[path = "api_safety/contention.rs"]
+mod contention;
 #[path = "api_safety/usage.rs"]
 mod usage;
 
@@ -13,7 +15,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ironcrew::api::{AppState, create_router};
-use ironcrew::engine::audit::AuditFilter;
 use ironcrew::engine::run_history::{JsonFileStore, RunStatus};
 use ironcrew::engine::store::StateStore;
 use ironcrew::llm::provider::ChatMessage;
@@ -494,74 +495,6 @@ async fn concurrent_conversation_admission_never_exceeds_cap() {
 }
 
 #[tokio::test]
-async fn overlapping_conversation_message_fails_fast_instead_of_queueing() {
-    let server = spawn_server(2, 1, Duration::from_secs(60)).await;
-    let client = reqwest::Client::new();
-    let started = client
-        .post(format!(
-            "{}/flows/chat/conversations/busy/start",
-            server.base
-        ))
-        .json(&serde_json::json!({ "agent": "tutor" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(started.status(), reqwest::StatusCode::OK);
-
-    let handle = server
-        .state
-        .active_conversations
-        .read()
-        .await
-        .get(&("chat".to_string(), "busy".to_string()))
-        .cloned()
-        .expect("active conversation handle");
-    let _active_turn = handle.turn_lock.lock().await;
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(1),
-        client
-            .post(format!(
-                "{}/flows/chat/conversations/busy/messages",
-                server.base
-            ))
-            .json(&serde_json::json!({ "content": "do not queue" }))
-            .send(),
-    )
-    .await
-    .expect("busy response must not wait for the active turn")
-    .unwrap();
-
-    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(
-        body["error"],
-        "Conversation is busy; retry after the active operation completes"
-    );
-    let audits = server
-        .store
-        .list_audit_events(
-            &AuditFilter {
-                flow_path: Some("chat".into()),
-                action: Some("conversation.message".into()),
-                success: Some(false),
-                ..Default::default()
-            },
-            10,
-            0,
-        )
-        .await
-        .unwrap();
-    assert_eq!(audits.len(), 1);
-    assert_eq!(audits[0].target.as_deref(), Some("busy"));
-    assert_eq!(audits[0].status_code, 409);
-    assert_eq!(
-        audits[0].metadata,
-        Some(serde_json::json!({ "idempotent": false }))
-    );
-}
-
-#[tokio::test]
 async fn stale_durable_conversation_revision_invalidates_and_reloads_the_live_handle() {
     let server = spawn_server(2, 1, Duration::from_secs(60)).await;
     let client = reqwest::Client::new();
@@ -820,87 +753,6 @@ async fn liveness_stays_up_while_readiness_checks_shutdown_flows_and_storage() {
     );
     let body: serde_json::Value = storage_down.json().await.unwrap();
     assert_eq!(body["component"], "storage");
-}
-
-#[tokio::test]
-async fn overlapping_readiness_probes_coalesce_without_a_false_503() {
-    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
-    let cache_guard = server.state.readiness_cache.lock().await;
-    let client = reqwest::Client::new();
-    let request = tokio::spawn({
-        let url = format!("{}/health/ready", server.base);
-        async move { client.get(url).send().await.unwrap() }
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !request.is_finished(),
-        "an overlapping healthy probe must wait for the in-flight check"
-    );
-    drop(cache_guard);
-
-    let response = tokio::time::timeout(Duration::from_secs(1), request)
-        .await
-        .expect("coalesced readiness request must finish")
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["status"], "ready");
-    assert_eq!(body["component"], "storage");
-}
-
-#[tokio::test]
-async fn queued_readiness_probe_observes_a_drain_transition() {
-    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
-    let cache_guard = server.state.readiness_cache.lock().await;
-    let client = reqwest::Client::new();
-    let request = tokio::spawn({
-        let url = format!("{}/health/ready", server.base);
-        async move { client.get(url).send().await.unwrap() }
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !request.is_finished(),
-        "the probe must be queued behind the active readiness check"
-    );
-    server.state.lifecycle.begin_fencing();
-    drop(cache_guard);
-
-    let response = tokio::time::timeout(Duration::from_secs(1), request)
-        .await
-        .expect("the queued readiness request must finish")
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["status"], "not_ready");
-    assert_eq!(body["component"], "lifecycle");
-    assert_eq!(body["lifecycle_state"], "fencing");
-}
-
-#[tokio::test]
-async fn overlapping_readiness_probe_fails_closed_when_the_check_stalls() {
-    let server = spawn_server(1, 4, Duration::from_secs(60)).await;
-    let _cache_guard = server.state.readiness_cache.lock().await;
-    let started = std::time::Instant::now();
-    let response = tokio::time::timeout(
-        Duration::from_secs(3),
-        reqwest::Client::new()
-            .get(format!("{}/health/ready", server.base))
-            .send(),
-    )
-    .await
-    .expect("a stalled coalesced probe must fail closed within its bound")
-    .unwrap();
-
-    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        started.elapsed() >= Duration::from_millis(900),
-        "a contended probe should coalesce before failing closed"
-    );
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["status"], "not_ready");
-    assert_eq!(body["component"], "readiness_check");
 }
 
 #[tokio::test]

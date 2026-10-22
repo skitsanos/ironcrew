@@ -40,7 +40,7 @@ url = "2.5.8"
 sha2 = "0.11.1"
 md-5 = "0.11"
 tera = "2.4.0"
-jsonschema = { version = "0.59.0", default-features = false }
+jsonschema = { version = "0.60.0", default-features = false }
 glob = "0.3.4"
 regex = "1.13.1"
 futures = "0.3.34"
@@ -73,6 +73,7 @@ mcp = ["dep:rmcp", "dep:sse-stream"]
 [dev-dependencies]
 tempfile = "=3.27.0"
 portable-pty = "=0.9.0"
+tokio = { version = "=1.54.1", features = ["test-util"] }
 # Used by the `postgres`-gated integration tests (`postgres_store_test`,
 # `multi_replica_http_test`, `two_process_replica_acceptance` and its phase
 # modules) for setup/teardown against a live database. Those tests are skipped
