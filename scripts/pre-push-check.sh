@@ -50,6 +50,16 @@ require_command rustup "Install rustup before running the IronCrew validation ga
 require_command actionlint "Install actionlint before running the gate."
 require_command psql "Install the PostgreSQL client (psql) and add its bin directory to PATH before running the gate."
 
+# Runtime subprocesses search their working directory's ancestors for .env.
+# Validate before refresh or tests, then give every temp-directory API the same
+# owned root instead of leaving the caller's TMPDIR, TEMP, or TMP in effect.
+scratch_root=$(python3 -I "$repo_root/scripts/pre_push_tempdir.py" "$repo_root")
+cleanup() {
+  rm -rf -- "$scratch_root"
+}
+trap cleanup EXIT
+export TMPDIR="$scratch_root" TEMP="$scratch_root" TMP="$scratch_root"
+
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf '%s\n' \
     'pre-push: commit or otherwise reconcile every tracked and untracked change before running the gate.' >&2
@@ -96,12 +106,6 @@ fi
 # execute. Keep the local gate bounded while preserving the CI command contract.
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_DEV_DEBUG=0
-
-scratch_root=$(mktemp -d "${TMPDIR:-/tmp}/ironcrew-pre-push.XXXXXX")
-cleanup() {
-  rm -rf -- "$scratch_root"
-}
-trap cleanup EXIT
 
 git status --porcelain=v1 -z --untracked-files=all >"$scratch_root/worktree-before"
 
