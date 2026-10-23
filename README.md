@@ -4,9 +4,9 @@
 
 Works with OpenAI (Chat Completions + Responses API), Anthropic Claude (native), Google Gemini, Groq, Kimi K2.5, DeepSeek, xAI/Grok, Ollama, and any OpenAI-compatible API. Supports reasoning/thinking capture across providers. No Python, no Node.js, no Docker required — just one binary and your Lua scripts.
 
-IronCrew **4.0.3** isolates recovery diagnostics from runtime templates and
-updates security dependencies. Read the
-[release and upgrade notes](docs/releases/v4.0.3.md) before upgrading.
+IronCrew **4.0.4** makes validation temporary-directory isolation fail closed
+and refreshes dependencies and the release container base. Read the
+[release and upgrade notes](docs/releases/v4.0.4.md) before upgrading.
 
 ```lua
 local crew = Crew.new({
