@@ -41,6 +41,15 @@ reconcile files only when the user also asks for changes.
 - Put the PostgreSQL client `psql` on `PATH` for the replica soak. The gate
   checks for it before dependency refresh or compilation. For a Homebrew
   keg-only `libpq` installation, add its `bin` directory to the gate's `PATH`.
+- Temporary-directory admission also runs before dependency refresh. `TMPDIR`
+  must name an existing writable absolute directory outside the checkout with
+  no `.env` entry in its resolved ancestry. Unset or empty `TMPDIR` uses `/tmp`;
+  an unsafe or unusable base fails without trying another location. The gate
+  exports one private root as `TMPDIR`, `TEMP`, and `TMP` for subprocesses and
+  removes that root on exit, preserving the caller's base and its other files.
+  This prevents ancestor `.env` discovery in temporary test workspaces; it does
+  not scrub unrelated inherited environment variables or replace disposable
+  database admission.
 - The complete pre-push gate requires both `IRONCREW_TEST_PG_FLOOR_URL` for a
   disposable `postgres:17` database and `IRONCREW_TEST_PG_URL` for disposable
   `postgres:latest`. The shared runner checks both connections before any
