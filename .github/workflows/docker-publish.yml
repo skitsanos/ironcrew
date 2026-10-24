@@ -2,6 +2,8 @@ name: Docker Publish
 
 # Default-branch repository dispatch promotes only the signed OCI archive
 # produced by release.yml. It never rebuilds an image from this checkout.
+# Successful GitHub releases dispatch this workflow automatically; standalone
+# owner requests remain available for promotion recovery and identical replay.
 # `validate` mode traverses the protected environment without registry writes;
 # `publish` authorizes exact promotion and bounded reconciliation of `latest`.
 on:
@@ -112,7 +114,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends skopeo
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

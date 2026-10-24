@@ -8,6 +8,11 @@ IronCrew **4.0.4** makes validation temporary-directory isolation fail closed
 and refreshes dependencies and the release container base. Read the
 [release and upgrade notes](docs/releases/v4.0.4.md) before upgrading.
 
+Standard releases publish signed GitHub assets and promote the same OCI image
+to Docker Hub's versioned tag and `latest` through the protected workflow.
+See the [release process](docs/cloud-deployment.md#release-publication-and-docker-hub-promotion)
+for approval, verification and recovery requirements.
+
 ```lua
 local crew = Crew.new({
     goal = "Research and summarize a topic",

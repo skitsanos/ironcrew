@@ -1,4 +1,4 @@
 interface:
   display_name: "Release IronCrew"
   short_description: "Prepare and cut a gated IronCrew release"
-  default_prompt: "Use $release-ironcrew to prepare and cut the next IronCrew release safely."
+  default_prompt: "Use $release-ironcrew to prepare and cut the next IronCrew release, including protected Docker Hub promotion, latest reconciliation, and verification of both Linux architectures and digests."
