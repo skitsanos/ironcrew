@@ -7,7 +7,7 @@ on:
 permissions: {}
 
 # Serialize release selection with registry promotion/latest repair in the
-# manual publisher. GitHub concurrency groups span workflows in a repository.
+# protected publisher. GitHub concurrency groups span workflows in a repository.
 concurrency:
   group: release-publication
   cancel-in-progress: false
@@ -548,3 +548,39 @@ jobs:
             --latest \
             -- \
             release/*
+
+  docker-promotion:
+    name: Request protected Docker Hub promotion
+    needs: [guard, release]
+    if: >-
+      needs.guard.outputs.mode == 'publish' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The successful release job supplies the protected owner-approval boundary.
+    # This job only dispatches; registry credentials and approval stay in
+    # docker-publish.yml. A separate job can retry without recreating assets.
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
+    steps:
+      - name: Dispatch protected Docker Hub promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_ACTION: ${{ github.event.action }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = repository_dispatch
+          test "$DISPATCH_ACTION" = ironcrew_release_v1
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_REF" = \
+            "$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=ironcrew_docker_publish_v1 \
+            -f "client_payload[tag]=${RELEASE_TAG}" \
+            -f "client_payload[mode]=publish"
+          # Both workflows share release-publication. End this run so the
+          # protected publisher can start; waiting here would deadlock it.
+          printf 'Docker Hub promotion requested for %s. Approve Docker Publish and verify version/latest digests before completing the release.\n' \
+            "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
