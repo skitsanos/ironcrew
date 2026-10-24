@@ -20,7 +20,7 @@ const trustedReleaseActions = new Set([
   "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
   "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
   "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
-  "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
+  "docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
   "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
   "dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8",

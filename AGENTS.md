@@ -47,6 +47,11 @@
   release, check the official specification index, advance the strict source,
   tests, examples, and docs together when it changes, and remove the superseded
   revision rather than adding a compatibility fallback.
+- A standard release includes GitHub release publication and protected Docker
+  Hub promotion of the signed OCI archive. Release authorization covers both
+  unless the user explicitly narrows it. Retain the protected owner reviews;
+  verify the versioned image, `latest`, both Linux architectures and their
+  receipt-bound digests, and both workflows before reporting release completion.
 
 ## Multi-replica and deployment boundaries
 
