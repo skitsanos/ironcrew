@@ -2,8 +2,9 @@ name: Release Request Controller
 
 # Issues are the sole owner's low-authority request channel. GitHub evaluates
 # this workflow from the default branch, and GITHUB_TOKEN exists only for this
-# run. The controller dispatches the existing hardened publication workflows;
-# it never publishes artifacts or registry content itself.
+# run. The controller starts releases and standalone Docker recovery requests;
+# successful releases request their own protected Docker promotion. This
+# controller never publishes artifacts or registry content itself.
 on:
   issues:
     types: [labeled]

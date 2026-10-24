@@ -1,6 +1,6 @@
 ---
 name: release-ironcrew
-description: Prepare, verify, version, and publish an IronCrew release through develop and main with explicit approval gates. Use when the user asks to release, cut a release, ship a version, bump the product version for release, or integrate dependency work into a release. Do not use for routine dependency updates, PR review alone, or deployment without release intent.
+description: Prepare, verify, version, and publish an IronCrew release through develop and main, including protected Docker Hub promotion and latest verification. Use when the user asks to release, cut a release, ship a version, bump the product version for release, or integrate dependency work into a release. Do not use for routine dependency updates, PR review alone, or deployment without release intent.
 ---
 
 # Release IronCrew
@@ -8,6 +8,13 @@ description: Prepare, verify, version, and publish an IronCrew release through d
 Use explicit user approval before merges, remote PR changes, commits, pushes,
 version changes, tags, releases, images, or crates.io publication. Never
 force-push, rewrite a published commit, or delete a remote tag.
+
+A standard release includes GitHub publication and Docker Hub promotion of the
+same signed OCI archive to the versioned image and `latest`. A user's request
+to publish a release authorizes both unless they explicitly limit the scope.
+Use that existing authorization for the complete process rather than asking
+again for its individual steps. Protected environment owner reviews remain
+required. crates.io publication still requires separate authorization.
 
 ## Establish release state
 
@@ -40,11 +47,13 @@ environment, only the owner may create protected `v*` tags, tag updates and
 deletions remain prohibited, immutable releases are enabled, and the documented
 non-secret controls have been revalidated.
 
-The owner-only Issues controller is the request channel. It validates an exact
-issue and uses its run-scoped `GITHUB_TOKEN` to create the fixed repository
-dispatch, avoiding a standing Contents-write personal token. `validate` mode is
-non-publishing, but it still waits for the protected environment because its
-purpose is to prove that enforcement.
+The owner-only Issues controller starts releases and standalone Docker recovery
+requests. It validates an exact issue and uses its run-scoped `GITHUB_TOKEN` to
+create the fixed repository dispatch, avoiding a standing Contents-write
+personal token. After successful protected GitHub publication, the release
+workflow dispatches the Docker workflow for the same validated tag. `validate`
+mode is non-publishing and never requests promotion, but it still waits for the
+protected environment because its purpose is to prove that enforcement.
 
 Default-branch dispatch does not prevent a tag-capable actor from adding a
 different tag-push workflow to an off-main commit. Under the sole-owner model,
@@ -88,11 +97,12 @@ After approval:
 4. Fast-forward local `main` from `origin/main`. Create an annotated `vX.Y.Z`
    tag only on the verified release commit.
 5. Prove the tag is reachable from `main` and its `Cargo.toml` contains the same
-   version. Show the evidence and ask before pushing the tag.
-6. Push the tag only with explicit approval. Pushing it does not publish a
-   release. After the remote controls above exist, first ask for authorization
-   to exercise the protected environment without publication. Replace the tag
-   in this exact request with the pushed stable tag:
+   version. Record that evidence and confirm the user's release authorization
+   covers the tag push; ask only if that authorization is missing.
+6. Push the authorized tag. Pushing it does not publish a release. After the
+   remote controls above exist, exercise the protected environment without
+   publication as part of the authorized release. Replace the tag in this exact
+   request with the pushed stable tag:
 
    ```bash
    request=$(gh issue create --repo skitsanos/ironcrew \
@@ -110,7 +120,23 @@ After approval:
    Capture a separately designed denied adversarial canary; the controller's
    `repository_dispatch` always selects the default-branch workflow and cannot
    be pointed at an off-main ref.
-7. Only after those canaries and a separate explicit publication approval,
+
+   Before publishing, also require the exact Docker Hub stable-semver
+   immutability rule and IC-015's recorded replay/conflict/concurrent-`latest`
+   acceptance. Validate the Docker protected path under the same release
+   authorization:
+
+   ```bash
+   request=$(gh issue create --repo skitsanos/ironcrew \
+     --title 'IronCrew release request' \
+     --body '{"target":"docker","tag":"vX.Y.Z","mode":"validate"}')
+   gh issue edit "$request" --add-label release-request
+   ```
+
+   This validation must wait for the protected review and complete without
+   reading Docker credentials or accessing the registry. Close its request
+   issue afterward.
+7. Only after both protected canaries pass and publication is authorized,
    dispatch the exact release request:
 
    ```bash
@@ -120,32 +146,23 @@ After approval:
    gh issue edit "$request" --add-label release-request
    ```
 
-   A release created with the workflow's `GITHUB_TOKEN` does not cascade into
-   another release-event workflow; Docker promotion remains the separately
-   authorized dispatch below.
    Monitor `.github/workflows/release.yml`. It must create the release once and
    publish the signed OCI archive plus strict image receipt; it must not update
-   an existing release or replace its assets.
-8. Docker publication through `.github/workflows/docker-publish.yml` is a
-   separate authorization. It verifies and promotes the tag-owned signed
-   archive rather than rebuilding source. Before any Docker
-   publication, require the exact Docker Hub stable-semver immutability rule and
-   IC-015's recorded non-production replay/conflict/concurrent-`latest`
-   acceptance. After the protected environment exists, its non-publishing
-   Docker path can be checked with a separate authorization and this exact
-   request; it must not read Docker credentials or touch the registry:
+   an existing release or replace its assets. Its separate Docker handoff job
+   runs only after successful publication and submits
+   `ironcrew_docker_publish_v1` with the same tag and `mode=publish`. That explicit
+   repository dispatch works with `GITHUB_TOKEN`; a release event alone does
+   not cascade. The handoff ends without waiting because both workflows share
+   the `release-publication` concurrency group.
+8. Complete Docker publication through `.github/workflows/docker-publish.yml`
+   as a required part of the release. The automatically requested publishing
+   run needs the normal protected owner review too. It verifies and promotes
+   the signed archive, publishes `X.Y.Z` and reconciles `latest` against GitHub's
+   current stable release without rebuilding source.
 
-   ```bash
-   request=$(gh issue create --repo skitsanos/ironcrew \
-     --title 'IronCrew release request' \
-     --body '{"target":"docker","tag":"vX.Y.Z","mode":"validate"}')
-   gh issue edit "$request" --add-label release-request
-   ```
-
-   IC-015's non-production registry acceptance is resolved, but actual Docker
-   publication remains deferred until this IC-014 control plane is complete and
-   the user separately authorizes production promotion. Then use this exact
-   request:
+   If the handoff fails, retry only its job so the immutable GitHub release is
+   not recreated. If the Docker run fails or is cancelled, retry that run or use
+   this standalone recovery request for the existing release:
 
    ```bash
    request=$(gh issue create --repo skitsanos/ironcrew \
@@ -154,11 +171,32 @@ After approval:
    gh issue edit "$request" --add-label release-request
    ```
 
-   Monitor the version digest and final `latest` digest against GitHub's current
-   stable release. Publish a crate only with separate authorization too.
-   Do not use this path to backfill a legacy release without the signed OCI
-   archive and receipt; promotion begins with the first release produced by the
-   trusted default-branch release workflow.
+   Both workflows retain the shared concurrency group; a later pending request
+   can replace an earlier pending run. Monitor the actual downstream run and
+   recover a cancelled request rather than treating dispatch as completion.
+   Close any recovery issue after its downstream run completes. Never rerun
+   GitHub publication to repair Docker promotion, change an existing version
+   digest, or backfill a legacy release without the signed archive and receipt.
+
+## Release completion
+
+Do not report a standard release complete until all of these are verified:
+
+- The exact release commit's CI and both publication workflows are green.
+- GitHub's immutable assets, signatures and source/binary/image bindings pass.
+- Docker Hub's versioned image and `latest` resolve to their signed receipt
+  indexes; `latest` corresponds to GitHub's current stable release.
+- Both `linux/amd64` and `linux/arm64` manifest/config digests, version and source
+  labels match the receipt. Digest-pinned registry fetches pass version and
+  readiness smoke checks; record emulation when used.
+- Owned test containers, image tags and temporary resources are removed while
+  preserving unrelated work and retained runtime data.
+
+A green GitHub release run proves the promotion request was submitted, not that
+Docker publication finished. For an explicitly GitHub-only request, cancel the
+automatically requested Docker run before approving its protected environment.
+Report that narrower boundary rather than describing it as a complete standard
+release.
 
 If an unpushed local release step is wrong, make a corrective edit or ask for
 direction. Once anything is pushed, use a forward fix unless the user explicitly

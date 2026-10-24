@@ -1562,15 +1562,44 @@ The runtime stage:
 - exposes the local/container default port `3000`
 - supplies a runnable server `CMD`
 
+### Release publication and Docker Hub promotion
+
+A standard release publishes GitHub assets and the Docker Hub versioned image
+and `latest`. Release authorization covers both unless the user explicitly
+limits its scope. Both publishing jobs still require the protected `release`
+environment's owner review.
+
 Release publishing uses [`docker/runtime.Dockerfile`](../docker/runtime.Dockerfile)
 with GNU/Linux artifacts built by the release workflow using Rust `1.99.1` and
 `--locked`. The exact tag workflow assembles one `linux/amd64` plus
 `linux/arm64` OCI archive on a content-addressed Wolfi base index, records its
 source and OCI object hashes in a signed receipt, and publishes both as release
-assets. The separately authorized Docker workflow verifies and promotes that
-archive; it does not rebuild a historical release from the current default
-branch. The release image retains the source image's permissions, numeric user,
-environment, and command contract.
+assets. After GitHub publication succeeds, a separate handoff job submits
+`ironcrew_docker_publish_v1` for that validated tag with `mode=publish`. This
+explicit [repository dispatch can trigger another workflow with `GITHUB_TOKEN`](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow);
+a release event alone does not. The Docker workflow verifies and promotes that
+archive, publishing `X.Y.Z` and reconciling `latest` against GitHub's current
+stable release. The release image retains the source image's permissions,
+numeric user, environment and command contract.
+
+Approve the Docker workflow's protected review and wait for its result before
+reporting the release complete. Verify the versioned tag and `latest` index
+digests, both `linux/amd64` and `linux/arm64` manifest/config digests, and source
+labels against the signed receipts. Fetch by digest and run version/readiness
+smokes for both architectures, recording any emulation. The exact source CI,
+GitHub publication and Docker publication must all be green; a successful
+handoff alone is not Docker publication evidence.
+
+The handoff does not wait for Docker within the release workflow: both share
+`release-publication`, so the release run must end to admit the Docker run.
+The shared group retains one pending slot, which a later pending request can
+replace. Monitor the downstream run and recover cancellations. Retry only the
+handoff job on dispatch failure, or the Docker run on promotion failure. The
+owner-only Issues controller's `target=docker` request remains the recovery
+path for an existing release. Do not recreate GitHub assets or overwrite an
+immutable version tag to repair a Docker publication. See the
+[release procedure](../.agents/skills/release-ironcrew/SKILL.md) for exact requests
+and the non-publishing protected checks.
 
 The release workflow records the Wolfi base as `BASE_IMAGE_REFERENCE` and
 `BASE_IMAGE_INDEX_DIGEST`, which must equal the runtime Dockerfile's `FROM`
@@ -1585,8 +1614,8 @@ disposable repository passed the real
 replay/conflict/concurrent-`latest` protocol and was then removed exactly; the
 retained machine receipt is linked from IC-015. No production image or tag was
 published or moved. The exact harness/evidence commit passed all platform CI
-jobs. Production Docker publication remains deferred under IC-014's
-release-control gate and the user's release-last sequence.
+jobs. Production promotion retains [IC-014](issues/IC-014.md)'s trusted-main and
+protected-owner-review boundaries and is now required for a standard release.
 The protocol starts with the first release produced by the new tag workflow;
 it does not retroactively rebuild or promote legacy releases that lack the
 signed OCI archive and receipt.
