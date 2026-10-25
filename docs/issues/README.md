@@ -6,7 +6,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 55
+- Total findings: 56
 - Active findings: 0
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
@@ -68,3 +68,4 @@ priority, area, and title. The registry is generated with
 | [IC-053](./IC-053.md) | P2 | Resolved | Supply chain | Locked TLS dependencies fail the current security advisory gate |
 | [IC-054](./IC-054.md) | P3 | Resolved | Toolchain and verification policy | Repository toolchain pins fail the required latest-stable gate |
 | [IC-055](./IC-055.md) | P2 | Resolved | Historical recovery | Legacy run history has no read-only inspection path after checked-usage migration |
+| [IC-056](./IC-056.md) | P2 | Resolved | MCP verification | Shared discovery deadline races Python startup in semantic MCP capability acceptance |

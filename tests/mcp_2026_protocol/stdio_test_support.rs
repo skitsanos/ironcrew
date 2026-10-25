@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::TempDir;
+
+pub(super) use super::process_assertions::assert_process_stopped;
 
 pub(super) async fn wait_for_file(path: &Path) {
     for _ in 0..80 {
@@ -45,26 +47,4 @@ pub(super) fn call_count(temp: &TempDir, name: &str) -> usize {
         .iter()
         .filter(|entry| entry["method"] == "tools/call" && entry["name"] == name)
         .count()
-}
-
-#[cfg(unix)]
-pub(super) async fn assert_process_stopped(pid_file: PathBuf) {
-    let pid = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .parse::<i32>()
-        .unwrap();
-    let pid = nix::unistd::Pid::from_raw(pid);
-    for _ in 0..80 {
-        if matches!(
-            nix::sys::signal::kill(pid, None),
-            Err(nix::errno::Errno::ESRCH)
-        ) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!(
-        "fixture process {pid} is still alive ({})",
-        pid_file.display()
-    );
 }
