@@ -7,8 +7,9 @@ historical evidence for the previous local source and executable; later candidat
 CI's `Release Build` checks out the exact pull-request head (or push commit) and builds with the
 locked dependency graph. `scripts/history_reader_artifact.py` packages the native Linux AMD64 ELF
 into a deterministic archive and records source commit, repository, workflow run/attempt, target,
-archive hash and executable hash. GitHub retains the candidate under an immutable artifact ID for
-14 days. This bounded CI retention is not a permanent release or an offsite data backup.
+archive hash and executable hash. The workflow requests 14-day retention under an immutable artifact
+ID; the service API's reported expiry is authoritative and may be shorter. Record that actual expiry
+in every acceptance receipt. This bounded retention is not a permanent release or an offsite backup.
 The build/package boundary requires a clean checkout, and all artifact files have regular-file and
 byte limits checked before bounded reads. Verification extracts the same archive bytes whose hash
 was checked, rather than reopening a mutable file after hashing it. The expanded tar stream is capped
