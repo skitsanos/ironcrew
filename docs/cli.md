@@ -430,6 +430,45 @@ ironcrew inspect <run_id> -p path/to/project
 |----------------|---------|-------------|
 | `-p, --project`| `.`     | Project path |
 
+### history
+
+Inspect PostgreSQL run history without starting a runtime store. This operator command requires
+the `postgres` feature and an explicitly supplied `DATABASE_URL` in the process environment;
+it deliberately does **not** load `.env`, including ancestor/project files. Use a SELECT-only role
+against a restored copy. `IRONCREW_PG_TABLE_PREFIX` or `--table-prefix` selects `public.<prefix>runs`.
+
+```bash
+# Supply DATABASE_URL securely in the process environment; do not put credentials in argv.
+ironcrew history --table-prefix ti_ list --limit 50 --offset 0
+ironcrew history --table-prefix ti_ list --flow retired-flow
+ironcrew history --table-prefix ti_ inspect RUN_ID
+ironcrew history --table-prefix ti_ inspect RUN_ID --flow ''
+```
+
+`list` returns bounded metadata, `has_more`, `limit` and `offset`, ordered by descending stored
+start time then run ID. Limit is 1–100 (default 50); offset is 0–10,000. It does not infer usage or
+hide records with empty/retired flow scopes. `--flow` is an exact optional stored-scope filter;
+no flow directory, Lua file or provider configuration is loaded. A mismatched scope reads as missing.
+
+`inspect` returns an inspection-only envelope with `read_only:true`, `executable:false`, the original
+database row in `record`, checked `run_usage`, and indexed task usage. Missing checked receipts are
+`null` and set `legacy_usage_missing:true`; original legacy counters remain only in `record` and are
+never converted into receipts or known zero. Present checked snapshots remain exact and are validated;
+malformed/null/contradictory checked usage fails instead of falling back to legacy counters.
+
+The connection sets session read-only mode and bounded timeouts. Every operation uses an explicit
+read-only transaction; no schema initialization, migration, reconciliation, retention prune, audit
+append, resume or provider request occurs. Each record is limited to 8 MiB before client transport,
+with at most 10,000 tasks and 4,096 bytes per checked snapshot. List summaries are at most 16 KiB
+each. Errors omit raw stored values and connection details. Output itself contains private historical
+task content: protect stdout and any redirected file appropriately.
+
+This currently covers PostgreSQL 17+ run rows, not JSON/SQLite archives, conversations, dialogs or
+HITL recovery. Normal `inspect`, runtime/HTTP `get_run`, replay/resume and checked accounting remain
+strict. A readable historical view is not executable state or a supported engine downgrade.
+See the [CI candidate artifact boundary](history-reader-ci-qualification.md) for exact-source
+builds, checksummed immutable artifacts, independent downloads and synthetic history execution.
+
 ### clean
 
 Remove old run history files from `.ironcrew/runs/`.

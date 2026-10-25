@@ -13,6 +13,8 @@ use ironcrew::usage;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+#[path = "main/command_environment.rs"]
+mod command_environment;
 #[path = "main/serve_address.rs"]
 mod serve_address;
 use serve_address::{ServeEnvironment, resolve_serve_address};
@@ -74,6 +76,8 @@ enum Commands {
     },
     /// List all available built-in tools
     Nodes,
+    /// Read PostgreSQL history without runtime startup, writes, or implicit .env loading
+    History(ironcrew::history_cli::HistoryArgs),
     /// Inspect a past run by ID
     Inspect {
         /// Run ID to inspect
@@ -173,26 +177,6 @@ enum Commands {
     },
 }
 
-/// The project/CWD path a command operates on, used to locate its `.env`.
-/// `None` for commands that don't target a project (`init`, `nodes`, `serve` —
-/// the server uses the CWD `.env` and process environment, never per-flow files).
-fn command_path(command: &Commands) -> Option<&std::path::Path> {
-    match command {
-        Commands::Run { path, .. }
-        | Commands::Validate { path, .. }
-        | Commands::List { path }
-        | Commands::Fmt { path }
-        | Commands::Doctor { path }
-        | Commands::Export { path, .. }
-        | Commands::Graph { path, .. }
-        | Commands::Chat { path, .. } => Some(path),
-        Commands::Inspect { project, .. }
-        | Commands::Clean { project, .. }
-        | Commands::Runs { project, .. } => Some(project),
-        Commands::Init { .. } | Commands::Nodes | Commands::Serve { .. } => None,
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -201,9 +185,7 @@ fn main() {
     // is single-threaded — doing it here (before any Tokio worker thread exists)
     // avoids the data race that per-request loading caused. Loading before the
     // logger also lets `IRONCREW_LOG` be set from `.env`.
-    if !matches!(cli.command, Commands::Validate { evaluate: true, .. }) {
-        cli::project::load_dotenv(command_path(&cli.command));
-    }
+    command_environment::load_command_environment(&cli.command);
     utils::logger::init(cli.verbose);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -233,6 +215,9 @@ fn main() {
             Commands::List { path } => cli::commands::cmd_list(&path),
             Commands::Init { name } => cli::commands::cmd_init(&name),
             Commands::Nodes => cli::commands::cmd_nodes(),
+            Commands::History(args) => ironcrew::history_cli::execute(args)
+                .await
+                .map_err(|error| utils::error::IronCrewError::Validation(error.to_string())),
             Commands::Inspect { run_id, project } => {
                 cli::history::cmd_inspect(&project, &run_id).await
             }

@@ -8,6 +8,8 @@ use ironcrew::usage::{UsageCounts, UsageCoverage, UsageReceipt, UsageSnapshot, U
 
 #[path = "usage_storage/budgets.rs"]
 mod budgets;
+#[path = "usage_storage/history_reader.rs"]
+mod history_reader;
 #[path = "usage_storage/sessions.rs"]
 mod sessions;
 

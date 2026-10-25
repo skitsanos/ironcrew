@@ -24,6 +24,12 @@ hardening step.
 
 ## Available Backends
 
+For legacy PostgreSQL run payloads, use the separate
+[`ironcrew history list/inspect` reader](cli.md#history). It uses explicit read-only transactions
+and SELECT-only credentials without bootstrapping this runtime's schema or maintenance. Its
+inspection-only views preserve original fields and mark missing checked usage unknown. Normal
+runtime store decoding remains strict; this is neither a migration nor a replay/resume path.
+
 | Backend | Config value | Use case |
 |---------|-------------|----------|
 | JSON files | `json` (default) | Local development, small deployments, zero config |

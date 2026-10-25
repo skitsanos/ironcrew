@@ -68,6 +68,11 @@ local results = crew:run()
 
 ## Quick Start
 
+Recovering older PostgreSQL run history? The
+[`ironcrew history` reader](docs/cli.md#history) inspects original records with SELECT-only access,
+without runtime startup or migrations. Missing checked usage stays unknown; legacy records are
+not made executable or resumable.
+
 > **Prerequisites:** Rust **1.99.1** or newer is the minimum supported toolchain
 > (some dependencies require it to compile). Install via [rustup](https://rustup.rs)
 > and run `rustup update stable`.

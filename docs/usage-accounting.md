@@ -143,8 +143,12 @@ their unavailable snapshot has zero **observed** requests and null counts, not
 evidence of zero cost. SQL schema upgrades add this explicit unavailable marker
 to rows without a checkpoint; they never infer receipts from old integer columns.
 Old columns are left untouched, but are no longer read or written. Old JSON run
-records and old task-result payloads without `usage` are unsupported and fail
-decoding; export/archive them before upgrading. No legacy result adapter exists.
+records and old task-result payloads without `usage` remain unsupported by runtime decoding;
+export/archive them before upgrading. The separate PostgreSQL
+[`history` operator reader](cli.md#history) provides read-only inspection with missing checked
+usage marked `null`. Original legacy counters remain separate; they never become checked receipts,
+known zero or executable state. Malformed present receipts still fail. No runtime result adapter,
+automatic rewrite, replay or resume compatibility is introduced.
 Conversation/dialog records require the same checked `usage` field. SQL migration
 marks older session checkpoints unavailable; old JSON session shapes without it
 are unsupported. A successful save commits usage and transcript together under
