@@ -8,7 +8,7 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
-| — | — | — | — | No active findings |
+| [IC-056](docs/issues/IC-056.md) | P2 | In progress | MCP verification | Shared discovery deadline races Python startup in semantic MCP capability acceptance |
 
 ## Working agreement
 
