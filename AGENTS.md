@@ -16,6 +16,10 @@
   CI, so a coordinated marker rollback and tail-page deletion must fail.
 - Preserve user-owned and unrelated worktree changes. Inspect `git status` and
   overlapping diffs before editing.
+- Keep consumer product identities, customer data, external workspace paths, and
+  consumer-specific integration receipts out of this independent repository,
+  its issues, pull requests, commit messages, and public build artifacts. Record
+  generic runtime defects with synthetic reproductions and repository-local evidence.
 - Work in English. Do not commit, push, merge, tag, publish, deploy, or mutate a
   remote service unless the user explicitly asks.
 - Keep `docs/superpowers/` untouched unless the user explicitly brings those
