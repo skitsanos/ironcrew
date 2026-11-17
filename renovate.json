@@ -10,7 +10,9 @@
   "labels": [
     "dependencies"
   ],
-  "dependencyDashboard": true,
+  "dependencyDashboard": {
+    "enabled": true
+  },
   "ignorePaths": [
     "**/node_modules/**",
     "**/bower_components/**",
