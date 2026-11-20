@@ -1,0 +1,23 @@
+# The dependency audit fails closed (`cargo audit --deny warnings`, IC-013).
+# Every entry below is a reviewed exception; do not add one without a finding
+# page that records the review, the exposure and the exit condition.
+#
+# RUSTSEC-2026-0543 (chrono 0.4.45), IC-057, reviewed 2026-11-20.
+#
+# The advisory reports chrono as unmaintained. It names no vulnerability and
+# has no patched version.
+#
+# Why it is not fixed here: IronCrew uses chrono directly for timestamps
+# (`Utc::now().to_rfc3339()`, RFC 3339 parsing, durations), and rmcp also
+# resolves it, so no lockfile update removes it from the graph. Replacing it
+# is the migration IC-057 tracks.
+#
+# Exposure: none known. IronCrew formats and parses only RFC 3339 timestamps
+# and enables only chrono's `serde` feature.
+#
+# Exit: remove the entry when chrono leaves the resolved graph or the advisory
+# is withdrawn. scripts/tests/repository_policy.test.ts fails if this file
+# ignores anything else or if the entry outlives the crate. Review again by
+# 2026-12-20.
+[advisories]
+ignore = ["RUSTSEC-2026-0543"]
