@@ -20,11 +20,11 @@ const trustedReleaseActions = new Set([
   "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
   "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
   "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
-  "docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6",
+  "docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550",
   "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
   "docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1",
-  "dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8",
-  "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
+  "dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff",
+  "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532",
   "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
 ]);
 
@@ -313,19 +313,19 @@ describe("repository integration policy", () => {
     expect(commands).toContain("cargo test --doc");
     expect(
       source.match(
-        /dtolnay\/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8/g,
+        /dtolnay\/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff/g,
       ),
     ).toHaveLength(8);
-    expect(manifest).toContain('rust-version = "1.99.1"');
-    expect(toolchain).toContain('channel = "1.99.1"');
+    expect(manifest).toContain('rust-version = "1.100.0"');
+    expect(toolchain).toContain('channel = "1.100.0"');
     expect(toolchain).toContain('components = ["clippy", "rustfmt"]');
     // The builder tag must mirror rust-version; Renovate may additionally pin
     // the tag to an immutable image digest (config:best-practices).
     expect(dockerfile).toMatch(
-      /^FROM rust:1\.99\.1-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
+      /^FROM rust:1\.100\.0-bookworm(@sha256:[0-9a-f]{64})? AS builder$/m,
     );
     expect(release).toContain(
-      "dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1",
+      "dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0",
     );
     expect(release).toContain(
       "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3",
@@ -337,7 +337,7 @@ describe("repository integration policy", () => {
     const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
 
     expect(workflow).toContain("cargo audit --deny warnings");
-    expect(workflow).toContain("cargo-audit --version 0.22.2 --locked");
+    expect(workflow).toContain("cargo-audit --version 0.23.0 --locked");
     expect(lockfile).toContain('name = "event-listener"\nversion = "5.4.2"');
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
   });
