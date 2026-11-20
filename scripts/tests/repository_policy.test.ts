@@ -342,6 +342,20 @@ describe("repository integration policy", () => {
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
   });
 
+  test("the audit ignores only the reviewed chrono advisory while chrono is resolved (IC-057)", async () => {
+    const config = Bun.TOML.parse(
+      await Bun.file(join(repository, ".cargo/audit.toml")).text(),
+    ) as { advisories?: { ignore?: string[] } };
+    const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
+    const ignored = config.advisories?.ignore ?? [];
+
+    expect(ignored.every((id) => id === "RUSTSEC-2026-0543")).toBe(true);
+    if (ignored.includes("RUSTSEC-2026-0543")) {
+      // The exception must not outlive the crate it covers.
+      expect(lockfile).toContain('name = "chrono"\nversion = "0.4.');
+    }
+  });
+
   test("Renovate consolidates latest dependency and immutable pin refreshes", async () => {
     const renovate = await Bun.file(join(repository, "renovate.json")).json() as {
       extends: string[];
