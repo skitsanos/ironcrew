@@ -134,9 +134,14 @@
   direct-dependency, and immutable GitHub Action freshness boundaries. Review
   and commit every resulting manifest, lockfile, workflow, or policy change
   before validation.
-- Before a requested push, run every locally reproducible CI gate through
-  `./scripts/pre-push-check.sh`. Enable the tracked fail-closed hook once per
-  clone with `task hooks-install`; do not bypass it with `--no-verify`. The gate
+- Before a requested push, commit, then run every locally reproducible CI gate
+  through `./scripts/pre-push-check.sh` (or `task pre-push`) outside the push.
+  A passing run records a receipt for the exact clean tree it validated in the
+  worktree's Git directory and refuses one if the tree changed during the run.
+  Enable the tracked fail-closed hook once per clone with `task hooks-install`;
+  it never runs the gate, and accepts a push only when a receipt at most 24 h
+  old (`IRONCREW_GATE_RECEIPT_MAX_AGE_SECONDS`) covers the tree of every pushed
+  ref. Do not bypass it with `--no-verify`. The gate
   starts clean, reruns the latest-stable refresh, and stops if refresh changes
   repository files. The complete gate requires disposable databases for both
   `IRONCREW_TEST_PG_FLOOR_URL` (floor) and `IRONCREW_TEST_PG_URL` (latest stable).

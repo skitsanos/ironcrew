@@ -32,11 +32,13 @@ async function runPreflight(options: {
       copyFile(join(import.meta.dir, "..", file), join(scripts, file))));
     await symlink("/usr/bin/dirname", join(bin, "dirname"));
     await symlink("/bin/rm", join(bin, "rm"));
+    await symlink("/bin/date", join(bin, "date"));
     await symlink(Bun.which("python3")!, join(bin, "python3"));
     await writeFile(join(bin, "git"), `#!/bin/bash
 printf 'git %s\n' "$*" >> "$PREFLIGHT_TRACE"
 case "$*" in
   'rev-parse --local-env-vars') ;;
+  'rev-parse --verify HEAD^{tree}') printf '%040d\n' 0 ;;
   'status --porcelain=v1 --untracked-files=all'|'status --short')
     if [[ "$PREFLIGHT_DIRTY" == 1 ]]; then printf '?? fixture\n'; fi
     ;;
@@ -126,6 +128,7 @@ describe("pre-push command preflight", () => {
     expect(result.trace).toEqual([
       "git rev-parse --local-env-vars",
       "git status --porcelain=v1 --untracked-files=all",
+      "git rev-parse --verify HEAD^{tree}",
       "refresh",
     ]);
   });
