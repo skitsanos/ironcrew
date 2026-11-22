@@ -743,7 +743,7 @@ impl UserData for LuaCrew {
                 .unwrap_or(&this.runtime.provider)
                 .clone();
             let provider = super::usage::bind(&lua, provider)?;
-            let run_start = chrono::Utc::now();
+            let run_start = crate::utils::timestamp::now();
             let api_lifecycle = lua
                 .app_data_ref::<ApiRunLifecycle>()
                 .map(|lifecycle| lifecycle.clone());
@@ -802,7 +802,7 @@ impl UserData for LuaCrew {
                     suggested_id: pre_assigned_run_id,
                     flow_name: flow_name_for_intent,
                     flow: flow_slug,
-                    started_at: run_start.to_rfc3339(),
+                    started_at: crate::utils::timestamp::to_rfc3339(run_start),
                     agent_count: agent_count_for_intent,
                     task_count: task_count_for_intent,
                     tags: tags.clone(),
@@ -849,8 +849,8 @@ impl UserData for LuaCrew {
                 }
             };
 
-            let run_end = chrono::Utc::now();
-            let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
+            let run_end = crate::utils::timestamp::now();
+            let total_ms = crate::utils::timestamp::elapsed_millis(run_start, run_end);
 
             let results = match run_outcome {
                 Ok(results) => {
@@ -858,15 +858,15 @@ impl UserData for LuaCrew {
                     let mut record = crew.create_run_record(
                         Some(run_id.clone()),
                         &results,
-                        &run_start.to_rfc3339(),
-                        &run_end.to_rfc3339(),
+                        &crate::utils::timestamp::to_rfc3339(run_start),
+                        &crate::utils::timestamp::to_rfc3339(run_end),
                         total_ms,
                         usage.clone(),
                     );
                     record.tags = tags.clone();
                     let completion = RunCompletion {
                         status: record.status.clone(),
-                        finished_at: run_end.to_rfc3339(),
+                        finished_at: crate::utils::timestamp::to_rfc3339(run_end),
                         duration_ms: total_ms,
                         // `create_run_record` already cloned the results so the
                         // originals remain available for the Lua return value.
@@ -888,7 +888,7 @@ impl UserData for LuaCrew {
                 Err(e) => {
                     let completion = RunCompletion {
                         status: crate::engine::run_history::RunStatus::Failed,
-                        finished_at: run_end.to_rfc3339(),
+                        finished_at: crate::utils::timestamp::to_rfc3339(run_end),
                         duration_ms: total_ms,
                         task_results: Vec::new(),
                         usage,

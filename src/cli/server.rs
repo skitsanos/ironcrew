@@ -82,7 +82,7 @@ pub async fn cmd_serve(host: &str, port: u16, flows_dir: &Path) -> Result<()> {
     let max_sse_connections = api::handlers::max_sse_connections();
     let max_run_lifetime = api::handlers::max_run_lifetime();
     let idempotency = api::idempotency::IdempotencyConfig::from_env(max_run_lifetime)?;
-    let prune_now = chrono::Utc::now().to_rfc3339();
+    let prune_now = crate::utils::timestamp::now_rfc3339();
     let maintenance_watchdog = store.run_maintenance_watchdog();
     let pruned_idempotency_records = match startup_prune_with_policy(
         maintenance_watchdog,

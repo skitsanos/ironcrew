@@ -550,9 +550,8 @@ fn sqlite_indeterminate_exclusive_records(
 fn sqlite_parse_idempotency_time(
     label: &str,
     value: &str,
-) -> Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+) -> Result<crate::utils::timestamp::Timestamp> {
+    crate::utils::timestamp::parse_rfc3339(value)
         .map_err(|error| IronCrewError::Validation(format!("{label} is not RFC3339: {error}")))
 }
 
@@ -594,10 +593,7 @@ fn sqlite_quota_retry_after(
     };
     let deadline = sqlite_parse_idempotency_time("idempotency capacity deadline", &deadline)?;
     let now = sqlite_parse_idempotency_time("idempotency capacity clock", now)?;
-    let milliseconds = deadline
-        .signed_duration_since(now)
-        .num_milliseconds()
-        .max(1);
+    let milliseconds = crate::utils::timestamp::millis_between(now, deadline).max(1);
     Ok(u64::try_from(milliseconds.saturating_add(999) / 1_000)
         .unwrap_or(u64::MAX)
         .max(1))
@@ -618,12 +614,12 @@ fn sqlite_recovery_grace_elapsed(
         .unwrap_or(hazard.updated_at.as_str());
     let marked_at = sqlite_parse_idempotency_time("idempotency hazard time", marked_at)?;
     let claim_time = sqlite_parse_idempotency_time("idempotency recovery claim time", claim_time)?;
-    let grace = chrono::Duration::from_std(ttl).map_err(|error| {
+    let grace = crate::utils::timestamp::signed_duration(ttl).map_err(|error| {
         IronCrewError::Validation(format!(
             "Idempotency recovery grace is out of range: {error}"
         ))
     })?;
-    let recovery_at = marked_at.checked_add_signed(grace).ok_or_else(|| {
+    let recovery_at = crate::utils::timestamp::checked_add(marked_at, grace).ok_or_else(|| {
         IronCrewError::Validation("Idempotency recovery grace deadline overflow".into())
     })?;
     Ok(claim_time >= recovery_at)
@@ -646,9 +642,9 @@ fn sqlite_retention_expiry(now: &str, ttl_seconds: u64) -> Result<String> {
     let now = sqlite_parse_idempotency_time("idempotency current time", now)?;
     let ttl = i64::try_from(ttl_seconds)
         .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?;
-    now.checked_add_signed(chrono::Duration::seconds(ttl))
+    crate::utils::timestamp::checked_add_seconds(now, ttl)
         .ok_or_else(|| IronCrewError::Validation("Idempotency retention expiry overflow".into()))
-        .map(|timestamp| timestamp.to_rfc3339())
+        .map(crate::utils::timestamp::to_rfc3339)
 }
 
 fn sqlite_prune_idempotency(conn: &rusqlite::Connection, now: &str, limit: usize) -> Result<usize> {
@@ -1434,12 +1430,11 @@ impl StateStore for SqliteStore {
     }
 
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
-        let normalized_now = chrono::DateTime::parse_from_rfc3339(now)
-            .map_err(|e| {
+        let normalized_now = crate::utils::timestamp::to_rfc3339(
+            crate::utils::timestamp::parse_rfc3339(now).map_err(|e| {
                 IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
-            })?
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339();
+            })?,
+        );
         let conn = Arc::clone(&self.conn);
         let now = now.to_string();
 

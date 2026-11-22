@@ -118,13 +118,10 @@ impl LeaseHeartbeat {
                     return;
                 }
                 let heartbeat_started = tokio::time::Instant::now();
-                let deadline = chrono::Utc::now()
-                    .checked_add_signed(
-                        chrono::Duration::from_std(lease_ttl)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(60)),
-                    )
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-                    .to_rfc3339();
+                let deadline = crate::utils::timestamp::lease_deadline(
+                    crate::utils::timestamp::now(),
+                    lease_ttl,
+                );
                 match heartbeat_before_deadline(
                     store.run_maintenance_watchdog().is_some(),
                     lease_deadline,
@@ -390,13 +387,8 @@ impl RunLeaseHeartbeat {
     ) -> Result<Self> {
         let lease_ttl = store.run_lease_ttl();
         let heartbeat_started = tokio::time::Instant::now();
-        let deadline = chrono::Utc::now()
-            .checked_add_signed(
-                chrono::Duration::from_std(lease_ttl)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
-            )
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-            .to_rfc3339();
+        let deadline =
+            crate::utils::timestamp::lease_deadline(crate::utils::timestamp::now(), lease_ttl);
         let established = heartbeat_before_deadline(
             store.run_maintenance_watchdog().is_some(),
             initial_lease_deadline,
@@ -479,13 +471,10 @@ impl RunLeaseHeartbeat {
                     continue;
                 }
                 let heartbeat_started = tokio::time::Instant::now();
-                let deadline = chrono::Utc::now()
-                    .checked_add_signed(
-                        chrono::Duration::from_std(lease_ttl)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(60)),
-                    )
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-                    .to_rfc3339();
+                let deadline = crate::utils::timestamp::lease_deadline(
+                    crate::utils::timestamp::now(),
+                    lease_ttl,
+                );
                 match heartbeat_before_deadline(
                     store.run_maintenance_watchdog().is_some(),
                     lease_deadline,
@@ -689,11 +678,11 @@ impl IdempotencyConfig {
         Ok(config)
     }
 
-    pub fn retention_expiry(&self, completed_at: chrono::DateTime<chrono::Utc>) -> String {
-        completed_at
-            .checked_add_signed(chrono::Duration::seconds(self.ttl_seconds as i64))
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-            .to_rfc3339()
+    pub fn retention_expiry(&self, completed_at: crate::utils::timestamp::Timestamp) -> String {
+        crate::utils::timestamp::saturating_rfc3339(crate::utils::timestamp::checked_add_seconds(
+            completed_at,
+            self.ttl_seconds as i64,
+        ))
     }
 
     pub fn limits(&self) -> IdempotencyLimits {

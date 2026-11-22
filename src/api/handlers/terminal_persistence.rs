@@ -29,7 +29,7 @@ pub(super) async fn persist_terminal_outcome(
         None => {
             synthesized = RunCompletion {
                 status: terminal.status.clone(),
-                finished_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: crate::utils::timestamp::now_rfc3339(),
                 duration_ms: terminal.duration_ms,
                 task_results: Vec::new(),
                 usage: terminal.usage,

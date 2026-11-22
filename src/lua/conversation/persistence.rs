@@ -33,7 +33,7 @@ impl LuaConversationInner {
             execution: self.execution.clone(),
             messages,
             created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: crate::utils::timestamp::now_rfc3339(),
             revision: *revision,
         };
         *revision = store.save_conversation(&record).await?;

@@ -169,7 +169,7 @@ async fn scenario(pair: &mut ProcessPair) {
         assert_eq!(history["status"], "WaitingForInput");
         assert_eq!(history["owner_instance_id"], pair.owner_a_id);
         assert_eq!(history["task_results"], serde_json::json!([]));
-        chrono::DateTime::parse_from_rfc3339(
+        ironcrew::utils::timestamp::parse_rfc3339(
             history["lease_expires_at"].as_str().expect("history lease"),
         )
         .expect("parse history lease");
@@ -222,7 +222,7 @@ async fn scenario(pair: &mut ProcessPair) {
         question_after_conflict["questions"][0]["question_id"],
         question_id
     );
-    let lease_before = chrono::DateTime::parse_from_rfc3339(
+    let lease_before = ironcrew::utils::timestamp::parse_rfc3339(
         after_conflict
             .run_lease
             .as_deref()
@@ -231,7 +231,7 @@ async fn scenario(pair: &mut ProcessPair) {
     .expect("parse IC-006 active lease");
     wait_for_next_lease(pair, &run_id).await;
     let renewed = snapshot(pair, &run_id).await;
-    let lease_after = chrono::DateTime::parse_from_rfc3339(
+    let lease_after = ironcrew::utils::timestamp::parse_rfc3339(
         renewed.run_lease.as_deref().expect("IC-006 renewed lease"),
     )
     .expect("parse IC-006 renewed lease");

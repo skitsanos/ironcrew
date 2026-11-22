@@ -41,7 +41,7 @@ impl AgentDialog {
             stopped,
             stop_reason,
             created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: crate::utils::timestamp::now_rfc3339(),
             revision: *revision,
         };
         *revision = store.save_dialog_state(&record).await?;

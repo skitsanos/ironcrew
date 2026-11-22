@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::utils::timestamp::Timestamp;
 use sqlx::Row;
 
 use crate::engine::idempotency::{IdempotencyClaim, IdempotencyClaimOutcome, PrincipalId};
@@ -14,7 +14,7 @@ impl PostgresStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         claim: &IdempotencyClaim,
-        database_timestamp: DateTime<Utc>,
+        database_timestamp: Timestamp,
     ) -> Result<ExclusiveScopeResolution> {
         let Some(exclusive_scope) = claim.exclusive_scope.as_deref() else {
             return Ok(ExclusiveScopeResolution::Continue(None));
@@ -77,7 +77,7 @@ impl PostgresStore {
         } else {
             None
         };
-        let grace = chrono::Duration::from_std(self.lease.ttl()).map_err(|_| {
+        let grace = crate::utils::timestamp::signed_duration(self.lease.ttl()).map_err(|_| {
             IronCrewError::Validation(
                 "PostgreSQL idempotency recovery grace is out of range".into(),
             )
@@ -89,7 +89,7 @@ impl PostgresStore {
                 parse_timestamp("stored idempotency hazard completion", completed_at)
             })
             .transpose()?
-            .and_then(|completed_at| completed_at.checked_add_signed(grace))
+            .and_then(|completed_at| crate::utils::timestamp::checked_add(completed_at, grace))
             .is_some_and(|recovery_at| recovery_at <= database_timestamp);
         let recoverable = hazard.as_ref().is_some_and(|(key_hash, principal_id, _)| {
             principal_id == &claim.principal_id

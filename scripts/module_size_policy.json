@@ -19,17 +19,17 @@
     },
     {
       "path": "src/api/conversations.rs",
-      "max_lines": 2264,
+      "max_lines": 2258,
       "rationale": "IC-011 baseline after SSE extraction: conversation start, keyed turns, durable cold rehydration, history, deletion, and lifecycle fencing remain coupled; split idempotency or lifecycle handlers before extending the API. IC-034: server-side failures answer generically instead of echoing backend errors. IC-046: checked session usage helpers extracted and the ceiling ratcheted. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/api/handlers.rs",
-      "max_lines": 3641,
+      "max_lines": 3635,
       "rationale": "IC-011 baseline, ratcheted by IC-029 flow-inspection extraction: run HTTP handlers still combine readiness, idempotent execution, terminal persistence, cancellation, HITL, history, and run SSE coordination; extract route families before adding endpoints. IC-031/IC-034: run-store lookups distinguish missing from unavailable, and 5xx bodies are sanitized. IC-047: admission and lifecycle helpers extracted; ceiling ratcheted."
     },
     {
       "path": "src/api/idempotency.rs",
-      "max_lines": 1224,
+      "max_lines": 1213,
       "rationale": "IC-011 baseline: request-key validation, lease heartbeat, owner fencing, cancellation observation, quotas, and recovery responses share the API idempotency boundary; extract heartbeat coordination before new lease behavior."
     },
     {
@@ -109,17 +109,17 @@
     },
     {
       "path": "src/engine/run_history.rs",
-      "max_lines": 2525,
+      "max_lines": 2522,
       "rationale": "IC-011 priority debt, ratcheted by IC-029 async-adapter extraction: the synchronous JSON core still combines run history, bounded atomic I/O, leases and reconciliation, idempotency, conversations, dialogs, and audit persistence; extract protocol-specific stores before adding another record family. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/engine/sqlite_store.rs",
-      "max_lines": 3743,
+      "max_lines": 3738,
       "rationale": "IC-011 priority debt: the SQLite StateStore combines migrations and repositories for runs, idempotency, conversations, HITL, journals, audit, and leases; extract table-focused repositories before extending storage. IC-046: checked session usage helpers extracted and the ceiling ratcheted."
     },
     {
       "path": "src/engine/store.rs",
-      "max_lines": 766,
+      "max_lines": 763,
       "rationale": "IC-011 baseline, ratcheted by IC-029 local-backend bootstrap extraction: the StateStore contract owns lease and instance configuration, backend capability defaults, all durable protocol methods, and backend selection; split the trait's protocol families before adding another store capability."
     },
     {

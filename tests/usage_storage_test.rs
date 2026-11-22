@@ -42,7 +42,7 @@ async fn checked_round_trip(store: &dyn StateStore) {
             suggested_id: Some(uuid::Uuid::new_v4().to_string()),
             flow_name: "usage".into(),
             flow: "usage".into(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: ironcrew::utils::timestamp::now_rfc3339(),
             agent_count: 1,
             task_count: 1,
             tags: vec!["checked".into()],
@@ -55,7 +55,7 @@ async fn checked_round_trip(store: &dyn StateStore) {
     );
     let completion = RunCompletion {
         status: RunStatus::Failed,
-        finished_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: ironcrew::utils::timestamp::now_rfc3339(),
         duration_ms: 1,
         task_results: vec![TaskResult {
             task: "failed".into(),
@@ -114,7 +114,7 @@ async fn checked_round_trip(store: &dyn StateStore) {
     assert!(wire["task_results"][0].get("token_usage").is_none());
     let superseded = RunCompletion {
         status: RunStatus::Success,
-        finished_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: ironcrew::utils::timestamp::now_rfc3339(),
         duration_ms: 2,
         task_results: vec![],
         usage: UsageSnapshot::default(),

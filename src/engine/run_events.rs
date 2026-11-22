@@ -700,7 +700,7 @@ impl RunEventEntry {
             payload_bytes: self.payload_bytes,
         }
         .validate(config.max_event_bytes)?;
-        chrono::DateTime::parse_from_rfc3339(&self.created_at).map_err(|error| {
+        crate::utils::timestamp::parse_rfc3339(&self.created_at).map_err(|error| {
             IronCrewError::Validation(format!("Run-event created_at must be RFC3339: {error}"))
         })?;
         Ok(())

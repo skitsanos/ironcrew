@@ -557,7 +557,7 @@ from inside custom tools.
 |----------------------|----------|-------------|
 | `env(name)`          | string or nil | Read an environment variable (see security note below) |
 | `uuid4()`            | string   | Generate a random UUID v4 |
-| `now_rfc3339()`      | string   | Current UTC time in RFC 3339 format |
+| `now_rfc3339()`      | string   | Current UTC time in RFC 3339 format with a `+00:00` offset and no fraction for a whole second, otherwise 3, 6 or 9 fraction digits (`2026-01-02T03:04:05.120+00:00`) |
 | `now_unix_ms()`      | number   | Current UTC time as Unix milliseconds |
 | `json_parse(str)`    | value    | Parse a JSON string into a Lua value |
 | `json_stringify(val)` | string  | Serialize a Lua value to JSON |

@@ -306,13 +306,13 @@ fn terminal_status_mismatch_names_context_run_and_statuses() {
 pub(super) async fn wait_for_next_lease(
     pair: &ProcessPair,
     run_id: &str,
-) -> chrono::DateTime<chrono::Utc> {
+) -> ironcrew::utils::timestamp::Timestamp {
     let initial = read_run(pair, run_id).await;
     assert_eq!(initial["status"], "WaitingForInput");
     let original = initial["lease_expires_at"]
         .as_str()
         .expect("initial lease")
-        .parse::<chrono::DateTime<chrono::Utc>>()
+        .parse::<ironcrew::utils::timestamp::Timestamp>()
         .expect("parse initial lease");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -320,7 +320,7 @@ pub(super) async fn wait_for_next_lease(
         assert_eq!(observed["status"], "WaitingForInput");
         if let Some(renewed) = observed["lease_expires_at"]
             .as_str()
-            .and_then(|value| value.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .and_then(|value| value.parse::<ironcrew::utils::timestamp::Timestamp>().ok())
             && renewed > original
         {
             return renewed;

@@ -524,7 +524,7 @@ async fn stale_durable_conversation_revision_invalidates_and_reloads_the_live_ha
         Some("committed by another pod".into()),
         None,
     ));
-    durable.updated_at = chrono::Utc::now().to_rfc3339();
+    durable.updated_at = ironcrew::utils::timestamp::now_rfc3339();
     server.store.save_conversation(&durable).await.unwrap();
 
     let conflict = tokio::time::timeout(

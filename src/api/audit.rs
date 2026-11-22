@@ -53,7 +53,7 @@ pub async fn record(
 ) {
     let event = AuditEvent {
         id: String::new(), // overwritten by the backend
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: crate::utils::timestamp::now_rfc3339(),
         action: action.to_string(),
         flow_path: flow_path.map(str::to_string),
         target: target.map(str::to_string),

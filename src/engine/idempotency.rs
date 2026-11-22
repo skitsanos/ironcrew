@@ -606,7 +606,7 @@ fn validate_bounded_printable(label: &str, value: &str, max_bytes: usize) -> Res
 }
 
 fn validate_timestamp(label: &str, value: &str) -> Result<()> {
-    chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+    crate::utils::timestamp::parse_rfc3339(value).map_err(|error| {
         IronCrewError::Validation(format!("{label} is not valid RFC3339: {error}"))
     })?;
     Ok(())

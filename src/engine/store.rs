@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -101,15 +100,15 @@ impl RunLeaseConfig {
         self.ttl
     }
 
-    pub fn deadline_from(&self, now: DateTime<Utc>) -> String {
-        let ttl = ChronoDuration::seconds(self.ttl.as_secs() as i64);
-        now.checked_add_signed(ttl)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC)
-            .to_rfc3339()
+    pub fn deadline_from(&self, now: crate::utils::timestamp::Timestamp) -> String {
+        crate::utils::timestamp::saturating_rfc3339(crate::utils::timestamp::checked_add_seconds(
+            now,
+            self.ttl.as_secs() as i64,
+        ))
     }
 
     pub fn deadline_now(&self) -> String {
-        self.deadline_from(Utc::now())
+        self.deadline_from(crate::utils::timestamp::now())
     }
 }
 
@@ -708,9 +707,7 @@ mod tests {
 
         let config = RunLeaseConfig::new(" pod-a ", Duration::from_secs(60)).unwrap();
         assert_eq!(config.instance_id(), "pod-a");
-        let now = DateTime::parse_from_rfc3339("2026-07-18T10:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = crate::utils::timestamp::parse_rfc3339("2026-07-18T10:00:00Z").unwrap();
         assert_eq!(config.deadline_from(now), "2026-07-18T10:01:00+00:00");
     }
 

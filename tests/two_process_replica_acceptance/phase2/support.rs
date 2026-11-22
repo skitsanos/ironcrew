@@ -191,7 +191,7 @@ pub(super) async fn assert_stale_completion_fenced(pair: &ProcessPair, run_id: &
             run_id,
             RunCompletion {
                 status: RunStatus::Success,
-                finished_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: ironcrew::utils::timestamp::now_rfc3339(),
                 duration_ms: 1,
                 task_results: vec![],
                 usage: fixture_usage(0, 0),

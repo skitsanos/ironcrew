@@ -310,7 +310,7 @@ async fn non_owner_replica_reports_ownership_and_recovers_terminal_sse() {
             suggested_id: Some(locally_owned_but_missing.clone()),
             flow_name: "local owner miss".into(),
             flow: "flow-a".into(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: ironcrew::utils::timestamp::now_rfc3339(),
             agent_count: 0,
             task_count: 0,
             tags: vec![],

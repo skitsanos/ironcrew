@@ -37,11 +37,13 @@ fn numbered_digest(value: u64) -> String {
 }
 
 fn timestamp_after(timestamp: &str, duration: std::time::Duration) -> String {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .unwrap()
-        .checked_add_signed(chrono::Duration::from_std(duration).unwrap())
-        .unwrap()
-        .to_rfc3339()
+    ironcrew::utils::timestamp::to_rfc3339(
+        ironcrew::utils::timestamp::checked_add(
+            ironcrew::utils::timestamp::parse_rfc3339(timestamp).unwrap(),
+            duration,
+        )
+        .unwrap(),
+    )
 }
 
 fn conversation_claim(
@@ -1421,8 +1423,8 @@ async fn exercise_idempotent_run_heartbeat(store: Arc<dyn StateStore>) {
     ));
     let non_keyed_after = store.get_run(&non_keyed_id).await.unwrap().lease_expires_at;
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&non_keyed_after).unwrap()
-            >= chrono::DateTime::parse_from_rfc3339(&non_keyed_before).unwrap()
+        ironcrew::utils::timestamp::parse_rfc3339(&non_keyed_after).unwrap()
+            >= ironcrew::utils::timestamp::parse_rfc3339(&non_keyed_before).unwrap()
     );
 
     store
@@ -1590,8 +1592,8 @@ async fn exercise_provisional_run_hydration(store: Arc<dyn StateStore>) {
     assert_eq!(hydrated.tags, vec!["hydrated"]);
     assert_eq!(hydrated.started_at, CREATED_AT);
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&hydrated.lease_expires_at).unwrap()
-            >= chrono::DateTime::parse_from_rfc3339(&provisional.lease_expires_at).unwrap()
+        ironcrew::utils::timestamp::parse_rfc3339(&hydrated.lease_expires_at).unwrap()
+            >= ironcrew::utils::timestamp::parse_rfc3339(&provisional.lease_expires_at).unwrap()
     );
     assert!(matches!(
         store

@@ -179,7 +179,7 @@ async fn age_idempotency_completion(url: &str, prefix: &str, key_hash: &str, age
     pool.close().await;
 }
 
-async fn postgres_now(url: &str) -> chrono::DateTime<chrono::Utc> {
+async fn postgres_now(url: &str) -> ironcrew::utils::timestamp::Timestamp {
     let pool = sqlx::PgPool::connect(url)
         .await
         .expect("connect to read PostgreSQL clock");
@@ -193,9 +193,7 @@ async fn postgres_now(url: &str) -> chrono::DateTime<chrono::Utc> {
     .await
     .expect("read PostgreSQL clock");
     pool.close().await;
-    chrono::DateTime::parse_from_rfc3339(&now)
-        .expect("parse PostgreSQL clock")
-        .with_timezone(&chrono::Utc)
+    ironcrew::utils::timestamp::parse_rfc3339(&now).expect("parse PostgreSQL clock")
 }
 
 fn intent(id: &str, flow: &str, started_at: &str, tags: Vec<String>) -> RunIntent {
@@ -1160,7 +1158,7 @@ async fn pg_reconcile_abandoned() {
         RunStatus::Abandoned
     );
     let finished_at = store.get_run("r1").await.unwrap().finished_at;
-    assert!(chrono::DateTime::parse_from_rfc3339(&finished_at).is_ok());
+    assert!(ironcrew::utils::timestamp::parse_rfc3339(&finished_at).is_ok());
     assert_ne!(finished_at, "1900-04-23T10:05:00Z");
 
     // Idempotent — nothing left in Running.
@@ -1536,7 +1534,7 @@ async fn pg_reconcile_sweeps_waiting_for_input() {
     assert_eq!(count, 1);
     let r = store.get_run("wfi-2").await.unwrap();
     assert_eq!(r.status, RunStatus::Abandoned);
-    assert!(chrono::DateTime::parse_from_rfc3339(&r.finished_at).is_ok());
+    assert!(ironcrew::utils::timestamp::parse_rfc3339(&r.finished_at).is_ok());
     assert_ne!(r.finished_at, "1900-07-07T11:00:00Z");
 }
 
@@ -1729,7 +1727,7 @@ async fn pg_run_maintenance_row_lock_statement_timeout_recovers_pool() {
         .save_run_intent(intent("locked-run", "demo", "2026-08-07T10:00:00Z", vec![]))
         .await
         .unwrap();
-    let before = chrono::DateTime::parse_from_rfc3339(
+    let before = ironcrew::utils::timestamp::parse_rfc3339(
         &store.get_run("locked-run").await.unwrap().lease_expires_at,
     )
     .unwrap();
@@ -1755,7 +1753,7 @@ async fn pg_run_maintenance_row_lock_statement_timeout_recovers_pool() {
 
     blocker.rollback().await.unwrap();
     assert_eq!(heartbeat_owned_runs_bounded(&maintenance).await.unwrap(), 1);
-    let after = chrono::DateTime::parse_from_rfc3339(
+    let after = ironcrew::utils::timestamp::parse_rfc3339(
         &store.get_run("locked-run").await.unwrap().lease_expires_at,
     )
     .unwrap();
@@ -1893,15 +1891,14 @@ async fn pg_run_maintenance_keyed_heartbeat_keeps_database_sampled_deadline() {
 
     let observed_at = postgres_now(&url).await;
     let record = store.get_run("latency-run").await.unwrap();
-    let durable_deadline = chrono::DateTime::parse_from_rfc3339(&record.lease_expires_at)
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let remaining = durable_deadline.signed_duration_since(observed_at);
-    let configured_ttl = chrono::Duration::seconds(lease_ttl.as_secs() as i64);
-    assert!(remaining > chrono::Duration::zero());
+    let durable_deadline =
+        ironcrew::utils::timestamp::parse_rfc3339(&record.lease_expires_at).unwrap();
+    let remaining = ironcrew::utils::timestamp::millis_between(observed_at, durable_deadline);
+    let configured_ttl = lease_ttl.as_millis() as i64;
+    assert!(remaining > 0);
     assert!(
-        remaining < configured_ttl - chrono::Duration::milliseconds(350),
-        "the durable lease was reset from response time instead of retaining the database-sampled deadline: {remaining}"
+        remaining < configured_ttl - 350,
+        "the durable lease was reset from response time instead of retaining the database-sampled deadline: {remaining}ms"
     );
 
     let ledger_sql =
@@ -2766,18 +2763,15 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
         other => panic!("expected database-timed claim, got {other:?}"),
     };
     let after_claim = postgres_now(&url).await;
-    let stored_created = chrono::DateTime::parse_from_rfc3339(&stored.created_at)
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let stored_deadline = chrono::DateTime::parse_from_rfc3339(&stored.lease_expires_at)
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let stored_created = ironcrew::utils::timestamp::parse_rfc3339(&stored.created_at).unwrap();
+    let stored_deadline =
+        ironcrew::utils::timestamp::parse_rfc3339(&stored.lease_expires_at).unwrap();
     assert!(stored.created_at.ends_with('Z'));
     assert!(stored.lease_expires_at.ends_with('Z'));
     assert!(stored_created >= before_claim && stored_created <= after_claim);
     assert_eq!(
-        stored_deadline - stored_created,
-        chrono::Duration::seconds(60)
+        ironcrew::utils::timestamp::checked_add_seconds(stored_created, 60),
+        Some(stored_deadline)
     );
 
     let mut future_competitor = idempotency_claim(
@@ -2829,11 +2823,15 @@ async fn pg_idempotency_uses_database_clock_despite_client_skew() {
         other => panic!("expected live claim after skewed heartbeat, got {other:?}"),
     };
     let heartbeat_deadline =
-        chrono::DateTime::parse_from_rfc3339(&heartbeat_record.lease_expires_at)
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-    assert!(heartbeat_deadline > heartbeat_now + chrono::Duration::seconds(55));
-    assert!(heartbeat_deadline <= heartbeat_now + chrono::Duration::seconds(60));
+        ironcrew::utils::timestamp::parse_rfc3339(&heartbeat_record.lease_expires_at).unwrap();
+    assert!(
+        heartbeat_deadline
+            > ironcrew::utils::timestamp::checked_add_seconds(heartbeat_now, 55).unwrap()
+    );
+    assert!(
+        heartbeat_deadline
+            <= ironcrew::utils::timestamp::checked_add_seconds(heartbeat_now, 60).unwrap()
+    );
     assert!(
         store
             .heartbeat_idempotency(&claim.key_hash, &claim.attempt_id, "1900-01-01T00:00:01Z",)
@@ -4110,11 +4108,16 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
         IdempotencyLookup::InProgress(record) => record,
         other => panic!("expected claimed fence after heartbeat, got {other:?}"),
     };
-    let claimed_deadline = chrono::DateTime::parse_from_rfc3339(&claimed_record.lease_expires_at)
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    assert!(claimed_deadline > database_now + chrono::Duration::seconds(55));
-    assert!(claimed_deadline <= database_now + chrono::Duration::seconds(60));
+    let claimed_deadline =
+        ironcrew::utils::timestamp::parse_rfc3339(&claimed_record.lease_expires_at).unwrap();
+    assert!(
+        claimed_deadline
+            > ironcrew::utils::timestamp::checked_add_seconds(database_now, 55).unwrap()
+    );
+    assert!(
+        claimed_deadline
+            <= ironcrew::utils::timestamp::checked_add_seconds(database_now, 60).unwrap()
+    );
 
     store
         .save_run_intent(intent(
@@ -4141,16 +4144,12 @@ async fn pg_idempotent_run_heartbeat_renews_both_fences_only() {
     assert_eq!(store.heartbeat_owned_runs().await.unwrap(), 1);
     let linked_run_before = store.get_run("fenced-run").await.unwrap();
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&linked_run_before.lease_expires_at)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
+        ironcrew::utils::timestamp::parse_rfc3339(&linked_run_before.lease_expires_at).unwrap()
             <= postgres_now(&url).await
     );
     let ordinary_run = store.get_run("ordinary-heartbeat-run").await.unwrap();
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&ordinary_run.lease_expires_at)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
+        ironcrew::utils::timestamp::parse_rfc3339(&ordinary_run.lease_expires_at).unwrap()
             > postgres_now(&url).await
     );
 

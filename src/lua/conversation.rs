@@ -348,7 +348,7 @@ impl LuaConversationInner {
             execution: self.execution.clone(),
             messages: history,
             created_at: self.created_at.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: crate::utils::timestamp::now_rfc3339(),
             revision: base_revision,
         };
 

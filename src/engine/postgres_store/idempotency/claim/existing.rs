@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::utils::timestamp::Timestamp;
 
 use crate::engine::idempotency::{IdempotencyClaim, IdempotencyClaimOutcome, IdempotencyState};
 use crate::utils::error::{IronCrewError, Result};
@@ -44,7 +44,7 @@ impl PostgresStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         claim: &IdempotencyClaim,
-        database_timestamp: DateTime<Utc>,
+        database_timestamp: Timestamp,
     ) -> Result<Option<ClaimDecision>> {
         let Some(record) = self
             .get_idempotency_in_transaction(tx, &claim.key_hash)
