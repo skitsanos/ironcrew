@@ -90,7 +90,8 @@ After approval:
 
 1. On `develop`, update the package version in `Cargo.toml`, refresh the exact
    root package entry in `Cargo.lock`, and read both back.
-2. Rerun the complete gate. Stage only explicit release paths and commit/push
+2. Stage only explicit release paths and commit when authorized, then rerun the
+   complete gate on that commit; its receipt admits the push, which happens
    only when authorized.
 3. Open or update the `develop` to `main` release PR. Wait for green CI, then
    merge only with explicit sole-owner authorization.
@@ -99,7 +100,10 @@ After approval:
 5. Prove the tag is reachable from `main` and its `Cargo.toml` contains the same
    version. Record that evidence and confirm the user's release authorization
    covers the tag push; ask only if that authorization is missing.
-6. Push the authorized tag. Pushing it does not publish a release. After the
+6. Push the authorized tag. The pre-push hook admits it only with a fresh gate
+   receipt for the tag's tree; if the release commit's tree differs from the
+   gated `develop` tree or the receipt expired, rerun the gate on it first.
+   Pushing the tag does not publish a release. After the
    remote controls above exist, exercise the protected environment without
    publication as part of the authorized release. Replace the tag in this exact
    request with the pushed stable tag:

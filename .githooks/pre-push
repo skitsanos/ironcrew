@@ -1,5 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-exec "$repo_root/scripts/pre-push-check.sh"
+# IC-059: the complete gate outlives an idle SSH push session, so it runs before
+# the push (`./scripts/pre-push-check.sh` or `task pre-push`) and records a
+# receipt for the clean tree it validated. This hook only verifies that a fresh
+# receipt covers the tree of every pushed ref; it never runs the gate itself.
+#
+# Git runs the hook from the root of the pushing worktree. Keep that directory
+# so the receipt is read from the pushing worktree's Git directory even when
+# core.hooksPath points at another checkout's hooks.
+hook_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+while IFS= read -r git_environment_name; do
+  unset "$git_environment_name"
+done < <(git rev-parse --local-env-vars)
+
+if ! command -v bun >/dev/null 2>&1; then
+  printf 'pre-push: required command not found: bun\n' >&2
+  exit 1
+fi
+
+exec bun --no-env-file "$hook_root/scripts/gate_receipt.ts" verify-push

@@ -64,15 +64,18 @@ After approval:
 
 1. Update `Cargo.toml`, refresh the root package version in `Cargo.lock`, and
    read both back.
-2. Rerun the complete gate. Stage only explicit release files; commit and push
-   `develop` only when authorized.
+2. Stage only explicit release files and commit when authorized, then rerun
+   the complete gate on that commit; its receipt admits the `develop` push,
+   which happens only when authorized.
 3. Open or update the `develop` to `main` release PR. Wait for green CI and
    approval; merge only with user authorization.
 4. Fast-forward local `main`, create an annotated `vX.Y.Z` on the verified
    release commit, prove it is reachable from `main`, and prove its manifest
    version matches.
-5. Show the evidence and ask before pushing the tag. Pushing the tag does not
-   publish a release. Once the remote controls above exist, separately ask to
+5. Show the evidence and ask before pushing the tag. The pre-push hook admits
+   it only with a fresh gate receipt for the tag's tree; rerun the gate on the
+   release commit if its tree differs from the gated `develop` tree. Pushing
+   the tag does not publish a release. Once the remote controls above exist, separately ask to
    exercise the protected environment without publication. Replace the tag in
    this exact request with the pushed stable tag:
 

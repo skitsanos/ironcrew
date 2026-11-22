@@ -32,8 +32,16 @@ reconcile files only when the user also asks for changes.
 - Before committing work intended for `develop`, run `task develop-refresh`.
   Review and commit any toolchain, manifest, lockfile, workflow, or policy
   changes produced by the latest-stable refresh before validation.
-- Run `./scripts/pre-push-check.sh` directly before push even when the hook is
-  enabled. It is the canonical locally reproducible CI gate. It requires a
+- Commit, then run `./scripts/pre-push-check.sh` (or `task pre-push`) before
+  the push. It is the canonical locally reproducible CI gate and takes longer
+  than a hosting provider keeps an idle SSH push session open, so the hook does
+  not run it (IC-059). A passing run records a receipt for the clean tree it
+  captured before its first check, in the worktree's Git directory, and refuses
+  one if that tree changed during the run. The hook accepts a push only when a
+  receipt at most `IRONCREW_GATE_RECEIPT_MAX_AGE_SECONDS` old (default 86400)
+  covers the tree of every pushed ref, including tags; otherwise it blocks and
+  names the gate to run. A message-only amend keeps the receipt; any content
+  change needs a new run. The gate requires a
   clean worktree, upgrades Bun before Bun-based tooling, refreshes managed
   dependencies, and fails closed when refresh changes need a commit or the
   Rust, cargo-audit, actionlint, or immutable GitHub Action pins do not match

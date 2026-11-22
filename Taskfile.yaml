@@ -23,7 +23,7 @@ tasks:
       - ./scripts/refresh-develop-dependencies.sh
 
   pre-push:
-    desc: Refresh dependencies and run every locally reproducible CI gate
+    desc: Run every locally reproducible CI gate and record the push receipt
     cmds:
       - ./scripts/pre-push-check.sh
 

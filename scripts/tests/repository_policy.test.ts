@@ -125,7 +125,8 @@ describe("repository integration policy", () => {
     expect(
       (await stat(join(repository, "scripts/refresh-develop-dependencies.sh"))).mode & 0o111,
     ).not.toBe(0);
-    expect(hook).toContain('exec "$repo_root/scripts/pre-push-check.sh"');
+    expect(hook).toContain('scripts/gate_receipt.ts" verify-push');
+    expect(guard).toContain('scripts/gate_receipt.ts" write');
     expect(taskfile).toContain("core.hooksPath .githooks");
     expect(taskfile).toContain("./scripts/pre-push-check.sh");
     expect(taskfile).toContain("./scripts/refresh-develop-dependencies.sh");

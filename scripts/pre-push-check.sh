@@ -67,6 +67,12 @@ if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   exit 1
 fi
 
+# IC-059: bind the receipt to the clean tree observed before the first check.
+# The push hook accepts only that tree, so a commit made during the run cannot
+# inherit a receipt for code the earlier checks never saw.
+gate_start_tree=$(git rev-parse --verify 'HEAD^{tree}')
+gate_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
 run "latest-stable tool and dependency refresh" \
   ./scripts/refresh-develop-dependencies.sh
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
@@ -172,6 +178,11 @@ if ! cmp -s "$scratch_root/worktree-before" "$scratch_root/worktree-after"; then
   git status --short >&2
   exit 1
 fi
+
+# The hook verifies this receipt instead of rerunning the gate inside `git push`,
+# whose idle SSH session the hosting provider closes long before the gate ends.
+run "gate receipt for the validated tree" \
+  bun --no-env-file "$repo_root/scripts/gate_receipt.ts" write "$gate_start_tree" "$gate_started"
 
 printf '%s\n' \
   'pre-push: every locally reproducible CI gate passed.' \
