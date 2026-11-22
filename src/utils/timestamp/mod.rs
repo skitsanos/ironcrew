@@ -102,7 +102,8 @@ pub fn to_rfc3339(instant: Timestamp) -> String {
 }
 
 /// The form `chrono`'s `to_rfc3339_opts(SecondsFormat::Micros, true)` wrote:
-/// six fraction digits, truncated, and `Z`.
+/// six fraction digits, truncated, and `Z`. Only the PostgreSQL store writes it.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub fn to_rfc3339_micros_z(instant: Timestamp) -> String {
     let mut text = write_seconds(instant);
     let _ = write!(text, ".{:06}Z", instant.nanos / 1_000);
