@@ -95,6 +95,12 @@ Run in this order:
 4. `cargo test --doc`
 5. `cargo audit --deny warnings` after dependency or security-sensitive changes
 
+CI denies compiler warnings in every job through workflow-level
+`RUSTFLAGS=-Dwarnings`, including `cargo build --no-default-features`, and
+`./scripts/pre-push-check.sh` exports the same value for its Rust steps
+(IC-060). When reproducing a feature-specific CI step by hand, use the same
+environment, for example `RUSTFLAGS=-Dwarnings cargo build --no-default-features`.
+
 Stop after a failure and preserve the actionable output. Do not add an allow,
 ignore, or exception merely to make a gate green.
 
