@@ -15,7 +15,7 @@ COPY examples/graph-prototype/assets ./examples/graph-prototype/assets
 
 RUN cargo build --release --locked
 
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS runtime
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
 WORKDIR /app
 

@@ -15,7 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   BASE_IMAGE_REFERENCE: cgr.dev/chainguard/wolfi-base
-  BASE_IMAGE_INDEX_DIGEST: sha256:360896efb0753a5701c48f860e17130c205eae5a264797aa3e7ea126ee2923a7
+  BASE_IMAGE_INDEX_DIGEST: sha256:be019c1c74fe69204a42c4e10bc4d886a49bf5403ffa74374ef7baa408fc9a26
 
 jobs:
   guard:
