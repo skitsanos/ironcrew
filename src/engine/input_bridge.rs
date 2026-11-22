@@ -915,7 +915,7 @@ impl InputBridge {
             question_id: question_id.to_string(),
             prompt: prompt.to_string(),
             choices: choices.to_vec(),
-            asked_at: chrono::Utc::now().to_rfc3339(),
+            asked_at: crate::utils::timestamp::now_rfc3339(),
             timeout_s,
             kind: kind.to_string(),
         };
@@ -1583,7 +1583,7 @@ mod tests {
                 suggested_id: Some(uuid::Uuid::new_v4().to_string()),
                 flow_name: "cancellation cleanup".into(),
                 flow: "test".into(),
-                started_at: chrono::Utc::now().to_rfc3339(),
+                started_at: crate::utils::timestamp::now_rfc3339(),
                 agent_count: 0,
                 task_count: 0,
                 tags: Vec::new(),

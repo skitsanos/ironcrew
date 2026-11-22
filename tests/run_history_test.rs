@@ -465,17 +465,21 @@ async fn json_store_owner_lease_and_exactly_once_terminal_transition() {
 
     let record = owner_a.get_run("leased-json").await.unwrap();
     assert_eq!(record.owner_instance_id, "owner-a");
-    let deadline = chrono::DateTime::parse_from_rfc3339(&record.lease_expires_at).unwrap();
+    let deadline = ironcrew::utils::timestamp::parse_rfc3339(&record.lease_expires_at).unwrap();
     assert_eq!(
         owner_b
-            .reconcile_abandoned_runs(&(deadline - chrono::Duration::seconds(1)).to_rfc3339())
+            .reconcile_abandoned_runs(&ironcrew::utils::timestamp::to_rfc3339(
+                ironcrew::utils::timestamp::checked_add_seconds(deadline, -1).unwrap()
+            ))
             .await
             .unwrap(),
         0
     );
     assert_eq!(
         owner_b
-            .reconcile_abandoned_runs(&(deadline + chrono::Duration::seconds(1)).to_rfc3339())
+            .reconcile_abandoned_runs(&ironcrew::utils::timestamp::to_rfc3339(
+                ironcrew::utils::timestamp::checked_add_seconds(deadline, 1).unwrap()
+            ))
             .await
             .unwrap(),
         1

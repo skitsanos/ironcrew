@@ -58,11 +58,7 @@ fn matches_model(model: &str, alias: &str, compact_date: bool) -> bool {
             .strip_prefix(alias)
             .and_then(|suffix| suffix.strip_prefix('-'))
             .is_some_and(|date| {
-                let (length, format) = if compact_date {
-                    (8, "%Y%m%d")
-                } else {
-                    (10, "%Y-%m-%d")
-                };
+                let length = if compact_date { 8 } else { 10 };
                 date.len() == length
                     && date.bytes().enumerate().all(|(index, byte)| {
                         if !compact_date && matches!(index, 4 | 7) {
@@ -71,8 +67,24 @@ fn matches_model(model: &str, alias: &str, compact_date: bool) -> bool {
                             byte.is_ascii_digit()
                         }
                     })
-                    && chrono::NaiveDate::parse_from_str(date, format).is_ok()
+                    && is_calendar_date(date.as_bytes(), compact_date)
             })
+}
+
+/// Whether the already shape-checked `YYYYMMDD` or `YYYY-MM-DD` digits name
+/// a proleptic Gregorian day.
+fn is_calendar_date(date: &[u8], compact_date: bool) -> bool {
+    let number = |range: std::ops::Range<usize>| {
+        date[range]
+            .iter()
+            .fold(0u32, |value, digit| value * 10 + u32::from(digit - b'0'))
+    };
+    let (month, day) = if compact_date {
+        (4..6, 6..8)
+    } else {
+        (5..7, 8..10)
+    };
+    crate::utils::timestamp::is_valid_date(i64::from(number(0..4)), number(month), number(day))
 }
 
 fn invalid(model: &str, message: &str) -> IronCrewError {

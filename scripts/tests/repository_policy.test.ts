@@ -343,17 +343,46 @@ describe("repository integration policy", () => {
     expect(lockfile).not.toContain('name = "event-listener"\nversion = "5.4.1"');
   });
 
-  test("the audit ignores only the reviewed chrono advisory while chrono is resolved (IC-057)", async () => {
+  test("the audit ignores only the reviewed chrono advisory while rmcp resolves chrono (IC-057)", async () => {
     const config = Bun.TOML.parse(
       await Bun.file(join(repository, ".cargo/audit.toml")).text(),
     ) as { advisories?: { ignore?: string[] } };
-    const lockfile = await Bun.file(join(repository, "Cargo.lock")).text();
+    const lockfile = Bun.TOML.parse(
+      await Bun.file(join(repository, "Cargo.lock")).text(),
+    ) as { package: Array<{ name: string; dependencies?: string[] }> };
     const ignored = config.advisories?.ignore ?? [];
+    const chronoDependents = lockfile.package
+      .filter((pkg) =>
+        (pkg.dependencies ?? []).some((dependency) => dependency.split(" ")[0] === "chrono")
+      )
+      .map((pkg) => pkg.name);
 
     expect(ignored.every((id) => id === "RUSTSEC-2026-0543")).toBe(true);
+    // IronCrew itself no longer depends on chrono; only rmcp may resolve it.
+    expect(chronoDependents.every((name) => name === "rmcp")).toBe(true);
     if (ignored.includes("RUSTSEC-2026-0543")) {
       // The exception must not outlive the crate it covers.
-      expect(lockfile).toContain('name = "chrono"\nversion = "0.4.');
+      expect(chronoDependents).toEqual(["rmcp"]);
+    }
+  });
+
+  test("IronCrew code reads and writes timestamps without chrono (IC-057)", async () => {
+    const offenders: string[] = [];
+    for (const directory of ["src", "tests", "benches", "examples"]) {
+      for await (const path of new Bun.Glob(`${directory}/**/*.rs`).scan(repository)) {
+        const text = await Bun.file(join(repository, path)).text();
+        if (/\bchrono::|\buse\s+chrono\b|\bextern\s+crate\s+chrono\b/.test(text)) {
+          offenders.push(path);
+        }
+      }
+    }
+    const manifest = Bun.TOML.parse(
+      await Bun.file(join(repository, "Cargo.toml")).text(),
+    ) as Record<string, Record<string, unknown> | undefined>;
+
+    expect(offenders).toEqual([]);
+    for (const table of ["dependencies", "dev-dependencies", "build-dependencies"]) {
+      expect(Object.keys(manifest[table] ?? {})).not.toContain("chrono");
     }
   });
 

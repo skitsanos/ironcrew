@@ -353,7 +353,7 @@ impl AgentDialog {
                 !tool_registry.schemas_for(&agent.tools).is_empty(),
             )?;
         }
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::utils::timestamp::now_rfc3339();
         let participant_limit = configured_dialog_max_participants();
         if !(2..=participant_limit).contains(&agents.len()) {
             return Err(IronCrewError::Validation(format!(

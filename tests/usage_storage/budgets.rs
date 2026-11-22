@@ -11,7 +11,7 @@ pub async fn checked_round_trip(store: &dyn StateStore) {
             suggested_id: Some(uuid::Uuid::new_v4().to_string()),
             flow_name: "budget".into(),
             flow: "budget".into(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: ironcrew::utils::timestamp::now_rfc3339(),
             agent_count: 1,
             task_count: 1,
             tags: vec![],
@@ -20,7 +20,7 @@ pub async fn checked_round_trip(store: &dyn StateStore) {
         .unwrap();
     let completion = RunCompletion {
         status: RunStatus::Failed,
-        finished_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: ironcrew::utils::timestamp::now_rfc3339(),
         duration_ms: 1,
         task_results: vec![],
         usage: usage.clone(),

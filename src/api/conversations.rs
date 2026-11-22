@@ -1010,8 +1010,8 @@ async fn message_handle(
 // ---------------------------------------------------------------------------
 
 async fn mark_message_indeterminate(state: &Arc<AppState>, attempt: &MessageIdempotencyAttempt) {
-    let completed_at = chrono::Utc::now();
-    let completed_at_text = completed_at.to_rfc3339();
+    let completed_at = crate::utils::timestamp::now();
+    let completed_at_text = crate::utils::timestamp::to_rfc3339(completed_at);
     let expires_at = state.idempotency.retention_expiry(completed_at);
     let mut persistence_degraded = false;
     let mut retry_delay = Duration::from_millis(250);
@@ -1331,7 +1331,7 @@ async fn execute_idempotent_message(
             return Err(message_idempotency_store_error(error));
         }
     };
-    let completed_at = chrono::Utc::now();
+    let completed_at = crate::utils::timestamp::now();
     let completion = IdempotencyCompletion {
         key_hash: attempt.key_hash.clone(),
         principal_id: attempt.principal_id.clone(),
@@ -1340,7 +1340,7 @@ async fn execute_idempotent_message(
         owner_instance_id: state.store.instance_id().to_string(),
         response_status: StatusCode::OK.as_u16(),
         response_body,
-        completed_at: completed_at.to_rfc3339(),
+        completed_at: crate::utils::timestamp::to_rfc3339(completed_at),
         expires_at: state.idempotency.retention_expiry(completed_at),
     };
 
@@ -1479,7 +1479,7 @@ pub(super) async fn post_message_inner(
     );
 
     if let Some(request_key) = request_key.as_ref() {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::utils::timestamp::now_rfc3339();
         match state
             .store
             .lookup_idempotency_for_principal(
@@ -1559,16 +1559,10 @@ pub(super) async fn post_message_inner(
         let scope =
             super::idempotency::conversation_scope(&key.0, &id, &durable.execution.incarnation_id);
         let lease_started = tokio::time::Instant::now();
-        let now = chrono::Utc::now();
+        let now = crate::utils::timestamp::now();
         let lease_ttl = state.store.run_lease_ttl();
         let attempt_id = uuid::Uuid::new_v4().to_string();
-        let lease_expires_at = now
-            .checked_add_signed(
-                chrono::Duration::from_std(lease_ttl)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
-            )
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-            .to_rfc3339();
+        let lease_expires_at = crate::utils::timestamp::lease_deadline(now, lease_ttl);
         let claim = IdempotencyClaim {
             key_hash: request_key.key_hash.clone(),
             principal_id: principal.id().clone(),
@@ -1587,7 +1581,7 @@ pub(super) async fn post_message_inner(
             response_body: None,
             max_total_response_bytes: state.idempotency.max_total_response_bytes,
             lease_expires_at,
-            created_at: now.to_rfc3339(),
+            created_at: crate::utils::timestamp::to_rfc3339(now),
             ttl_seconds: state.idempotency.ttl_seconds,
         };
         let attempt = MessageIdempotencyAttempt {

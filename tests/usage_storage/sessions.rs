@@ -26,7 +26,7 @@ pub(super) async fn checked_round_trip(store: &dyn StateStore) {
         .unwrap();
     let usage = scope.snapshot().unwrap();
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = ironcrew::utils::timestamp::now_rfc3339();
     let mut chat = ConversationRecord {
         id: id.clone(),
         flow_name: "session usage".into(),

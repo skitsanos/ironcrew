@@ -33,16 +33,19 @@ pub(super) fn decode_stored_json<T: DeserializeOwned>(raw: &str, field: &str) ->
     })
 }
 
-pub(super) fn parse_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-        .map_err(|error| {
-            IronCrewError::Validation(format!("{label} is not valid RFC3339: {error}"))
-        })
+pub(super) fn parse_timestamp(
+    label: &str,
+    value: &str,
+) -> Result<crate::utils::timestamp::Timestamp> {
+    crate::utils::timestamp::parse_rfc3339(value).map_err(|error| {
+        IronCrewError::Validation(format!("{label} is not valid RFC3339: {error}"))
+    })
 }
 
 pub(super) fn canonical_timestamp(label: &str, value: &str) -> Result<String> {
-    Ok(parse_timestamp(label, value)?.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+    Ok(crate::utils::timestamp::to_rfc3339_micros_z(
+        parse_timestamp(label, value)?,
+    ))
 }
 
 #[cfg(test)]

@@ -120,7 +120,7 @@ mod tests {
                     suggested_id: Some("blocking-boundary".into()),
                     flow_name: "boundary".into(),
                     flow: "boundary".into(),
-                    started_at: chrono::Utc::now().to_rfc3339(),
+                    started_at: crate::utils::timestamp::now_rfc3339(),
                     agent_count: 0,
                     task_count: 0,
                     tags: Vec::new(),

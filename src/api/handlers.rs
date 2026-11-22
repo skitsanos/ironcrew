@@ -145,7 +145,7 @@ async fn release_run_idempotency(state: &AppState, attempt: Option<&RunIdempoten
 }
 
 async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotencyAttempt) {
-    let completed_at = chrono::Utc::now();
+    let completed_at = crate::utils::timestamp::now();
     let completion = IdempotencyCompletion {
         key_hash: attempt.key_hash,
         principal_id: attempt.principal_id,
@@ -154,7 +154,7 @@ async fn complete_run_idempotency(state: &Arc<AppState>, attempt: RunIdempotency
         owner_instance_id: state.store.instance_id().to_string(),
         response_status: StatusCode::OK.as_u16(),
         response_body: Some(attempt.response_body),
-        completed_at: completed_at.to_rfc3339(),
+        completed_at: crate::utils::timestamp::to_rfc3339(completed_at),
         expires_at: state.idempotency.retention_expiry(completed_at),
     };
     let mut persistence_degraded = false;
@@ -226,8 +226,8 @@ async fn mark_run_idempotency_indeterminate(
     state: &Arc<AppState>,
     attempt: &RunIdempotencyAttempt,
 ) {
-    let completed_at = chrono::Utc::now();
-    let completed_at_text = completed_at.to_rfc3339();
+    let completed_at = crate::utils::timestamp::now();
+    let completed_at_text = crate::utils::timestamp::to_rfc3339(completed_at);
     let expires_at = state.idempotency.retention_expiry(completed_at);
     let mut persistence_degraded = false;
     let mut retry_delay = Duration::from_millis(250);
@@ -1010,7 +1010,7 @@ pub async fn run_flow(
     // temporarily unavailable). Only digests, never the raw client key, reach
     // the persistence layer or logs.
     if let Some(key) = request_key.as_ref() {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::utils::timestamp::now_rfc3339();
         match state
             .store
             .lookup_idempotency_for_principal(
@@ -1135,16 +1135,10 @@ pub async fn run_flow(
             )
         })?;
         let lease_started = tokio::time::Instant::now();
-        let now = chrono::Utc::now();
+        let now = crate::utils::timestamp::now();
         let lease_ttl = state.store.run_lease_ttl();
         let attempt_id = uuid::Uuid::new_v4().to_string();
-        let lease_expires_at = now
-            .checked_add_signed(
-                chrono::Duration::from_std(lease_ttl)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60)),
-            )
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-            .to_rfc3339();
+        let lease_expires_at = crate::utils::timestamp::lease_deadline(now, lease_ttl);
         let claim = IdempotencyClaim {
             key_hash: key.key_hash.clone(),
             principal_id: principal.id().clone(),
@@ -1161,7 +1155,7 @@ pub async fn run_flow(
             response_body: Some(response_body.clone()),
             max_total_response_bytes: state.idempotency.max_total_response_bytes,
             lease_expires_at,
-            created_at: now.to_rfc3339(),
+            created_at: crate::utils::timestamp::to_rfc3339(now),
             ttl_seconds: state.idempotency.ttl_seconds,
         };
         match state
@@ -1260,7 +1254,7 @@ pub async fn run_flow(
     };
     let eventbus =
         EventBus::new_durable(256, state.store.clone(), flow_slug.clone(), run_id.clone());
-    let started_at = chrono::Utc::now().to_rfc3339();
+    let started_at = crate::utils::timestamp::now_rfc3339();
     let started = std::time::Instant::now();
 
     // Per-run human-input transport: crew:ask_human() parks on this, the
@@ -1566,7 +1560,7 @@ pub async fn run_flow(
         } else {
             staged_completion.map(|mut staged| {
                 staged.completion.status = requested_status.clone();
-                staged.completion.finished_at = chrono::Utc::now().to_rfc3339();
+                staged.completion.finished_at = crate::utils::timestamp::now_rfc3339();
                 staged.completion.duration_ms = started.elapsed().as_millis() as u64;
                 staged.completion.usage = usage.clone();
                 staged.completion
@@ -1816,7 +1810,7 @@ async fn execute_crew_from_path_with_events(
             .and_then(|segment| segment.to_str())
             .unwrap_or("")
             .to_string();
-        let started_at = chrono::Utc::now().to_rfc3339();
+        let started_at = crate::utils::timestamp::now_rfc3339();
         store
             .save_run_intent(RunIntent {
                 suggested_id: Some(run_id.to_string()),

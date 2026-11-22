@@ -767,7 +767,7 @@ fn validate_question(question: &QuestionInfo) -> Result<()> {
         ));
     }
     if question.asked_at.len() > MAX_ASKED_AT_BYTES
-        || chrono::DateTime::parse_from_rfc3339(&question.asked_at).is_err()
+        || crate::utils::timestamp::parse_rfc3339(&question.asked_at).is_err()
     {
         return Err(IronCrewError::Validation(
             "human-input asked_at must be an RFC 3339 timestamp".into(),

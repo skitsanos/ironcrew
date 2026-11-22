@@ -560,7 +560,7 @@ async fn wait_for_lease_renewal(
     client: &Client,
     base_url: &str,
     run_id: &str,
-    previous_deadline: chrono::DateTime<chrono::Utc>,
+    previous_deadline: ironcrew::utils::timestamp::Timestamp,
 ) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_observation = String::from("no response");
@@ -577,8 +577,8 @@ async fn wait_for_lease_renewal(
                 serde_json::from_str(&body).expect("parse run lease response");
             let renewed = record["lease_expires_at"]
                 .as_str()
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.with_timezone(&chrono::Utc) > previous_deadline)
+                .and_then(|value| ironcrew::utils::timestamp::parse_rfc3339(value).ok())
+                .map(|value| value > previous_deadline)
                 .unwrap_or(false);
             if renewed {
                 return record;
@@ -1241,13 +1241,12 @@ async fn genuine_two_process_postgres_replica_acceptance() {
     // A must renew the same durable run before B can classify it as dead.
     #[cfg(unix)]
     {
-        let observed_deadline = chrono::DateTime::parse_from_rfc3339(
+        let observed_deadline = ironcrew::utils::timestamp::parse_rfc3339(
             active_before_kill["lease_expires_at"]
                 .as_str()
                 .expect("active run lease deadline"),
         )
-        .expect("parse active run lease deadline")
-        .with_timezone(&chrono::Utc);
+        .expect("parse active run lease deadline");
         wait_for_lease_renewal(
             &client,
             &owner_death_b.base_url,
@@ -1268,15 +1267,14 @@ async fn genuine_two_process_postgres_replica_acceptance() {
         .json()
         .await
         .expect("parse stopped owner's run");
-        let lease_while_stopped = chrono::DateTime::parse_from_rfc3339(
+        let lease_while_stopped = ironcrew::utils::timestamp::parse_rfc3339(
             stopped_record["lease_expires_at"]
                 .as_str()
                 .expect("stopped run lease deadline"),
         )
-        .expect("parse stopped run lease deadline")
-        .with_timezone(&chrono::Utc);
+        .expect("parse stopped run lease deadline");
         assert!(
-            lease_while_stopped > chrono::Utc::now(),
+            lease_while_stopped > ironcrew::utils::timestamp::now(),
             "the confirmed-stopped owner must still have time to recover"
         );
         tokio::time::sleep(Duration::from_millis(4_250)).await;

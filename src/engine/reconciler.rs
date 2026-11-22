@@ -7,8 +7,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::Utc;
-
 use crate::engine::store::StateStore;
 use crate::utils::error::{IronCrewError, Result};
 
@@ -47,7 +45,7 @@ pub async fn heartbeat_owned_runs_bounded(store: &Arc<dyn StateStore>) -> Result
 }
 
 pub async fn reconcile_stuck_runs(store: &Arc<dyn StateStore>) -> Result<usize> {
-    let now = Utc::now().to_rfc3339();
+    let now = crate::utils::timestamp::now_rfc3339();
     reconcile_stuck_runs_at(store, &now).await
 }
 

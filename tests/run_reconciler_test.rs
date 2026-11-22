@@ -133,17 +133,17 @@ async fn test_04_full_lifecycle_writes_success_record() {
         .unwrap();
 
     // Run the crew.
-    let run_start = chrono::Utc::now();
+    let run_start = ironcrew::utils::timestamp::now();
     let results = crew.run(provider, &registry).await.unwrap();
-    let run_end = chrono::Utc::now();
-    let total_ms = (run_end - run_start).num_milliseconds().max(0) as u64;
+    let run_end = ironcrew::utils::timestamp::now();
+    let total_ms = ironcrew::utils::timestamp::elapsed_millis(run_start, run_end);
 
     // Derive terminal fields via the existing helper, then complete.
     let record = crew.create_run_record(
         Some(run_id.clone()),
         &results,
-        &run_start.to_rfc3339(),
-        &run_end.to_rfc3339(),
+        &ironcrew::utils::timestamp::to_rfc3339(run_start),
+        &ironcrew::utils::timestamp::to_rfc3339(run_end),
         total_ms,
         ironcrew::usage::UsageSnapshot::unavailable(),
     );
@@ -152,7 +152,7 @@ async fn test_04_full_lifecycle_writes_success_record() {
             &run_id,
             ironcrew::engine::run_history::RunCompletion {
                 status: record.status.clone(),
-                finished_at: run_end.to_rfc3339(),
+                finished_at: ironcrew::utils::timestamp::to_rfc3339(run_end),
                 duration_ms: total_ms,
                 task_results: record.task_results.clone(),
                 usage: record.usage.clone(),

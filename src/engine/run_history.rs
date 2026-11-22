@@ -695,11 +695,11 @@ fn write_run_record_atomic(path: &Path, record: &RunRecord) -> Result<()> {
     write_serialized_record_atomic(path, record, "run record")
 }
 
-fn lease_is_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn lease_is_expired(lease_expires_at: &str, now: crate::utils::timestamp::Timestamp) -> bool {
     if lease_expires_at.is_empty() {
         return true;
     }
-    chrono::DateTime::parse_from_rfc3339(lease_expires_at)
+    crate::utils::timestamp::parse_rfc3339(lease_expires_at)
         .map(|deadline| deadline <= now)
         // Invalid legacy/corrupt leases must not make an in-flight row immortal.
         .unwrap_or(true)
@@ -748,9 +748,11 @@ fn read_idempotency_record(path: &Path) -> Result<IdempotencyRecord> {
     Ok(record)
 }
 
-fn parse_idempotency_timestamp(label: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+fn parse_idempotency_timestamp(
+    label: &str,
+    value: &str,
+) -> Result<crate::utils::timestamp::Timestamp> {
+    crate::utils::timestamp::parse_rfc3339(value)
         .map_err(|error| IronCrewError::Validation(format!("{label} is not RFC3339: {error}")))
 }
 
@@ -783,10 +785,7 @@ fn retry_after_seconds(deadline: Option<&str>, now: &str) -> Result<u64> {
     };
     let deadline = parse_idempotency_timestamp("idempotency capacity deadline", deadline)?;
     let now = parse_idempotency_timestamp("idempotency capacity clock", now)?;
-    let milliseconds = deadline
-        .signed_duration_since(now)
-        .num_milliseconds()
-        .max(1);
+    let milliseconds = crate::utils::timestamp::millis_between(now, deadline).max(1);
     Ok(u64::try_from(milliseconds.saturating_add(999) / 1_000)
         .unwrap_or(u64::MAX)
         .max(1))
@@ -808,12 +807,12 @@ fn json_recovery_grace_elapsed(
         .unwrap_or(hazard.updated_at.as_str());
     let marked_at = parse_idempotency_timestamp("idempotency hazard time", marked_at)?;
     let claim_time = parse_idempotency_timestamp("idempotency recovery claim time", claim_time)?;
-    let grace = chrono::Duration::from_std(ttl).map_err(|error| {
+    let grace = crate::utils::timestamp::signed_duration(ttl).map_err(|error| {
         IronCrewError::Validation(format!(
             "Idempotency recovery grace is out of range: {error}"
         ))
     })?;
-    let recovery_at = marked_at.checked_add_signed(grace).ok_or_else(|| {
+    let recovery_at = crate::utils::timestamp::checked_add(marked_at, grace).ok_or_else(|| {
         IronCrewError::Validation("Idempotency recovery grace deadline overflow".into())
     })?;
     Ok(claim_time >= recovery_at)
@@ -823,9 +822,9 @@ fn retention_expiry(now: &str, ttl_seconds: u64) -> Result<String> {
     let now = parse_idempotency_timestamp("idempotency current time", now)?;
     let ttl = i64::try_from(ttl_seconds)
         .map_err(|_| IronCrewError::Validation("Idempotency TTL is out of range".into()))?;
-    now.checked_add_signed(chrono::Duration::seconds(ttl))
+    crate::utils::timestamp::checked_add_seconds(now, ttl)
         .ok_or_else(|| IronCrewError::Validation("Idempotency retention expiry overflow".into()))
-        .map(|timestamp| timestamp.to_rfc3339())
+        .map(crate::utils::timestamp::to_rfc3339)
 }
 
 fn classify_idempotency_record(
@@ -1343,11 +1342,9 @@ impl StateStore for JsonFileStoreCore {
     }
 
     async fn reconcile_abandoned_runs(&self, now: &str) -> Result<usize> {
-        let now_parsed = chrono::DateTime::parse_from_rfc3339(now)
-            .map_err(|e| {
-                IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
-            })?
-            .with_timezone(&chrono::Utc);
+        let now_parsed = crate::utils::timestamp::parse_rfc3339(now).map_err(|e| {
+            IronCrewError::Validation(format!("Invalid reconciliation timestamp: {}", e))
+        })?;
         let _guard = self
             .run_lock
             .lock()

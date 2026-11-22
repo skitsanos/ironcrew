@@ -451,7 +451,7 @@ fn register_lua_globals_with_policy(lua: &Lua, vm_policy: LuaVmPolicy) -> LuaRes
     lua.globals().set("uuid4", uuid_fn)?;
 
     // now_rfc3339()
-    let now_rfc3339_fn = lua.create_function(|_, ()| Ok(chrono::Utc::now().to_rfc3339()))?;
+    let now_rfc3339_fn = lua.create_function(|_, ()| Ok(crate::utils::timestamp::now_rfc3339()))?;
     lua.globals().set("now_rfc3339", now_rfc3339_fn)?;
 
     // now_unix_ms()

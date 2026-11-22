@@ -35,7 +35,7 @@ impl LuaConversationInner {
             &agent.chat_request(model.clone(), vec![]),
             !tool_registry.schemas_for(&agent.tools).is_empty(),
         )?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::utils::timestamp::now_rfc3339();
         let max_history = match max_history {
             Some(value) if (1..=HARD_CHAT_HISTORY_MAX_MESSAGES).contains(&value) => value,
             Some(value) => {

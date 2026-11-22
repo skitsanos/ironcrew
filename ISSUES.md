@@ -9,7 +9,6 @@ stable paths such as [`docs/issues/IC-001.md`](docs/issues/IC-001.md).
 | ID | Priority | Status | Area | Summary |
 |---|---:|---|---|---|
 | [IC-056](docs/issues/IC-056.md) | P2 | In progress | MCP verification | Shared discovery deadline races Python startup in semantic MCP capability acceptance |
-| [IC-057](docs/issues/IC-057.md) | P3 | Open | Supply chain | Dependency audit fails because chrono is unmaintained |
 
 ## Working agreement
 

@@ -168,7 +168,7 @@ async fn owner_death_before_durable_cancellation_pickup_reconciles_once() {
                 .run_lease
                 .as_deref()
                 .expect("stopped owner lease")
-                .parse::<chrono::DateTime<chrono::Utc>>()
+                .parse::<ironcrew::utils::timestamp::Timestamp>()
                 .expect("parse stopped owner lease");
             assert!(stopped_lease >= fresh_lease);
             assert_ready(pair).await;
