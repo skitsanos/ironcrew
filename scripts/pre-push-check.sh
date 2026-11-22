@@ -113,6 +113,13 @@ fi
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_DEV_DEBUG=0
 
+# IC-060: CI sets RUSTFLAGS=-Dwarnings for every job, so a warning on any cfg
+# path (for example dead code only without the postgres feature) fails CI.
+# Apply the same value to every Rust step below. Cargo ignores RUSTFLAGS when
+# CARGO_ENCODED_RUSTFLAGS is set, and CI sets no rustdoc flags.
+unset CARGO_ENCODED_RUSTFLAGS CARGO_ENCODED_RUSTDOCFLAGS RUSTDOCFLAGS
+export RUSTFLAGS=-Dwarnings
+
 git status --porcelain=v1 -z --untracked-files=all >"$scratch_root/worktree-before"
 
 # Fail before expensive gates if the required database coverage cannot run.

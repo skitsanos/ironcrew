@@ -6,7 +6,7 @@ priority, area, and title. The registry is generated with
 `bun run scripts/issues_registry.ts generate` and verified with
 `bun run scripts/issues_registry.ts check`.
 
-- Total findings: 59
+- Total findings: 60
 - Active findings: 1
 - Issued-through marker: [HIGH_WATER_MARK](./HIGH_WATER_MARK)
 - Historical audit evidence: [AUDIT_EVIDENCE.md](./AUDIT_EVIDENCE.md)
@@ -72,3 +72,4 @@ priority, area, and title. The registry is generated with
 | [IC-057](./IC-057.md) | P3 | Resolved | Supply chain | Dependency audit fails because chrono is unmaintained |
 | [IC-058](./IC-058.md) | P3 | Resolved | Toolchain and verification policy | Repository toolchain pins fail the required latest-stable gate after Rust 1.100.0 |
 | [IC-059](./IC-059.md) | P2 | Resolved | Toolchain and verification policy | Pre-push gate outlives the SSH push session, so a passing gate cannot complete the push |
+| [IC-060](./IC-060.md) | P3 | Resolved | Toolchain and verification policy | Pre-push gate does not deny Rust warnings as CI does |
