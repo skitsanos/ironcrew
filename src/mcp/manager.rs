@@ -5,7 +5,7 @@
 //! the whole bounded batch after every connection attempt settles. The manager is then cached on `LuaCrew` so
 //! subsequent runs reuse the same connections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -35,7 +35,18 @@ impl McpConnectionManager {
     ///
     /// After successful connection, all discovered tools are registered into
     /// `tool_registry` using the `mcp__<label>__<tool>` naming scheme.
+    /// Duplicate labels fail before connection. Composed tool-name collisions
+    /// reject the whole batch and preserve the caller's existing registry.
     pub async fn connect_all(config: &McpConfig, tool_registry: &mut ToolRegistry) -> Result<Self> {
+        let mut labels = HashSet::new();
+        for server in &config.servers {
+            if !labels.insert(&server.label) {
+                return Err(IronCrewError::Mcp {
+                    server: server.label.clone(),
+                    message: "duplicate MCP server label".to_owned(),
+                });
+            }
+        }
         // Build one connect future per server
         let connect_futs: Vec<_> = config
             .servers
@@ -94,7 +105,10 @@ impl McpConnectionManager {
             discovered.push((label.clone(), Arc::clone(client), tools));
         }
 
-        // Register tools only after every server completed bounded discovery.
+        // Stage the complete batch before mutating the registry. Distinct
+        // server/raw-name pairs can compose to the same provider-visible name.
+        let mut names: HashSet<String> = tool_registry.list().into_iter().collect();
+        let mut pending = Vec::new();
         for (label, client, tools) in discovered {
             tracing::info!(
                 server = %label,
@@ -115,12 +129,22 @@ impl McpConnectionManager {
                     execution_identity_fingerprint,
                 ) {
                     Ok(bridge) => {
+                        if !names.insert(bridge.name().to_owned()) {
+                            shutdown_clients(&clients).await;
+                            return Err(IronCrewError::Mcp {
+                                server: label.clone(),
+                                message: format!(
+                                    "MCP tool name `{}` conflicts with another discovered or registered tool",
+                                    bridge.name()
+                                ),
+                            });
+                        }
                         tracing::debug!(
                             server = %label,
                             tool = bridge.name(),
-                            "Registered MCP bridge tool"
+                            "Validated MCP bridge tool"
                         );
-                        tool_registry.register(Box::new(bridge));
+                        pending.push(bridge);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -132,6 +156,9 @@ impl McpConnectionManager {
                     }
                 }
             }
+        }
+        for bridge in pending {
+            tool_registry.register(Box::new(bridge));
         }
 
         Ok(Self { clients })

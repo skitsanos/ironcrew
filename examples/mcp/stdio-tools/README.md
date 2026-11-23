@@ -8,6 +8,11 @@ discovers it with `server/discover`, and exposes its `echo` tool as
 The strict process-owned stdio transport is supported on Unix. On Windows,
 configure a sessionless MCP `2026-07-28` Streamable HTTP endpoint instead.
 
+Each advertised tool name must be unique, including across paginated listings.
+The composed `mcp__<server>__<tool>` names must also be unique across the crew.
+Discovery rejects collisions before registering tools and reaps the new stdio
+servers; rename the conflicting label or tool before retrying.
+
 ## Run
 
 From the repository root:

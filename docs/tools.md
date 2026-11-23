@@ -437,6 +437,11 @@ extensions are never writable.
 
 ## MCP Tools
 
+MCP discovery requires unique server-local names across all pages and unique
+composed names across the complete crew registry. A collision fails discovery
+before any MCP tool is registered and closes the new connections. See
+[tool naming](crews.md#tool-naming) for collision examples and migration guidance.
+
 When a crew configures `mcp_servers`, each tool exported by a connected MCP
 server is registered in IronCrew's tool registry under the canonical name
 `mcp__<server>__<tool>` (see `src/mcp/config.rs`). Agents list them in their

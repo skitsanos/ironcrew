@@ -141,6 +141,7 @@ run "chat UI production bundle" \
 
 run "Rust formatting" cargo fmt --all -- --check
 run "Rust no-default-features build" cargo build --no-default-features
+run "Rust no-default-features binary Clippy" cargo clippy --no-default-features --bin ironcrew -- -D warnings
 run "Rust all-target Clippy" cargo clippy --all-targets -- -D warnings
 # Database targets share destructive fixtures; run them only in the serial gate.
 run "Rust all-target tests" \

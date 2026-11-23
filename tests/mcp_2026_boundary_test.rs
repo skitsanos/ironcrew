@@ -24,6 +24,9 @@ mod http_param_header_tests;
 mod http_param_header_value_tests;
 #[path = "mcp_2026_protocol/param_header_schemas.rs"]
 mod param_header_schemas;
+#[path = "mcp_2026_protocol/process_assertions.rs"]
+#[cfg(unix)]
+mod process_assertions;
 #[path = "mcp_2026_protocol/raw_http_fixture.rs"]
 mod raw_http_fixture;
 #[path = "mcp_2026_protocol/raw_http_response.rs"]

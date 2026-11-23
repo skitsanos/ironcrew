@@ -76,6 +76,7 @@ impl McpClient {
         let mut tools = Vec::new();
         let mut cursor = None;
         let mut seen_cursors = HashSet::new();
+        let mut seen_names = HashSet::new();
 
         for _ in 0..max_pages {
             let mut result = call::list_tools(
@@ -103,6 +104,12 @@ impl McpClient {
                 {
                     guard.poison();
                     return Err(error);
+                }
+                if !seen_names.insert(tool.name.clone()) {
+                    guard.poison();
+                    return Err(mcp_error(
+                        "MCP tool discovery returned a duplicate tool name",
+                    ));
                 }
             }
             tools.extend(result.tools);

@@ -1239,6 +1239,17 @@ Constraints:
 - Server label: `^[a-z][a-z0-9_-]{0,15}$` (lowercase, max 16 chars)
 - Composed name: ≤ 64 characters total
 
+Each server must advertise unique tool names across its entire paginated listing.
+Programmatic Rust configurations must also use unique server labels; duplicate
+labels are rejected before any connection is opened.
+Composed names must also be unique across all configured servers and must not
+replace a tool already in the crew's registry. For example, server `a` / tool
+`b__c` conflicts with server `a__b` / tool `c`. Discovery rejects such a batch,
+closes its connections and leaves the existing registry unchanged. This is an
+intentional compatibility change: ambiguous configurations that previously
+silently replaced a tool now fail. Rename a server label or tool to disambiguate
+them; distinct names containing underscores remain supported.
+
 ### Connection lifecycle
 
 - MCP servers are **connected in parallel** when tools are first finalized for
