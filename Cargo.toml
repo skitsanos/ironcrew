@@ -20,7 +20,7 @@ codegen-units = 1
 strip = true
 
 [dependencies]
-mlua = { version = "0.12.2", features = ["lua54", "async", "send", "serialize", "vendored"] }
+mlua = { version = "0.12.3", features = ["lua54", "async", "send", "serialize", "vendored"] }
 tokio = { version = "1.54.1", features = ["full"] }
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -39,7 +39,7 @@ url = "2.5.9"
 sha2 = "0.11.1"
 md-5 = "0.11"
 tera = "2.4.0"
-jsonschema = { version = "0.62.0", default-features = false }
+jsonschema = { version = "0.63.0", default-features = false }
 glob = "0.3.4"
 regex = "1.13.2"
 futures = "0.3.34"
