@@ -1,7 +1,7 @@
 # Keep the builder aligned with `package.rust-version` in Cargo.toml. Using an
 # exact toolchain tag prevents a future `rust:latest` release from changing the
 # build underneath us.
-FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
+FROM rust:1.100.0-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94 AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY examples/graph-prototype/assets ./examples/graph-prototype/assets
 
 RUN cargo build --release --locked
 
-FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+FROM debian:13-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0 AS runtime
 
 WORKDIR /app
 
